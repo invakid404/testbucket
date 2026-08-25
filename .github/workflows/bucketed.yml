@@ -85,7 +85,7 @@ jobs:
 
       - name: Restore the timing store
         id: restore
-        uses: actions/cache/restore@v4.3.0
+        uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ runner.temp }}/testbucket-store
           key: testbucket-timings-v1-${{ github.sha }}
@@ -240,7 +240,7 @@ jobs:
             "${events[@]}"
 
       - name: Restore the previous timing store
-        uses: actions/cache/restore@v4.3.0
+        uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ runner.temp }}/testbucket-store
           key: testbucket-timings-v1-${{ github.sha }}
@@ -295,7 +295,7 @@ jobs:
         # Writes on a new master commit; on a same-SHA re-run the entry already
         # exists and the action warns instead of overwriting, keeping the split
         # deterministic for a given SHA.
-        uses: actions/cache/save@v4.3.0
+        uses: actions/cache/save@v6.1.0
         with:
           path: ${{ runner.temp }}/testbucket-store
           key: testbucket-timings-v1-${{ github.sha }}
