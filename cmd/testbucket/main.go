@@ -32,18 +32,29 @@ import (
 	"github.com/invakid404/testbucket/internal/runner/gorunner"
 )
 
+// Build metadata, injected at release time via -ldflags -X (goreleaser fills
+// these from the tag). They default to "dev" for a `go build` / `go install`
+// off a checkout, so `testbucket version` always answers something sensible.
+var (
+	version = "dev"
+	commit  = ""
+	date    = ""
+)
+
 const usage = `testbucket — time-balanced unit-test bucketing
 
 usage:
-  testbucket plan   [flags]   compute K buckets and emit a GH-Actions matrix
-  testbucket ingest [flags]   fold a run's timings back into the store
-  testbucket whales [flags]   show the per-runnable distribution behind each
+  testbucket plan    [flags]  compute K buckets and emit a GH-Actions matrix
+  testbucket ingest  [flags]  fold a run's timings back into the store
+  testbucket whales  [flags]  show the per-runnable distribution behind each
                               split decision, so the divisibility question can
                               be re-derived from any store
-  testbucket audit  [flags]   check a finished run's captured events against
+  testbucket audit   [flags]  check a finished run's captured events against
                               the plan it was fanned out from: every target
                               covered exactly as scheduled, shards and slices
                               accounted for
+  testbucket version          print the build version (a released binary reports
+                              its tag; a checkout reports "dev")
 
 run "testbucket <subcommand> -h" for the flags of each.
 `
@@ -63,6 +74,9 @@ func main() {
 		err = runWhales(os.Args[2:])
 	case "audit":
 		err = runAudit(os.Args[2:])
+	case "version", "--version", "-v":
+		printVersion()
+		return
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, usage)
 		return
@@ -73,6 +87,19 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "testbucket: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// printVersion writes the build metadata: the tag for a released binary, "dev"
+// for a plain checkout. The commit and date lines are omitted when unset so a
+// dev build stays terse.
+func printVersion() {
+	fmt.Printf("testbucket %s\n", version)
+	if commit != "" {
+		fmt.Printf("commit: %s\n", commit)
+	}
+	if date != "" {
+		fmt.Printf("built:  %s\n", date)
 	}
 }
 

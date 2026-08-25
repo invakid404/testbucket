@@ -1,0 +1,69 @@
+# goreleaser config for the testbucket CLI.
+#
+# `goreleaser release` runs on a `v*` tag push (see .github/workflows/release.yml)
+# and builds the four cross-platform binaries, packages them as tar.gz archives
+# with a checksums file, and cuts a GitHub Release. Validate locally without
+# publishing: `goreleaser release --snapshot --clean`.
+version: 2
+
+project_name: testbucket
+
+builds:
+  - id: testbucket
+    main: ./cmd/testbucket
+    binary: testbucket
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # The version subcommand reports these; goreleaser fills them from the tag.
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .CommitDate }}
+    # Reproducible archives: pin embedded file mtimes to the commit time.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: testbucket
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  github:
+    owner: invakid404
+    name: testbucket
+  draft: false
+  # A pre-release tag (v1.2.3-rc.1) is published as a prerelease automatically.
+  prerelease: auto
+  name_template: "{{ .Tag }}"
+  # Make a rerun after a transient failure safe: replace same-named assets
+  # instead of failing the whole release with GitHub's `already_exists`.
+  replace_existing_artifacts: true
