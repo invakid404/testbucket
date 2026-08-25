@@ -46,7 +46,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v7.0.0
         with:
-          go-version: "1.27"
+          go-version: "1.27.0"
       - name: go test ./... (unbucketed)
         run: go test -race -count=1 ./...
 
