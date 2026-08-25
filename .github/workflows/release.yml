@@ -45,7 +45,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5.6.0
         with:
-          go-version: "1.27"
+          go-version: "1.27.0"
 
       - name: Run goreleaser
         # Pinned to a reviewed commit SHA (third-party code with a write token);
