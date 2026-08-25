@@ -1,0 +1,91 @@
+name: testbucket run-bucket
+description: >-
+  Install testbucket and run one planned bucket. The bucket's generated script
+  tees machine-readable timing events for a later ingest; this action renders a
+  human-readable log alongside and exits with the SCRIPT's status, never the
+  renderer's — a happy renderer must not make a red bucket look green.
+
+inputs:
+  runner:
+    description: 'Test-runner adapter: go or vitest.'
+    default: go
+  script:
+    description: 'The bucket''s generated script (matrix.script).'
+    required: true
+  name:
+    description: 'Human label for the bucket (matrix.name).'
+    default: bucket
+  est-seconds:
+    description: 'The bucket''s time estimate in seconds (matrix.est_seconds).'
+    default: ""
+  events-dir:
+    description: >-
+      Absolute directory the generated script tees its events into. Must match
+      the events-dir the plan baked into the script; this action creates it
+      before the run so the script's `tee` has somewhere to write.
+    default: /tmp/testbucket-events
+  version:
+    description: 'testbucket binary to install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
+    default: v1
+  working-directory:
+    description: 'Directory to run the bucket in.'
+    default: "."
+
+runs:
+  using: composite
+  steps:
+    # Only the Go runner needs the binary here (for `testbucket render`); a Vitest
+    # bucket's script prints its own default-reporter log, so it needs no binary —
+    # and therefore no Go on a Vitest runner even in local-install mode.
+    - name: Install testbucket
+      if: inputs.runner == 'go'
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    - name: Run the bucket
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        # Passed through the environment and quoted on use rather than
+        # interpolated into the shell: the script is generated data, and
+        # splicing generated text into a command line is how a workflow grows an
+        # injection.
+        TB_RUNNER: ${{ inputs.runner }}
+        BUCKET_SCRIPT: ${{ inputs.script }}
+        BUCKET_NAME: ${{ inputs.name }}
+        BUCKET_EST: ${{ inputs.est-seconds }}
+        TB_EVENTS_DIR: ${{ inputs.events-dir }}
+      run: |
+        set -euo pipefail
+        # The generated script tees its events into this directory; create it
+        # first so `tee` has somewhere to write (the script itself does not mkdir,
+        # and each bucket runs on a fresh runner).
+        mkdir -p "$TB_EVENTS_DIR"
+        echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
+        printf '%s\n' "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
+        echo "--- invocations ---"
+        cat "$RUNNER_TEMP/testbucket-bucket.sh"
+        echo "--- output ---"
+
+        # The generated script already tees each stream to the events directory
+        # for the record job. The status taken is the SCRIPT's (PIPESTATUS[0]),
+        # never the renderer's.
+        set +e
+        if [ "$TB_RUNNER" = "go" ]; then
+          # Go's script emits `go test -json` on stdout; pipe it through
+          # `testbucket render` to reproduce the plain test log for humans.
+          bash "$RUNNER_TEMP/testbucket-bucket.sh" | testbucket render
+          status=${PIPESTATUS[0]}
+        else
+          # Vitest's script prints a default-reporter log itself (the JSON report
+          # goes to a side file), so run it directly.
+          bash "$RUNNER_TEMP/testbucket-bucket.sh"
+          status=$?
+        fi
+        set -e
+        exit "$status"

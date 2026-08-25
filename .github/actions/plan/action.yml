@@ -1,0 +1,106 @@
+name: testbucket plan
+description: >-
+  Install testbucket and compute a K-way, time-balanced bucket matrix from a
+  rolling timing store. Emits the fromJSON matrix for a fan-out plus the path of
+  the full shard-plan. The never-drop-a-test coverage gate runs inside the plan:
+  if any live target would go unscheduled it fails closed and emits no matrix.
+
+inputs:
+  runner:
+    description: 'Test-runner adapter: go or vitest.'
+    default: go
+  k:
+    description: 'Number of buckets — the single knob (adding a lane = bumping k).'
+    default: "6"
+  count:
+    description: 'Flake-sweep -count for the Go runner; the Vitest runner requires 1.'
+    default: "1"
+  store-path:
+    description: 'Timing-store JSON path; a missing store is a cold start, not an error.'
+    default: test-timings.json
+  events-dir:
+    description: >-
+      Absolute directory the emitted invocations tee their events into for a
+      later ingest. Must be a literal path (it is baked into the plan script and
+      executed on a different runner), so do not use a per-job variable.
+    default: /tmp/testbucket-events
+  shard-plan:
+    description: 'Path to write the full shard-plan JSON (upload it for the record job to audit).'
+    default: /tmp/testbucket-shard-plan.json
+  version:
+    description: 'testbucket binary to install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
+    default: v1
+  working-directory:
+    description: 'Directory to plan in (where the tests live).'
+    default: "."
+  vitest-command:
+    description: 'How to invoke vitest (--runner vitest); empty means "npx vitest". Ignored for the Go runner.'
+    default: ""
+
+outputs:
+  matrix:
+    description: 'The fromJSON matrix to feed the test job''s strategy.'
+    value: ${{ steps.plan.outputs.matrix }}
+  shard-plan:
+    description: 'Path of the written shard-plan JSON.'
+    value: ${{ inputs.shard-plan }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install testbucket
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    - name: Compute the bucket matrix
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TB_RUNNER: ${{ inputs.runner }}
+        TB_K: ${{ inputs.k }}
+        TB_COUNT: ${{ inputs.count }}
+        TB_STORE: ${{ inputs.store-path }}
+        TB_EVENTS_DIR: ${{ inputs.events-dir }}
+        TB_SHARD_PLAN: ${{ inputs.shard-plan }}
+        TB_VITEST_COMMAND: ${{ inputs.vitest-command }}
+      run: |
+        set -euo pipefail
+        if [ -f "$TB_STORE" ]; then
+          echo "planning from the restored store at $TB_STORE"
+        else
+          echo "no store at $TB_STORE — planning from the cold-start mean weight"
+        fi
+
+        # A vitest command override is passed as one properly-quoted argument
+        # (an array element), never spliced into the command line, so a
+        # multi-word command survives with its grouping intact.
+        extra=()
+        if [ -n "$TB_VITEST_COMMAND" ]; then
+          extra+=(--vitest-command "$TB_VITEST_COMMAND")
+        fi
+
+        # --json puts the fromJSON matrix on stdout and the loaded-vs-missing
+        # summary on stderr, so the summary lands in this log while the matrix
+        # stays machine-clean. The coverage gate runs inside this command: a
+        # live target left unscheduled exits non-zero and emits no matrix,
+        # failing the fan-out closed rather than open.
+        matrix=$(testbucket plan \
+          --runner "$TB_RUNNER" \
+          --k "$TB_K" \
+          --count "$TB_COUNT" \
+          --store "$TB_STORE" \
+          --events-dir "$TB_EVENTS_DIR" \
+          --shard-plan "$TB_SHARD_PLAN" \
+          "${extra[@]}" \
+          --json)
+
+        # printf, not echo: the matrix carries \n escapes inside its script
+        # fields, and some shells' echo would expand them into real newlines,
+        # corrupting the JSON and the single-line key=value $GITHUB_OUTPUT form.
+        printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
