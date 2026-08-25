@@ -1,0 +1,267 @@
+name: testbucket bucketed (reusable)
+
+# A drop-in bucketed unit-test lane a consumer adopts in ~10 lines:
+#
+#   jobs:
+#     tests:
+#       uses: invakid404/testbucket/.github/workflows/bucketed-reusable.yml@v1
+#       with:
+#         runner: go       # or vitest
+#         k: "6"
+#
+# It wires plan -> matrix -> test -> record: a cheap `plan` job partitions the
+# live target set K ways from a rolling timing store and emits a fromJSON matrix;
+# the `test` job fans out over it, each bucket running only its own slice; a
+# default-branch-only `record` job audits the run and folds the measured timings
+# back into the store, so the next split is better than this one. The coverage
+# gate inside `plan` is what makes the fan-out safe: it refuses to emit a matrix
+# unless every live target lands in exactly one bucket.
+#
+# The composite actions are referenced with the `$/` self-repository syntax, so
+# they resolve to THIS repo at the SAME ref the reusable workflow was called with
+# — the pinned actions for an external `@v1` consumer, and the local checkout for
+# testbucket's own pre-release dogfood. Plain `./` would resolve against the
+# CALLER's repo and break every external consumer.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'Test-runner adapter: go or vitest.'
+        type: string
+        default: go
+      k:
+        description: 'Number of buckets — the single knob.'
+        type: string
+        default: "6"
+      count:
+        description: 'Flake-sweep -count for the Go runner; the Vitest runner requires 1.'
+        type: string
+        default: "1"
+      test-command:
+        description: 'Vitest invocation override (e.g. "npx vitest"); ignored for the Go runner.'
+        type: string
+        default: ""
+      cache-scope:
+        description: 'Namespace for the timing-store cache key and artifact names, so multiple suites in one repo do not collide.'
+        type: string
+        default: default
+      testbucket-version:
+        description: 'Which testbucket binary the actions install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
+        type: string
+        default: v1
+      go-version:
+        description: 'Go toolchain version (runner: go).'
+        type: string
+        default: "1.27"
+      node-version:
+        description: 'Node version (runner: vitest, or any node-needing Go bucket).'
+        type: string
+        default: "24.19.0"
+      working-directory:
+        description: 'Directory the tests live in.'
+        type: string
+        default: "."
+      runs-on:
+        description: 'Runner label for every job.'
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  # 1/3 — PLAN. Cheap, and the gate for everything downstream.
+  plan:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # Go is needed for the Go adapter AND for a local testbucket build (which
+      # the plan action always does when version==local), regardless of adapter.
+      - name: Set up Go
+        if: inputs.runner == 'go' || inputs.testbucket-version == 'local'
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Set up Node
+        if: inputs.runner == 'vitest'
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install test dependencies
+        if: inputs.runner == 'vitest'
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci
+
+      - name: Restore the timing store
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-${{ inputs.cache-scope }}-v1-${{ github.sha }}
+          restore-keys: |
+            testbucket-timings-${{ inputs.cache-scope }}-v1-
+
+      - name: Plan the buckets
+        id: plan
+        uses: $/.github/actions/plan
+        with:
+          runner: ${{ inputs.runner }}
+          k: ${{ inputs.k }}
+          count: ${{ inputs.count }}
+          store-path: ${{ runner.temp }}/testbucket-store/test-timings.json
+          events-dir: /tmp/testbucket-events
+          shard-plan: ${{ runner.temp }}/shard-plan.json
+          version: ${{ inputs.testbucket-version }}
+          working-directory: ${{ inputs.working-directory }}
+          vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
+
+      - name: Upload the shard plan
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: testbucket-shard-plan-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/shard-plan.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # 2/3 — TEST. One job per bucket, each running only its own slice.
+  test:
+    needs: plan
+    runs-on: ${{ inputs.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        if: inputs.runner == 'go'
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Set up Node
+        if: inputs.runner == 'vitest' || matrix.needs_node
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install test dependencies
+        if: inputs.runner == 'vitest'
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci
+
+      - name: Run bucket ${{ matrix.bucket }}
+        uses: $/.github/actions/run-bucket
+        with:
+          runner: ${{ inputs.runner }}
+          script: ${{ matrix.script }}
+          name: ${{ matrix.name }}
+          est-seconds: ${{ matrix.est_seconds }}
+          events-dir: /tmp/testbucket-events
+          version: ${{ inputs.testbucket-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Upload timing events
+        # if: always() so a red bucket still contributes what it measured;
+        # ingest drops a failed unit's weight and keeps the rest.
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: testbucket-events-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
+          path: /tmp/testbucket-events/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # 3/3 — RECORD. Default-branch push only. Folds the measured timings back in.
+  record:
+    needs: [plan, test]
+    # !cancelled() rather than always(): record what a red run measured, but not
+    # a cancelled one whose artifacts are arbitrary partial captures. Only the
+    # consumer's default branch is authoritative for the shared store.
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # Go is needed for the Go adapter AND for a local testbucket build (which
+      # the record action always does when version==local), regardless of adapter.
+      - name: Set up Go
+        if: inputs.runner == 'go' || inputs.testbucket-version == 'local'
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Set up Node
+        if: inputs.runner == 'vitest'
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install test dependencies
+        if: inputs.runner == 'vitest'
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci
+
+      - name: Download timing events
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: testbucket-events-${{ inputs.cache-scope }}-bucket-*
+          merge-multiple: true
+          path: /tmp/testbucket-events
+
+      - name: Download the shard plan
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: testbucket-shard-plan-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/plan
+
+      - name: Restore the previous timing store
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-${{ inputs.cache-scope }}-v1-${{ github.sha }}
+          restore-keys: |
+            testbucket-timings-${{ inputs.cache-scope }}-v1-
+
+      - name: Audit and record the run
+        uses: $/.github/actions/record
+        with:
+          runner: ${{ inputs.runner }}
+          k: ${{ inputs.k }}
+          count: ${{ inputs.count }}
+          store-path: ${{ runner.temp }}/testbucket-store/test-timings.json
+          events-dir: /tmp/testbucket-events
+          shard-plan: ${{ runner.temp }}/plan/shard-plan.json
+          version: ${{ inputs.testbucket-version }}
+          working-directory: ${{ inputs.working-directory }}
+          vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
+
+      - name: Save the timing store
+        # Writes on a new default-branch commit; on a same-SHA re-run the entry
+        # already exists and the action warns instead of overwriting, keeping the
+        # split deterministic for a given SHA.
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-${{ inputs.cache-scope }}-v1-${{ github.sha }}
+
+      - name: Upload the timing store
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: testbucket-timing-store-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/testbucket-store/test-timings.json
+          if-no-files-found: warn
+          retention-days: 30
