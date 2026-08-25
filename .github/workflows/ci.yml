@@ -115,7 +115,7 @@ jobs:
       - name: goreleaser check + snapshot build
         # Pinned to the same reviewed commit SHA + exact goreleaser version as
         # the release workflow, so the dry-run validates what actually ships.
-        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "2.18.0"
           args: release --snapshot --clean
