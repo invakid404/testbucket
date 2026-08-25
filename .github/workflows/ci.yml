@@ -55,5 +55,39 @@ jobs:
 
       - name: go test
         # -race and -count=1 (no test cache) so the baseline measures the same
-        # work the bucketed lane does.
+        # work the bucketed lane does. The Vitest adapter's integration test
+        # skips here (no Node/vitest install) and runs for real in the
+        # vitest-adapter job below.
         run: go test -race -count=1 ./...
+
+  # The Vitest adapter (internal/runner/vitestrunner) has offline unit tests that
+  # run everywhere plus one end-to-end test that discovers, runs and ingests a
+  # real sample Vitest project. This job gives it Node + an installed vitest so
+  # that end-to-end test actually executes rather than skipping.
+  vitest-adapter:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the sample Vitest project
+        working-directory: testdata/vitest-sample
+        run: npm ci
+
+      - name: Test the Vitest adapter (end-to-end runs)
+        run: go test -count=1 -v ./internal/runner/vitestrunner/...

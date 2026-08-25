@@ -9,8 +9,9 @@ so the next split is better than the last.
 
 It is **framework-agnostic at its core** and speaks to a concrete test runner
 through a small **runner-adapter seam**. The Go runner (`go test`) is adapter #1
-and ships here; a second adapter (e.g. Vitest) implements the same interface
-without touching the engine. See [Adding a framework adapter](#adding-a-framework-adapter).
+and Vitest is adapter #2; both implement the same interface without touching the
+engine (`internal/core` is byte-for-byte unchanged between them). See
+[Adding a framework adapter](#adding-a-framework-adapter).
 
 This repository **self-hosts**: its own CI buckets its own test suite through
 the tool (see [`.github/workflows/bucketed.yml`](.github/workflows/bucketed.yml)).
@@ -104,10 +105,11 @@ job produced no events, an artifact that failed to upload.
 ## Architecture: the runner-adapter seam
 
 ```
-internal/core            the language-agnostic engine (imports only the seam + stdlib)
-internal/runner          the Runner interface + the value types that cross the seam
-internal/runner/gorunner the Go adapter (adapter #1): go list / go test -json / go test
-cmd/testbucket           CLI wiring: parse flags, build the adapter, call the core
+internal/core               the language-agnostic engine (imports only the seam + stdlib)
+internal/runner             the Runner interface + the value types that cross the seam
+internal/runner/gorunner    the Go adapter (adapter #1): go list / go test -json / go test
+internal/runner/vitestrunner the Vitest adapter (adapter #2): vitest list / vitest run --reporter=json
+cmd/testbucket              CLI wiring: parse flags, build the adapter, call the core
 ```
 
 `internal/core` knows nothing about `go`, `go test`, `go list`, GOWORK, or any
@@ -221,13 +223,25 @@ importing `gorunner`, without touching `internal/core`, and with a bare `10000`
 timeout** — the compile-checked proof that the seam is genuinely
 framework-agnostic.
 
+The full worked example is **`internal/runner/vitestrunner`** (adapter #2). It
+discovers via `vitest list --json`, weighs files from the Vitest JSON reporter,
+and renders `vitest run <files> --no-file-parallelism` — bucketing at **file
+granularity** (a spec file is the unit, as a Go package is). Its end-to-end test
+discovers a real sample project (`testdata/vitest-sample`), runs the tool's own
+emitted commands, ingests the timings, and re-plans into a time-balanced split.
+It was added with **zero changes to `internal/core`**. (Name-slicing a whale spec
+by test name — an escaped `-t` over `vitest list` names, with duplicate-title and
+nested-`describe` handling — is a deliberate follow-up; until then a whale spec
+runs whole and `ValidateUnit` refuses run-slice/count-shard units so the gate
+stays a real backstop.)
+
 ## Development
 
 ```sh
 gofmt -l .          # formatting
 go vet ./...        # vet
 go build ./...      # build
-go test ./... -race # the full suite (~112 tests)
+go test ./... -race # the full suite (~124 tests)
 ```
 
 ## License
