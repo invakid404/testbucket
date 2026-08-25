@@ -11,17 +11,23 @@
 # Test binary, built with `go test -c`
 *.test
 
-# Code coverage profiles and other test artifacts
+# Code coverage profiles and other test artifacts.
+# NOTE: keep these specific to profile OUTPUT files — a bare `coverage.*` also
+# matches source files like coverage.go and silently drops them from the repo.
 *.out
-coverage.*
+coverage.out
+coverage.html
+coverage.txt
 *.coverprofile
 profile.cov
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# Go workspace file
-go.work
+# Go workspace file — go.work IS committed here: testbucket self-hosts through
+# its own bucketer, and a workspace is what lets its packages be scheduled
+# individually (a lone GOWORK=off module packs as one indivisible atom). The
+# lock file stays ignored; the module has no third-party dependencies.
 go.work.sum
 
 # env file

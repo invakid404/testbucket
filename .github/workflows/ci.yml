@@ -1,0 +1,59 @@
+name: CI
+
+# The plain quality gate: format, vet, build and the full test suite over the
+# whole module. It runs unbucketed, so it is also the baseline the dogfood
+# `bucketed.yml` lane is measured against — same commits, same tests, one job
+# vs a K-way fan-out.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.27"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: gofmt
+        # gofmt -l prints any file that is not already formatted; a non-empty
+        # list fails the job. This catches formatting drift before it reaches a
+        # reviewer.
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        # -race and -count=1 (no test cache) so the baseline measures the same
+        # work the bucketed lane does.
+        run: go test -race -count=1 ./...

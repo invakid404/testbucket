@@ -1,0 +1,310 @@
+name: Bucketed (dogfood)
+
+# testbucket bucketing its OWN test suite — the tool run through itself.
+#
+# The mechanism in one paragraph: a cheap `plan` job restores the rolling timing
+# store, partitions the live package set K ways with Karmarkar-Karp, and emits a
+# `fromJSON` matrix. The `test` job fans out over it, each bucket running only
+# its own slice. A master-only `record` job folds the measured timings back in,
+# so the next run's split is better than this one's. The never-drop-a-test
+# coverage gate inside `plan` is what makes the fan-out safe: it refuses to emit
+# a matrix unless every live package lands in exactly one bucket, so a green
+# matrix is a statement about coverage and not just about exit codes.
+#
+# The `baseline` job runs the same tests unbucketed, so the two makespans are
+# directly comparable on the same commit. This suite is small (the tool has few
+# packages), so this lane's value is proof the loop closes end to end, not a
+# wall-time win — the design transfers to a large Go suite, which is where the
+# K-way split pays off.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: bucketed-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.27"
+
+  # THE SINGLE K KNOB. It drives BOTH `ingest --whale-k` and `plan --k`, because
+  # the whale-split policy is derived and stored at record time against total/K
+  # while the matrix width is applied at plan time. Adding a lane is changing
+  # this number and nothing else; it settles on the next master record. Set to
+  # this repo's package count; a large consumer suite runs it at 6+.
+  TESTBUCKET_K: "2"
+
+  # The flake-sweep -count. Kept at 1 here to keep the dogfood fast; a real
+  # consumer raises it (e.g. 100) so count-sharding has iterations to divide.
+  TESTBUCKET_COUNT: "1"
+
+  # Where the plan-emitted invocations tee their `go test -json` streams. A
+  # fixed absolute path rather than $RUNNER_TEMP on purpose: the path is baked
+  # into the script by the PLAN job and executed by the TEST job, on different
+  # runners. A literal path is valid in both; an expansion of a per-job variable
+  # is not.
+  TESTBUCKET_EVENTS_DIR: /tmp/testbucket-events
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Baseline: the same tests, unbucketed. The number the fan-out is measured
+  # against.
+  baseline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: go test ./... (unbucketed)
+        run: go test -race -count=1 ./...
+
+  # ---------------------------------------------------------------------------
+  # 1/3 — PLAN. Cheap, and the gate for everything downstream.
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Restore the timing store
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-v1-${{ github.sha }}
+          restore-keys: |
+            testbucket-timings-v1-
+
+      - name: Compute the bucket matrix
+        id: plan
+        run: |
+          set -euo pipefail
+          store="$RUNNER_TEMP/testbucket-store/test-timings.json"
+          if [ -f "$store" ]; then
+            echo "restored a store from cache key '${{ steps.restore.outputs.cache-matched-key }}'"
+          else
+            echo "no store in the cache yet — planning from the cold-start mean weight"
+          fi
+
+          # --json puts the fromJSON matrix on stdout and the loaded-vs-missing
+          # summary on stderr, so the summary lands in this log while the matrix
+          # stays machine-clean. --shard-plan writes the full plan for download.
+          # The coverage gate runs inside this command: if any live package
+          # would be left unscheduled it exits non-zero and no matrix is
+          # produced, failing the fan-out closed rather than open.
+          matrix=$(go run ./cmd/testbucket plan \
+            --k "$TESTBUCKET_K" \
+            --count "$TESTBUCKET_COUNT" \
+            --store "$store" \
+            --events-dir "$TESTBUCKET_EVENTS_DIR" \
+            --shard-plan "$RUNNER_TEMP/shard-plan.json" \
+            --json)
+
+          # printf, not echo: the matrix carries \n escapes inside its script
+          # fields, and some shells' echo expands those into real newlines,
+          # corrupting the JSON and breaking the single-line key=value form
+          # $GITHUB_OUTPUT expects.
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the shard plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testbucket-shard-plan
+          path: ${{ runner.temp }}/shard-plan.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 2/3 — TEST. One job per bucket, each running only its own slice.
+  test:
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run bucket ${{ matrix.bucket }}
+        env:
+          # Passed through the environment and quoted on use rather than
+          # interpolated into the shell: the script is generated data, and
+          # splicing generated text into a command line is how a workflow grows
+          # an injection.
+          BUCKET_SCRIPT: ${{ matrix.script }}
+          BUCKET_NAME: ${{ matrix.name }}
+          BUCKET_EST: ${{ matrix.est_seconds }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$TESTBUCKET_EVENTS_DIR"
+
+          echo "=== $BUCKET_NAME — estimated ${BUCKET_EST}s ==="
+          printf '%s\n' "$BUCKET_SCRIPT" > "$RUNNER_TEMP/bucket.sh"
+          echo "--- invocations ---"
+          cat "$RUNNER_TEMP/bucket.sh"
+          echo "--- output ---"
+
+          # The generated script already carries -json and tees each stream to
+          # $TESTBUCKET_EVENTS_DIR for the record job. Piping its stdout back
+          # through the renderer turns that NDJSON into the plain test log a
+          # human reading a failure expects. The status taken is the SCRIPT's,
+          # never the renderer's: a happy renderer must not make a red bucket
+          # look green.
+          set +e
+          bash "$RUNNER_TEMP/bucket.sh" | bash scripts/testbucket-render.sh
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Upload timing events
+        # if: always() so a red bucket still contributes what it measured;
+        # ingest drops a failed package's weight and keeps the rest.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testbucket-events-bucket-${{ matrix.bucket }}
+          path: /tmp/testbucket-events/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 3/3 — RECORD. Master-only. Folds the measured timings back into the store.
+  record:
+    needs: [plan, test]
+    # !cancelled() rather than always(): record what a red run measured, but not
+    # a cancelled one whose artifacts are arbitrary partial captures.
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download timing events
+        uses: actions/download-artifact@v4
+        with:
+          pattern: testbucket-events-bucket-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/testbucket-events
+
+      - name: Download the shard plan
+        uses: actions/download-artifact@v4
+        with:
+          name: testbucket-shard-plan
+          path: ${{ runner.temp }}/plan
+
+      - name: Audit the run against the plan
+        run: |
+          set -euo pipefail
+          # The plan's coverage gate proved the MATRIX was complete before
+          # anything ran. This proves the RUN was: a bucket whose job produced
+          # no events, an artifact that failed to upload, a shard that died
+          # before reporting — all invisible to a gate that only ever saw the
+          # plan.
+          shopt -s nullglob
+          events=("$RUNNER_TEMP/testbucket-events"/*.ndjson)
+          go run ./cmd/testbucket audit \
+            --shard-plan "$RUNNER_TEMP/plan/shard-plan.json" \
+            "${events[@]}"
+
+      - name: Restore the previous timing store
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-v1-${{ github.sha }}
+          restore-keys: |
+            testbucket-timings-v1-
+
+      - name: Ingest timings into the store
+        run: |
+          set -euo pipefail
+          store_dir="$RUNNER_TEMP/testbucket-store"
+          events_dir="$RUNNER_TEMP/testbucket-events"
+          mkdir -p "$store_dir"
+
+          shopt -s nullglob
+          events=("$events_dir"/*.ndjson)
+          if [ ${#events[@]} -eq 0 ]; then
+            echo "no timing events were uploaded; nothing to record" >&2
+            exit 1
+          fi
+          echo "ingesting ${#events[@]} event file(s) from $TESTBUCKET_K bucket(s)"
+
+          # A sharded package reports once per shard; ingest sums the
+          # package-level Elapsed back into a whole-package weight, so the store
+          # keeps measuring PACKAGES however the matrix happened to slice them.
+          # --whale-k is the same K the plan used.
+          go run ./cmd/testbucket ingest \
+            --store "$store_dir/test-timings.json" \
+            --count "$TESTBUCKET_COUNT" \
+            --whale-k "$TESTBUCKET_K" \
+            "${events[@]}"
+
+      - name: Show the plan the next run will get
+        run: |
+          set -euo pipefail
+          echo "planning at the recorded K=$TESTBUCKET_K"
+          go run ./cmd/testbucket plan \
+            --k "$TESTBUCKET_K" \
+            --count "$TESTBUCKET_COUNT" \
+            --store "$RUNNER_TEMP/testbucket-store/test-timings.json"
+
+      - name: Show the split decisions behind it
+        run: |
+          set -euo pipefail
+          # The divisibility evidence re-derived on CI's own numbers: per-runnable
+          # distribution and both mechanism costs for every package that crossed
+          # the split threshold.
+          go run ./cmd/testbucket whales \
+            --k "$TESTBUCKET_K" \
+            --store "$RUNNER_TEMP/testbucket-store/test-timings.json"
+
+      - name: Save the timing store
+        # Writes on a new master commit; on a same-SHA re-run the entry already
+        # exists and the action warns instead of overwriting, keeping the split
+        # deterministic for a given SHA.
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-v1-${{ github.sha }}
+
+      - name: Upload the timing store
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testbucket-timing-store
+          path: ${{ runner.temp }}/testbucket-store/test-timings.json
+          if-no-files-found: warn
+          retention-days: 30
