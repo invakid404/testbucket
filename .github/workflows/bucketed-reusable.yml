@@ -62,6 +62,14 @@ on:
         description: 'Directory the tests live in.'
         type: string
         default: "."
+      node-prefixes:
+        description: 'Forwarded to the plan action (Go runner): comma-separated package-dir prefixes whose buckets need Node set up (sets the matrix needs_node flag). Empty = none.'
+        type: string
+        default: ""
+      exclude-module:
+        description: 'Forwarded to plan + record (Go runner): module dirs (globs) to leave out of the discovered module set, one per line. Empty = every module under working-directory is in scope.'
+        type: string
+        default: ""
       runs-on:
         description: 'Runner label for every job.'
         type: string
@@ -121,6 +129,8 @@ jobs:
           version: ${{ inputs.testbucket-version }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
+          node-prefixes: ${{ inputs.node-prefixes }}
+          exclude-module: ${{ inputs.exclude-module }}
 
       - name: Upload the shard plan
         if: always()
@@ -247,6 +257,7 @@ jobs:
           version: ${{ inputs.testbucket-version }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
+          exclude-module: ${{ inputs.exclude-module }}
 
       - name: Save the timing store
         # Writes on a new default-branch commit; on a same-SHA re-run the entry
