@@ -50,6 +50,14 @@ inputs:
       modules out of the pure lane here). Empty = every module under the working
       directory is in scope.
     default: ""
+  setup-command:
+    description: >-
+      Optional shell command run once, in the working-directory, BEFORE the plan
+      command — the same per-runner provisioning seam as run-bucket, for discovery
+      that needs a toolchain (codegen, generated sources) before the module set is
+      resolved. Runs as a bash block; a failure fails the plan. Empty = no setup
+      step ⇒ unchanged behavior.
+    default: ""
 
 outputs:
   matrix:
@@ -70,6 +78,19 @@ runs:
         TB_BINDIR: ${{ runner.temp }}/testbucket-bin
         GH_TOKEN: ${{ github.token }}
       run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    # A consumer's own provisioning, run before discovery — for a toolchain the
+    # module walk needs (codegen, generated sources). Passed through the
+    # environment and executed as a bash block (never spliced into the command
+    # line) so consumer-supplied data cannot grow an injection; `-e` so a failed
+    # provisioning step fails the plan rather than yielding a wrong module set.
+    - name: Set up the plan
+      if: inputs.setup-command != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TB_SETUP_COMMAND: ${{ inputs.setup-command }}
+      run: bash -eo pipefail -c "$TB_SETUP_COMMAND"
 
     - name: Compute the bucket matrix
       id: plan

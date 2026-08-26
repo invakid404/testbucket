@@ -70,6 +70,10 @@ on:
         description: 'Forwarded to plan + record (Go runner): module dirs (globs) to leave out of the discovered module set, one per line. Empty = every module under working-directory is in scope.'
         type: string
         default: ""
+      setup-command:
+        description: 'Forwarded to plan + test: a shell command run once per job, in the working-directory, before the plan/test command — a per-runner provisioning seam (DB binaries, codegen, toolchains). Empty = no setup step.'
+        type: string
+        default: ""
       runs-on:
         description: 'Runner label for every job.'
         type: string
@@ -131,6 +135,7 @@ jobs:
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
           node-prefixes: ${{ inputs.node-prefixes }}
           exclude-module: ${{ inputs.exclude-module }}
+          setup-command: ${{ inputs.setup-command }}
 
       - name: Upload the shard plan
         if: always()
@@ -180,6 +185,7 @@ jobs:
           events-dir: /tmp/testbucket-events
           version: ${{ inputs.testbucket-version }}
           working-directory: ${{ inputs.working-directory }}
+          setup-command: ${{ inputs.setup-command }}
 
       - name: Upload timing events
         # if: always() so a red bucket still contributes what it measured;
