@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/invakid404/testbucket/internal/runner"
 )
@@ -45,6 +46,40 @@ func TestParseListGroupsByFile(t *testing.T) {
 		if live[i].Atom != "" {
 			t.Errorf("file %s got Atom=%q, want empty (files mix freely)", live[i].ID, live[i].Atom)
 		}
+	}
+}
+
+// The glob discovery shape (`vitest list --filesOnly --json`): rows carry a
+// file (and an ignored projectName) but NO name. parseList must reduce it to the
+// same live set as the full-collection shape, since discovery only ever needs
+// files.
+const globFixture = `[
+  {"file":"/repo/tests/slow.spec.ts","projectName":"a"},
+  {"file":"/repo/tests/fast.spec.ts","projectName":"a"},
+  {"file":"/repo/tests/tiny.spec.ts","projectName":"b"}
+]`
+
+func TestParseListAcceptsGlobFilesOnlyShape(t *testing.T) {
+	live, err := parseList("/repo", []byte(globFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"tests/fast.spec.ts", "tests/slow.spec.ts", "tests/tiny.spec.ts"}
+	if len(live) != len(want) {
+		t.Fatalf("got %d files, want %d: %+v", len(live), len(want), live)
+	}
+	for i, w := range want {
+		if live[i].ID != w {
+			t.Errorf("file %d id=%q, want %q", i, live[i].ID, w)
+		}
+		if !live[i].HasTests {
+			t.Errorf("file %s not marked HasTests", live[i].ID)
+		}
+	}
+	// A row with no file is still refused in the glob shape — a filesOnly document
+	// that dropped a path would silently lose a test file.
+	if _, err := parseList("/repo", []byte(`[{"projectName":"a"}]`)); err == nil {
+		t.Error("a filesOnly row with no file was accepted")
 	}
 }
 
@@ -200,6 +235,60 @@ func TestValidateUnit(t *testing.T) {
 				t.Errorf("defects miss %q: %v", tc.want, d)
 			}
 		})
+	}
+}
+
+func TestDiscoveryInvocationSelection(t *testing.T) {
+	// glob is the DEFAULT: `list --filesOnly --json` (resolves files without
+	// importing them).
+	glob := mustNew(t, Options{Root: ".", Command: []string{"npx", "vitest"}})
+	if tool, args := glob.discoveryInvocation(); strings.Join(tool.command, " ") != "npx vitest" ||
+		strings.Join(args, " ") != "list --filesOnly --json" {
+		t.Errorf("default discovery = %q %q, want the base command + `list --filesOnly --json`", tool.command, args)
+	}
+	// Explicit glob is identical.
+	if _, args := mustNew(t, Options{Root: ".", DiscoveryMode: "glob"}).discoveryInvocation(); strings.Join(args, " ") != "list --filesOnly --json" {
+		t.Errorf("glob discovery args = %q, want `list --filesOnly --json`", args)
+	}
+	// list opts back into the importing full-collection path.
+	if _, args := mustNew(t, Options{Root: ".", DiscoveryMode: "list"}).discoveryInvocation(); strings.Join(args, " ") != "list --json" {
+		t.Errorf("list discovery args = %q, want `list --json`", args)
+	}
+	// A verbatim discovery command OWNS its subcommand: it is run as-is with NO
+	// appended args, and it overrides the mode.
+	verbatim := mustNew(t, Options{
+		Root:             ".",
+		Command:          []string{"npx", "vitest"},
+		DiscoveryMode:    "list",
+		DiscoveryCommand: []string{"pnpm", "exec", "tb-discover"},
+	})
+	tool, args := verbatim.discoveryInvocation()
+	if strings.Join(tool.command, " ") != "pnpm exec tb-discover" {
+		t.Errorf("verbatim discovery command = %q, want the override run as-is", tool.command)
+	}
+	if len(args) != 0 {
+		t.Errorf("verbatim discovery appended %q; a command that owns its subcommand must get nothing appended", args)
+	}
+}
+
+func TestDiscoveryConfigValidation(t *testing.T) {
+	// An unknown discovery mode fails loudly at construction.
+	if _, err := New(Options{Root: ".", DiscoveryMode: "collect"}); err == nil {
+		t.Error("an unknown discovery mode was accepted")
+	}
+	// A negative discovery timeout is refused (0 is the disable sentinel).
+	if _, err := New(Options{Root: ".", DiscoveryTimeout: -time.Second}); err == nil {
+		t.Error("a negative discovery timeout was accepted")
+	}
+	// DiscoveryTimeout takes precedence over the general Timeout for the discovery
+	// subprocess; when it is unset, Timeout is the fallback.
+	r := mustNew(t, Options{Root: ".", Timeout: 9 * time.Second, DiscoveryTimeout: 3 * time.Second})
+	if tool, _ := r.discoveryInvocation(); tool.timeout != 3*time.Second {
+		t.Errorf("discovery deadline = %s, want the DiscoveryTimeout (3s) to win over Timeout", tool.timeout)
+	}
+	fallback := mustNew(t, Options{Root: ".", Timeout: 9 * time.Second})
+	if tool, _ := fallback.discoveryInvocation(); tool.timeout != 9*time.Second {
+		t.Errorf("discovery deadline = %s, want the fallback to Timeout (9s) when DiscoveryTimeout is unset", tool.timeout)
 	}
 }
 

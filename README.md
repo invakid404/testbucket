@@ -108,7 +108,7 @@ job produced no events, an artifact that failed to upload.
 internal/core               the language-agnostic engine (imports only the seam + stdlib)
 internal/runner             the Runner interface + the value types that cross the seam
 internal/runner/gorunner    the Go adapter (adapter #1): go list / go test -json / go test
-internal/runner/vitestrunner the Vitest adapter (adapter #2): vitest list / vitest run --reporter=json
+internal/runner/vitestrunner the Vitest adapter (adapter #2): vitest list --filesOnly (glob) / vitest run --reporter=json
 cmd/testbucket              CLI wiring: parse flags, build the adapter, call the core
 ```
 
@@ -224,16 +224,55 @@ timeout** — the compile-checked proof that the seam is genuinely
 framework-agnostic.
 
 The full worked example is **`internal/runner/vitestrunner`** (adapter #2). It
-discovers via `vitest list --json`, weighs files from the Vitest JSON reporter,
-and renders `vitest run <files> --no-file-parallelism` — bucketing at **file
-granularity** (a spec file is the unit, as a Go package is). Its end-to-end test
-discovers a real sample project (`testdata/vitest-sample`), runs the tool's own
-emitted commands, ingests the timings, and re-plans into a time-balanced split.
-It was added with **zero changes to `internal/core`**. (Name-slicing a whale spec
-by test name — an escaped `-t` over `vitest list` names, with duplicate-title and
-nested-`describe` handling — is a deliberate follow-up; until then a whale spec
-runs whole and `ValidateUnit` refuses run-slice/count-shard units so the gate
-stays a real backstop.)
+discovers by **glob** (`vitest list --filesOnly --json`), weighs files from the
+Vitest JSON reporter, and renders `vitest run <files> --no-file-parallelism` —
+bucketing at **file granularity** (a spec file is the unit, as a Go package is).
+Its end-to-end test discovers a real sample project (`testdata/vitest-sample`),
+runs the tool's own emitted commands, ingests the timings, and re-plans into a
+time-balanced split. It was added with **zero changes to `internal/core`**.
+(Name-slicing a whale spec by test name — an escaped `-t` over `vitest list`
+names, with duplicate-title and nested-`describe` handling — is a deliberate
+follow-up; until then a whale spec runs whole and `ValidateUnit` refuses
+run-slice/count-shard units so the gate stays a real backstop.)
+
+### Vitest discovery: glob, timeout, and the `--vitest-command` contract
+
+**Glob discovery is the default and needs no collection.** `vitest list --json`
+imports the whole module graph to enumerate per-test names; on a multi-project
+config that collection can **deadlock**, hanging `plan` indefinitely. Because the
+adapter buckets at file granularity it only needs the file *list*, so it
+discovers with `vitest list --filesOnly --json` — the CLI surface of Vitest's
+`globTestSpecifications()`, which resolves each project's include/exclude by glob
+**without importing a line of test code**. It is immune to the collection hang and
+returns in ~1 s on suites where `list` takes minutes.
+
+- `--vitest-discovery glob` (default) | `list`. Choose `list` only if you need the
+  importing full-collection path (its per-test names are unused by
+  file-granularity bucketing today); it re-exposes the deadlock, so it is opt-in.
+- `--discovery-timeout 180s` (env **`TB_DISCOVERY_TIMEOUT`**, a Go duration; `0`
+  disables) bounds discovery specifically and **fails fast with a clear error**
+  rather than hanging the job. It is separate from `--timeout` (the `go test`
+  run budget) so a stalled discovery can't hide behind a generous run deadline.
+  The subprocess is run in its own process group and killed as a group on timeout,
+  so a deadlocked `node` worker tree cannot keep the deadline from firing.
+
+**The `--vitest-command` contract.** testbucket treats `--vitest-command` as
+*program + leading args* (whitespace-split) and **appends** the subcommand itself:
+
+| path | testbucket runs |
+|---|---|
+| discovery (glob) | `<vitest-command> list --filesOnly --json` |
+| discovery (list) | `<vitest-command> list --json` |
+| a run bucket | `<vitest-command> run --no-file-parallelism <files> [--reporter=…]` |
+
+So the command must behave like **bare `vitest`**: accept `list`, `run`,
+positional files, `--filesOnly`, `--no-file-parallelism`, `--reporter`, `--json`.
+A wrapper that hard-codes its own subcommand (e.g. one that always runs
+`vitest run`) does **not** satisfy this — testbucket would append a second `run`
+or `list`. For that case, **`--vitest-discovery-command`** takes a command run
+**verbatim** (it owns its subcommand and flags; testbucket appends nothing) and
+must print the same `[{file}]` / `[{name,file}]` JSON on stdout — letting a
+run-wrapper be paired with a separate discovery command without a second façade.
 
 ## Development
 

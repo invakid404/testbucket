@@ -141,8 +141,11 @@ type runnerConfig struct {
 	timeout      string
 	nodePrefixes []string
 	// Vitest run envelope.
-	root          string
-	vitestCommand string
+	root                   string
+	vitestCommand          string
+	vitestDiscovery        string
+	vitestDiscoveryCommand string
+	discoveryTimeout       time.Duration
 	// Shared by both adapters.
 	eventsDir string
 }
@@ -176,22 +179,17 @@ func newRunner(cfg runnerConfig) (runner.Runner, liveLoader, error) {
 		if strings.TrimSpace(root) == "" {
 			root = "."
 		}
-		// The Go adapter splices --timeout verbatim into `go test -timeout`; the
-		// Vitest adapter wants a real duration. Parse the same flag so one
-		// --timeout serves both ("" leaves the Vitest deadline disabled).
-		var timeout time.Duration
-		if s := strings.TrimSpace(cfg.timeout); s != "" {
-			d, err := time.ParseDuration(s)
-			if err != nil {
-				return nil, nil, fmt.Errorf("--timeout %q: %w", cfg.timeout, err)
-			}
-			timeout = d
-		}
+		// Discovery is bounded by --discovery-timeout (a discovery-specific
+		// deadline), NOT --timeout: --timeout is the `go test -timeout` run budget
+		// and reusing it for discovery is what let a deadlocked `vitest list` hang
+		// for the whole job.
 		r, err := vitestrunner.New(vitestrunner.Options{
-			Root:      root,
-			Command:   splitCommand(cfg.vitestCommand),
-			Timeout:   timeout,
-			EventsDir: cfg.eventsDir,
+			Root:             root,
+			Command:          splitCommand(cfg.vitestCommand),
+			DiscoveryMode:    cfg.vitestDiscovery,
+			DiscoveryCommand: splitCommand(cfg.vitestDiscoveryCommand),
+			DiscoveryTimeout: cfg.discoveryTimeout,
+			EventsDir:        cfg.eventsDir,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -257,7 +255,35 @@ func splitPrefixes(s string) []string {
 	return strings.Split(s, ",")
 }
 
+// defaultDiscoveryTimeout is the fail-fast budget for test discovery, used when
+// neither --discovery-timeout nor TB_DISCOVERY_TIMEOUT is given.
+const defaultDiscoveryTimeout = 180 * time.Second
+
+// discoveryTimeoutDefault resolves the --discovery-timeout flag default from the
+// TB_DISCOVERY_TIMEOUT env var (a Go duration such as "180s" or "3m"), falling
+// back to defaultDiscoveryTimeout. A malformed or negative env value is a loud
+// error rather than a silently-ignored setting. An explicit --discovery-timeout
+// on the command line still overrides whatever this returns.
+func discoveryTimeoutDefault() (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv("TB_DISCOVERY_TIMEOUT"))
+	if v == "" {
+		return defaultDiscoveryTimeout, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("TB_DISCOVERY_TIMEOUT %q: %w", v, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("TB_DISCOVERY_TIMEOUT %q must be >= 0 (0 disables the deadline)", v)
+	}
+	return d, nil
+}
+
 func runPlan(args []string) error {
+	defDiscoveryTimeout, err := discoveryTimeoutDefault()
+	if err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
 	k := fs.Int("k", 6, "number of buckets (the single knob: adding a lane = bumping K)")
 	store := fs.String("store", "test-timings.json", "timing store path, or - for stdin; a missing store is a cold start")
@@ -273,7 +299,10 @@ func runPlan(args []string) error {
 	toolchainTimeout := fs.Duration("toolchain-timeout", 10*time.Minute, "deadline for each `go` subprocess (go work edit / go list / go test -list); 0 disables")
 	runnerKind := fs.String("runner", "go", "test-runner adapter: go or vitest")
 	root := fs.String("root", "", "vitest project directory (--runner vitest); empty means the working directory")
-	vitestCommand := fs.String("vitest-command", "", "how to invoke vitest (--runner vitest); empty means \"npx vitest\"")
+	vitestCommand := fs.String("vitest-command", "", "bare-vitest invocation (--runner vitest); empty means \"npx vitest\". testbucket treats it as program + leading args (whitespace-split) and APPENDS the subcommand: discovery adds \"list --filesOnly --json\" (or \"list --json\" under --vitest-discovery=list); a run bucket adds \"run --no-file-parallelism <files>\". The command must therefore accept those like bare vitest")
+	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly` — resolves files by glob WITHOUT importing them, immune to the multi-project `vitest list` collection deadlock) or list (`vitest list --json` — imports the module graph; only its per-test names matter, which file-granularity bucketing does not use today)")
+	vitestDiscoveryCommand := fs.String("vitest-discovery-command", "", "override discovery with a command run VERBATIM (--runner vitest): it OWNS its subcommand and flags (testbucket appends nothing) and must print the [{file}] / [{name,file}] JSON to stdout. Lets a run-wrapper that already owns `run` be paired with a separate discovery command. Empty = derive from --vitest-command + --vitest-discovery")
+	discoveryTimeout := fs.Duration("discovery-timeout", defDiscoveryTimeout, "fail-fast deadline for vitest test discovery (--runner vitest); a stalled `vitest list` errors here instead of hanging the whole job. 0 disables. Default overridable via TB_DISCOVERY_TIMEOUT")
 	var excludes stringList
 	fs.Var(&excludes, "exclude-module", "module dir (glob) to leave out of the module set; repeatable, replaces the defaults")
 	if err := fs.Parse(args); err != nil {
@@ -303,16 +332,19 @@ func runPlan(args []string) error {
 
 	ctx := context.Background()
 	rnr, loadLive, err := newRunner(runnerConfig{
-		kind:             *runnerKind,
-		toolchainTimeout: *toolchainTimeout,
-		excludes:         excludes,
-		race:             *race,
-		count:            count,
-		timeout:          *timeout,
-		nodePrefixes:     splitPrefixes(*nodePrefixes),
-		root:             *root,
-		vitestCommand:    *vitestCommand,
-		eventsDir:        *eventsDir,
+		kind:                   *runnerKind,
+		toolchainTimeout:       *toolchainTimeout,
+		excludes:               excludes,
+		race:                   *race,
+		count:                  count,
+		timeout:                *timeout,
+		nodePrefixes:           splitPrefixes(*nodePrefixes),
+		root:                   *root,
+		vitestCommand:          *vitestCommand,
+		vitestDiscovery:        *vitestDiscovery,
+		vitestDiscoveryCommand: *vitestDiscoveryCommand,
+		discoveryTimeout:       *discoveryTimeout,
+		eventsDir:              *eventsDir,
 	})
 	if err != nil {
 		return err
@@ -373,6 +405,10 @@ func runPlan(args []string) error {
 }
 
 func runIngest(args []string) error {
+	defDiscoveryTimeout, err := discoveryTimeoutDefault()
+	if err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 	store := fs.String("store", "test-timings.json", "timing store path to create or update")
 	alpha := fs.Float64("ewma", 0.5, "EWMA smoothing factor: new = alpha*measured + (1-alpha)*old")
@@ -386,7 +422,10 @@ func runIngest(args []string) error {
 	toolchainTimeout := fs.Duration("toolchain-timeout", 10*time.Minute, "deadline for each `go` subprocess; 0 disables")
 	runnerKind := fs.String("runner", "go", "test-runner adapter: go or vitest")
 	root := fs.String("root", "", "vitest project directory (--runner vitest); empty means the working directory")
-	vitestCommand := fs.String("vitest-command", "", "how to invoke vitest (--runner vitest); empty means \"npx vitest\"")
+	vitestCommand := fs.String("vitest-command", "", "bare-vitest invocation (--runner vitest); empty means \"npx vitest\". testbucket appends the subcommand (discovery: \"list --filesOnly --json\"); see `plan -h`")
+	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly`, no import) or list (`vitest list --json`); see `plan -h`")
+	vitestDiscoveryCommand := fs.String("vitest-discovery-command", "", "override discovery with a command run VERBATIM (--runner vitest); must print the discovery JSON to stdout. Empty = derive from --vitest-command + --vitest-discovery")
+	discoveryTimeout := fs.Duration("discovery-timeout", defDiscoveryTimeout, "fail-fast deadline for vitest test discovery (--runner vitest); 0 disables. Default overridable via TB_DISCOVERY_TIMEOUT")
 	var in stringList
 	fs.Var(&in, "in", "go test -json file to ingest, or - for stdin; repeatable (extra positional args also count)")
 	var excludes stringList
@@ -426,13 +465,16 @@ func runIngest(args []string) error {
 
 	ctx := context.Background()
 	rnr, loadLive, err := newRunner(runnerConfig{
-		kind:             *runnerKind,
-		toolchainTimeout: *toolchainTimeout,
-		excludes:         excludes,
-		race:             *race,
-		count:            count,
-		root:             *root,
-		vitestCommand:    *vitestCommand,
+		kind:                   *runnerKind,
+		toolchainTimeout:       *toolchainTimeout,
+		excludes:               excludes,
+		race:                   *race,
+		count:                  count,
+		root:                   *root,
+		vitestCommand:          *vitestCommand,
+		vitestDiscovery:        *vitestDiscovery,
+		vitestDiscoveryCommand: *vitestDiscoveryCommand,
+		discoveryTimeout:       *discoveryTimeout,
 	})
 	if err != nil {
 		return err
