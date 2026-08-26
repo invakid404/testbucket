@@ -33,6 +33,13 @@ inputs:
   vitest-command:
     description: 'How to invoke vitest (--runner vitest) for the ingest''s discovery; empty means "npx vitest". Ignored for the Go runner.'
     default: ""
+  exclude-module:
+    description: >-
+      Module dirs (globs) to leave out of the ingest's stale-row pruning
+      discovery, one per line; repeatable, replaces the tool's empty default.
+      Set this to the SAME value the plan used so pruning sees the same module
+      set. Empty = every module under the working directory is in scope.
+    default: ""
 
 runs:
   using: composite
@@ -57,6 +64,7 @@ runs:
         TB_EVENTS_DIR: ${{ inputs.events-dir }}
         TB_SHARD_PLAN: ${{ inputs.shard-plan }}
         TB_VITEST_COMMAND: ${{ inputs.vitest-command }}
+        TB_EXCLUDE_MODULE: ${{ inputs.exclude-module }}
       run: |
         set -euo pipefail
         mkdir -p "$(dirname "$TB_STORE")"
@@ -87,6 +95,14 @@ runs:
         if [ -n "$TB_VITEST_COMMAND" ]; then
           extra+=(--vitest-command "$TB_VITEST_COMMAND")
         fi
+
+        # exclude-module scopes the ingest's stale-row pruning discovery to the
+        # same module set the plan used; one glob per line, each its own
+        # repeatable flag. Blank lines are skipped. (audit above needs no scope —
+        # it reconciles events against the already-scoped shard-plan.)
+        while IFS= read -r mod; do
+          [ -n "$mod" ] && extra+=(--exclude-module "$mod")
+        done <<< "$TB_EXCLUDE_MODULE"
 
         # A sharded unit reports once per shard; ingest sums the per-unit weight
         # back into a whole-unit measurement, so the store keeps measuring units
