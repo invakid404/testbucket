@@ -72,14 +72,23 @@ func TestSpaceForm(t *testing.T) {
 // TestAmbiguous flags exactly the ids that collapse to a shared space-form — the
 // ones a -t pattern cannot tell apart — and leaves distinct ones alone.
 func TestAmbiguous(t *testing.T) {
-	// "a > b" (a flat title with a literal separator) and "a" describe + "b"
-	// project to the same space-form "a b": a collision.
+	// Two DISTINCT ids that project to the same space-form "a b" — "a > b" and a
+	// flat "a b" — are a collision.
 	got := ambiguous([]string{"a > b", "a b", "plain"})
 	if strings.Join(got, ",") != "a > b,a b" {
 		t.Errorf("ambiguous = %v, want the two colliding ids", got)
 	}
 	if len(ambiguous([]string{"outer > inner", "outer > other", "flat"})) != 0 {
 		t.Error("distinct nested names were wrongly flagged ambiguous")
+	}
+	// IDENTICAL ids (a genuine duplicate title, or two `test("")`) are NOT a
+	// collision — they share one universe entry and one slice, so they stay
+	// sliceable. Flagging them would needlessly demote a fine file.
+	if len(ambiguous([]string{"dup", "dup", "other"})) != 0 {
+		t.Error("a duplicate name was wrongly flagged ambiguous")
+	}
+	if len(ambiguous([]string{"", "", "x"})) != 0 {
+		t.Error("two empty titles (a duplicate) were wrongly flagged ambiguous")
 	}
 	if len(ambiguous(nil)) != 0 {
 		t.Error("empty input flagged ambiguous")

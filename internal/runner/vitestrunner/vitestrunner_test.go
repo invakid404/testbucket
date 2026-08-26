@@ -121,6 +121,32 @@ func TestRunnableNamesFiltersByFile(t *testing.T) {
 	}
 }
 
+// TestRunnableNamesKeepsEmptyTitle is the P1 regression guard: Vitest accepts
+// `test("", ...)` and reports it as `"name":""`, a LEGAL runnable. It must stay
+// in the slice universe — dropping it lets a whale be sliced over an incomplete
+// universe and silently loses that test. A row with the name field ABSENT (not
+// merely empty) is a different thing — a truncated capture — and is refused.
+func TestRunnableNamesKeepsEmptyTitle(t *testing.T) {
+	const withEmpty = `[
+      {"name":"","file":"/repo/tests/whale.spec.ts"},
+      {"name":"named one","file":"/repo/tests/whale.spec.ts"},
+      {"name":"named two","file":"/repo/tests/whale.spec.ts"}
+    ]`
+	names, err := runnableNames("/repo", "tests/whale.spec.ts", []byte(withEmpty))
+	if err != nil {
+		t.Fatalf("runnableNames: %v", err)
+	}
+	if got := strings.Join(names, "|"); got != "|named one|named two" {
+		t.Errorf("names = %q, want the empty title kept (sorts first): \"|named one|named two\"", got)
+	}
+	// A row with NO name field at all is a truncated/reshaped capture — refuse it
+	// loudly rather than drop a test.
+	const absentName = `[{"file":"/repo/tests/whale.spec.ts"}]`
+	if _, err := runnableNames("/repo", "tests/whale.spec.ts", []byte(absentName)); err == nil {
+		t.Error("a row with an absent name field was accepted; a truncated capture must be refused")
+	}
+}
+
 // A Vitest JSON-reporter fixture: three passing files with distinct walls, one
 // failed file, one file with no tests.
 const reportFixture = `{
@@ -198,17 +224,22 @@ func TestParseTimingsFromReporter(t *testing.T) {
 
 // TestParseTimingsSkipsAmbiguousFile proves a file whose test names collide under
 // the space-joined form -t matches is DEMOTED at ingest: its per-test rows are
-// dropped so the planner never flags it for a slice it could not run cleanly. The
-// file's wall time is still recorded (it still runs, whole).
+// dropped and the unsliceable signal is raised, so the planner never flags it for
+// a slice it could not run cleanly. The file's wall time is still recorded (it
+// still runs, whole).
 func TestParseTimingsSkipsAmbiguousFile(t *testing.T) {
 	r := mustNew(t, Options{Root: "/repo"})
-	// "a > b" (a flat title with a literal separator) and "a > b" reached via a
-	// describe both collapse to the space-form "a b": indistinguishable to -t.
+	// Two DISTINCT `" > "` ids that collapse to the same space-form the reporter
+	// (and -t) produce: `describe("a") test("b c")` -> id "a > b c" and
+	// `describe("a b") test("c")` -> id "a b > c", both fullName "a b c". Their -t
+	// patterns would each match the other's test, so the file cannot be sliced.
+	// (Two IDENTICAL ids — a genuine duplicate — are NOT this case; they share a
+	// slice and stay sliceable.)
 	const ambig = `{"testResults":[
       {"name":"/repo/tests/ambig.spec.ts","status":"passed","startTime":0,"endTime":100,
        "assertionResults":[
-         {"title":"a > b","ancestorTitles":[],"fullName":"a > b","status":"passed","duration":40},
-         {"title":"b","ancestorTitles":["a"],"fullName":"a b","status":"passed","duration":60}]}]}`
+         {"title":"b c","ancestorTitles":["a"],"fullName":"a b c","status":"passed","duration":40},
+         {"title":"c","ancestorTitles":["a b"],"fullName":"a b c","status":"passed","duration":60}]}]}`
 	sum, err := r.ParseTimings(strings.NewReader(ambig))
 	if err != nil {
 		t.Fatalf("ParseTimings: %v", err)
@@ -218,6 +249,29 @@ func TestParseTimingsSkipsAmbiguousFile(t *testing.T) {
 	}
 	if _, ok := sum.TestSeconds["tests/ambig.spec.ts"]; ok {
 		t.Errorf("per-test rows recorded for an ambiguous file (%v); it must be demoted to whole-file", sum.TestSeconds)
+	}
+	if !sum.Unsliceable["tests/ambig.spec.ts"] {
+		t.Error("the unsliceable signal was not raised for the ambiguous file")
+	}
+
+	// A genuine DUPLICATE (two tests with the identical full name) is NOT
+	// ambiguous — it shares one slice and stays sliceable, so per-test rows ARE
+	// recorded and the file is not flagged.
+	const dup = `{"testResults":[
+      {"name":"/repo/tests/dup.spec.ts","status":"passed","startTime":0,"endTime":50,
+       "assertionResults":[
+         {"title":"same","ancestorTitles":[],"fullName":"same","status":"passed","duration":10},
+         {"title":"same","ancestorTitles":[],"fullName":"same","status":"passed","duration":20},
+         {"title":"other","ancestorTitles":[],"fullName":"other","status":"passed","duration":15}]}]}`
+	sum2, err := r.ParseTimings(strings.NewReader(dup))
+	if err != nil {
+		t.Fatalf("ParseTimings(dup): %v", err)
+	}
+	if sum2.Unsliceable["tests/dup.spec.ts"] {
+		t.Error("a genuine duplicate name was wrongly flagged unsliceable")
+	}
+	if rows := sum2.TestSeconds["tests/dup.spec.ts"]; len(rows) != 2 {
+		t.Errorf("duplicate-name file recorded %d per-test rows, want 2 (the dup collapses to one key)", len(rows))
 	}
 }
 

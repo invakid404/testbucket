@@ -119,6 +119,13 @@ func recordTestSeconds(sum *runner.RunSummary, file string, assertions []vitestA
 		ids = append(ids, assertionID(a))
 	}
 	if len(ambiguous(ids)) > 0 {
+		// Record no per-test rows for an ambiguous file AND raise the explicit
+		// unsliceable signal. Without the signal, a file that was split=run on a
+		// PRIOR record keeps its stale per-test map (ingest only prunes when fresh
+		// rows arrive), stays split=run, and then fails the next plan closed when
+		// Runnables refuses the collision. The signal makes ingest demote it to a
+		// whole-file unit instead — a recoverable fallback, not a hard failure.
+		sum.Unsliceable[file] = true
 		return
 	}
 	for _, a := range assertions {

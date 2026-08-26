@@ -194,6 +194,67 @@ func TestApplyIngestKeepsThePriorWeightOnFailure(t *testing.T) {
 	}
 }
 
+// TestApplyIngestDemotesAnUnsliceableWhale is the P2 regression guard. When a
+// runner reports a file as unsliceable (its per-test names are ambiguous for that
+// runner's name filter), a row that was split=run on a PRIOR record must DEMOTE
+// to a whole-file unit — clearing the now-unsafe per-test map — not keep the
+// stale map and stay split=run. Staying split would fail the NEXT plan closed
+// when the adapter refuses the collision, turning a recoverable collision into a
+// hard planning failure.
+func TestApplyIngestDemotesAnUnsliceableWhale(t *testing.T) {
+	const file = "tests/whale.spec.ts"
+	build := func() *Store {
+		st := NewStore(canonicalFlags(true, 1))
+		st.Units[file] = &UnitStat{
+			Seconds: 100, Samples: 3, Split: "run", SplitInto: 3,
+			SplitReason: "name-divisible (prior record)",
+			Tests:       map[string]float64{"a": 40, "b": 35, "c": 25},
+		}
+		return st
+	}
+	opt := IngestOptions{
+		Alpha: 1, Token: canonicalFlags(true, 1), Count: 1, WhaleK: 6,
+		MinShardSeconds: 1, Now: time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC),
+	}
+
+	// Control: the same whale re-measured with its per-test picture intact STAYS
+	// split=run — so the demotion below is caused by the unsliceable signal, not by
+	// the weights.
+	ctrl := build()
+	ctrlSum := runner.NewRunSummary()
+	ctrlSum.PackageSeconds[file] = 100
+	ctrlSum.PackageRuns[file] = 1
+	ctrlSum.TestSeconds[file] = map[string]float64{"a": 40, "b": 35, "c": 25}
+	if _, err := ApplyIngest(ctrl, ctrlSum, opt); err != nil {
+		t.Fatalf("ApplyIngest(control): %v", err)
+	}
+	if ctrl.Units[file].splitPolicy() != splitRun {
+		t.Fatalf("control whale did not stay split=run (got %q); the fixture no longer isolates the signal",
+			ctrl.Units[file].Split)
+	}
+
+	// The fix: an unsliceable report demotes the existing split=run row to whole.
+	st := build()
+	sum := runner.NewRunSummary()
+	sum.PackageSeconds[file] = 100
+	sum.PackageRuns[file] = 1
+	sum.Unsliceable[file] = true // this record's per-test names collided
+	if _, err := ApplyIngest(st, sum, opt); err != nil {
+		t.Fatalf("ApplyIngest: %v", err)
+	}
+	row := st.Units[file]
+	if row.splitPolicy() != splitNone {
+		t.Errorf("unsliceable whale stayed split=%q; it must demote to whole", row.Split)
+	}
+	if len(row.Tests) != 0 {
+		t.Errorf("stale per-test map kept (%v); an unsliceable report must clear it", row.Tests)
+	}
+	// It still ran — its wall time is recorded and it is scheduled whole next plan.
+	if !row.measured() {
+		t.Error("the whale lost its measured weight; it must still run whole")
+	}
+}
+
 func TestApplyIngestFlagsWhalesAndPicksAPolicy(t *testing.T) {
 	// Automatic whale detection: a package that alone exceeds total/K sets
 	// the makespan, so it must be split before K can buy anything.

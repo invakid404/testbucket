@@ -20,13 +20,27 @@ import (
 // map (parseProjects) reads ProjectName. A missing File is the loud-refusal case
 // (see parseList).
 type listEntry struct {
-	Name string `json:"name"`
-	File string `json:"file"`
+	// Name is a pointer so an ABSENT name field (nil — a truncated/reshaped row)
+	// is distinguishable from a PRESENT-but-empty title (""). Vitest accepts
+	// `test("", ...)` and `vitest list --json` reports it as `"name":""`, a LEGAL
+	// runnable that must NOT be dropped from the slice universe (dropping it lets
+	// the gate pass over an incomplete universe and silently lose that test).
+	Name *string `json:"name"`
+	File string  `json:"file"`
 	// ProjectName is the Vitest project a file belongs to in a multi-project
 	// config (empty for a single-project config). It lets Runnables scope its
 	// importing `vitest list` to one project, so a sibling project's collection
 	// deadlock cannot reach it — the whole reason glob discovery exists.
 	ProjectName string `json:"projectName,omitempty"`
+}
+
+// quoteName renders a row's name for an error message, distinguishing an absent
+// field (<absent>) from a present-but-empty title ("").
+func quoteName(name *string) string {
+	if name == nil {
+		return "<absent>"
+	}
+	return fmt.Sprintf("%q", *name)
 }
 
 // relID turns an absolute test-file path into the neutral, machine-independent
@@ -67,7 +81,7 @@ func parseList(root string, data []byte) ([]runner.LivePackage, error) {
 		// empty array — a project with genuinely no tests — has no rows to
 		// reject and returns an empty set, which is legitimate.)
 		if strings.TrimSpace(r.File) == "" {
-			return nil, fmt.Errorf("vitest list row %d has no file (name=%q); refusing to drop a test — the capture is truncated or the reporter schema changed", i, r.Name)
+			return nil, fmt.Errorf("vitest list row %d has no file (name=%s); refusing to drop a test — the capture is truncated or the reporter schema changed", i, quoteName(r.Name))
 		}
 		id := relID(root, r.File)
 		if strings.TrimSpace(id) == "" {
@@ -102,11 +116,25 @@ func runnableNames(root, file string, data []byte) ([]string, error) {
 	seen := map[string]bool{}
 	var names []string
 	for _, r := range rows {
-		if relID(root, r.File) != file || r.Name == "" || seen[r.Name] {
+		if relID(root, r.File) != file {
 			continue
 		}
-		seen[r.Name] = true
-		names = append(names, r.Name)
+		// A row for this file with NO name field is a truncated/reshaped capture,
+		// not a real test — refuse loudly rather than drop it. But a PRESENT-but-
+		// empty name is the legal `test("")` runnable and MUST be kept: dropping it
+		// here would slice the whale over an incomplete universe and silently lose
+		// that test (the gate only checks the names it is given). The `^()$` the
+		// renderer emits matches it exactly.
+		if r.Name == nil {
+			return nil, fmt.Errorf(
+				"vitest list row for %s has no name field; refusing to drop a test — the capture is truncated or the reporter schema changed", file)
+		}
+		n := *r.Name
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		names = append(names, n)
 	}
 	sort.Strings(names)
 	if dupes := ambiguous(names); len(dupes) > 0 {

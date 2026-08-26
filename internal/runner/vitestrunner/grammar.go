@@ -88,17 +88,15 @@ func (r *Runner) ValidateUnit(u runner.Unit, live map[string]runner.LivePackage,
 		if len(u.Run) == 0 {
 			bad("is a run-slice with an empty name set; the renderer would emit no -t and run the whole file, duplicating the other slices")
 		}
-		for _, n := range u.Run {
-			if strings.TrimSpace(n) == "" {
-				bad("has an empty name in its -t set")
-			}
-		}
-		// Unlike the Go adapter, a Vitest name may contain any character (a title
-		// is arbitrary text): the renderer regex-escapes each one, so no character
-		// is forbidden here. What IS forbidden is two names in ONE slice colliding
-		// under the space-form -t actually matches — the -t would run each in the
-		// place of the other. (Cross-slice collisions are caught by the core gate
-		// resolving the same universe; this catches a malformed single slice.)
+		// A Vitest name may be ANY string, INCLUDING the empty title `test("")`
+		// reports as "" — a legal runnable the renderer matches with `^()$` (or the
+		// empty alternative in `^(|foo)$`). So no individual name is rejected for
+		// being empty or whitespace; the Go adapter forbids that only because a Go
+		// identifier cannot be empty. What IS forbidden is two names in ONE slice
+		// colliding under the space-form -t actually matches — the -t would run
+		// each in the place of the other. (Cross-slice collisions are caught by the
+		// core gate resolving the same universe; this catches a malformed single
+		// slice.)
 		if dupes := ambiguous(u.Run); len(dupes) > 0 {
 			bad("names collide under the space-joined form Vitest's -t matches (%s); they cannot be told apart by a name filter", strings.Join(dupes, ", "))
 		}

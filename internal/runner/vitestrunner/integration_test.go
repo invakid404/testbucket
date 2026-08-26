@@ -517,6 +517,88 @@ func TestVitestGlobSlicingMultiProjectNoDeadlock(t *testing.T) {
 	}
 }
 
+// emptytitleRoot points at the fixture carrying a legal empty-title test.
+func emptytitleRoot(t *testing.T) string {
+	t.Helper()
+	sample, err := filepath.Abs(filepath.Join("..", "..", "..", "testdata", "vitest-sample"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("no npx on PATH")
+	}
+	if _, err := os.Stat(filepath.Join(sample, "node_modules")); err != nil {
+		t.Skip("vitest sample not installed (run `npm install` in testdata/vitest-sample)")
+	}
+	return filepath.Join(sample, "emptytitle")
+}
+
+// TestVitestSliceIncludesEmptyTitle is the P1 regression proof: Vitest accepts
+// `test("", ...)`, and `vitest list --json` reports it as `"name":""` — a legal
+// runnable. Earlier the adapter dropped empty names from the slice universe, so a
+// whale with an empty-title test got sliced only over its NAMED tests and the
+// empty one was silently dropped (the gate passed over the incomplete universe).
+// This drives it end to end: glob discovery, a real slice, a real run — and the
+// empty-title test is scheduled and runs exactly once.
+func TestVitestSliceIncludesEmptyTitle(t *testing.T) {
+	root := emptytitleRoot(t)
+	ctx := context.Background()
+	const whale = "whale.vtest.ts"
+	events := t.TempDir()
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, EventsDir: events, DiscoveryTimeout: 45 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The universe INCLUDES the empty title (the bug was dropping it here).
+	live, err := rnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	names, err := rnr.Runnables(ctx, runner.LivePackage{ID: whale, HasTests: true})
+	if err != nil {
+		t.Fatalf("Runnables: %v", err)
+	}
+	if strings.Join(names, "|") != "|named one|named two" {
+		t.Fatalf("Runnables = %v, want the empty title kept alongside the two named tests", names)
+	}
+
+	// Flag the whale for a real name-slice and plan over the discovered set.
+	st := core.NewStore(rnr.CanonicalToken())
+	st.Units[whale] = &core.UnitStat{
+		Seconds: 9, Samples: 3, Split: "run", SplitInto: 3,
+		Tests: map[string]float64{"": 3, "named one": 3, "named two": 3},
+	}
+	plan, err := core.BuildPlan(ctx, rnr, st, "", planOpts(live, rnr.CanonicalToken()))
+	if err != nil {
+		t.Fatalf("coverage gate rejected the empty-title slice plan: %v", err)
+	}
+
+	// Run the slices for real; the empty-title test must report exactly once.
+	runBuckets(t, ctx, plan)
+	evFiles, _ := filepath.Glob(filepath.Join(events, "*.json"))
+	sum, err := parseAll(t, rnr, evFiles)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := sum.TestSeconds[whale]
+	names2 := make([]string, 0, len(got))
+	for n := range got {
+		names2 = append(names2, n)
+	}
+	sort.Strings(names2)
+	if strings.Join(names2, "|") != "|named one|named two" {
+		t.Errorf("sliced run reported %v, want the empty title AND the two named tests each once", names2)
+	}
+	if _, ok := got[""]; !ok {
+		t.Error("the empty-title test was DROPPED — it did not report from any slice")
+	}
+	planned := loadPlanned(t, plan)
+	if err := core.AuditCoverage(io.Discard, planned, sum); err != nil {
+		t.Fatalf("audit rejected the empty-title sliced run: %v", err)
+	}
+}
+
 func TestVitestRejectsRepeatSweep(t *testing.T) {
 	// Vitest has no per-invocation repeat sweep, so a plan at a base above one
 	// must be REJECTED by the coverage gate rather than silently rendered as a

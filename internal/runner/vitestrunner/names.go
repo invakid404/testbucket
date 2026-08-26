@@ -79,22 +79,33 @@ func spaceForm(id string) string {
 	return strings.ReplaceAll(id, nameSep, " ")
 }
 
-// ambiguous returns the ids that collide with another id under spaceForm — the
-// set that makes a file unsafe to name-slice, because their -t patterns would
+// ambiguous returns the ids that collide with a DIFFERENT id under spaceForm —
+// the set that makes a file unsafe to name-slice, because their -t patterns would
 // overlap and run a test in more than one slice. It is empty for the overwhelming
 // common case (every fully-qualified test name is unique once the describe path
-// is included). When it is not, the caller refuses to slice the file and runs it
-// whole: a slower bucket, never a double-run.
+// is included).
+//
+// It compares DISTINCT ids only: two IDENTICAL ids (a genuine duplicate title, or
+// two `test("")`) are NOT a collision — they collapse to one universe entry whose
+// single -t alternative runs every physical test of that name, in one slice, so
+// coverage stays exactly-once. Flagging them would needlessly demote a perfectly
+// sliceable file. When ids DO collide, the caller refuses to slice and runs the
+// file whole: a slower bucket, never a double-run.
 func ambiguous(ids []string) []string {
-	bySpace := map[string][]string{}
+	bySpace := map[string]map[string]bool{}
 	for _, id := range ids {
 		sf := spaceForm(id)
-		bySpace[sf] = append(bySpace[sf], id)
+		if bySpace[sf] == nil {
+			bySpace[sf] = map[string]bool{}
+		}
+		bySpace[sf][id] = true
 	}
 	var bad []string
 	for _, group := range bySpace {
 		if len(group) > 1 {
-			bad = append(bad, group...)
+			for id := range group {
+				bad = append(bad, id)
+			}
 		}
 	}
 	sort.Strings(bad)

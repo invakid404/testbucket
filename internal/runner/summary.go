@@ -28,10 +28,20 @@ type RunSummary struct {
 	// Failed targets contribute no fresh weight: a target that aborted under
 	// the race detector or hit its -timeout reports a wall time that measures
 	// the failure, not the work.
-	Failed  map[string]bool
-	NoTests map[string]bool
-	Lines   int
-	Events  int
+	Failed map[string]bool
+	// Unsliceable marks targets whose per-test picture was OBSERVED but cannot be
+	// name-sliced — for Vitest, two test names that collapse to the same string
+	// its -t matches, so a slice would run one in the other's place. The adapter
+	// records no TestSeconds for such a target; this flag is the separate,
+	// explicit signal that lets ingest DEMOTE an existing split=run row to a
+	// whole-file unit (clearing the now-unsafe per-test map) instead of leaving a
+	// stale map that the next plan would refuse — turning a recoverable collision
+	// into a hard planning failure. The Go adapter never sets it (Go names cannot
+	// collide this way).
+	Unsliceable map[string]bool
+	NoTests     map[string]bool
+	Lines       int
+	Events      int
 	// Subtests counts child pass events seen and deliberately not weighed.
 	Subtests int
 	// Implausible counts events whose elapsed could not be believed.
@@ -46,6 +56,7 @@ func NewRunSummary() *RunSummary {
 		PackageRuns:    map[string]int{},
 		TestSeconds:    map[string]map[string]float64{},
 		Failed:         map[string]bool{},
+		Unsliceable:    map[string]bool{},
 		NoTests:        map[string]bool{},
 	}
 }
