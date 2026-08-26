@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,25 @@ func fixtureRoot(t *testing.T) string {
 		t.Skip("vitest sample not installed (run `npm install` in testdata/vitest-sample)")
 	}
 	return root
+}
+
+// multiprojectRoot points at the deadlock fixture nested under the sample. It
+// reuses the sample's single `node_modules` (node resolves vitest by walking up
+// from the fixture dir), so no second install is needed, and it is gated on the
+// same real Vitest install as fixtureRoot.
+func multiprojectRoot(t *testing.T) string {
+	t.Helper()
+	sample, err := filepath.Abs(filepath.Join("..", "..", "..", "testdata", "vitest-sample"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("no npx on PATH")
+	}
+	if _, err := os.Stat(filepath.Join(sample, "node_modules")); err != nil {
+		t.Skip("vitest sample not installed (run `npm install` in testdata/vitest-sample)")
+	}
+	return filepath.Join(sample, "multiproject")
 }
 
 func planOpts(live []runner.LivePackage, token string) core.PlanOptions {
@@ -211,6 +231,78 @@ func loadPlanned(t *testing.T, doc *core.PlanDocument) *core.PlannedCoverage {
 		t.Fatal(err)
 	}
 	return planned
+}
+
+// TestVitestGlobDiscoveryAvoidsCollectionDeadlock is the headline proof for
+// issues #26 (glob discovery) and #25 (discovery timeout): a multi-project
+// config with a spec whose MODULE never finishes importing.
+//
+//   - Under `--vitest-discovery=list` (full collection imports the module graph),
+//     discovery DEADLOCKS — and the discovery timeout catches it, failing fast
+//     with a clear error instead of hanging the whole job.
+//   - Under the default glob mode (`vitest list --filesOnly`, no import),
+//     discovery resolves BOTH files — including the hanging one — in about a
+//     second, green.
+//
+// Same fixture, same adapter: only the discovery mode differs. That is the exact
+// contrast that let consumers drop their `tb-vitest.ts` façade workaround.
+func TestVitestGlobDiscoveryAvoidsCollectionDeadlock(t *testing.T) {
+	root := multiprojectRoot(t)
+	ctx := context.Background()
+
+	// 1. list mode: collection imports pkg-b/hang.vtest.ts, whose top-level await
+	//    never resolves — a genuine deadlock. A short discovery timeout turns the
+	//    silent hang into a fast, actionable error.
+	listRnr, err := vitestrunner.New(vitestrunner.Options{
+		Root:             root,
+		DiscoveryMode:    "list",
+		DiscoveryTimeout: 12 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := listRnr.Discover(ctx); err == nil {
+		t.Fatal("`vitest list` collection did NOT deadlock — the fixture stopped reproducing the hang; the glob-vs-list contrast is no longer proven")
+	} else {
+		elapsed := time.Since(start)
+		// It must fail FAST (near the deadline), not hang for minutes.
+		if elapsed > 90*time.Second {
+			t.Fatalf("discovery did not fail fast: took %s (the timeout did not bound the hang)", elapsed)
+		}
+		if !strings.Contains(err.Error(), "timed out") || !strings.Contains(err.Error(), "discovery") {
+			t.Fatalf("the deadlock error is not a clear discovery timeout: %v", err)
+		}
+		t.Logf("list-mode collection deadlocked and was caught by the discovery timeout in %s: %v", elapsed.Round(time.Millisecond), err)
+	}
+
+	// 2. glob mode (the default): resolves the file list WITHOUT importing a line
+	//    of test code, so the hanging module is enumerated, not executed.
+	globRnr, err := vitestrunner.New(vitestrunner.Options{
+		Root:             root,
+		DiscoveryTimeout: 60 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	globStart := time.Now()
+	live, err := globRnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("glob discovery failed on the deadlock fixture (it must be immune to the collection hang): %v", err)
+	}
+	gotIDs := make([]string, 0, len(live))
+	for _, p := range live {
+		gotIDs = append(gotIDs, p.ID)
+		if !p.HasTests {
+			t.Errorf("glob-discovered file %s is not marked HasTests", p.ID)
+		}
+	}
+	sort.Strings(gotIDs)
+	wantIDs := []string{"pkg-a/ok.vtest.ts", "pkg-b/hang.vtest.ts"}
+	if strings.Join(gotIDs, ",") != strings.Join(wantIDs, ",") {
+		t.Fatalf("glob discovered %v, want the two multi-project specs %v", gotIDs, wantIDs)
+	}
+	t.Logf("glob discovery resolved %d files (incl. the hanging module) in %s — no collection", len(live), time.Since(globStart).Round(time.Millisecond))
 }
 
 func TestVitestRejectsRepeatSweep(t *testing.T) {

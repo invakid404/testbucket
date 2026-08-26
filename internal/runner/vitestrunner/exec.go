@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -22,6 +24,20 @@ type nodetool struct {
 	command []string
 	// timeout bounds each subprocess. Zero disables the per-command deadline.
 	timeout time.Duration
+}
+
+// timeoutError is returned when a subprocess hit ITS OWN deadline (not the
+// caller's cancellation). It is a distinct type so a caller — discovery, most of
+// all — can recognise a deadline hit with errors.As and add domain guidance (a
+// deadlocked `vitest list` collection reads as a hang, not a broken project).
+type timeoutError struct {
+	program string
+	args    []string
+	after   time.Duration
+}
+
+func (e *timeoutError) Error() string {
+	return fmt.Sprintf("%s %s timed out after %s", e.program, strings.Join(e.args, " "), e.after)
 }
 
 func (t nodetool) context(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -47,10 +63,28 @@ func (t nodetool) run(ctx context.Context, dir string, args ...string) ([]byte, 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+
+	// Run the child in its OWN process group. `vitest` is `npx` -> `node` ->
+	// worker processes; a deadlocked collection is the workers, not npx. The
+	// default context cancellation kills only the direct child (npx), leaving the
+	// node workers alive and STILL HOLDING the stdout pipe — so cmd.Wait blocks on
+	// the pipe forever and the deadline never actually fires (the exact hang #25
+	// is about). Killing the whole group on cancel reaps the workers too; WaitDelay
+	// is a belt-and-suspenders backstop that force-closes the pipes and returns
+	// even if some descendant escapes the group.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// Negative pid => the whole process group (the child is its leader).
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+		return os.ErrProcessDone
+	}
+	cmd.WaitDelay = 10 * time.Second
+
 	if err := cmd.Run(); err != nil {
 		if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-			return nil, fmt.Errorf("%s %s timed out after %s (raise or disable the vitest timeout)",
-				t.command[0], strings.Join(full, " "), t.timeout)
+			return nil, &timeoutError{program: t.command[0], args: full, after: t.timeout}
 		}
 		return nil, fmt.Errorf("%s %s: %w: %s", t.command[0], strings.Join(full, " "), err, strings.TrimSpace(stderr.String()))
 	}

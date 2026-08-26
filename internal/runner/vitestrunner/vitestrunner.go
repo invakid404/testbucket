@@ -8,7 +8,15 @@
 // It buckets at FILE granularity — a Vitest spec file is the unit of
 // scheduling, as a Go package is for the Go adapter:
 //
-//   - Discover: `vitest list --json` -> one LivePackage per test file;
+//   - Discover: `vitest list --filesOnly --json` -> one LivePackage per test
+//     file. `--filesOnly` resolves each project's include/exclude by GLOB and
+//     returns the file specifiers WITHOUT importing or collecting a line of test
+//     code (it is the CLI surface of Vitest's globTestSpecifications()). The
+//     older full-collection `vitest list --json` imports the whole module graph
+//     and can DEADLOCK on a multi-project config; glob discovery is immune, so
+//     it is the default. `--vitest-discovery=list` opts back into the importing
+//     path (only its per-test names, unused by file-granularity bucketing today,
+//     require collection);
 //   - ParseTimings: the Vitest JSON reporter -> per-file wall-time weights;
 //   - Render: a bucket -> `vitest run <the bucket's files>` (files serial, so a
 //     bucket's wall time is the sum the balancer partitioned).
@@ -31,11 +39,25 @@ import (
 	"github.com/invakid404/testbucket/internal/runner"
 )
 
+// Discovery modes. glob is the default: it resolves test files without importing
+// them, so it cannot inherit `vitest list`'s multi-project collection deadlock.
+const (
+	discoveryGlob = "glob" // `vitest list --filesOnly --json`
+	discoveryList = "list" // `vitest list --json` (imports the module graph)
+)
+
 // Runner is the Vitest adapter.
 type Runner struct {
-	tool   nodetool
-	root   string // absolute project dir, for subprocesses and id relativisation
-	render renderConfig
+	tool nodetool // the base vitest command; bounds discovery and Runnables
+	// discoveryMode selects the built-in discovery invocation (glob | list). It
+	// is ignored when discoveryCmd is set.
+	discoveryMode string
+	// discoveryCmd, when non-empty, is run VERBATIM for discovery (it owns its
+	// own subcommand and flags) instead of appending to the base command — the
+	// escape hatch for a consumer whose wrapper already answers discovery.
+	discoveryCmd []string
+	root         string // absolute project dir, for subprocesses and id relativisation
+	render       renderConfig
 }
 
 // Options configures the Vitest adapter.
@@ -44,10 +66,27 @@ type Options struct {
 	// live); "" means the process working directory. It is used relative for the
 	// emitted script's `cd` and absolute for subprocesses / id relativisation.
 	Root string
-	// Command is how Vitest is invoked; nil defaults to ["npx", "vitest"].
+	// Command is how Vitest is invoked; nil defaults to ["npx", "vitest"]. It is
+	// the RUN command and the base for built-in discovery, which appends
+	// `list --filesOnly --json` (glob) or `list --json` (list).
 	Command []string
-	// Timeout bounds each Vitest subprocess; 0 disables the deadline.
+	// DiscoveryMode selects the built-in discovery invocation: "glob" (default,
+	// `vitest list --filesOnly`, no collection) or "list" (`vitest list --json`,
+	// imports the graph). "" means glob.
+	DiscoveryMode string
+	// DiscoveryCommand, when non-empty, is run VERBATIM for discovery (program +
+	// its own args, nothing appended) and must print the same [{file}] /
+	// [{name,file}] JSON on stdout. It lets a wrapper that already owns its
+	// subcommand serve discovery; DiscoveryMode is then ignored.
+	DiscoveryCommand []string
+	// Timeout bounds each Vitest subprocess; 0 disables the deadline. It is the
+	// general per-command deadline; DiscoveryTimeout overrides it for discovery.
 	Timeout time.Duration
+	// DiscoveryTimeout bounds the discovery subprocess specifically; 0 falls back
+	// to Timeout. It is separate so a stalled discovery fails fast even when the
+	// run budget is generous — a deadlocked `vitest list` must not hang for the
+	// whole job (the 14-minute silent hang this adapter is hardened against).
+	DiscoveryTimeout time.Duration
 	// EventsDir, when set, makes Render write each bucket's JSON report there for
 	// a later ingest.
 	EventsDir string
@@ -58,7 +97,14 @@ type Options struct {
 // ValidateUnit, CanonicalToken, LoadLivePackages) never touch the toolchain,
 // and Discover / Runnables surface any problem when they run `vitest`.
 func New(opt Options) (*Runner, error) {
-	if err := validateTimeout(opt.Timeout); err != nil {
+	if err := validateTimeout("vitest timeout", opt.Timeout); err != nil {
+		return nil, err
+	}
+	if err := validateTimeout("vitest discovery timeout", opt.DiscoveryTimeout); err != nil {
+		return nil, err
+	}
+	mode, err := normalizeDiscoveryMode(opt.DiscoveryMode)
+	if err != nil {
 		return nil, err
 	}
 	cmd := opt.Command
@@ -73,9 +119,19 @@ func New(opt Options) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Discovery gets its own deadline: DiscoveryTimeout when set, else the general
+	// Timeout. Discovery (and Runnables) are the ONLY subprocesses this adapter
+	// runs — Render just emits a script CI executes — so the base tool's deadline
+	// IS the discovery deadline.
+	discTimeout := opt.DiscoveryTimeout
+	if discTimeout == 0 {
+		discTimeout = opt.Timeout
+	}
 	return &Runner{
-		tool: nodetool{command: cmd, timeout: opt.Timeout},
-		root: abs,
+		tool:          nodetool{command: cmd, timeout: discTimeout},
+		discoveryMode: mode,
+		discoveryCmd:  append([]string(nil), opt.DiscoveryCommand...),
+		root:          abs,
 		render: renderConfig{
 			command:   cmd,
 			rootRel:   rootRel,
@@ -84,17 +140,34 @@ func New(opt Options) (*Runner, error) {
 	}, nil
 }
 
-func validateTimeout(timeout time.Duration) error {
+func validateTimeout(label string, timeout time.Duration) error {
 	if timeout < 0 {
-		return fmt.Errorf("vitest timeout must be >= 0 (0 disables the deadline), got %v", timeout)
+		return fmt.Errorf("%s must be >= 0 (0 disables the deadline), got %v", label, timeout)
 	}
 	return nil
+}
+
+// normalizeDiscoveryMode defaults "" to glob and rejects anything but the two
+// known modes, so a typo in --vitest-discovery fails loudly at construction
+// rather than silently discovering nothing.
+func normalizeDiscoveryMode(mode string) (string, error) {
+	switch mode {
+	case "":
+		return discoveryGlob, nil
+	case discoveryGlob, discoveryList:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unknown vitest discovery mode %q (want %q or %q)", mode, discoveryGlob, discoveryList)
+	}
 }
 
 // compile-time proof the adapter satisfies the seam.
 var _ runner.Runner = (*Runner)(nil)
 
-// Discover enumerates the live test files via `vitest list --json`.
+// Discover enumerates the live test files by GLOB (`vitest list --filesOnly
+// --json`) — files resolved from each project's include/exclude without
+// importing them, so multi-project collection cannot deadlock discovery. See
+// discover for the mode/override/timeout handling.
 func (r *Runner) Discover(ctx context.Context) ([]runner.LivePackage, error) {
 	return r.discover(ctx)
 }
