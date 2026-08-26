@@ -30,6 +30,14 @@ inputs:
   working-directory:
     description: 'Directory to run the bucket in.'
     default: "."
+  setup-command:
+    description: >-
+      Optional shell command run once per bucket job, in the working-directory,
+      BEFORE the rendered test command — a first-class seam for a consumer's own
+      per-runner provisioning (DB binaries, codegen, toolchains). Runs as a bash
+      block; a failure fails the bucket before any test runs. Empty = no setup
+      step ⇒ unchanged behavior.
+    default: ""
 
 runs:
   using: composite
@@ -46,6 +54,19 @@ runs:
         TB_BINDIR: ${{ runner.temp }}/testbucket-bin
         GH_TOKEN: ${{ github.token }}
       run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    # A consumer's own per-runner provisioning, run once before the bucket's test
+    # command. Passed through the environment and executed as a bash block (never
+    # spliced into the command line): the command is consumer-supplied data, and
+    # splicing it into a run: line is how a workflow grows an injection. `-e` so a
+    # failed provisioning step fails the bucket instead of leaking into the tests.
+    - name: Set up the bucket
+      if: inputs.setup-command != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TB_SETUP_COMMAND: ${{ inputs.setup-command }}
+      run: bash -eo pipefail -c "$TB_SETUP_COMMAND"
 
     - name: Run the bucket
       shell: bash
