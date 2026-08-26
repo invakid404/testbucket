@@ -53,6 +53,39 @@ func TestIsRunnableMatchesGoTestRunSemantics(t *testing.T) {
 	}
 }
 
+// TestFileParallelismKnob proves #22 for the Go adapter: -p defaults to 1
+// (serial, the sum-of-weights model), and the knob raises it.
+func TestFileParallelismKnob(t *testing.T) {
+	b := runner.Bucket{Index: 0, Units: []runner.Unit{{
+		ID: "example.test/repo/pkg", Kind: runner.KindPackage, Count: 1,
+		Mode: runner.ModeWork, Module: ".",
+		Packages: []runner.LivePackage{{ID: "example.test/repo/pkg", Mode: runner.ModeWork, Module: ".", HasTests: true}},
+	}}}
+
+	def := renderBucket(b, renderConfig{count: 1})
+	if got := argValue(def.Invocations[0].Args, "-p"); got != "1" {
+		t.Errorf("default -p = %q, want 1 (serial)", got)
+	}
+
+	par := renderBucket(b, renderConfig{count: 1, fileParallelism: 4})
+	if got := argValue(par.Invocations[0].Args, "-p"); got != "4" {
+		t.Errorf("fileParallelism=4 -p = %q, want 4", got)
+	}
+}
+
+// argValue reads a flag's value from an argv, accepting both `-p=1` and `-p 1`.
+func argValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+		if strings.HasPrefix(a, flag+"=") {
+			return strings.TrimPrefix(a, flag+"=")
+		}
+	}
+	return ""
+}
+
 func TestTimeoutValidation(t *testing.T) {
 	// The go-test -timeout is the adapter's render config, so the adapter
 	// validates it at construction: it is spliced verbatim into every emitted

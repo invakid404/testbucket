@@ -5,26 +5,35 @@
 // project root, the event-capture directory) so none of that leaks across the
 // neutral seam into internal/core.
 //
-// It buckets at FILE granularity — a Vitest spec file is the unit of
-// scheduling, as a Go package is for the Go adapter:
+// A Vitest spec file is the unit of scheduling, as a Go package is for the Go
+// adapter, and a whale file is name-sliced across buckets by test name:
 //
-//   - Discover: `vitest list --filesOnly --json` -> one LivePackage per test
-//     file. `--filesOnly` resolves each project's include/exclude by GLOB and
-//     returns the file specifiers WITHOUT importing or collecting a line of test
-//     code (it is the CLI surface of Vitest's globTestSpecifications()). The
-//     older full-collection `vitest list --json` imports the whole module graph
-//     and can DEADLOCK on a multi-project config; glob discovery is immune, so
-//     it is the default. `--vitest-discovery=list` opts back into the importing
-//     path (only its per-test names, unused by file-granularity bucketing today,
-//     require collection);
-//   - ParseTimings: the Vitest JSON reporter -> per-file wall-time weights;
-//   - Render: a bucket -> `vitest run <the bucket's files>` (files serial, so a
-//     bucket's wall time is the sum the balancer partitioned).
+//   - Discover: `vitest list --filesOnly --json` (glob) -> one LivePackage per
+//     test file. `--filesOnly` resolves each project's include/exclude by GLOB
+//     and returns the file specifiers WITHOUT importing or collecting a line of
+//     test code (the CLI surface of Vitest's globTestSpecifications()). The
+//     full-collection `vitest list --json` imports the whole module graph and can
+//     DEADLOCK on a multi-project config; glob discovery is immune, so it is the
+//     default. `--vitest-discovery=list` opts back into the importing path.
+//   - Runnables: for a whale being name-sliced, `vitest list --json --project
+//     <the file's project>` -> that file's `" > "`-joined test names. Scoping to
+//     the file's OWN project is what keeps this (necessarily importing) call from
+//     inheriting a sibling project's collection deadlock; the file->project map
+//     comes from the same deadlock-safe glob. A brand-new test in the whale is
+//     therefore seen live, so the never-drop gate stays sound under glob default.
+//   - ParseTimings: the Vitest JSON reporter -> per-file wall-time weights plus
+//     per-test durations for name-slicing;
+//   - Render: a bucket -> `vitest run <files>` for whole files, plus one
+//     `vitest run -t '<robust regex>' <file>` per name slice (files serial by
+//     default, so a bucket's wall time is the sum the balancer partitioned;
+//     see #22 / fileParallelism to bound intra-bucket concurrency instead).
 //
-// Name-slicing a whale spec by test name is a documented follow-up (it needs
-// -t regex escaping plus duplicate-title / nested-describe handling); until
-// then ValidateUnit refuses run-slice and count-shard units so the never-drop
-// gate stays a real backstop.
+// The correctness subtlety name-slicing turns on is that a Vitest test's name
+// takes three divergent forms — `vitest list`'s `" > "`-joined path, the
+// reporter's space-joined fullName, and the string -t matches — so this adapter
+// keys everything on the first, renders a -t robust to the ambiguity between
+// them (names.go), and refuses to slice a file whose names collide under that
+// projection. A count-shard is still refused: there is no repeat sweep to divide.
 //
 // internal/core is UNCHANGED by this package: it is a second implementation of
 // the same six-method interface against the same value types.
@@ -32,6 +41,7 @@ package vitestrunner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -58,6 +68,12 @@ type Runner struct {
 	discoveryCmd []string
 	root         string // absolute project dir, for subprocesses and id relativisation
 	render       renderConfig
+	// projectByFile maps a file id to its Vitest project name, resolved once
+	// (lazily) from the deadlock-safe glob so Runnables can scope its importing
+	// `vitest list` to a single project. nil until first resolved; "" for a file
+	// in a single-project config (no --project scoping needed). Runnables is
+	// called sequentially by the core, so no lock guards this.
+	projectByFile map[string]string
 }
 
 // Options configures the Vitest adapter.
@@ -90,6 +106,10 @@ type Options struct {
 	// EventsDir, when set, makes Render write each bucket's JSON report there for
 	// a later ingest.
 	EventsDir string
+	// FileParallelism bounds intra-bucket file concurrency (#22). 0 or 1 keeps
+	// Vitest serial (--no-file-parallelism), the sum-of-weights model the balancer
+	// packs to; a value >1 renders --maxWorkers=N instead.
+	FileParallelism int
 }
 
 // New builds the Vitest adapter. The root is resolved to an absolute path but
@@ -133,9 +153,10 @@ func New(opt Options) (*Runner, error) {
 		discoveryCmd:  append([]string(nil), opt.DiscoveryCommand...),
 		root:          abs,
 		render: renderConfig{
-			command:   cmd,
-			rootRel:   rootRel,
-			eventsDir: opt.EventsDir,
+			command:         cmd,
+			rootRel:         rootRel,
+			eventsDir:       opt.EventsDir,
+			fileParallelism: opt.FileParallelism,
 		},
 	}, nil
 }
@@ -172,15 +193,67 @@ func (r *Runner) Discover(ctx context.Context) ([]runner.LivePackage, error) {
 	return r.discover(ctx)
 }
 
-// Runnables lists one file's test names via `vitest list --json`. The Vitest
-// split model does not name-slice yet, so this is unused by planning today, but
-// the method is implemented so a future name-slicing pass has its data source.
+// Runnables lists one file's test names — the universe the planner slices a
+// whale over and the never-drop gate checks the slices against. It refuses a
+// file whose names cannot be told apart by a -t filter (see runnableNames).
+//
+// It cannot use glob discovery (that returns no test names) so it must import;
+// but it scopes the import to the file's OWN Vitest project (`vitest list --json
+// --project <name>`), so a sibling project's collection deadlock — the exact hang
+// glob discovery exists to avoid — cannot reach this call. The file->project map
+// is resolved once from the same deadlock-safe glob. A single-project config has
+// no project name, so the call is a plain `vitest list --json`; there is no
+// sibling to deadlock on there.
 func (r *Runner) Runnables(ctx context.Context, p runner.LivePackage) ([]string, error) {
-	out, err := r.tool.run(ctx, r.root, "list", "--json")
+	project, err := r.projectFor(ctx, p.ID)
 	if err != nil {
 		return nil, err
 	}
+	args := []string{"list", "--json"}
+	if project != "" {
+		args = append(args, "--project", project)
+	}
+	out, err := r.tool.run(ctx, r.root, args...)
+	if err != nil {
+		return nil, r.runnablesError(p.ID, project, err)
+	}
 	return runnableNames(r.root, p.ID, out)
+}
+
+// projectFor resolves the Vitest project a file belongs to, lazily building the
+// file->project map from a deadlock-safe glob and caching it. An empty string
+// means a single-project config (no scoping needed).
+func (r *Runner) projectFor(ctx context.Context, fileID string) (string, error) {
+	if r.projectByFile == nil {
+		out, err := r.tool.run(ctx, r.root, "list", "--filesOnly", "--json")
+		if err != nil {
+			return "", r.discoveryError(err)
+		}
+		m, err := parseProjects(r.root, out)
+		if err != nil {
+			return "", err
+		}
+		r.projectByFile = m
+	}
+	return r.projectByFile[fileID], nil
+}
+
+// runnablesError enriches a name-listing failure. A deadline hit here means the
+// file's OWN project could not finish importing (a genuine hang in the code under
+// test, not a sibling), so the hint points at the file, not at glob mode.
+func (r *Runner) runnablesError(fileID, project string, err error) error {
+	var te *timeoutError
+	if !errors.As(err, &te) {
+		return err
+	}
+	scope := "single-project config"
+	if project != "" {
+		scope = fmt.Sprintf("project %q", project)
+	}
+	return fmt.Errorf(
+		"listing test names for name-slice target %s timed out (%s): importing that file's project did not finish — "+
+			"a module in it may hang on import, or raise --discovery-timeout / TB_DISCOVERY_TIMEOUT if it is legitimately slow: %w",
+		fileID, scope, err)
 }
 
 // CanonicalToken is the opaque comparability token weights are measured within.

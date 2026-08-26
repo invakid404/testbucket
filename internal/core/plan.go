@@ -19,7 +19,13 @@ type PlanUnit struct {
 	// left implicit in the ID because a module-atom unit covers several
 	// targets, and a reader auditing the plan artifact should not have to
 	// re-derive that.
-	Packages  []string `json:"packages"`
+	Packages []string `json:"packages"`
+	// Run is a name-slice's runnable names, verbatim. It is spelled out here — not
+	// left to be parsed back out of the ID's `pkg[a|b]` form — because a runnable
+	// name may itself contain the '|' the ID joins on (a Vitest test title is
+	// arbitrary text), so splitting the ID would corrupt the audit's name check.
+	// Empty for every non-slice unit.
+	Run       []string `json:"run,omitempty"`
 	Seconds   float64  `json:"est_seconds"`
 	Estimated bool     `json:"estimated,omitempty"`
 }
@@ -292,7 +298,7 @@ func renderPlanBucket(b runner.Bucket, r runner.Rendered) PlanBucket {
 			covered = append(covered, p.ID)
 		}
 		pb.Units = append(pb.Units, PlanUnit{
-			ID: u.ID, Kind: u.Kind, Packages: covered, Seconds: u.Seconds, Estimated: u.Estimate,
+			ID: u.ID, Kind: u.Kind, Packages: covered, Run: u.Run, Seconds: u.Seconds, Estimated: u.Estimate,
 		})
 	}
 	return pb

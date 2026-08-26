@@ -65,10 +65,17 @@ testbucket audit --shard-plan plan.json /tmp/ev/*.ndjson
 **Karmarkar-Karp k-way partition.** The balancer is Karmarkar-Karp (largest
 differencing), deterministic down to the tie-break, so the same store and the
 same K always produce the same buckets. Its objective is the SUM of a bucket's
-unit times, so every emitted invocation runs its packages serially (`-p=1`) —
-which is what makes that sum the job's actual wall time rather than a proxy for
-it. (LPT is kept one function away as the reference the KK partition is measured
-against in the tests.)
+unit times, so by default every emitted invocation runs its units serially
+(`-p=1` for Go, `--no-file-parallelism` for Vitest) — which is what makes that sum
+the job's actual wall time rather than a proxy for it. (LPT is kept one function
+away as the reference the KK partition is measured against in the tests.)
+
+`--file-parallelism N` (N>1) opts out, rendering `-p=N` / `--maxWorkers=N` so a
+bucket uses more of its cores. It is a deliberate trade: a parallel bucket
+finishes nearer its heaviest unit than its sum, so the sum-of-weights estimate
+over-reads and the timings a `record` job ingests under it contend and are less
+comparable. Prefer bumping `k` first; reach for this only when lanes are scarcer
+than cores.
 
 **Rolling timing store.** A JSON store keyed by unit identity (the Go import
 path) carries an EWMA-smoothed weight per unit. `ingest` folds each run in with
@@ -224,37 +231,54 @@ timeout** — the compile-checked proof that the seam is genuinely
 framework-agnostic.
 
 The full worked example is **`internal/runner/vitestrunner`** (adapter #2). It
-discovers by **glob** (`vitest list --filesOnly --json`), weighs files from the
-Vitest JSON reporter, and renders `vitest run <files> --no-file-parallelism` —
-bucketing at **file granularity** (a spec file is the unit, as a Go package is).
-Its end-to-end test discovers a real sample project (`testdata/vitest-sample`),
-runs the tool's own emitted commands, ingests the timings, and re-plans into a
-time-balanced split. It was added with **zero changes to `internal/core`**.
-(Name-slicing a whale spec by test name — an escaped `-t` over `vitest list`
-names, with duplicate-title and nested-`describe` handling — is a deliberate
-follow-up; until then a whale spec runs whole and `ValidateUnit` refuses
-run-slice/count-shard units so the gate stays a real backstop.)
+discovers by **glob** (`vitest list --filesOnly --json`), weighs files — and, for
+whales, individual tests — from the Vitest JSON reporter, and renders `vitest run
+<files>` for whole files plus `vitest run -t '<regex>' <file>` for each name slice
+— bucketing at **file granularity**, then **name-slicing** a whale spec across
+buckets by test name. Its end-to-end test discovers a real sample project
+(`testdata/vitest-sample`), runs the tool's own emitted commands, ingests the
+timings, and re-plans into a time-balanced split that slices the whale. It was
+added with **zero changes to `internal/core`**.
+
+Name-slicing turns on a subtlety of Vitest naming: a test's name has three
+divergent forms — `vitest list`'s `" > "`-joined path, the JSON reporter's
+space-joined `fullName`, and the string `-t` matches — so the adapter keys
+everything on the first, renders a `-t` robust to the ambiguity between them (each
+`" > "` becomes `(?: > | )`, each title regex-escaped), and refuses to slice a
+file whose names collide under that projection. `ValidateUnit` still refuses a
+count-shard: Vitest has no repeat sweep to divide.
+
+The one place name-slicing needs per-test **names** — a whale's slice universe —
+it gets them without reopening the collection deadlock glob discovery avoids: it
+runs `vitest list --json --project <the whale's project>`, scoping the
+(necessarily importing) call to the file's own project so a *sibling* project's
+hang cannot reach it. The file→project map comes from the same deadlock-safe glob.
+So the never-drop gate sees a whale's brand-new test live, even under the glob
+default.
 
 ### Vitest discovery: glob, timeout, and the `--vitest-command` contract
 
 **Glob discovery is the default and needs no collection.** `vitest list --json`
 imports the whole module graph to enumerate per-test names; on a multi-project
-config that collection can **deadlock**, hanging `plan` indefinitely. Because the
-adapter buckets at file granularity it only needs the file *list*, so it
-discovers with `vitest list --filesOnly --json` — the CLI surface of Vitest's
-`globTestSpecifications()`, which resolves each project's include/exclude by glob
-**without importing a line of test code**. It is immune to the collection hang and
-returns in ~1 s on suites where `list` takes minutes.
+config that collection can **deadlock**, hanging `plan` indefinitely. So discovery
+(the file *list*) uses `vitest list --filesOnly --json` — the CLI surface of
+Vitest's `globTestSpecifications()`, which resolves each project's include/exclude
+by glob **without importing a line of test code**. It is immune to the collection
+hang and returns in ~1 s on suites where `list` takes minutes.
 
-- `--vitest-discovery glob` (default) | `list`. Choose `list` only if you need the
-  importing full-collection path (its per-test names are unused by
-  file-granularity bucketing today); it re-exposes the deadlock, so it is opt-in.
+- `--vitest-discovery glob` (default) | `list`. `list` is the importing
+  full-collection *discovery* path and re-exposes the multi-project deadlock, so
+  it is opt-in and rarely needed. Name-slicing's per-test **names** do NOT come
+  from it — they come from a project-**scoped** `vitest list --json --project
+  <name>` (see above), so slicing works under the glob default without importing
+  a sibling project.
 - `--discovery-timeout 180s` (env **`TB_DISCOVERY_TIMEOUT`**, a Go duration; `0`
   disables) bounds discovery specifically and **fails fast with a clear error**
   rather than hanging the job. It is separate from `--timeout` (the `go test`
   run budget) so a stalled discovery can't hide behind a generous run deadline.
   The subprocess is run in its own process group and killed as a group on timeout,
-  so a deadlocked `node` worker tree cannot keep the deadline from firing.
+  so a deadlocked `node` worker tree cannot keep the deadline from firing. The same
+  budget bounds the project-scoped slice-name listing.
 
 **The `--vitest-command` contract.** testbucket treats `--vitest-command` as
 *program + leading args* (whitespace-split) and **appends** the subcommand itself:
@@ -263,16 +287,18 @@ returns in ~1 s on suites where `list` takes minutes.
 |---|---|
 | discovery (glob) | `<vitest-command> list --filesOnly --json` |
 | discovery (list) | `<vitest-command> list --json` |
-| a run bucket | `<vitest-command> run --no-file-parallelism <files> [--reporter=…]` |
+| slice-name listing | `<vitest-command> list --json [--project <name>]` |
+| a run bucket | `<vitest-command> run [--no-file-parallelism \| --maxWorkers=N] [-t '<regex>'] <files> [--reporter=…]` |
 
 So the command must behave like **bare `vitest`**: accept `list`, `run`,
-positional files, `--filesOnly`, `--no-file-parallelism`, `--reporter`, `--json`.
-A wrapper that hard-codes its own subcommand (e.g. one that always runs
-`vitest run`) does **not** satisfy this — testbucket would append a second `run`
-or `list`. For that case, **`--vitest-discovery-command`** takes a command run
-**verbatim** (it owns its subcommand and flags; testbucket appends nothing) and
-must print the same `[{file}]` / `[{name,file}]` JSON on stdout — letting a
-run-wrapper be paired with a separate discovery command without a second façade.
+positional files, `--filesOnly`, `--project`, `--no-file-parallelism`,
+`--maxWorkers`, `-t`, `--reporter`, `--json`. A wrapper that hard-codes its own
+subcommand (e.g. one that always runs `vitest run`) does **not** satisfy this —
+testbucket would append a second `run` or `list`. For that case,
+**`--vitest-discovery-command`** takes a command run **verbatim** (it owns its
+subcommand and flags; testbucket appends nothing) and must print the same
+`[{file}]` / `[{name,file}]` JSON on stdout — letting a run-wrapper be paired with
+a separate discovery command without a second façade.
 
 ## Development
 

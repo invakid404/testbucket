@@ -18,9 +18,12 @@ type renderConfig struct {
 	timeout      string
 	eventsDir    string
 	nodePrefixes []string
+	// fileParallelism is the -p value every emitted invocation carries (#22).
+	// 0 falls back to serialPackages.
+	fileParallelism int
 }
 
-// serialPackages is the -p value every emitted invocation carries.
+// serialPackages is the DEFAULT -p value every emitted invocation carries.
 //
 // It is 1 because the balancer's objective must be the job's wall time, and the
 // weights it partitions are SUMMED package elapsed times. `go test` runs package
@@ -35,7 +38,21 @@ type renderConfig struct {
 // and that concurrency is already inside the package's measured elapsed time.
 // Only cross-package concurrency is given up, and it is bought back — with far
 // better balance — by the K buckets themselves.
+//
+// The #22 fileParallelism knob can raise -p to use more of a bucket's cores, at
+// the cost of that sum-of-weights guarantee: a bucket then finishes nearer its
+// heaviest package than its sum, so its plan estimate over-reads and — because
+// the packages now contend — the timings a `record` job ingests under it are no
+// longer contention-free. Default stays 1.
 const serialPackages = 1
+
+// packageParallelism is the effective -p for this render config.
+func (c renderConfig) packageParallelism() int {
+	if c.fileParallelism > 1 {
+		return c.fileParallelism
+	}
+	return serialPackages
+}
 
 // renderBucket turns a bucket's units into the concrete invocations the CI job
 // will run, merging everything that legitimately shares one `go test` call and
@@ -112,7 +129,7 @@ func goTestArgs(cfg renderConfig, count int, run []string, paths []string) []str
 	if cfg.race {
 		args = append(args, "-race")
 	}
-	args = append(args, fmt.Sprintf("-p=%d", serialPackages))
+	args = append(args, fmt.Sprintf("-p=%d", cfg.packageParallelism()))
 	args = append(args, fmt.Sprintf("-count=%d", count))
 	if cfg.timeout != "" {
 		args = append(args, "-timeout", cfg.timeout)

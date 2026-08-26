@@ -38,6 +38,15 @@ on:
         description: 'Flake-sweep -count for the Go runner; the Vitest runner requires 1.'
         type: string
         default: "1"
+      file-parallelism:
+        description: >-
+          Intra-bucket file/package concurrency (#22). 1 (default) keeps each
+          bucket serial — the sum-of-weights model the balancer packs to. A value
+          >1 lets a bucket use more cores (`-p=N` / `--maxWorkers=N`), trading that
+          model (a bucket's estimate over-reads and its recorded timings contend).
+          Prefer raising `k`.
+        type: string
+        default: "1"
       test-command:
         description: 'Vitest invocation override (e.g. "npx vitest"); ignored for the Go runner.'
         type: string
@@ -127,6 +136,7 @@ jobs:
           runner: ${{ inputs.runner }}
           k: ${{ inputs.k }}
           count: ${{ inputs.count }}
+          file-parallelism: ${{ inputs.file-parallelism }}
           store-path: ${{ runner.temp }}/testbucket-store/test-timings.json
           events-dir: /tmp/testbucket-events
           shard-plan: ${{ runner.temp }}/shard-plan.json

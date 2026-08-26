@@ -330,6 +330,18 @@ func ApplyIngest(st *Store, sum *runner.RunSummary, opt IngestOptions) (*IngestR
 			countShards = affordable
 		}
 
+		// An UNSLICEABLE target — its per-test names were observed but cannot be
+		// name-sliced (the adapter's -t cannot tell two of them apart) — must lose
+		// any prior per-test picture, or a target that was split=run on an earlier
+		// record would keep that stale map, stay split=run, and fail the next
+		// plan closed when the adapter refuses the collision. Clearing it here
+		// routes the target through chooseSplitPolicy below with no named coverage,
+		// so it demotes to a whole-file (or count-shard) unit — a recoverable
+		// fallback rather than a hard failure.
+		if sum.Unsliceable[pkg] {
+			row.Tests = nil
+		}
+
 		// Fold this batch's per-test weights in before deciding whether the
 		// target can be name-sliced, so a target that becomes a whale on the
 		// same run it was measured can go straight to name slicing.

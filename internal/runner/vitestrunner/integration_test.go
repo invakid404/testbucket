@@ -305,6 +305,300 @@ func TestVitestGlobDiscoveryAvoidsCollectionDeadlock(t *testing.T) {
 	t.Logf("glob discovery resolved %d files (incl. the hanging module) in %s — no collection", len(live), time.Since(globStart).Round(time.Millisecond))
 }
 
+// TestVitestSlicingEndToEnd forces a REAL name-slice against an installed Vitest
+// and proves the never-drop invariant physically: the slow spec (two tests) is
+// split across buckets, each bucket runs its own `vitest run -t <regex>`, and the
+// union of what actually reported is exactly the file's two tests, each once —
+// with the audit oracle accepting the run.
+func TestVitestSlicingEndToEnd(t *testing.T) {
+	root := fixtureRoot(t)
+	ctx := context.Background()
+	const slowID = "tests/slow.spec.ts"
+
+	// A warm plan needs a store that flags the slow spec for name-slicing. Get it
+	// the honest way: run a cold plan, run it, and ingest with a MinShardSeconds
+	// low enough that the sub-second fixture crosses the "worth slicing" bar.
+	events1 := t.TempDir()
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, EventsDir: events1, Timeout: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := rnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	cold, err := core.BuildPlan(ctx, rnr, nil, "cold", planOpts(live, rnr.CanonicalToken()))
+	if err != nil {
+		t.Fatalf("cold plan: %v", err)
+	}
+	runBuckets(t, ctx, cold)
+	files, _ := filepath.Glob(filepath.Join(events1, "*.json"))
+	sum, err := parseAll(t, rnr, files)
+	if err != nil {
+		t.Fatalf("ingest parse: %v", err)
+	}
+	st := core.NewStore(rnr.CanonicalToken())
+	if _, err := core.ApplyIngest(st, sum, core.IngestOptions{
+		Alpha: 1, Count: 1, WhaleK: 2, MinShardSeconds: 0.02, Token: rnr.CanonicalToken(),
+		Now: time.Now(), Live: live, LiveAuthoritative: true,
+	}); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if st.Units[slowID] == nil || st.Units[slowID].Split != "run" {
+		t.Skipf("the fixture's slow spec was not flagged split=run (policy=%v); timing too tight to force a slice on this machine",
+			st.Units[slowID])
+	}
+
+	// Warm plan — the slow spec is now name-sliced across the two buckets.
+	events2 := t.TempDir()
+	rnr2, err := vitestrunner.New(vitestrunner.Options{Root: root, EventsDir: events2, Timeout: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	warm, err := core.BuildPlan(ctx, rnr2, st, "", planOpts(live, rnr2.CanonicalToken()))
+	if err != nil {
+		t.Fatalf("warm plan failed the gate: %v", err)
+	}
+	slices := 0
+	for _, b := range warm.Buckets {
+		for _, u := range b.Units {
+			if u.Kind == runner.KindRunSlice && len(u.Packages) == 1 && u.Packages[0] == slowID {
+				slices++
+			}
+		}
+	}
+	if slices < 2 {
+		t.Fatalf("the slow spec was not sliced across buckets (%d slice unit(s))", slices)
+	}
+
+	// Run the warm plan for real and collect what each -t slice actually executed.
+	runBuckets(t, ctx, warm)
+	warmFiles, _ := filepath.Glob(filepath.Join(events2, "*.json"))
+	warmSum, err := parseAll(t, rnr2, warmFiles)
+	if err != nil {
+		t.Fatalf("warm parse: %v", err)
+	}
+
+	// Physical never-drop: the two tests of the slow spec each reported exactly
+	// once across the slices — none dropped, none run twice.
+	got := warmSum.TestSeconds[slowID]
+	wantTests := []string{"slow calc", "slow io"}
+	gotNames := make([]string, 0, len(got))
+	for n := range got {
+		gotNames = append(gotNames, n)
+	}
+	sort.Strings(gotNames)
+	if strings.Join(gotNames, ",") != strings.Join(wantTests, ",") {
+		t.Errorf("slices ran %v, want exactly the slow spec's two tests %v", gotNames, wantTests)
+	}
+	if warmSum.PackageRuns[slowID] != slices {
+		t.Errorf("slow spec reported %d invocations, want %d (one per slice)", warmSum.PackageRuns[slowID], slices)
+	}
+
+	// The audit oracle accepts the sliced run against the plan it came from.
+	planned := loadPlanned(t, warm)
+	if err := core.AuditCoverage(io.Discard, planned, warmSum); err != nil {
+		t.Fatalf("audit rejected a complete sliced run: %v", err)
+	}
+}
+
+// runBuckets executes each non-empty bucket's own emitted script.
+func runBuckets(t *testing.T, ctx context.Context, doc *core.PlanDocument) {
+	t.Helper()
+	for _, b := range doc.Buckets {
+		if len(strings.Split(strings.TrimSpace(b.Script), "\n")) < 2 {
+			continue
+		}
+		cmd := exec.CommandContext(ctx, "bash", "-c", b.Script)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("bucket %d script failed: %v\n%s", b.Index, err, out)
+		}
+	}
+}
+
+// TestVitestGlobSlicingMultiProjectNoDeadlock is the reconciliation proof for
+// #21 landing on top of #28's glob discovery: name-slicing needs per-test NAMES,
+// which glob discovery (files only) does not provide and which the whole-suite
+// `vitest list` collection would DEADLOCK to produce on this multi-project
+// fixture (pkg-b never finishes importing). The adapter resolves a whale's names
+// with a project-SCOPED `vitest list --json --project <name>`, importing only the
+// whale's own project — so slicing works under the glob default without ever
+// touching the hanging sibling. This runs it end to end: glob discovery, a
+// project-scoped Runnables, a real slice, and a real run, with no drop.
+func TestVitestGlobSlicingMultiProjectNoDeadlock(t *testing.T) {
+	root := multiprojectRoot(t)
+	ctx := context.Background()
+	const whale = "pkg-a/ok.vtest.ts"
+
+	// A short discovery budget: if project scoping FAILED to avoid the sibling's
+	// import deadlock, this fails fast instead of hanging the suite.
+	events := t.TempDir()
+	rnr, err := vitestrunner.New(vitestrunner.Options{
+		Root: root, EventsDir: events, DiscoveryTimeout: 45 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Glob discovery is active (the default) and resolves both files without
+	//    importing the hanging one.
+	live, err := rnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("glob discovery failed on the multi-project fixture: %v", err)
+	}
+	if len(live) != 2 {
+		t.Fatalf("glob discovered %d files, want 2 (pkg-a + pkg-b)", len(live))
+	}
+
+	// 2. Runnables on the healthy whale returns its names FAST — proof the
+	//    project-scoped list imports only pkg-a, not the deadlocking pkg-b.
+	start := time.Now()
+	names, err := rnr.Runnables(ctx, runner.LivePackage{ID: whale, HasTests: true})
+	if err != nil {
+		t.Fatalf("Runnables deadlocked or failed on the multi-project whale: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 40*time.Second {
+		t.Fatalf("Runnables took %s — it did not scope to the project and inherited the collection hang", elapsed)
+	}
+	if strings.Join(names, ",") != "alpha,group > beta,ok" {
+		t.Fatalf("project-scoped Runnables = %v, want the three pkg-a names in `>`-form", names)
+	}
+	t.Logf("project-scoped Runnables resolved %d names in %s (sibling pkg-b never imported)", len(names), time.Since(start).Round(time.Millisecond))
+
+	// 3. Plan over ONLY the healthy project (pkg-b's module is an intentional
+	//    never-importing fixture — unrunnable by design), flagging the whale for a
+	//    real name-slice. The gate must pass and the file must slice.
+	st := core.NewStore(rnr.CanonicalToken())
+	st.Units[whale] = &core.UnitStat{
+		Seconds: 9, Samples: 3, Split: "run", SplitInto: 3,
+		Tests: map[string]float64{"ok": 3, "alpha": 3, "group > beta": 3},
+	}
+	pkgA := []runner.LivePackage{{ID: whale, HasTests: true}}
+	plan, err := core.BuildPlan(ctx, rnr, st, "", planOpts(pkgA, rnr.CanonicalToken()))
+	if err != nil {
+		t.Fatalf("coverage gate rejected the multi-project slice plan: %v", err)
+	}
+	slices := 0
+	for _, b := range plan.Buckets {
+		for _, u := range b.Units {
+			if u.Kind == runner.KindRunSlice {
+				slices++
+			}
+		}
+	}
+	if slices < 2 {
+		t.Fatalf("the whale was not sliced across buckets (%d slice unit(s))", slices)
+	}
+
+	// 4. Run the slices for real and prove no test dropped or double-ran. Running
+	//    a pkg-a file imports only pkg-a (vitest scopes a run by its file filter),
+	//    so this does not touch pkg-b either.
+	runBuckets(t, ctx, plan)
+	evFiles, _ := filepath.Glob(filepath.Join(events, "*.json"))
+	if len(evFiles) == 0 {
+		t.Fatal("no JSON reports were captured from the sliced run")
+	}
+	sum, err := parseAll(t, rnr, evFiles)
+	if err != nil {
+		t.Fatalf("parse sliced-run events: %v", err)
+	}
+	got := sum.TestSeconds[whale]
+	names2 := make([]string, 0, len(got))
+	for n := range got {
+		names2 = append(names2, n)
+	}
+	sort.Strings(names2)
+	if strings.Join(names2, ",") != "alpha,group > beta,ok" {
+		t.Errorf("sliced run reported %v, want the three pkg-a tests each once", names2)
+	}
+	planned := loadPlanned(t, plan)
+	if err := core.AuditCoverage(io.Discard, planned, sum); err != nil {
+		t.Fatalf("audit rejected the multi-project sliced run: %v", err)
+	}
+}
+
+// emptytitleRoot points at the fixture carrying a legal empty-title test.
+func emptytitleRoot(t *testing.T) string {
+	t.Helper()
+	sample, err := filepath.Abs(filepath.Join("..", "..", "..", "testdata", "vitest-sample"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("no npx on PATH")
+	}
+	if _, err := os.Stat(filepath.Join(sample, "node_modules")); err != nil {
+		t.Skip("vitest sample not installed (run `npm install` in testdata/vitest-sample)")
+	}
+	return filepath.Join(sample, "emptytitle")
+}
+
+// TestVitestSliceIncludesEmptyTitle is the P1 regression proof: Vitest accepts
+// `test("", ...)`, and `vitest list --json` reports it as `"name":""` — a legal
+// runnable. Earlier the adapter dropped empty names from the slice universe, so a
+// whale with an empty-title test got sliced only over its NAMED tests and the
+// empty one was silently dropped (the gate passed over the incomplete universe).
+// This drives it end to end: glob discovery, a real slice, a real run — and the
+// empty-title test is scheduled and runs exactly once.
+func TestVitestSliceIncludesEmptyTitle(t *testing.T) {
+	root := emptytitleRoot(t)
+	ctx := context.Background()
+	const whale = "whale.vtest.ts"
+	events := t.TempDir()
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, EventsDir: events, DiscoveryTimeout: 45 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The universe INCLUDES the empty title (the bug was dropping it here).
+	live, err := rnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	names, err := rnr.Runnables(ctx, runner.LivePackage{ID: whale, HasTests: true})
+	if err != nil {
+		t.Fatalf("Runnables: %v", err)
+	}
+	if strings.Join(names, "|") != "|named one|named two" {
+		t.Fatalf("Runnables = %v, want the empty title kept alongside the two named tests", names)
+	}
+
+	// Flag the whale for a real name-slice and plan over the discovered set.
+	st := core.NewStore(rnr.CanonicalToken())
+	st.Units[whale] = &core.UnitStat{
+		Seconds: 9, Samples: 3, Split: "run", SplitInto: 3,
+		Tests: map[string]float64{"": 3, "named one": 3, "named two": 3},
+	}
+	plan, err := core.BuildPlan(ctx, rnr, st, "", planOpts(live, rnr.CanonicalToken()))
+	if err != nil {
+		t.Fatalf("coverage gate rejected the empty-title slice plan: %v", err)
+	}
+
+	// Run the slices for real; the empty-title test must report exactly once.
+	runBuckets(t, ctx, plan)
+	evFiles, _ := filepath.Glob(filepath.Join(events, "*.json"))
+	sum, err := parseAll(t, rnr, evFiles)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := sum.TestSeconds[whale]
+	names2 := make([]string, 0, len(got))
+	for n := range got {
+		names2 = append(names2, n)
+	}
+	sort.Strings(names2)
+	if strings.Join(names2, "|") != "|named one|named two" {
+		t.Errorf("sliced run reported %v, want the empty title AND the two named tests each once", names2)
+	}
+	if _, ok := got[""]; !ok {
+		t.Error("the empty-title test was DROPPED — it did not report from any slice")
+	}
+	planned := loadPlanned(t, plan)
+	if err := core.AuditCoverage(io.Discard, planned, sum); err != nil {
+		t.Fatalf("audit rejected the empty-title sliced run: %v", err)
+	}
+}
+
 func TestVitestRejectsRepeatSweep(t *testing.T) {
 	// Vitest has no per-invocation repeat sweep, so a plan at a base above one
 	// must be REJECTED by the coverage gate rather than silently rendered as a

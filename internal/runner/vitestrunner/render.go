@@ -18,14 +18,23 @@ type renderConfig struct {
 	// eventsDir, when set, makes each invocation write its JSON report there for
 	// a later ingest.
 	eventsDir string
+	// fileParallelism is the intra-bucket file concurrency (#22). 1 (the default)
+	// keeps Vitest serial (--no-file-parallelism), which is the cost model the
+	// balancer packs to: a bucket's wall time is the SUM of its file weights.
+	// A value >1 bounds Vitest's own file parallelism (--maxWorkers=N) instead,
+	// trading that sum-of-weights guarantee — a bucket then finishes nearer its
+	// heaviest file than its sum — for using more of a runner's cores.
+	fileParallelism int
 }
 
 // Render turns one planned bucket into the concrete `vitest run` command(s). It
 // mirrors the Go adapter's shape: whole-file units merge into one invocation
 // (Vitest runs several files in one call), while a name slice is its own call
-// (its -t filter applies to the whole invocation). Files run SERIALLY
+// (its -t filter applies to the whole invocation). Files run SERIALLY by default
 // (--no-file-parallelism) so a bucket's wall time is the sum of its file weights
 // — the cost model the balancer partitions, exactly as the Go adapter's -p=1.
+// The fileParallelism knob (#22) can bound intra-bucket concurrency instead; see
+// renderConfig.fileParallelism for the makespan trade-off.
 func (r *Runner) Render(b runner.Bucket) runner.Rendered {
 	return renderBucket(b, r.render)
 }
@@ -76,13 +85,22 @@ func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
 // anchored -t name filter selecting exactly those tests.
 func vitestInvocation(cfg renderConfig, files, names []string) runner.Invocation {
 	args := append([]string(nil), cfg.command...)
-	args = append(args, "run", "--no-file-parallelism")
+	args = append(args, "run")
+	// Intra-bucket file concurrency (#22). Default (1) stays serial so a bucket's
+	// wall time is the sum of its file weights — what the balancer partitioned.
+	if cfg.fileParallelism > 1 {
+		args = append(args, fmt.Sprintf("--maxWorkers=%d", cfg.fileParallelism))
+	} else {
+		args = append(args, "--no-file-parallelism")
+	}
 	if len(names) > 0 {
 		sorted := append([]string(nil), names...)
 		sort.Strings(sorted)
-		// Anchored alternation, like the Go adapter's -run: without ^...$ a name
-		// "adds" would also match "adds two" and run it in two slices.
-		args = append(args, "-t", fmt.Sprintf("^(%s)$", strings.Join(sorted, "|")))
+		// A robust, anchored testNamePattern: -t matches the reporter's
+		// space-joined full name, which the `" > "`-joined ids cannot be turned
+		// into unambiguously, so runPattern matches every possible resolution and
+		// never drops a test to a naming guess. See names.go.
+		args = append(args, "-t", runPattern(sorted))
 	}
 	files = append([]string(nil), files...)
 	sort.Strings(files)
