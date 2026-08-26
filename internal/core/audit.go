@@ -40,12 +40,18 @@ func LoadPlannedCoverage(path string) (*PlannedCoverage, error) {
 				out.Invocations[p]++
 			}
 			if u.Kind == runner.KindRunSlice && len(u.Packages) == 1 {
-				// The names are in the unit ID (pkg[A|B|C]) — the same text the
-				// emitted name regex is built from.
-				if open := strings.Index(u.ID, "["); open >= 0 && strings.HasSuffix(u.ID, "]") {
-					names := strings.Split(u.ID[open+1:len(u.ID)-1], "|")
-					out.Runnables[u.Packages[0]] = append(out.Runnables[u.Packages[0]], names...)
+				// Prefer the structural Run field: a runnable name can contain the
+				// '|' the ID joins on (a Vitest title), so parsing it out of the ID
+				// would split one name into two. The ID parse stays as a fallback
+				// for a plan artifact written before the field existed — its names
+				// are Go identifiers, where '|' cannot occur.
+				names := u.Run
+				if len(names) == 0 {
+					if open := strings.Index(u.ID, "["); open >= 0 && strings.HasSuffix(u.ID, "]") {
+						names = strings.Split(u.ID[open+1:len(u.ID)-1], "|")
+					}
 				}
+				out.Runnables[u.Packages[0]] = append(out.Runnables[u.Packages[0]], names...)
 			}
 		}
 	}

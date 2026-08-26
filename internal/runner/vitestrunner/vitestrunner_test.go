@@ -83,6 +83,34 @@ func TestParseListAcceptsGlobFilesOnlyShape(t *testing.T) {
 	}
 }
 
+// TestParseProjects builds the file->project routing table Runnables uses to
+// scope its importing list. A single-project row (no projectName) maps to "" —
+// Runnables reads that as "no --project needed".
+func TestParseProjects(t *testing.T) {
+	m, err := parseProjects("/repo", []byte(globFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"tests/slow.spec.ts": "a",
+		"tests/fast.spec.ts": "a",
+		"tests/tiny.spec.ts": "b",
+	}
+	for id, proj := range want {
+		if m[id] != proj {
+			t.Errorf("%s -> %q, want %q", id, m[id], proj)
+		}
+	}
+	// Single-project shape (no projectName) maps every file to "".
+	single, err := parseProjects("/repo", []byte(`[{"file":"/repo/a.spec.ts"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := single["a.spec.ts"]; !ok || v != "" {
+		t.Errorf("single-project file mapped to %q (ok=%v), want \"\"", v, ok)
+	}
+}
+
 func TestRunnableNamesFiltersByFile(t *testing.T) {
 	names, err := runnableNames("/repo", "tests/slow.spec.ts", []byte(listFixture))
 	if err != nil {
@@ -98,13 +126,16 @@ func TestRunnableNamesFiltersByFile(t *testing.T) {
 const reportFixture = `{
   "testResults": [
     {"name":"/repo/tests/slow.spec.ts","status":"passed","startTime":1000,"endTime":1300,
-     "assertionResults":[{"title":"slow io","status":"passed","duration":180},{"title":"slow calc","status":"passed","duration":120}]},
+     "assertionResults":[
+       {"title":"slow io","ancestorTitles":[],"fullName":"slow io","status":"passed","duration":180},
+       {"title":"inner","ancestorTitles":["group"],"fullName":"group inner","status":"passed","duration":120},
+       {"title":"skipped one","ancestorTitles":[],"fullName":"skipped one","status":"skipped","duration":null}]},
     {"name":"/repo/tests/fast.spec.ts","status":"passed","startTime":2000,"endTime":2050,
-     "assertionResults":[{"title":"fast add","status":"passed","duration":50}]},
+     "assertionResults":[{"title":"fast add","ancestorTitles":[],"fullName":"fast add","status":"passed","duration":50}]},
     {"name":"/repo/tests/tiny.spec.ts","status":"passed","startTime":3000,"endTime":3010,
-     "assertionResults":[{"title":"tiny","status":"passed","duration":10}]},
+     "assertionResults":[{"title":"tiny","ancestorTitles":[],"fullName":"tiny","status":"passed","duration":10}]},
     {"name":"/repo/tests/broken.spec.ts","status":"failed","startTime":4000,"endTime":9000,
-     "assertionResults":[{"title":"boom","status":"failed","duration":5000}]},
+     "assertionResults":[{"title":"boom","ancestorTitles":[],"fullName":"boom","status":"failed","duration":5000}]},
     {"name":"/repo/tests/empty.spec.ts","status":"passed","startTime":5000,"endTime":5001,
      "assertionResults":[]}
   ]
@@ -139,14 +170,54 @@ func TestParseTimingsFromReporter(t *testing.T) {
 	if !sum.NoTests["tests/empty.spec.ts"] {
 		t.Error("the empty file was not recorded as no-tests")
 	}
-	// File granularity: NO per-test weights are recorded (name-slicing is a
-	// documented follow-up).
-	if len(sum.TestSeconds) != 0 {
-		t.Errorf("per-test weights were recorded (%v); the file-granularity adapter must not", sum.TestSeconds)
+	// Per-test weights ARE recorded now (name-slicing). Keys are the `" > "`-joined
+	// task path (ancestor describes + title), the same identity `vitest list`
+	// reports — a nested test is keyed "group > inner", not the reporter's
+	// space-joined "group inner".
+	slow := sum.TestSeconds["tests/slow.spec.ts"]
+	if got := slow["slow io"]; got < 0.18-1e-9 || got > 0.18+1e-9 {
+		t.Errorf("slow io per-test weight = %v, want 0.18", got)
+	}
+	if got := slow["group > inner"]; got < 0.12-1e-9 || got > 0.12+1e-9 {
+		t.Errorf("nested test weight = %v under key %q, want 0.12 under \"group > inner\"", got, "group > inner")
+	}
+	// A skipped test has a null duration and contributes no weight (it is still in
+	// the Runnables universe, so it is never dropped — just unweighed).
+	if _, ok := slow["skipped one"]; ok {
+		t.Errorf("a skipped test was weighed: %v", slow)
+	}
+	// A failed file contributes no per-test weights either.
+	if _, ok := sum.TestSeconds["tests/broken.spec.ts"]; ok {
+		t.Error("a failed file contributed per-test weights")
 	}
 	// A stream with nothing usable is a broken capture, not a silent success.
 	if _, err := r.ParseTimings(strings.NewReader(`{"testResults":[]}`)); err == nil {
 		t.Error("an empty report was accepted")
+	}
+}
+
+// TestParseTimingsSkipsAmbiguousFile proves a file whose test names collide under
+// the space-joined form -t matches is DEMOTED at ingest: its per-test rows are
+// dropped so the planner never flags it for a slice it could not run cleanly. The
+// file's wall time is still recorded (it still runs, whole).
+func TestParseTimingsSkipsAmbiguousFile(t *testing.T) {
+	r := mustNew(t, Options{Root: "/repo"})
+	// "a > b" (a flat title with a literal separator) and "a > b" reached via a
+	// describe both collapse to the space-form "a b": indistinguishable to -t.
+	const ambig = `{"testResults":[
+      {"name":"/repo/tests/ambig.spec.ts","status":"passed","startTime":0,"endTime":100,
+       "assertionResults":[
+         {"title":"a > b","ancestorTitles":[],"fullName":"a > b","status":"passed","duration":40},
+         {"title":"b","ancestorTitles":["a"],"fullName":"a b","status":"passed","duration":60}]}]}`
+	sum, err := r.ParseTimings(strings.NewReader(ambig))
+	if err != nil {
+		t.Fatalf("ParseTimings: %v", err)
+	}
+	if got := sum.PackageSeconds["tests/ambig.spec.ts"]; got < 0.1-1e-9 || got > 0.1+1e-9 {
+		t.Errorf("ambiguous file lost its wall time (%v); it must still run whole", got)
+	}
+	if _, ok := sum.TestSeconds["tests/ambig.spec.ts"]; ok {
+		t.Errorf("per-test rows recorded for an ambiguous file (%v); it must be demoted to whole-file", sum.TestSeconds)
 	}
 }
 
@@ -189,6 +260,91 @@ func TestRenderWholeFilesSerially(t *testing.T) {
 	}
 }
 
+func sliceUnit(file string, names []string) runner.Unit {
+	return runner.Unit{
+		ID: file + "[" + strings.Join(names, "|") + "]", Kind: runner.KindRunSlice, Count: 1,
+		Run:      names,
+		Packages: []runner.LivePackage{{ID: file, HasTests: true}},
+	}
+}
+
+// TestRenderRunSlice proves a name slice renders to its own `vitest run -t` call
+// over exactly its one file, with the robust anchored pattern.
+func TestRenderRunSlice(t *testing.T) {
+	r := mustNew(t, Options{Root: "frontend"})
+	b := runner.Bucket{Index: 1, Units: []runner.Unit{
+		sliceUnit("tests/whale.spec.ts", []string{"outer > inner a", "flat one"}),
+		wholeFileUnit("tests/small.spec.ts", 1),
+	}}
+	got := r.Render(b)
+	if len(got.Invocations) != 2 {
+		t.Fatalf("got %d invocations, want a whole-file merge + one slice call", len(got.Invocations))
+	}
+	// Find the slice invocation (the one carrying -t).
+	var sliceArgs string
+	for _, inv := range got.Invocations {
+		joined := strings.Join(inv.Args, "\x00")
+		if strings.Contains(joined, "-t") {
+			sliceArgs = joined
+		}
+	}
+	if sliceArgs == "" {
+		t.Fatalf("no slice invocation carried -t: %+v", got.Invocations)
+	}
+	// The robust, anchored pattern (separators -> (?: > | ), sorted names).
+	if !strings.Contains(sliceArgs, `^(flat one|outer(?: > | )inner a)$`) {
+		t.Errorf("slice -t pattern is not the robust anchored form: %s", strings.ReplaceAll(sliceArgs, "\x00", " "))
+	}
+	// The slice runs its ONE file, not the other bucket file.
+	if !strings.Contains(sliceArgs, "tests/whale.spec.ts") || strings.Contains(sliceArgs, "tests/small.spec.ts\x00") {
+		t.Errorf("slice invocation did not target exactly its own file: %s", strings.ReplaceAll(sliceArgs, "\x00", " "))
+	}
+}
+
+// TestRenderFileParallelism proves #22: default is serial (--no-file-parallelism),
+// a bound >1 renders --maxWorkers=N and drops the serial flag.
+func TestRenderFileParallelism(t *testing.T) {
+	serial := mustNew(t, Options{Root: "."})
+	got := serial.Render(runner.Bucket{Units: []runner.Unit{wholeFileUnit("a.spec.ts", 1)}})
+	args := strings.Join(got.Invocations[0].Args, " ")
+	if !strings.Contains(args, "--no-file-parallelism") || strings.Contains(args, "--maxWorkers") {
+		t.Errorf("default render must stay serial: %s", args)
+	}
+
+	par := mustNew(t, Options{Root: ".", FileParallelism: 4})
+	got = par.Render(runner.Bucket{Units: []runner.Unit{wholeFileUnit("a.spec.ts", 1)}})
+	args = strings.Join(got.Invocations[0].Args, " ")
+	if !strings.Contains(args, "--maxWorkers=4") || strings.Contains(args, "--no-file-parallelism") {
+		t.Errorf("FileParallelism=4 must render --maxWorkers=4 and no serial flag: %s", args)
+	}
+}
+
+func TestRunnableNamesRejectsAmbiguous(t *testing.T) {
+	// Two rows for one file whose names collapse to the same space-form: a -t
+	// filter cannot separate them, so the whole file is refused for slicing.
+	const list = `[
+      {"name":"a > b","file":"/repo/tests/x.spec.ts"},
+      {"name":"a b","file":"/repo/tests/x.spec.ts"}
+    ]`
+	if _, err := runnableNames("/repo", "tests/x.spec.ts", []byte(list)); err == nil {
+		t.Fatal("ambiguous names were accepted; a slice could run a test twice")
+	} else if !strings.Contains(err.Error(), "collide") {
+		t.Errorf("error does not explain the collision: %v", err)
+	}
+	// Distinct nested names are fine.
+	const ok = `[
+      {"name":"group > a","file":"/repo/tests/x.spec.ts"},
+      {"name":"group > b","file":"/repo/tests/x.spec.ts"}
+    ]`
+	names, err := runnableNames("/repo", "tests/x.spec.ts", []byte(ok))
+	if err != nil {
+		t.Fatalf("distinct nested names rejected: %v", err)
+	}
+	if strings.Join(names, ",") != "group > a,group > b" {
+		t.Errorf("names = %v, want the two nested names in `>`-form", names)
+	}
+}
+
 func TestRenderCapturesEventsWhenConfigured(t *testing.T) {
 	r := mustNew(t, Options{Root: ".", EventsDir: "/tmp/ev"})
 	got := r.Render(runner.Bucket{Index: 3, Units: []runner.Unit{wholeFileUnit("a.spec.ts", 1)}})
@@ -211,6 +367,16 @@ func TestValidateUnit(t *testing.T) {
 	if d := r.ValidateUnit(wholeFileUnit("tests/a.spec.ts", 1), live, 1); len(d) != 0 {
 		t.Errorf("a well-formed whole-file unit was rejected: %v", d)
 	}
+	// Healthy run-slice unit — including a name with a literal separator and a
+	// regex metacharacter, both of which the renderer handles.
+	okSlice := runner.Unit{
+		ID: "tests/a.spec.ts[group > inner|has (p)]", Kind: runner.KindRunSlice, Count: 1,
+		Run:      []string{"group > inner", "has (p)"},
+		Packages: []runner.LivePackage{live["tests/a.spec.ts"]},
+	}
+	if d := r.ValidateUnit(okSlice, live, 1); len(d) != 0 {
+		t.Errorf("a well-formed run-slice was rejected: %v", d)
+	}
 
 	bad := []struct {
 		name string
@@ -218,8 +384,10 @@ func TestValidateUnit(t *testing.T) {
 		want string
 	}{
 		{"count-shard", runner.Unit{ID: "x#shard1", Kind: runner.KindCountShard, Count: 1, Shard: 1, Shards: 2, Packages: []runner.LivePackage{live["tests/a.spec.ts"]}}, "count-shard"},
-		{"run-slice", runner.Unit{ID: "x[t]", Kind: runner.KindRunSlice, Count: 1, Run: []string{"t"}, Packages: []runner.LivePackage{live["tests/a.spec.ts"]}}, "run-slice"},
 		{"name filter on whole file", runner.Unit{ID: "tests/a.spec.ts", Kind: runner.KindPackage, Count: 1, Run: []string{"t"}, Packages: []runner.LivePackage{live["tests/a.spec.ts"]}}, "name filter"},
+		{"empty run-slice", runner.Unit{ID: "x[]", Kind: runner.KindRunSlice, Count: 1, Run: nil, Packages: []runner.LivePackage{live["tests/a.spec.ts"]}}, "empty name set"},
+		{"run-slice over two files", runner.Unit{ID: "x[t]", Kind: runner.KindRunSlice, Count: 1, Run: []string{"t"}, Packages: []runner.LivePackage{live["tests/a.spec.ts"], live["tests/notest.ts"]}}, "must cover exactly 1"},
+		{"run-slice colliding names", runner.Unit{ID: "x[a > b|a b]", Kind: runner.KindRunSlice, Count: 1, Run: []string{"a > b", "a b"}, Packages: []runner.LivePackage{live["tests/a.spec.ts"]}}, "collide"},
 		{"missing file", wholeFileUnit("tests/ghost.ts", 1), "not in the live test set"},
 		{"no-test file", wholeFileUnit("tests/notest.ts", 1), "has no tests"},
 		{"zero sweep", runner.Unit{ID: "tests/a.spec.ts", Kind: runner.KindPackage, Count: 0, Packages: []runner.LivePackage{live["tests/a.spec.ts"]}}, "runs each file exactly once"},

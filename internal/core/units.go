@@ -179,7 +179,7 @@ func expandUnits(live []runner.LivePackage, st *Store, opt expandOptions) (*expa
 			slices := sliceByName(p, names, row, sec, clampShards(row.SplitInto, opt.K), opt.BaseCount, estimated)
 			ex.Units = append(ex.Units, slices...)
 			ex.Notes = append(ex.Notes, fmt.Sprintf(
-				"run-slice %s into %d slices over %d live runnables (tests, examples and fuzz targets)",
+				"run-slice %s into %d slices over %d live runnables",
 				p.ID, len(slices), len(names)))
 
 		default:

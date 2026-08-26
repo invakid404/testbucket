@@ -147,7 +147,8 @@ type runnerConfig struct {
 	vitestDiscoveryCommand string
 	discoveryTimeout       time.Duration
 	// Shared by both adapters.
-	eventsDir string
+	eventsDir       string
+	fileParallelism int
 }
 
 // liveLoader reads the live target set from a JSON file using the schema of the
@@ -169,6 +170,7 @@ func newRunner(cfg runnerConfig) (runner.Runner, liveLoader, error) {
 			Timeout:          cfg.timeout,
 			EventsDir:        cfg.eventsDir,
 			NodePrefixes:     cfg.nodePrefixes,
+			FileParallelism:  cfg.fileParallelism,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -190,6 +192,7 @@ func newRunner(cfg runnerConfig) (runner.Runner, liveLoader, error) {
 			DiscoveryCommand: splitCommand(cfg.vitestDiscoveryCommand),
 			DiscoveryTimeout: cfg.discoveryTimeout,
 			EventsDir:        cfg.eventsDir,
+			FileParallelism:  cfg.fileParallelism,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -295,6 +298,7 @@ func runPlan(args []string) error {
 	live := fs.String("live", "", "read the live package set from this JSON file instead of running go list")
 	nodePrefixes := fs.String("node-prefixes", "", "comma-separated package-dir prefixes whose buckets need Node set up (empty = none; a consumer opts in)")
 	eventsDir := fs.String("events-dir", "", "if set, emitted invocations add -json and tee events into this directory")
+	fileParallelism := fs.Int("file-parallelism", 1, "intra-bucket file/package concurrency (#22): 1 keeps a bucket serial (the sum-of-weights model the balancer packs to); N>1 renders `-p=N` (Go) / `--maxWorkers=N` (Vitest), trading that estimate for more cores")
 	staleAfter := fs.Duration("stale-after", 14*24*time.Hour, "warn when the store was recorded longer ago than this (0 disables)")
 	toolchainTimeout := fs.Duration("toolchain-timeout", 10*time.Minute, "deadline for each `go` subprocess (go work edit / go list / go test -list); 0 disables")
 	runnerKind := fs.String("runner", "go", "test-runner adapter: go or vitest")
@@ -315,6 +319,9 @@ func runPlan(args []string) error {
 	count, err := resolveCount(*runnerKind, *countFlag, flagWasSet(fs, "count"))
 	if err != nil {
 		return err
+	}
+	if *fileParallelism < 1 {
+		return fmt.Errorf("--file-parallelism must be >= 1, got %d", *fileParallelism)
 	}
 
 	opt := core.PlanOptions{
@@ -345,6 +352,7 @@ func runPlan(args []string) error {
 		vitestDiscoveryCommand: *vitestDiscoveryCommand,
 		discoveryTimeout:       *discoveryTimeout,
 		eventsDir:              *eventsDir,
+		fileParallelism:        *fileParallelism,
 	})
 	if err != nil {
 		return err

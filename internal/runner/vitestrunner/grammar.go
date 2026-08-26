@@ -11,11 +11,10 @@ import (
 
 // ValidateUnit is the command-grammar half of the never-drop gate for the Vitest
 // runner: it checks that a final unit renders to a `vitest run` command that
-// actually runs what the unit claims. Because this adapter buckets at file
-// granularity, only whole-file and whole-project(atom) units are renderable;
-// count-shard and run-slice units are refused as a backstop (the core will not
-// produce them without a sweep count or per-test weights, which this adapter
-// does not supply, but the gate must not trust that).
+// actually runs what the unit claims. Whole-file, whole-project(atom) and
+// name-slice (run-slice) units are renderable; a count-shard is refused, because
+// this adapter has no per-invocation sweep to divide and the core must not be
+// trusted never to hand it one.
 func (r *Runner) ValidateUnit(u runner.Unit, live map[string]runner.LivePackage, baseCount int) []string {
 	var defects []string
 	label := u.ID
@@ -27,19 +26,24 @@ func (r *Runner) ValidateUnit(u runner.Unit, live map[string]runner.LivePackage,
 	}
 
 	switch u.Kind {
-	case runner.KindPackage, runner.KindModuleAtom:
+	case runner.KindPackage, runner.KindModuleAtom, runner.KindRunSlice:
 	case runner.KindCountShard:
 		bad("is a count-shard; the Vitest adapter has no per-invocation sweep to divide, so it schedules at file granularity — refusing rather than emitting a command that reruns the file")
-		return defects
-	case runner.KindRunSlice:
-		bad("is a run-slice; the Vitest adapter buckets whole files (name-slicing is a documented follow-up) — refusing rather than emitting a -t that would skip the rest of the file")
 		return defects
 	default:
 		bad("has unknown kind %q", u.Kind)
 		return defects
 	}
 
-	if len(u.Packages) == 0 {
+	// Arity. A run-slice carries one -t regex computed for exactly one file, and
+	// the renderer applies it to that file's invocation; a passenger file would be
+	// filtered by the first file's regex. A whole-file/atom unit may cover several.
+	if u.Kind == runner.KindRunSlice {
+		if len(u.Packages) != 1 {
+			bad("is a run-slice over %d files; a name-sliced unit must cover exactly 1", len(u.Packages))
+			return defects
+		}
+	} else if len(u.Packages) == 0 {
 		bad("is a %s covering no test file at all", u.Kind)
 		return defects
 	}
@@ -75,11 +79,35 @@ func (r *Runner) ValidateUnit(u runner.Unit, live map[string]runner.LivePackage,
 		bad("runs a sweep of %d, but the Vitest adapter runs each file exactly once (no repeat sweep to divide or repeat)", u.Count)
 	}
 
-	// A -t filter or shard coordinates on a file-granularity unit would run a
-	// subset while claiming the whole file.
-	if len(u.Run) > 0 {
-		bad("carries a name filter (%s) but the Vitest adapter runs whole files; it would skip the rest of the file", strings.Join(sortedCopy(u.Run), "|"))
+	// The -t name filter. It is emitted whenever Run is non-empty, for any kind,
+	// so a filter on a NON-run-slice unit would run a subset while claiming the
+	// whole file — and a run-slice with an EMPTY filter would emit no -t and run
+	// the whole file, duplicating whatever the other slices cover.
+	switch u.Kind {
+	case runner.KindRunSlice:
+		if len(u.Run) == 0 {
+			bad("is a run-slice with an empty name set; the renderer would emit no -t and run the whole file, duplicating the other slices")
+		}
+		for _, n := range u.Run {
+			if strings.TrimSpace(n) == "" {
+				bad("has an empty name in its -t set")
+			}
+		}
+		// Unlike the Go adapter, a Vitest name may contain any character (a title
+		// is arbitrary text): the renderer regex-escapes each one, so no character
+		// is forbidden here. What IS forbidden is two names in ONE slice colliding
+		// under the space-form -t actually matches — the -t would run each in the
+		// place of the other. (Cross-slice collisions are caught by the core gate
+		// resolving the same universe; this catches a malformed single slice.)
+		if dupes := ambiguous(u.Run); len(dupes) > 0 {
+			bad("names collide under the space-joined form Vitest's -t matches (%s); they cannot be told apart by a name filter", strings.Join(dupes, ", "))
+		}
+	default:
+		if len(u.Run) > 0 {
+			bad("carries a name filter (%s) but the Vitest adapter runs whole files; it would skip the rest of the file", strings.Join(sortedCopy(u.Run), "|"))
+		}
 	}
+
 	if u.Shard != 0 || u.Shards != 0 {
 		bad("is a %s but carries count-shard coordinates %d/%d", u.Kind, u.Shard, u.Shards)
 	}

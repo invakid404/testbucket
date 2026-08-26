@@ -68,6 +68,10 @@ type Options struct {
 	// NodePrefixes are target-dir prefixes whose buckets need Node set up. Empty
 	// by default — a consumer opts in explicitly.
 	NodePrefixes []string
+	// FileParallelism is the -p intra-bucket package concurrency (#22). 0 or 1
+	// keeps the default serial -p=1 (the sum-of-weights model the balancer packs
+	// to); a value >1 renders -p=N.
+	FileParallelism int
 }
 
 // New builds the Go adapter, resolving the repo root once. A missing root is
@@ -96,11 +100,12 @@ func New(opt Options) (*Runner, error) {
 		repoRoot: root,
 		rootErr:  rootErr,
 		render: renderConfig{
-			race:         opt.Race,
-			count:        opt.Count,
-			timeout:      opt.Timeout,
-			eventsDir:    opt.EventsDir,
-			nodePrefixes: opt.NodePrefixes,
+			race:            opt.Race,
+			count:           opt.Count,
+			timeout:         opt.Timeout,
+			eventsDir:       opt.EventsDir,
+			nodePrefixes:    opt.NodePrefixes,
+			fileParallelism: opt.FileParallelism,
 		},
 	}, nil
 }

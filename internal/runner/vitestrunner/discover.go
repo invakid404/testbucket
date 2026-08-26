@@ -15,12 +15,18 @@ import (
 
 // listEntry is one row of Vitest discovery JSON. The full-collection shape
 // (`vitest list --json`) carries a per-test {name, file}; the glob shape
-// (`vitest list --filesOnly --json`) carries {file} only (and an ignored
-// projectName). Both are decoded here; discovery reads File, and Runnables reads
-// Name. A missing File is the loud-refusal case (see parseList).
+// (`vitest list --filesOnly --json`) carries {file, projectName}. All three are
+// decoded here; discovery reads File, Runnables reads Name, and the file->project
+// map (parseProjects) reads ProjectName. A missing File is the loud-refusal case
+// (see parseList).
 type listEntry struct {
 	Name string `json:"name"`
 	File string `json:"file"`
+	// ProjectName is the Vitest project a file belongs to in a multi-project
+	// config (empty for a single-project config). It lets Runnables scope its
+	// importing `vitest list` to one project, so a sibling project's collection
+	// deadlock cannot reach it — the whole reason glob discovery exists.
+	ProjectName string `json:"projectName,omitempty"`
 }
 
 // relID turns an absolute test-file path into the neutral, machine-independent
@@ -79,7 +85,15 @@ func parseList(root string, data []byte) ([]runner.LivePackage, error) {
 
 // runnableNames extracts the test names of ONE file from a `vitest list --json`
 // output, in sorted order — the universe the never-drop gate checks a file's
-// name slices against, and what an emitted `-t '^(a|b)$'` selects.
+// name slices against, and what an emitted robust -t selects. Each name is the
+// `" > "`-joined task path, the same identity `ingest` records.
+//
+// It refuses (loudly) a file whose names collide under the space-joined form -t
+// actually matches: two such names cannot be placed in different slices without
+// a -t running one in the other's place. This is the plan-time backstop for a
+// name added since the last record — the steady-state case is already demoted at
+// ingest, so refusing here is rare, and refusing beats emitting a slice that
+// would double-run a test.
 func runnableNames(root, file string, data []byte) ([]string, error) {
 	var rows []listEntry
 	if err := json.Unmarshal(data, &rows); err != nil {
@@ -95,7 +109,42 @@ func runnableNames(root, file string, data []byte) ([]string, error) {
 		names = append(names, r.Name)
 	}
 	sort.Strings(names)
+	if dupes := ambiguous(names); len(dupes) > 0 {
+		return nil, fmt.Errorf(
+			"cannot safely name-slice %s: its test names collide under the space-joined form Vitest's -t matches (%s) — "+
+				"a name filter cannot tell them apart, so a slice would run a test twice; rename them or the file runs whole",
+			file, strings.Join(dupes, ", "))
+	}
 	return names, nil
+}
+
+// parseProjects reduces glob discovery JSON to a file-id -> project-name map,
+// the routing table Runnables uses to scope its importing `vitest list` to one
+// project. A row with no projectName (single-project config) maps to "", which
+// Runnables reads as "no --project scoping needed". A row with no file is skipped
+// rather than refused: this map is only a routing hint (parseList already refused
+// a fileless discovery), so a stray row costs a scoping decision, not coverage.
+func parseProjects(root string, data []byte) (map[string]string, error) {
+	var rows []listEntry
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return nil, fmt.Errorf("parse vitest list --filesOnly --json: %w", err)
+	}
+	m := map[string]string{}
+	for _, r := range rows {
+		if strings.TrimSpace(r.File) == "" {
+			continue
+		}
+		id := relID(root, r.File)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		// First writer wins so the map is a pure function of the input; every row
+		// for one file carries the same projectName anyway.
+		if _, ok := m[id]; !ok {
+			m[id] = r.ProjectName
+		}
+	}
+	return m, nil
 }
 
 // discover runs the configured discovery command and reduces its JSON to the
