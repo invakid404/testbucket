@@ -47,6 +47,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/invakid404/testbucket/internal/runner"
@@ -203,11 +204,13 @@ func (r *Runner) Discover(ctx context.Context) ([]runner.LivePackage, error) {
 // It cannot use glob discovery (that returns no test names) so it must import;
 // but it imports as LITTLE as possible. Two scopes stack:
 //
-//   - the file id is passed as a positional FILE FILTER, so Vitest collects only
-//     that one spec instead of the whole project — on a 1,398-file project that is
-//     the difference between importing every module to read one file's names (201s
-//     measured) and importing one (30s). runnableNames still filters to the file's
-//     exact rows, so a substring over-match cannot add a sibling's names.
+//   - the file id is passed as a positional FILE FILTER (`./`-prefixed so a
+//     root-level id starting with '-' is not misread as an option), so Vitest
+//     collects only that one spec instead of the whole project — on a 1,398-file
+//     project that is the difference between importing every module to read one
+//     file's names (201s measured) and importing one (30s). runnableNames still
+//     filters to the file's exact rows, so a substring over-match cannot add a
+//     sibling's names.
 //   - `--project <name>` scopes to the file's OWN Vitest project, so a sibling
 //     project's collection deadlock — the exact hang glob discovery exists to
 //     avoid — cannot reach this call. The file->project map is resolved once from
@@ -240,11 +243,27 @@ func (r *Runner) Runnables(ctx context.Context, p runner.LivePackage) ([]string,
 // a multi-project file. It is a pure function of (project, fileID) so the arg order
 // — the clobber-and-scope invariant — is unit-tested offline, no subprocess.
 func runnablesArgs(project, fileID string) []string {
-	args := []string{"list", fileID, "--json"}
+	args := []string{"list", filterPathArg(fileID), "--json"}
 	if project != "" {
 		args = append(args, "--project", project)
 	}
 	return args
+}
+
+// filterPathArg makes a root-relative file id safe to pass as a Vitest positional
+// filter. Vitest/CAC reads a positional that begins with '-' as an OPTION, so a
+// root-level spec whose id starts with '-' (e.g. `--odd.spec.ts`) fails the whole
+// list with "Unknown option --odd" — a valid file the old whole-project path
+// handled fine. Prefixing `./` turns the id into an unambiguous path token that
+// Vitest resolves against the root and matches the SAME file; verified to keep
+// normal ids scoping too, so it is applied uniformly. An id that is already an
+// explicit path (relative `.`/`..` or absolute `/`) is left as-is: it cannot be
+// read as an option, and rerooting an absolute path would break the match.
+func filterPathArg(fileID string) string {
+	if strings.HasPrefix(fileID, ".") || strings.HasPrefix(fileID, "/") {
+		return fileID
+	}
+	return "./" + fileID
 }
 
 // projectFor resolves the Vitest project a file belongs to, lazily building the

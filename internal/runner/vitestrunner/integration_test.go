@@ -828,3 +828,70 @@ func relOf(t *testing.T, root, file string) string {
 	}
 	return filepath.ToSlash(rel)
 }
+
+// dashfileRoot points at the fixture whose single spec's root-relative id starts
+// with "-" (`--odd.vtest.ts`). It reuses the sample's node_modules like the other
+// nested fixtures and is gated on the same real Vitest install.
+func dashfileRoot(t *testing.T) string {
+	t.Helper()
+	sample, err := filepath.Abs(filepath.Join("..", "..", "..", "testdata", "vitest-sample"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("no npx on PATH")
+	}
+	if _, err := os.Stat(filepath.Join(sample, "node_modules")); err != nil {
+		t.Skip("vitest sample not installed (run `npm install` in testdata/vitest-sample)")
+	}
+	return filepath.Join(sample, "dashfile")
+}
+
+// TestVitestRunnablesHandlesDashLeadingFileID is the regression proof for the Codex
+// finding: a root-level spec whose id starts with '-' (`--odd.vtest.ts`), passed as
+// a BARE `vitest list` positional, is read by CAC as an option and fails the whole
+// list with "Unknown option --odd" — a valid file the old whole-project-then-filter
+// path handled. The adapter `./`-prefixes the filter, so Runnables scopes to the
+// file and returns its names, identical to the old path; the common case still
+// resolves too.
+func TestVitestRunnablesHandlesDashLeadingFileID(t *testing.T) {
+	root := dashfileRoot(t)
+	ctx := context.Background()
+	const dashID = "--odd.vtest.ts"
+
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, Timeout: 60 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Glob discovery sees the file even though its id begins with '-'.
+	live, err := rnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(live) != 1 || live[0].ID != dashID {
+		t.Fatalf("glob discovered %v, want exactly [%q]", live, dashID)
+	}
+
+	// Runnables must NOT fail with an option-parse error; it scopes to the file.
+	got, err := rnr.Runnables(ctx, runner.LivePackage{ID: dashID, HasTests: true})
+	if err != nil {
+		t.Fatalf("Runnables on a '-'-leading id failed (the positional was read as an option?): %v", err)
+	}
+	if strings.Join(got, ",") != "odd one,odd two" {
+		t.Fatalf("Runnables(%q) = %v, want the file's two names", dashID, got)
+	}
+
+	// Complete: identical to the whole-project-then-filter path (the old path a
+	// bare positional would have crashed before ever reaching).
+	oldNames := namesForFile(t, root, dashID, rawVitestList(t, ctx, root, "list", "--json"))
+	if strings.Join(got, "\x00") != strings.Join(oldNames, "\x00") {
+		t.Fatalf("`-`-leading names %v != whole-project-filtered %v", got, oldNames)
+	}
+	// Scoped: the `./`-prefixed invocation the adapter emits collects only this file.
+	scoped := relFilesOf(t, root, rawVitestList(t, ctx, root, "list", "./"+dashID, "--json"))
+	if len(scoped) != 1 || scoped[0] != dashID {
+		t.Fatalf("`./`-prefixed list collected %v, want only %q", scoped, dashID)
+	}
+	t.Logf("`-`-leading id %q scoped to %v with names %v (a bare positional would have been read as an option)", dashID, scoped, got)
+}

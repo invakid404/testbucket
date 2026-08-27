@@ -493,37 +493,51 @@ func TestDiscoveryInvocationSelection(t *testing.T) {
 	}
 }
 
-// TestRunnablesArgsFileLeadsJSON pins the Runnables invocation order offline (no
-// Node). The file id must be a POSITIONAL that leads --json, which is what both
-// scopes the collection to that one spec and dodges `--json`'s optional value:
-// Vitest's `--json [true|path]` swallows a file token that immediately follows it
-// as an OUTPUT PATH, so `list --json <file>` writes the report INTO the test file
-// (clobbering it) and prints nothing. This guards the two subtle properties the
-// real-Vitest tests measure, on every CI run, even where Vitest is not installed.
+// TestRunnablesArgsFileLeadsJSON pins the Runnables invocation offline (no Node).
+// Three invariants the real-Vitest tests measure, guarded on every CI run even
+// without Vitest installed:
+//   - the file id leads --json — Vitest's `--json [true|path]` swallows a file
+//     token immediately after it as an OUTPUT PATH, so `list --json <file>` writes
+//     the report INTO the test file (clobbering it) and prints nothing;
+//   - the file filter is present — a missing one un-scopes the list back to the
+//     whole 201s project import;
+//   - the positional cannot be read as an OPTION — a root-level id starting with
+//     '-' (e.g. `--odd.spec.ts`) is `./`-prefixed, or CAC fails with "Unknown
+//     option". Normal ids are `./`-prefixed too (verified to still scope).
 func TestRunnablesArgsFileLeadsJSON(t *testing.T) {
-	// Single-project (no project name): `list <file> --json`.
+	// Single-project (no project name): `list ./<file> --json`.
 	single := runnablesArgs("", "tests/whale.spec.ts")
-	if strings.Join(single, " ") != "list tests/whale.spec.ts --json" {
-		t.Errorf("single-project args = %q, want `list <file> --json`", single)
+	if strings.Join(single, " ") != "list ./tests/whale.spec.ts --json" {
+		t.Errorf("single-project args = %q, want `list ./<file> --json`", single)
 	}
 	// Multi-project: --project is appended AFTER; the file still leads --json.
 	multi := runnablesArgs("unit", "pkg-a/ok.vtest.ts")
-	if strings.Join(multi, " ") != "list pkg-a/ok.vtest.ts --json --project unit" {
-		t.Errorf("multi-project args = %q, want `list <file> --json --project <p>`", multi)
+	if strings.Join(multi, " ") != "list ./pkg-a/ok.vtest.ts --json --project unit" {
+		t.Errorf("multi-project args = %q, want `list ./<file> --json --project <p>`", multi)
 	}
-	// The invariant, stated directly: the file id is present and strictly precedes
-	// --json in both forms — never adjacent-after it, never absent (a missing file
-	// filter would un-scope the list back to the whole 201s project import).
+	// A root-level id that starts with '-' must be neutralised into a path token.
+	dash := runnablesArgs("", "--odd.spec.ts")
+	if strings.Join(dash, " ") != "list ./--odd.spec.ts --json" {
+		t.Errorf("dash-leading args = %q, want the id `./`-prefixed so it is not read as an option", dash)
+	}
+
 	for _, tc := range []struct {
-		name, file string
-		args       []string
-	}{{"single", "tests/whale.spec.ts", single}, {"multi", "pkg-a/ok.vtest.ts", multi}} {
-		fi, ji := indexOfArg(tc.args, tc.file), indexOfArg(tc.args, "--json")
-		if fi < 0 {
-			t.Errorf("%s: file filter %q absent from %q — the list would import the whole project", tc.name, tc.file, tc.args)
+		name string
+		args []string
+	}{{"single", single}, {"multi", multi}, {"dash", dash}} {
+		// The positional filter is arg index 1 (`list` is 0). It must exist, must
+		// carry the file id, must not be readable as an option, and must precede
+		// --json.
+		if len(tc.args) < 2 || tc.args[0] != "list" {
+			t.Fatalf("%s: args %q do not start with `list <filter>`", tc.name, tc.args)
 		}
-		if ji < 0 || fi >= ji {
-			t.Errorf("%s: file at %d does not lead --json at %d in %q — Vitest would swallow it as --json's output path and clobber the file", tc.name, fi, ji, tc.args)
+		filter := tc.args[1]
+		if strings.HasPrefix(filter, "-") {
+			t.Errorf("%s: positional filter %q begins with '-' — Vitest/CAC would read it as an option", tc.name, filter)
+		}
+		ji := indexOfArg(tc.args, "--json")
+		if ji <= 1 {
+			t.Errorf("%s: file filter at 1 does not lead --json at %d in %q — Vitest would swallow it as --json's output path and clobber the file", tc.name, ji, tc.args)
 		}
 	}
 }
