@@ -9,6 +9,7 @@ package vitestrunner_test
 // skipped otherwise, so the offline unit tests remain the always-on coverage.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -421,10 +422,10 @@ func runBuckets(t *testing.T, ctx context.Context, doc *core.PlanDocument) {
 // which glob discovery (files only) does not provide and which the whole-suite
 // `vitest list` collection would DEADLOCK to produce on this multi-project
 // fixture (pkg-b never finishes importing). The adapter resolves a whale's names
-// with a project-SCOPED `vitest list --json --project <name>`, importing only the
-// whale's own project — so slicing works under the glob default without ever
-// touching the hanging sibling. This runs it end to end: glob discovery, a
-// project-scoped Runnables, a real slice, and a real run, with no drop.
+// with a file- and project-scoped `vitest list <file> --json --project <name>`,
+// importing only the whale's own spec in its own project — so slicing works under
+// the glob default without ever touching the hanging sibling. This runs it end to
+// end: glob discovery, a scoped Runnables, a real slice, and a real run, no drop.
 func TestVitestGlobSlicingMultiProjectNoDeadlock(t *testing.T) {
 	root := multiprojectRoot(t)
 	ctx := context.Background()
@@ -623,4 +624,274 @@ func TestVitestRejectsRepeatSweep(t *testing.T) {
 	if _, err := core.BuildPlan(context.Background(), rnr, nil, "", opt); err != nil {
 		t.Fatalf("a Count=1 Vitest plan was rejected: %v", err)
 	}
+}
+
+// TestVitestRunnablesFileScopedListing is the headline proof for the file-scope
+// fix: Runnables lists EXACTLY one file's names by passing the file id as a
+// positional filter, so Vitest collects only that spec instead of importing the
+// whole project. Two properties, measured against a real Vitest on the four-file
+// single-project fixture:
+//
+//   - Scoped: the raw file-scoped `vitest list` collects rows for ONLY the target
+//     file; the other three specs are never imported (the 201s->30s win — on a
+//     1,398-file project it is the difference between importing all of them to read
+//     one file's names and importing one).
+//   - Complete: that scoped name set is IDENTICAL to the old path — a whole-project
+//     `vitest list --json` filtered to the same file in Go. No name dropped, none
+//     added. The universe the never-drop gate slices over is unchanged, just cheaper.
+func TestVitestRunnablesFileScopedListing(t *testing.T) {
+	root := fixtureRoot(t)
+	ctx := context.Background()
+	const target = "tests/slow.spec.ts"
+
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, Timeout: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// OLD path: import the WHOLE project, then filter to the target file in Go —
+	// exactly the name universe the pre-fix Runnables produced. `list --json` with
+	// no file argument is the safe (non-clobbering) whole-project form.
+	wholeRows := rawVitestList(t, ctx, root, "list", "--json")
+	if allFiles := relFilesOf(t, root, wholeRows); len(allFiles) < 2 {
+		t.Fatalf("whole-project list collected %v, want all four specs — fixture changed", allFiles)
+	}
+	oldNames := namesForFile(t, root, target, wholeRows)
+	if len(oldNames) == 0 {
+		t.Fatalf("whole-project list produced no names for %s — fixture changed", target)
+	}
+
+	// NEW path: the adapter's file-scoped Runnables.
+	start := time.Now()
+	got, err := rnr.Runnables(ctx, runner.LivePackage{ID: target, HasTests: true})
+	if err != nil {
+		t.Fatalf("file-scoped Runnables failed: %v", err)
+	}
+	t.Logf("file-scoped Runnables(%s) = %v in %s", target, got, time.Since(start).Round(time.Millisecond))
+
+	// Complete: old vs new name sets are identical.
+	if strings.Join(got, "\x00") != strings.Join(oldNames, "\x00") {
+		t.Fatalf("file-scoped names %v != whole-project-filtered names %v — a name was dropped or added by scoping", got, oldNames)
+	}
+	if strings.Join(got, ",") != "slow calc,slow io" {
+		t.Fatalf("Runnables = %v, want the slow spec's exactly two tests", got)
+	}
+
+	// Scoped: run the adapter's EXACT invocation form and prove the raw output
+	// carries rows for ONLY the target file — the other three specs were never
+	// collected. (If Vitest imported the whole project, their rows would appear.)
+	scopedRows := rawVitestList(t, ctx, root, "list", target, "--json")
+	scoped := relFilesOf(t, root, scopedRows)
+	if len(scoped) != 1 || scoped[0] != target {
+		t.Fatalf("file-scoped `vitest list %s --json` collected %v, want only %q — the import was NOT scoped to the file", target, scoped, target)
+	}
+	t.Logf("file-scoped list collected exactly %v; the other specs were never imported", scoped)
+}
+
+// TestVitestRunnablesFileScopeIsDeadlockSafe proves the file-scoped Runnables
+// stays deadlock-safe on the multi-project fixture: `vitest list <file-in-a>
+// --json --project a` collects only pkg-a's spec, so pkg-b — whose module never
+// finishes importing — is never touched. Both scopes (the file positional and
+// --project) exclude it. This asserts the adapter's exact combined invocation does
+// not hang, returns pkg-a's precise names, and — via the raw output — that pkg-b's
+// hanging file is absent from what was collected.
+func TestVitestRunnablesFileScopeIsDeadlockSafe(t *testing.T) {
+	root := multiprojectRoot(t)
+	ctx := context.Background()
+	const whale = "pkg-a/ok.vtest.ts"
+	const hangingSibling = "pkg-b/hang.vtest.ts"
+
+	// A short per-command deadline: if the file+project scope FAILED to exclude the
+	// hanging sibling, this fails fast instead of hanging the whole suite.
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, Timeout: 45 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The adapter path: Runnables must return pkg-a's names FAST — proof the scoped
+	// list imports only pkg-a's spec, not the deadlocking pkg-b.
+	start := time.Now()
+	names, err := rnr.Runnables(ctx, runner.LivePackage{ID: whale, HasTests: true})
+	if err != nil {
+		t.Fatalf("file-scoped Runnables hung or failed on the multi-project whale: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 40*time.Second {
+		t.Fatalf("Runnables took %s — it did not scope and inherited pkg-b's collection hang", elapsed)
+	}
+	if strings.Join(names, ",") != "alpha,group > beta,ok" {
+		t.Fatalf("file-scoped Runnables = %v, want pkg-a's three names in `>`-form", names)
+	}
+
+	// The raw invocation the adapter emits: its collected rows must name ONLY
+	// pkg-a's spec. The hanging sibling never appears — it was never imported, which
+	// is exactly why the call returned instead of deadlocking.
+	rows := rawVitestList(t, ctx, root, "list", whale, "--json", "--project", "a")
+	files := relFilesOf(t, root, rows)
+	if len(files) != 1 || files[0] != whale {
+		t.Fatalf("file+project-scoped list collected %v, want only %q", files, whale)
+	}
+	for _, f := range files {
+		if f == hangingSibling {
+			t.Fatalf("the hanging sibling %q was collected — the scope did not exclude it", hangingSibling)
+		}
+	}
+	t.Logf("file+project-scoped Runnables resolved %d names in %s; %q collected only %v (pkg-b never imported)",
+		len(names), elapsed.Round(time.Millisecond), whale, files)
+}
+
+// rawVitestList runs a raw `npx vitest <args...>` against root and decodes its
+// stdout as list JSON — the test's own window onto what Vitest actually collected,
+// independent of the adapter's parsing. It MUST be called only with clobber-safe
+// arg orderings (a file positional never immediately after --json; see Runnables),
+// since a report written to a file would corrupt the fixture rather than print.
+func rawVitestList(t *testing.T, ctx context.Context, root string, args ...string) []listEntryRaw {
+	t.Helper()
+	// Bound the raw call: if a regression un-scoped it on the multi-project fixture
+	// it would import the hanging pkg-b and block forever, so fail fast instead of
+	// hanging the whole suite to the go-test deadline.
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	full := append([]string{"vitest"}, args...)
+	cmd := exec.CommandContext(ctx, "npx", full...)
+	cmd.Dir = root
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("npx %s failed: %v\n%s", strings.Join(full, " "), err, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) == "" {
+		t.Fatalf("`vitest %s` printed nothing on stdout — did an option swallow a positional as its value?\nstderr: %s",
+			strings.Join(args, " "), stderr.String())
+	}
+	var rows []listEntryRaw
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		t.Fatalf("decoding `vitest %s` output: %v\nstdout: %q", strings.Join(args, " "), err, stdout.String())
+	}
+	return rows
+}
+
+// listEntryRaw mirrors the fields the tests read out of Vitest list JSON. Name is
+// a pointer so a present-but-empty title ("") is distinct from an absent field.
+type listEntryRaw struct {
+	Name *string `json:"name"`
+	File string  `json:"file"`
+}
+
+// relFilesOf reduces raw list rows to the sorted, unique set of root-relative
+// slash file ids they collected.
+func relFilesOf(t *testing.T, root string, rows []listEntryRaw) []string {
+	t.Helper()
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range rows {
+		id := relOf(t, root, r.File)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// namesForFile reduces raw list rows to the sorted, unique test names belonging to
+// one target file — the whole-project-then-filter path the pre-fix Runnables ran.
+func namesForFile(t *testing.T, root, target string, rows []listEntryRaw) []string {
+	t.Helper()
+	seen := map[string]bool{}
+	var names []string
+	for _, r := range rows {
+		if relOf(t, root, r.File) != target {
+			continue
+		}
+		if r.Name == nil {
+			t.Fatalf("list row for %s has no name field", target)
+		}
+		if seen[*r.Name] {
+			continue
+		}
+		seen[*r.Name] = true
+		names = append(names, *r.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func relOf(t *testing.T, root, file string) string {
+	t.Helper()
+	rel, err := filepath.Rel(root, file)
+	if err != nil {
+		t.Fatalf("relativising %q under %q: %v", file, root, err)
+	}
+	return filepath.ToSlash(rel)
+}
+
+// dashfileRoot points at the fixture whose single spec's root-relative id starts
+// with "-" (`--odd.vtest.ts`). It reuses the sample's node_modules like the other
+// nested fixtures and is gated on the same real Vitest install.
+func dashfileRoot(t *testing.T) string {
+	t.Helper()
+	sample, err := filepath.Abs(filepath.Join("..", "..", "..", "testdata", "vitest-sample"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("no npx on PATH")
+	}
+	if _, err := os.Stat(filepath.Join(sample, "node_modules")); err != nil {
+		t.Skip("vitest sample not installed (run `npm install` in testdata/vitest-sample)")
+	}
+	return filepath.Join(sample, "dashfile")
+}
+
+// TestVitestRunnablesHandlesDashLeadingFileID is the regression proof for the Codex
+// finding: a root-level spec whose id starts with '-' (`--odd.vtest.ts`), passed as
+// a BARE `vitest list` positional, is read by CAC as an option and fails the whole
+// list with "Unknown option --odd" — a valid file the old whole-project-then-filter
+// path handled. The adapter `./`-prefixes the filter, so Runnables scopes to the
+// file and returns its names, identical to the old path; the common case still
+// resolves too.
+func TestVitestRunnablesHandlesDashLeadingFileID(t *testing.T) {
+	root := dashfileRoot(t)
+	ctx := context.Background()
+	const dashID = "--odd.vtest.ts"
+
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, Timeout: 60 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Glob discovery sees the file even though its id begins with '-'.
+	live, err := rnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(live) != 1 || live[0].ID != dashID {
+		t.Fatalf("glob discovered %v, want exactly [%q]", live, dashID)
+	}
+
+	// Runnables must NOT fail with an option-parse error; it scopes to the file.
+	got, err := rnr.Runnables(ctx, runner.LivePackage{ID: dashID, HasTests: true})
+	if err != nil {
+		t.Fatalf("Runnables on a '-'-leading id failed (the positional was read as an option?): %v", err)
+	}
+	if strings.Join(got, ",") != "odd one,odd two" {
+		t.Fatalf("Runnables(%q) = %v, want the file's two names", dashID, got)
+	}
+
+	// Complete: identical to the whole-project-then-filter path (the old path a
+	// bare positional would have crashed before ever reaching).
+	oldNames := namesForFile(t, root, dashID, rawVitestList(t, ctx, root, "list", "--json"))
+	if strings.Join(got, "\x00") != strings.Join(oldNames, "\x00") {
+		t.Fatalf("`-`-leading names %v != whole-project-filtered %v", got, oldNames)
+	}
+	// Scoped: the `./`-prefixed invocation the adapter emits collects only this file.
+	scoped := relFilesOf(t, root, rawVitestList(t, ctx, root, "list", "./"+dashID, "--json"))
+	if len(scoped) != 1 || scoped[0] != dashID {
+		t.Fatalf("`./`-prefixed list collected %v, want only %q", scoped, dashID)
+	}
+	t.Logf("`-`-leading id %q scoped to %v with names %v (a bare positional would have been read as an option)", dashID, scoped, got)
 }

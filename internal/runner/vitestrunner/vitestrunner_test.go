@@ -493,6 +493,64 @@ func TestDiscoveryInvocationSelection(t *testing.T) {
 	}
 }
 
+// TestRunnablesArgsFileLeadsJSON pins the Runnables invocation offline (no Node).
+// Three invariants the real-Vitest tests measure, guarded on every CI run even
+// without Vitest installed:
+//   - the file id leads --json — Vitest's `--json [true|path]` swallows a file
+//     token immediately after it as an OUTPUT PATH, so `list --json <file>` writes
+//     the report INTO the test file (clobbering it) and prints nothing;
+//   - the file filter is present — a missing one un-scopes the list back to the
+//     whole 201s project import;
+//   - the positional cannot be read as an OPTION — a root-level id starting with
+//     '-' (e.g. `--odd.spec.ts`) is `./`-prefixed, or CAC fails with "Unknown
+//     option". Normal ids are `./`-prefixed too (verified to still scope).
+func TestRunnablesArgsFileLeadsJSON(t *testing.T) {
+	// Single-project (no project name): `list ./<file> --json`.
+	single := runnablesArgs("", "tests/whale.spec.ts")
+	if strings.Join(single, " ") != "list ./tests/whale.spec.ts --json" {
+		t.Errorf("single-project args = %q, want `list ./<file> --json`", single)
+	}
+	// Multi-project: --project is appended AFTER; the file still leads --json.
+	multi := runnablesArgs("unit", "pkg-a/ok.vtest.ts")
+	if strings.Join(multi, " ") != "list ./pkg-a/ok.vtest.ts --json --project unit" {
+		t.Errorf("multi-project args = %q, want `list ./<file> --json --project <p>`", multi)
+	}
+	// A root-level id that starts with '-' must be neutralised into a path token.
+	dash := runnablesArgs("", "--odd.spec.ts")
+	if strings.Join(dash, " ") != "list ./--odd.spec.ts --json" {
+		t.Errorf("dash-leading args = %q, want the id `./`-prefixed so it is not read as an option", dash)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{{"single", single}, {"multi", multi}, {"dash", dash}} {
+		// The positional filter is arg index 1 (`list` is 0). It must exist, must
+		// carry the file id, must not be readable as an option, and must precede
+		// --json.
+		if len(tc.args) < 2 || tc.args[0] != "list" {
+			t.Fatalf("%s: args %q do not start with `list <filter>`", tc.name, tc.args)
+		}
+		filter := tc.args[1]
+		if strings.HasPrefix(filter, "-") {
+			t.Errorf("%s: positional filter %q begins with '-' — Vitest/CAC would read it as an option", tc.name, filter)
+		}
+		ji := indexOfArg(tc.args, "--json")
+		if ji <= 1 {
+			t.Errorf("%s: file filter at 1 does not lead --json at %d in %q — Vitest would swallow it as --json's output path and clobber the file", tc.name, ji, tc.args)
+		}
+	}
+}
+
+func indexOfArg(args []string, want string) int {
+	for i, a := range args {
+		if a == want {
+			return i
+		}
+	}
+	return -1
+}
+
 func TestDiscoveryConfigValidation(t *testing.T) {
 	// An unknown discovery mode fails loudly at construction.
 	if _, err := New(Options{Root: ".", DiscoveryMode: "collect"}); err == nil {
