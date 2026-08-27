@@ -15,12 +15,15 @@
 //     full-collection `vitest list --json` imports the whole module graph and can
 //     DEADLOCK on a multi-project config; glob discovery is immune, so it is the
 //     default. `--vitest-discovery=list` opts back into the importing path.
-//   - Runnables: for a whale being name-sliced, `vitest list --json --project
-//     <the file's project>` -> that file's `" > "`-joined test names. Scoping to
-//     the file's OWN project is what keeps this (necessarily importing) call from
-//     inheriting a sibling project's collection deadlock; the file->project map
-//     comes from the same deadlock-safe glob. A brand-new test in the whale is
-//     therefore seen live, so the never-drop gate stays sound under glob default.
+//   - Runnables: for a whale being name-sliced, `vitest list <file> --json
+//     [--project <the file's project>]` -> that file's `" > "`-joined test names.
+//     The file positional scopes the (necessarily importing) collection to the one
+//     spec, not the whole project (201s -> 30s on a 1,398-file project); --project
+//     keeps it from inheriting a sibling project's collection deadlock. The file
+//     leads because `--json` takes an optional path value, so a file after it is
+//     swallowed as an output file. The file->project map comes from the same
+//     deadlock-safe glob. A brand-new test in the whale is therefore seen live, so
+//     the never-drop gate stays sound under glob default.
 //   - ParseTimings: the Vitest JSON reporter -> per-file wall-time weights plus
 //     per-test durations for name-slicing;
 //   - Render: a bucket -> `vitest run <files>` for whole files, plus one
@@ -198,26 +201,50 @@ func (r *Runner) Discover(ctx context.Context) ([]runner.LivePackage, error) {
 // file whose names cannot be told apart by a -t filter (see runnableNames).
 //
 // It cannot use glob discovery (that returns no test names) so it must import;
-// but it scopes the import to the file's OWN Vitest project (`vitest list --json
-// --project <name>`), so a sibling project's collection deadlock — the exact hang
-// glob discovery exists to avoid — cannot reach this call. The file->project map
-// is resolved once from the same deadlock-safe glob. A single-project config has
-// no project name, so the call is a plain `vitest list --json`; there is no
-// sibling to deadlock on there.
+// but it imports as LITTLE as possible. Two scopes stack:
+//
+//   - the file id is passed as a positional FILE FILTER, so Vitest collects only
+//     that one spec instead of the whole project — on a 1,398-file project that is
+//     the difference between importing every module to read one file's names (201s
+//     measured) and importing one (30s). runnableNames still filters to the file's
+//     exact rows, so a substring over-match cannot add a sibling's names.
+//   - `--project <name>` scopes to the file's OWN Vitest project, so a sibling
+//     project's collection deadlock — the exact hang glob discovery exists to
+//     avoid — cannot reach this call. The file->project map is resolved once from
+//     the same deadlock-safe glob. A single-project config has no project name, so
+//     `--project` is omitted; there is no sibling to deadlock on there.
+//
+// The file id MUST lead, before --json. Vitest's `--json` takes an OPTIONAL value
+// (`--json [true|path]`): a file token immediately AFTER --json is swallowed as an
+// output PATH, so `list --json <file>` writes the JSON report INTO <file> — it
+// clobbers the test and prints nothing. Leading with the positional keeps --json
+// bare (`list <file> --json [--project p]`), which is also the form that actually
+// scopes; `list --json ... <file>` only survives when --project sits between them.
 func (r *Runner) Runnables(ctx context.Context, p runner.LivePackage) ([]string, error) {
 	project, err := r.projectFor(ctx, p.ID)
 	if err != nil {
 		return nil, err
 	}
-	args := []string{"list", "--json"}
-	if project != "" {
-		args = append(args, "--project", project)
-	}
-	out, err := r.tool.run(ctx, r.root, args...)
+	out, err := r.tool.run(ctx, r.root, runnablesArgs(project, p.ID)...)
 	if err != nil {
 		return nil, r.runnablesError(p.ID, project, err)
 	}
 	return runnableNames(r.root, p.ID, out)
+}
+
+// runnablesArgs builds the `vitest list` invocation for one file's names:
+// `list <file> --json [--project <p>]`. The file id LEADS as a positional filter,
+// which both scopes collection to that one spec and keeps it clear of `--json`'s
+// optional value — a file token immediately after --json is swallowed as an output
+// path (`--json [true|path]`), clobbering the file. --project is appended only for
+// a multi-project file. It is a pure function of (project, fileID) so the arg order
+// — the clobber-and-scope invariant — is unit-tested offline, no subprocess.
+func runnablesArgs(project, fileID string) []string {
+	args := []string{"list", fileID, "--json"}
+	if project != "" {
+		args = append(args, "--project", project)
+	}
+	return args
 }
 
 // projectFor resolves the Vitest project a file belongs to, lazily building the
@@ -238,9 +265,10 @@ func (r *Runner) projectFor(ctx context.Context, fileID string) (string, error) 
 	return r.projectByFile[fileID], nil
 }
 
-// runnablesError enriches a name-listing failure. A deadline hit here means the
-// file's OWN project could not finish importing (a genuine hang in the code under
-// test, not a sibling), so the hint points at the file, not at glob mode.
+// runnablesError enriches a name-listing failure. A deadline hit here means that
+// one file could not finish importing (a genuine hang in the code under test, not
+// a sibling — the list is scoped to this file and its project), so the hint points
+// at the file, not at glob mode.
 func (r *Runner) runnablesError(fileID, project string, err error) error {
 	var te *timeoutError
 	if !errors.As(err, &te) {
@@ -251,8 +279,8 @@ func (r *Runner) runnablesError(fileID, project string, err error) error {
 		scope = fmt.Sprintf("project %q", project)
 	}
 	return fmt.Errorf(
-		"listing test names for name-slice target %s timed out (%s): importing that file's project did not finish — "+
-			"a module in it may hang on import, or raise --discovery-timeout / TB_DISCOVERY_TIMEOUT if it is legitimately slow: %w",
+		"listing test names for name-slice target %s timed out (%s): importing that file did not finish — "+
+			"a module it imports may hang on import, or raise --discovery-timeout / TB_DISCOVERY_TIMEOUT if it is legitimately slow: %w",
 		fileID, scope, err)
 }
 

@@ -493,6 +493,50 @@ func TestDiscoveryInvocationSelection(t *testing.T) {
 	}
 }
 
+// TestRunnablesArgsFileLeadsJSON pins the Runnables invocation order offline (no
+// Node). The file id must be a POSITIONAL that leads --json, which is what both
+// scopes the collection to that one spec and dodges `--json`'s optional value:
+// Vitest's `--json [true|path]` swallows a file token that immediately follows it
+// as an OUTPUT PATH, so `list --json <file>` writes the report INTO the test file
+// (clobbering it) and prints nothing. This guards the two subtle properties the
+// real-Vitest tests measure, on every CI run, even where Vitest is not installed.
+func TestRunnablesArgsFileLeadsJSON(t *testing.T) {
+	// Single-project (no project name): `list <file> --json`.
+	single := runnablesArgs("", "tests/whale.spec.ts")
+	if strings.Join(single, " ") != "list tests/whale.spec.ts --json" {
+		t.Errorf("single-project args = %q, want `list <file> --json`", single)
+	}
+	// Multi-project: --project is appended AFTER; the file still leads --json.
+	multi := runnablesArgs("unit", "pkg-a/ok.vtest.ts")
+	if strings.Join(multi, " ") != "list pkg-a/ok.vtest.ts --json --project unit" {
+		t.Errorf("multi-project args = %q, want `list <file> --json --project <p>`", multi)
+	}
+	// The invariant, stated directly: the file id is present and strictly precedes
+	// --json in both forms — never adjacent-after it, never absent (a missing file
+	// filter would un-scope the list back to the whole 201s project import).
+	for _, tc := range []struct {
+		name, file string
+		args       []string
+	}{{"single", "tests/whale.spec.ts", single}, {"multi", "pkg-a/ok.vtest.ts", multi}} {
+		fi, ji := indexOfArg(tc.args, tc.file), indexOfArg(tc.args, "--json")
+		if fi < 0 {
+			t.Errorf("%s: file filter %q absent from %q — the list would import the whole project", tc.name, tc.file, tc.args)
+		}
+		if ji < 0 || fi >= ji {
+			t.Errorf("%s: file at %d does not lead --json at %d in %q — Vitest would swallow it as --json's output path and clobber the file", tc.name, fi, ji, tc.args)
+		}
+	}
+}
+
+func indexOfArg(args []string, want string) int {
+	for i, a := range args {
+		if a == want {
+			return i
+		}
+	}
+	return -1
+}
+
 func TestDiscoveryConfigValidation(t *testing.T) {
 	// An unknown discovery mode fails loudly at construction.
 	if _, err := New(Options{Root: ".", DiscoveryMode: "collect"}); err == nil {
