@@ -257,10 +257,27 @@ func runnablesArgs(project, fileID string) []string {
 // handled fine. Prefixing `./` turns the id into an unambiguous path token that
 // Vitest resolves against the root and matches the SAME file; verified to keep
 // normal ids scoping too, so it is applied uniformly. An id that is already an
-// explicit path (relative `.`/`..` or absolute `/`) is left as-is: it cannot be
-// read as an option, and rerooting an absolute path would break the match.
+// explicit path (relative `.`/`..`, or absolute on EITHER path flavour) is left
+// as-is: it cannot be read as an option, and rerooting an absolute path would
+// break the match.
+//
+// The absolute test has to cover the platform's own notion of absolute, not just
+// a leading '/'. relID deliberately KEEPS an absolute path when filepath.Rel
+// fails, which is exactly what happens for a discovered file on a different
+// Windows volume: the id stays `D:/tests/a.vtest.ts`. That has no leading '.' or
+// '/', so a naive check would hand Vitest `./D:/tests/a.vtest.ts` and reroot the
+// file out of existence. filepath.IsAbs on the platform-native form catches it
+// (true for `D:\tests\a.vtest.ts` on Windows). The leading-'/' check is kept
+// alongside it because a POSIX-style absolute id is NOT filepath.IsAbs on
+// Windows, and such an id can reach a Windows run through a live set recorded
+// elsewhere.
+//
+// On POSIX the same `D:/tests/a.vtest.ts` is a genuinely RELATIVE path (a
+// directory literally named `D:`), so `./` is the correct answer there — the
+// behaviour differs by platform because the meaning does.
 func filterPathArg(fileID string) string {
-	if strings.HasPrefix(fileID, ".") || strings.HasPrefix(fileID, "/") {
+	if strings.HasPrefix(fileID, ".") || strings.HasPrefix(fileID, "/") ||
+		filepath.IsAbs(filepath.FromSlash(fileID)) {
 		return fileID
 	}
 	return "./" + fileID

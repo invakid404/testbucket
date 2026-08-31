@@ -104,7 +104,25 @@ func vitestInvocation(cfg renderConfig, files, names []string) runner.Invocation
 	}
 	files = append([]string(nil), files...)
 	sort.Strings(files)
-	args = append(args, files...)
+	// Each file goes in as a PATH TOKEN (`./x`), never a bare id: Vitest/CAC reads
+	// a positional beginning with '-' as an OPTION, so a root-level spec such as
+	// `--odd.spec.ts` would fail the whole invocation with "Unknown option". This
+	// is the same normalisation `Runnables` applies to its `vitest list` filter
+	// (see filterPathArg), so plan-time listing and run-time execution now name a
+	// file exactly one way.
+	//
+	// It deliberately does NOT claim to narrow WHICH files Vitest selects. A
+	// positional is matched with `testFile.includes(filter)` against the
+	// root-relative path, and Vitest normalises `./x` back to `x` before that
+	// test, so a filter still selects every file whose path CONTAINS it. Making
+	// the RUN exact is assignFilterAtoms' job on the discovery side: it
+	// co-schedules the files a filter cannot tell apart into ONE invocation, so
+	// an over-match can never cross an invocation boundary. See collide.go.
+	for _, f := range files {
+		args = append(args, filterPathArg(f))
+	}
+	// Desc keeps the canonical ids: it is the human/plan-facing identity, and it
+	// must keep matching the store keys and the ids the reporter reports.
 	return runner.Invocation{Dir: cfg.rootRel, Args: args, Desc: strings.Join(files, " ")}
 }
 

@@ -62,9 +62,12 @@ func relID(root, file string) string {
 // full-collection `[{name,file}]` shape — both are handled, File is all this
 // reads) to the live target set: one LivePackage per test FILE (the Vitest unit
 // of scheduling, as a Go package is the Go unit), keyed by its root-relative
-// path. Atom is left empty — Vitest spec files mix freely across a single
-// project for best balance; a workspace that must co-schedule a project's files
-// would set Atom to the project name.
+// path. Atom is left empty for the common case — Vitest spec files mix freely
+// across a single project for best balance — and is set only by
+// assignFilterAtoms, for the files whose ids Vitest's positional FILE filters
+// cannot tell apart (one id being a substring of another). Those must ride in
+// one invocation or the shorter filter runs its mate a second time; see
+// collide.go.
 func parseList(root string, data []byte) ([]runner.LivePackage, error) {
 	var rows []listEntry
 	if err := json.Unmarshal(data, &rows); err != nil {
@@ -94,6 +97,7 @@ func parseList(root string, data []byte) ([]runner.LivePackage, error) {
 		live = append(live, runner.LivePackage{ID: id, HasTests: true})
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].ID < live[j].ID })
+	assignFilterAtoms(live)
 	return live, nil
 }
 
@@ -262,6 +266,12 @@ func LoadLivePackages(root, path string) ([]runner.LivePackage, error) {
 		}
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].ID < live[j].ID })
+	// The neutral shape skips parseList, so it must co-schedule filter collisions
+	// here too. Without this an offline live set — a recorded tree, a fixture, a
+	// consumer's exported package list — would plan the colliding files into
+	// separate buckets and double-run them, exactly the defect the list-shaped
+	// path is protected from.
+	assignFilterAtoms(live)
 	return live, nil
 }
 

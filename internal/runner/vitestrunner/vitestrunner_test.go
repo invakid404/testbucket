@@ -297,14 +297,15 @@ func TestRenderWholeFilesSerially(t *testing.T) {
 		t.Fatalf("got %d invocations, want the whole files merged into 1", len(got.Invocations))
 	}
 	args := strings.Join(got.Invocations[0].Args, " ")
-	for _, want := range []string{"npx vitest run", "--no-file-parallelism", "tests/a.spec.ts", "tests/b.spec.ts"} {
+	for _, want := range []string{"npx vitest run", "--no-file-parallelism", "./tests/a.spec.ts", "./tests/b.spec.ts"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("invocation args miss %q: %s", want, args)
 		}
 	}
-	// Files are sorted, so the command is a pure function of the bucket.
-	if !strings.Contains(args, "tests/a.spec.ts tests/b.spec.ts") {
-		t.Errorf("files are not sorted: %s", args)
+	// Files are sorted, so the command is a pure function of the bucket. Each one
+	// goes in as a `./` PATH TOKEN, never a bare id — see exact_paths_test.go.
+	if !strings.Contains(args, "./tests/a.spec.ts ./tests/b.spec.ts") {
+		t.Errorf("files are not sorted, or are not rendered as path tokens: %s", args)
 	}
 	if !strings.HasPrefix(got.Script, "set -euo pipefail\n( cd frontend && npx vitest run") {
 		t.Errorf("script does not cd into the project and fail fast:\n%s", got.Script)

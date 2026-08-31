@@ -234,6 +234,294 @@ func loadPlanned(t *testing.T, doc *core.PlanDocument) *core.PlannedCoverage {
 	return planned
 }
 
+// suffixpairRoot points at the fixture that reproduces Mandel's two proven
+// suffix-sharing pairs: the same directory layout and basenames, under the
+// sample's `.vtest.ts` convention so the parent root's default discovery cannot
+// see them. Like multiproject it reuses the sample's single `node_modules` and
+// is gated on the same install.
+func suffixpairRoot(t *testing.T) string {
+	t.Helper()
+	sample, err := filepath.Abs(filepath.Join("..", "..", "..", "testdata", "vitest-sample"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("no npx on PATH")
+	}
+	if _, err := os.Stat(filepath.Join(sample, "node_modules")); err != nil {
+		t.Skip("vitest sample not installed (run `npm install` in testdata/vitest-sample)")
+	}
+	return filepath.Join(sample, "suffixpair")
+}
+
+// TestVitestSuffixSharingPairsRunExactlyOnce is the physical proof for #33,
+// against a REAL Vitest, on the two pairs Mandel actually carries:
+//
+//	lib/keto/organizations.*              shared/f/lib/keto/organizations.*
+//	lib/attribution/resolveSupplierUserAttribution.*
+//	                          shared/f/lib/attribution/resolveSupplierUserAttribution.*
+//
+// It measures three things end to end:
+//
+//  1. NEGATIVE CONTROL — the v0.2.1 shape. A single `vitest run <short id>`, the
+//     command the old renderer emitted for a bucket holding only the short file,
+//     really does collect and run its `shared/f/` mate too. So does the `./`
+//     path-token spelling: Vitest normalises both back to the same root-relative
+//     string before its substring test, which is why the argument rewrite alone
+//     could never have fixed this.
+//  2. The fix — discovery co-schedules each pair, so the plan puts both members
+//     in ONE invocation, and every planned file reports exactly once.
+//  3. The audit accepts that run.
+func TestVitestSuffixSharingPairsRunExactlyOnce(t *testing.T) {
+	root := suffixpairRoot(t)
+	ctx := context.Background()
+	events := t.TempDir()
+
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, EventsDir: events, Timeout: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		ketoShort  = "lib/keto/organizations.vtest.ts"
+		ketoShared = "shared/f/lib/keto/organizations.vtest.ts"
+		attrShort  = "lib/attribution/resolveSupplierUserAttribution.vtest.ts"
+		attrShared = "shared/f/lib/attribution/resolveSupplierUserAttribution.vtest.ts"
+	)
+
+	// 1. The negative control, measured rather than assumed: ask a real Vitest
+	//    which files each spelling of a short id selects. Run over BOTH pairs and
+	//    BOTH spellings — a control that only covered one pair could not tell a
+	//    fix that handles one pair from a fix that handles the defect.
+	for _, pair := range [][2]string{{ketoShort, ketoShared}, {attrShort, attrShared}} {
+		short, shared := pair[0], pair[1]
+		for _, spelling := range []string{short, "./" + short} {
+			got := listFiles(t, ctx, root, spelling)
+			want := []string{short, shared}
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("`vitest list %s` selected %v, want the substring over-match %v — "+
+					"the defect this fixture exists to reproduce is gone or the fixture is wrong",
+					spelling, got, want)
+			}
+		}
+		// The LONG id is unambiguous in the other direction, in both spellings:
+		// nothing contains it.
+		for _, spelling := range []string{shared, "./" + shared} {
+			if got := listFiles(t, ctx, root, spelling); strings.Join(got, ",") != shared {
+				t.Fatalf("`vitest list %s` selected %v, want only itself", spelling, got)
+			}
+		}
+	}
+
+	// 2. Discover: the two pairs must come back co-scheduled, the two groups
+	//    distinct.
+	live, err := rnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("Discover failed against an installed Vitest: %v", err)
+	}
+	atom := map[string]string{}
+	for _, p := range live {
+		atom[p.ID] = p.Atom
+	}
+	if len(atom) != 4 {
+		t.Fatalf("discovered %v, want the four fixture specs", atom)
+	}
+	if atom[ketoShort] == "" || atom[ketoShort] != atom[ketoShared] {
+		t.Errorf("keto pair not co-scheduled: %q vs %q", atom[ketoShort], atom[ketoShared])
+	}
+	if atom[attrShort] == "" || atom[attrShort] != atom[attrShared] {
+		t.Errorf("attribution pair not co-scheduled: %q vs %q", atom[attrShort], atom[attrShared])
+	}
+	if atom[ketoShort] == atom[attrShort] {
+		t.Errorf("both pairs share one atom %q; they are independent groups", atom[ketoShort])
+	}
+
+	// 3. Plan at K=4 — the split that would have put every file in its own
+	//    bucket, and did double-run the mates before the fix.
+	doc, err := core.BuildPlan(ctx, rnr, nil, "cold", core.PlanOptions{
+		K: 4, Count: 1, Live: live, Token: rnr.CanonicalToken(),
+		Now: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("cold plan failed the coverage gate: %v", err)
+	}
+	for _, b := range doc.Buckets {
+		for _, inv := range b.Invocations {
+			joined := strings.Join(inv.Args, " ")
+			for _, file := range []string{ketoShort, ketoShared, attrShort, attrShared} {
+				if strings.Contains(joined, " "+file) && !strings.Contains(joined, " ./"+file) {
+					t.Errorf("bucket %d passes %s as a bare id, not a ./ path token: %s", b.Index, file, joined)
+				}
+			}
+		}
+	}
+
+	// 4. Run each bucket's own emitted script, ingest, audit.
+	runBuckets(t, ctx, doc)
+	files, _ := filepath.Glob(filepath.Join(events, "*.json"))
+	if len(files) == 0 {
+		t.Fatal("no JSON reports were captured")
+	}
+	sum, err := parseAll(t, rnr, files)
+	if err != nil {
+		t.Fatalf("ParseTimings: %v", err)
+	}
+	for _, file := range []string{ketoShort, ketoShared, attrShort, attrShared} {
+		if got := sum.PackageRuns[file]; got != 1 {
+			t.Errorf("%s reported %d invocation(s), want exactly 1 (runs=%v)", file, got, sum.PackageRuns)
+		}
+	}
+	planned := loadPlanned(t, doc)
+	if err := core.AuditCoverage(os.Stderr, planned, sum); err != nil {
+		t.Fatalf("audit rejected a run in which every planned file ran exactly once: %v", err)
+	}
+}
+
+// listFiles asks a real Vitest which files one positional filter selects, and
+// returns them root-relative and sorted.
+func listFiles(t *testing.T, ctx context.Context, root, filter string) []string {
+	t.Helper()
+	// The filter LEADS, before --json: a file token immediately after --json is
+	// swallowed as an output path. Same invariant runnablesArgs encodes.
+	cmd := exec.CommandContext(ctx, "npx", "vitest", "list", filter, "--filesOnly", "--json")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("vitest list %s: %v", filter, err)
+	}
+	var rows []struct {
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil {
+		t.Fatalf("parse vitest list output %q: %v", out, err)
+	}
+	var got []string
+	for _, r := range rows {
+		rel, err := filepath.Rel(root, r.File)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, filepath.ToSlash(rel))
+	}
+	sort.Strings(got)
+	return got
+}
+
+// childrootRoot points at the fixture whose Vitest PROJECT is rooted below the
+// workspace root — the shape that makes a workspace-relative comparison miss a
+// real collision. Like the others it reuses the sample's single `node_modules`.
+func childrootRoot(t *testing.T) string {
+	t.Helper()
+	sample, err := filepath.Abs(filepath.Join("..", "..", "..", "testdata", "vitest-sample"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("no npx on PATH")
+	}
+	if _, err := os.Stat(filepath.Join(sample, "node_modules")); err != nil {
+		t.Skip("vitest sample not installed (run `npm install` in testdata/vitest-sample)")
+	}
+	return filepath.Join(sample, "childroot")
+}
+
+// TestVitestChildProjectRootPairsRunExactlyOnce is the physical proof that the
+// collision test must be asked at every project root, not just the workspace one.
+//
+// The fixture's project is rooted at `projects/unit`, so Vitest compares
+// `lib/keto/…` against `shared/f/lib/keto/…` while this adapter's ids are
+// `projects/unit/lib/keto/…` and `projects/unit/shared/f/lib/keto/…` — which
+// share no substring. Same three measurements as the single-root test:
+//
+//  1. NEGATIVE CONTROL — a real Vitest really does select both files for the
+//     short positional, in both spellings, for BOTH pairs.
+//  2. Discovery co-schedules each pair despite the workspace-relative ids.
+//  3. The run executes every planned file exactly once and the audit accepts it.
+func TestVitestChildProjectRootPairsRunExactlyOnce(t *testing.T) {
+	root := childrootRoot(t)
+	ctx := context.Background()
+	events := t.TempDir()
+
+	rnr, err := vitestrunner.New(vitestrunner.Options{Root: root, EventsDir: events, Timeout: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		ketoShort  = "projects/unit/lib/keto/organizations.vtest.ts"
+		ketoShared = "projects/unit/shared/f/lib/keto/organizations.vtest.ts"
+		attrShort  = "projects/unit/lib/attribution/resolveSupplierUserAttribution.vtest.ts"
+		attrShared = "projects/unit/shared/f/lib/attribution/resolveSupplierUserAttribution.vtest.ts"
+	)
+
+	// 1. The negative control, measured: both pairs, both spellings.
+	for _, pair := range [][2]string{{ketoShort, ketoShared}, {attrShort, attrShared}} {
+		short, shared := pair[0], pair[1]
+		for _, spelling := range []string{short, "./" + short} {
+			got := listFiles(t, ctx, root, spelling)
+			want := []string{short, shared}
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("`vitest list %s` selected %v, want the project-relative over-match %v — "+
+					"the child-root defect this fixture reproduces is gone or the fixture is wrong",
+					spelling, got, want)
+			}
+		}
+		for _, spelling := range []string{shared, "./" + shared} {
+			if got := listFiles(t, ctx, root, spelling); strings.Join(got, ",") != shared {
+				t.Fatalf("`vitest list %s` selected %v, want only itself", spelling, got)
+			}
+		}
+	}
+
+	// 2. Discovery must co-schedule both pairs, in two distinct groups.
+	live, err := rnr.Discover(ctx)
+	if err != nil {
+		t.Fatalf("Discover failed against an installed Vitest: %v", err)
+	}
+	atom := map[string]string{}
+	for _, p := range live {
+		atom[p.ID] = p.Atom
+	}
+	if len(atom) != 4 {
+		t.Fatalf("discovered %v, want the four fixture specs", atom)
+	}
+	if atom[ketoShort] == "" || atom[ketoShort] != atom[ketoShared] {
+		t.Errorf("keto pair not co-scheduled: %q vs %q", atom[ketoShort], atom[ketoShared])
+	}
+	if atom[attrShort] == "" || atom[attrShort] != atom[attrShared] {
+		t.Errorf("attribution pair not co-scheduled: %q vs %q", atom[attrShort], atom[attrShared])
+	}
+	if atom[ketoShort] == atom[attrShort] {
+		t.Errorf("both pairs share one atom %q; they are independent groups", atom[ketoShort])
+	}
+
+	// 3. Plan at K=4, run the emitted scripts, ingest, audit.
+	doc, err := core.BuildPlan(ctx, rnr, nil, "cold", core.PlanOptions{
+		K: 4, Count: 1, Live: live, Token: rnr.CanonicalToken(),
+		Now: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("cold plan failed the coverage gate: %v", err)
+	}
+	runBuckets(t, ctx, doc)
+	files, _ := filepath.Glob(filepath.Join(events, "*.json"))
+	if len(files) == 0 {
+		t.Fatal("no JSON reports were captured")
+	}
+	sum, err := parseAll(t, rnr, files)
+	if err != nil {
+		t.Fatalf("ParseTimings: %v", err)
+	}
+	for _, file := range []string{ketoShort, ketoShared, attrShort, attrShared} {
+		if got := sum.PackageRuns[file]; got != 1 {
+			t.Errorf("%s reported %d invocation(s), want exactly 1 (runs=%v)", file, got, sum.PackageRuns)
+		}
+	}
+	if err := core.AuditCoverage(os.Stderr, loadPlanned(t, doc), sum); err != nil {
+		t.Fatalf("audit rejected a run in which every planned file ran exactly once: %v", err)
+	}
+}
+
 // TestVitestGlobDiscoveryAvoidsCollectionDeadlock is the headline proof for
 // issues #26 (glob discovery) and #25 (discovery timeout): a multi-project
 // config with a spec whose MODULE never finishes importing.
