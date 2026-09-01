@@ -40,16 +40,34 @@ var candidateBinaryDigest = DigestBytes([]byte("candidate testbucket binary"))
 // testRelease is the delivery the fixture campaign was produced for: the
 // candidate arm's reviewed tip and its exact built binary. A campaign
 // authorises this delivery and no other.
-func testRelease() CampaignRelease {
-	// The set a real gate hashes: the platform binary the campaign was
-	// delivered with, plus the other assets published beside it.
-	return CampaignRelease{SHA: testTip, Artifacts: []ReleaseArtifact{
-		{Name: "testbucket_linux_amd64", Digest: candidateBinaryDigest},
-		{Name: "testbucket_linux_arm64", Digest: DigestBytes([]byte("linux arm64 binary"))},
-		{Name: "testbucket_darwin_amd64", Digest: DigestBytes([]byte("darwin amd64 binary"))},
-		{Name: "testbucket_darwin_arm64", Digest: DigestBytes([]byte("darwin arm64 binary"))},
-		{Name: "checksums.txt", Digest: DigestBytes([]byte("checksums"))},
+// testReleaseManifest is a real publish set in the shape goreleaser produces:
+// four archives and a checksums file, with the campaign's delivered binary
+// living INSIDE one of the archives rather than beside them. That is the
+// arrangement a release actually has, and the one a gate has to be able to
+// reason about.
+func testReleaseManifest() *ReleaseManifest {
+	archive := func(os, arch string, binary Digest) ReleaseAsset {
+		name := "testbucket_0.3.0_" + os + "_" + arch + ".tar.gz"
+		return ReleaseAsset{
+			Name: name, Path: "dist/" + name, Digest: DigestBytes([]byte("archive " + name)),
+			Contains: []ReleaseAssetMember{
+				{Name: "LICENSE", Digest: DigestBytes([]byte("license"))},
+				{Name: "README.md", Digest: DigestBytes([]byte("readme"))},
+				{Name: "testbucket", Digest: binary},
+			},
+		}
+	}
+	return &ReleaseManifest{Kind: ReleaseManifestKind, Assets: []ReleaseAsset{
+		archive("darwin", "amd64", DigestBytes([]byte("darwin amd64 binary"))),
+		archive("darwin", "arm64", DigestBytes([]byte("darwin arm64 binary"))),
+		archive("linux", "amd64", candidateBinaryDigest),
+		archive("linux", "arm64", DigestBytes([]byte("linux arm64 binary"))),
+		{Name: "checksums.txt", Path: "dist/checksums.txt", Digest: DigestBytes([]byte("checksums"))},
 	}}
+}
+
+func testRelease() CampaignRelease {
+	return CampaignRelease{SHA: testTip, Manifest: testReleaseManifest()}
 }
 
 // campaignFixture builds a fully authenticated five-pair campaign: signed
@@ -375,21 +393,24 @@ func TestACampaignAuthorisesOnlyTheDeliveryItWasProducedFor(t *testing.T) {
 	}{
 		{"no expected delivery at all", CampaignRelease{},
 			"cannot authorise any release"},
-		{"an abbreviated release SHA", CampaignRelease{SHA: "693a1998", Artifacts: testRelease().Artifacts},
+		{"an abbreviated release SHA", CampaignRelease{SHA: "693a1998", Manifest: testReleaseManifest()},
 			"full 40"},
-		{"no hashed artifact at all", CampaignRelease{SHA: testTip},
+		{"no publish set at all", CampaignRelease{SHA: testTip},
 			"authorises an asset it never saw"},
-		{"an artifact supplied with no digest", CampaignRelease{SHA: testTip,
-			Artifacts: []ReleaseArtifact{{Name: "testbucket_linux_amd64"}}},
-			"supplied with no digest"},
-		{"another commit", CampaignRelease{SHA: otherSHA, Artifacts: testRelease().Artifacts},
+		{"an empty publish set", CampaignRelease{SHA: testTip, Manifest: &ReleaseManifest{Kind: ReleaseManifestKind}},
+			"authorises an asset it never saw"},
+		{"another commit", CampaignRelease{SHA: otherSHA, Manifest: testReleaseManifest()},
 			"not the " + otherSHA + " being released"},
-		{"artifacts none of which is the delivered binary", CampaignRelease{SHA: testTip,
-			Artifacts: []ReleaseArtifact{
-				{Name: "testbucket_linux_amd64", Digest: DigestBytes([]byte("a later, differently built binary"))},
-				{Name: "checksums.txt", Digest: DigestBytes([]byte("checksums"))},
-			}},
-			"is not among the 2 artifact(s) being published"},
+		{"a publish set that does not carry the delivered binary", CampaignRelease{SHA: testTip,
+			Manifest: &ReleaseManifest{Kind: ReleaseManifestKind, Assets: []ReleaseAsset{
+				{Name: "testbucket_0.3.0_linux_amd64.tar.gz", Path: "dist/a.tar.gz",
+					Digest: DigestBytes([]byte("archive")),
+					Contains: []ReleaseAssetMember{
+						{Name: "testbucket", Digest: DigestBytes([]byte("a later, differently built binary"))},
+					}},
+				{Name: "checksums.txt", Path: "dist/checksums.txt", Digest: DigestBytes([]byte("checksums"))},
+			}}},
+			"not published by, or contained in, any of the 2 asset(s)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			idx, loader, keys, _ := campaignFixture(t)
@@ -433,10 +454,16 @@ func TestTheReleaseBindingNamesEveryPublishedArtifact(t *testing.T) {
 		if !g.Pass {
 			t.Fatalf("the campaign did not authorise its own delivery: %s (%s)", g.Observed, g.Detail)
 		}
-		for _, a := range release.Artifacts {
-			if !strings.Contains(g.Detail, a.Name) {
-				t.Errorf("the gate does not name published artifact %q: %s", a.Name, g.Detail)
+		for _, name := range release.Manifest.UploadNames() {
+			if !strings.Contains(g.Detail, name) {
+				t.Errorf("the gate does not name published asset %q: %s", name, g.Detail)
 			}
+		}
+		// And it says WHERE the measured binary is published, which is the
+		// fact a reader needs: the campaign binds an executable, the release
+		// ships archives, and "it matched something" is not an answer.
+		if !strings.Contains(g.Detail, "is published inside testbucket_0.3.0_linux_amd64.tar.gz as testbucket") {
+			t.Errorf("the gate does not say where the delivered binary is published: %s", g.Detail)
 		}
 		return
 	}

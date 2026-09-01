@@ -142,6 +142,15 @@ type TrainingLabel struct {
 	SelectedWorkDigest Digest    `json:"selected_work_digest"`
 	TopologyReceipt    Digest    `json:"topology_receipt"`
 	Features           []Feature `json:"features"`
+	// Evidence is the EXACT BYTES the three references above address: the
+	// physical-V receipt this duration came from, the selected work it is
+	// attributed to, and the receipt that says that topology was validated.
+	//
+	// Without it the three digests are strings, and sealing the set signs the
+	// strings rather than the observations — an offline surface built from
+	// labels whose references point at nothing was indistinguishable from one
+	// built from real measurements.
+	Evidence *LabelEvidence `json:"evidence,omitempty"`
 }
 
 // LabelProvenance is the only admissible training provenance.
@@ -180,9 +189,14 @@ type TrainingReceiptSet struct {
 	// not the lambda could not recompute the scorer, and "recompute it and
 	// compare" is the only check that distinguishes a model built from this
 	// evidence from one that merely cites it.
-	Lambda    float64    `json:"ridge_lambda"`
-	Seed      int64      `json:"seed"`
-	Signature *Signature `json:"signature,omitempty"`
+	Lambda float64 `json:"ridge_lambda"`
+	Seed   int64   `json:"seed"`
+	// EvidenceSigners are the PREDECLARED keys allowed to attest a label's
+	// physical-V receipt, selected-work document and topology receipt. They
+	// are inside the sealed set, so the set's own signature covers WHICH
+	// authority may vouch for the observations it is built from.
+	EvidenceSigners []string   `json:"evidence_signers"`
+	Signature       *Signature `json:"signature,omitempty"`
 }
 
 // PermanentExclusions are the anti-overfit examples the contract names. They
@@ -261,6 +275,9 @@ func (s TrainingReceiptSet) Validate(sealKeys []string) error {
 	for _, e := range append(append([]string(nil), PermanentExclusions...), s.Exclusions...) {
 		excluded[e] = true
 	}
+	if len(s.EvidenceSigners) == 0 {
+		return fmt.Errorf("training receipt set predeclares no evidence signer, so each label's receipt, selected-work and topology documents would authenticate themselves")
+	}
 	seen := map[string]bool{}
 	for _, l := range s.Labels {
 		switch {
@@ -289,6 +306,13 @@ func (s TrainingReceiptSet) Validate(sealKeys []string) error {
 		fv := FeatureVector{UnitID: l.UnitID, Features: l.Features}
 		if err := fv.Validate(s.FeatureSchema); err != nil {
 			return fmt.Errorf("label %s: %w", l.ReceiptID, err)
+		}
+		// The references are LOADED and checked, not merely non-empty. A
+		// training set is a lineage claim; a label whose receipt, attribution
+		// or topology cannot be produced makes the claim unverifiable, and
+		// there is no "skip the unverifiable rows" that leaves it true.
+		if problems := l.VerifyEvidence(s.EvidenceSigners); len(problems) > 0 {
+			return fmt.Errorf("training receipt set: %s", strings.Join(problems, "; "))
 		}
 		seen[l.ReceiptID] = true
 	}

@@ -404,20 +404,29 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   hand-written file and always exits non-zero, because a number in a JSON file
   is not an observation.
 - A campaign authorises the **delivery it was produced for**, by identity and
-  by bytes. `wall campaign` takes `--release-sha` and a repeatable
-  `--release-artifact <path>`, hashing every asset about to be published from
-  the file on disk; every pair's candidate arm must have reviewed, been
-  released from, and delivered one of those exact artifacts. There is no flag
-  that accepts a digest as a string, so the gate cannot be satisfied by a
-  declaration about assets nobody hashed, and a release publishes the same
-  bytes the gate saw rather than a later rebuild. With no expected delivery
-  supplied the gate does not pass: historical evidence stays auditable, and
-  authorises nothing else.
+  by bytes. `wall release-manifest` derives the publish set ONCE from
+  goreleaser's own artifact manifest — every asset a release uploads, hashed,
+  plus the digest of every file inside each archive — and both the gate and the
+  publisher read that one document. `wall campaign --release-sha …
+  --release-manifest …` re-verifies it against the files on disk and requires
+  every pair's candidate arm to have reviewed, been released from, and
+  delivered a binary this release actually publishes: an asset itself, or a
+  file inside one. A raw build intermediate that nothing uploads does not
+  count. With no publish set supplied the gate does not pass: historical
+  evidence stays auditable, and authorises nothing else.
 - Scoring needs the **sealed training set**, not a digest of it. `wall verify
   --training-set` revalidates it under the training authority the Stage-1
   manifest predeclares and REFITS the scorer from it. A model that cites this
   evidence and a model built from it are otherwise indistinguishable, because
   the receipt-set digest is a string the model states about itself.
+- Every training label carries the **exact bytes** of its physical-V receipt,
+  its selected work and its topology validation — not three digests. The
+  verifier hashes them, checks each against the reference that names it,
+  verifies their signatures against the evidence authority the sealed set
+  predeclares, and requires the receipt itself to be a passed, invocation-level,
+  physical, containment-delimited observation of that unit at that duration.
+  Refitting proves the coefficients follow the rows; only the evidence proves
+  the rows are observations.
 - Every frozen listing binds the **closure of its own argv**: the exact
   command, cwd, planning-relevant environment, resolved executable path and a
   complete tool/version/integrity closure. An unresolved or empty identity is a
@@ -426,9 +435,12 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   lockfile bytes, and its package closure is re-derived from the lock instead
   of read back from the receipt — the WHOLE closure, not the Vitest family
   within it, because a substituted transitive dependency changes what ran and a
-  receipt that may omit it cannot tell the two trees apart. The real adapter
-  fixture is pinned to that same frozen version, and a test reads the committed
-  manifest and lockfile so the pin cannot drift away from it.
+  receipt that may omit it cannot tell the two trees apart. The closure is a
+  multiset of resolved NODES keyed by the lock's own identity, so a real
+  lockfile that resolves one package at two versions is representable rather
+  than rejected. The real adapter fixture is pinned to that same frozen
+  version, and a test reads the committed manifest and lockfile so the pin
+  cannot drift away from it.
 
 ### A reproducible plan
 

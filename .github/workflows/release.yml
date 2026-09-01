@@ -55,13 +55,6 @@ jobs:
       # publishing half skipped. It produces the four platform binaries, their
       # four archives and the checksums file in ./dist from the tagged tree,
       # with the real release ldflags — the exact bytes that will be uploaded.
-      #
-      # It runs BEFORE the campaign gate so the gate can hash what is about to
-      # be published. The gate used to read a committed digest string instead,
-      # which meant the campaign was compared to a claim about the delivery
-      # rather than to the delivery: a matching declaration could authorise
-      # whatever was built afterwards, and one digest could not identify four
-      # platform artifacts at all.
       - name: Build the release artifacts (no publish)
         # Pinned to a reviewed commit SHA (third-party code); bump via an
         # explicit PR. goreleaser itself is pinned to an exact version in the
@@ -76,6 +69,31 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # DERIVE THE PUBLISH SET, ONCE.
+      #
+      # Everything downstream reads this one document: the gate checks it, the
+      # publisher uploads exactly the assets it names. That is the whole point.
+      # The gate used to select files by goreleaser artifact TYPE while the
+      # publisher selected them by GLOB, so the two sets differed by exactly
+      # the four raw platform binaries — gated, never uploaded, and therefore
+      # able to satisfy the campaign's delivered-binary match with a file no
+      # consumer ever receives.
+      #
+      # `wall release-manifest` reads goreleaser's own manifest (never a glob,
+      # which could miss a produced file), hashes every asset a release
+      # uploads, and hashes every file INSIDE each archive. The members matter:
+      # the campaign binds the measured executable and a release ships
+      # archives, so the only honest way for those two facts to meet is through
+      # the archive that actually carries the binary.
+      - name: Derive the canonical publish set
+        env:
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/testbucket-gate" ./cmd/testbucket
+          "$RUNNER_TEMP/testbucket-gate" wall release-manifest \
+            --dist dist --root . --out "$TB_RELEASE_MANIFEST"
+
       # THE CAMPAIGN GATE. The frozen acceptance contract prohibits release
       # until an authenticated five-pair / ten-run / eighty-action-row campaign
       # across at least three UTC dates has passed, assembled from eligible
@@ -89,10 +107,10 @@ jobs:
       # code a validator runs rather than reimplementing it here.
       #
       # It is bound to THIS release, by identity and by bytes. `--release-sha`
-      # is the immutable commit the tag resolves to, and every `--release-artifact`
-      # is hashed HERE from a file goreleaser just produced. There is no flag
-      # that accepts a digest as a string, so the gate cannot be satisfied by a
-      # declaration about assets nobody hashed.
+      # is the immutable commit the tag resolves to, and `--release-manifest`
+      # is the publish set derived above — re-verified against the files on
+      # disk before it is believed, so an edited manifest cannot claim the
+      # campaign's binary is inside an archive that does not contain it.
       - name: Refuse a release with no passing campaign
         env:
           # Path, inside the tagged tree, to the campaign index naming the
@@ -107,6 +125,7 @@ jobs:
           # the tag NAME: a tag is descriptive metadata that can be moved, and
           # a moved tag must not inherit another commit's evidence.
           TB_RELEASE_SHA: ${{ github.sha }}
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
         run: |
           set -euo pipefail
           if [ ! -f "$TB_CAMPAIGN_INDEX" ]; then
@@ -121,61 +140,49 @@ jobs:
             echo "A campaign verified against whatever signed it accepts any self-generated key." >&2
             exit 1
           fi
-
-          # Every asset goreleaser just built, read out of its own manifest
-          # rather than guessed from a glob: artifacts.json is what goreleaser
-          # says it produced, and a glob that missed one would gate a subset
-          # while publishing the whole set. jq is preinstalled on the runner
-          # and is already used by the alias job below.
-          mapfile -t assets < <(jq -r '.[] | select(.type=="Binary" or .type=="Archive" or .type=="Checksum") | .path' dist/artifacts.json)
-          if [ "${#assets[@]}" -eq 0 ]; then
-            echo "REFUSED: goreleaser produced no binaries, archives or checksums to gate." >&2
-            exit 1
-          fi
-          args=()
-          for a in "${assets[@]}"; do
-            if [ ! -f "$a" ]; then
-              echo "REFUSED: goreleaser's manifest names $a, which does not exist." >&2
-              exit 1
-            fi
-            args+=(--release-artifact "$a")
-          done
-          echo "gating ${#assets[@]} artifact(s) hashed from their actual bytes:"
-          sha256sum "${assets[@]}"
-
-          go build -o "$RUNNER_TEMP/testbucket-gate" ./cmd/testbucket
           # Non-zero unless every frozen gate passes over the full population
           # AND every candidate arm of that population reviewed, was released
-          # from, and delivered one of the artifacts hashed above.
+          # from, and delivered a binary this release actually publishes.
           "$RUNNER_TEMP/testbucket-gate" wall campaign \
             --index "$TB_CAMPAIGN_INDEX" \
             --authority "$TB_CAMPAIGN_AUTHORITY" \
             --authority-key "$TB_CAMPAIGN_AUTHORITY_KEY" \
             --release-sha "$TB_RELEASE_SHA" \
-            "${args[@]}"
+            --release-manifest "$TB_RELEASE_MANIFEST" \
+            --release-dist .
           echo "campaign gate: the frozen decision rule passes over the retained population,"
-          echo "and that population authorises exactly $TB_RELEASE_SHA and these exact bytes"
+          echo "and that population authorises exactly $TB_RELEASE_SHA and these exact assets"
 
-      # PUBLISH THE GATED BYTES. Not a second goreleaser run: a rebuild would
-      # publish artifacts the gate never saw, which is the whole defect this
-      # step exists to avoid. These are the files hashed above, uploaded as-is.
+      # PUBLISH THE GATED SET. Not a second goreleaser run — a rebuild would
+      # publish artifacts the gate never saw — and not a glob either: the asset
+      # list is read back out of the manifest the gate just verified, so the
+      # set that was checked and the set that is uploaded are the same set by
+      # construction.
       #
-      # Rerunning after a transient upload failure is safe — `gh release
-      # upload --clobber` replaces same-named assets, which is what
+      # Rerunning after a transient upload failure is safe: `gh release upload
+      # --clobber` replaces same-named assets, which is what
       # `replace_existing_artifacts` did for goreleaser.
-      - name: Publish the gated artifacts
+      - name: Publish the gated assets
         env:
           TAG: ${{ github.ref_name }}
           TB_RELEASE_SHA: ${{ github.sha }}
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          assets=(dist/*.tar.gz dist/checksums.txt)
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_RELEASE_MANIFEST")
           if [ "${#assets[@]}" -eq 0 ]; then
-            echo "no gated artifacts to publish" >&2
+            echo "REFUSED: the verified publish set names no asset." >&2
             exit 1
           fi
+          for a in "${assets[@]}"; do
+            if [ ! -f "$a" ]; then
+              echo "REFUSED: the verified publish set names $a, which does not exist." >&2
+              exit 1
+            fi
+          done
+          echo "publishing ${#assets[@]} gated asset(s):"
+          printf '  %s\n' "${assets[@]}"
 
           # A pre-release tag (v1.2.3-rc.1) publishes as a prerelease, which is
           # what `prerelease: auto` did.

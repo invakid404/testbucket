@@ -27,15 +27,17 @@ func TestTheLockClosureIsDerivedFromTheLockfileBytes(t *testing.T) {
 		want   map[string]LockedPackage
 	}{
 		{LockParserNPM, npmLockFixture, map[string]LockedPackage{
-			"vitest":         {Version: "4.1.10", Integrity: "sha512-vitest"},
-			"@vitest/runner": {Version: "4.1.10", Integrity: "sha512-runner"},
-			"tinyrainbow":    {Version: "2.0.0", Integrity: "sha512-rainbow"},
+			"node_modules/vitest":         {Key: "node_modules/vitest", Name: "vitest", Version: "4.1.10", Integrity: "sha512-vitest"},
+			"node_modules/@vitest/runner": {Key: "node_modules/@vitest/runner", Name: "@vitest/runner", Version: "4.1.10", Integrity: "sha512-runner"},
+			"node_modules/tinyrainbow":    {Key: "node_modules/tinyrainbow", Name: "tinyrainbow", Version: "2.0.0", Integrity: "sha512-rainbow"},
 		}},
 		{LockParserPNPM, testPnpmLock, map[string]LockedPackage{
-			"vitest":         {Version: "4.1.10", Integrity: "sha512-vitest"},
-			"@vitest/runner": {Version: "4.1.10", Integrity: "sha512-runner"},
-			"@vitest/expect": {Version: "4.1.10", Integrity: "sha512-expect"},
-			"tinyrainbow":    {Version: "2.0.0", Integrity: "sha512-tinyrainbow"},
+			"vitest@4.1.10":                     {Key: "vitest@4.1.10", Name: "vitest", Version: "4.1.10", Integrity: "sha512-vitest"},
+			"@vitest/runner@4.1.10":             {Key: "@vitest/runner@4.1.10", Name: "@vitest/runner", Version: "4.1.10", Integrity: "sha512-runner"},
+			"@vitest/expect@4.1.10(vite@7.0.0)": {Key: "@vitest/expect@4.1.10(vite@7.0.0)", Name: "@vitest/expect", Version: "4.1.10", Integrity: "sha512-expect"},
+			"tinyrainbow@2.0.0":                 {Key: "tinyrainbow@2.0.0", Name: "tinyrainbow", Version: "2.0.0", Integrity: "sha512-tinyrainbow"},
+			"@ai-sdk/provider-utils@2.2.8":      {Key: "@ai-sdk/provider-utils@2.2.8", Name: "@ai-sdk/provider-utils", Version: "2.2.8", Integrity: "sha512-provider-utils-2"},
+			"@ai-sdk/provider-utils@3.0.30":     {Key: "@ai-sdk/provider-utils@3.0.30", Name: "@ai-sdk/provider-utils", Version: "3.0.30", Integrity: "sha512-provider-utils-3"},
 		}},
 	} {
 		t.Run(tc.parser, func(t *testing.T) {
@@ -87,22 +89,22 @@ func TestTheSourceProfileClosureIsCheckedAgainstTheLock(t *testing.T) {
 			r.ParserID.Name = "yarn-berry"
 		}, "not one this verifier can re-derive"},
 		{"a package the lock does not resolve", func(r *SourceProfileReceipt) {
-			r.Packages["@vitest/invented"] = RequiredVitest
-			r.Integrities["@vitest/invented"] = "sha512-invented"
+			r.Packages["@vitest/invented@4.1.10"] = RequiredVitest
+			r.Integrities["@vitest/invented@4.1.10"] = "sha512-invented"
 		}, "which the bound lockfile does not resolve"},
 		{"a version the lock disagrees with", func(r *SourceProfileReceipt) {
-			r.Packages["vitest"] = "4.1.11"
+			r.Packages["vitest@4.1.10"] = "4.1.11"
 		}, "the bound lockfile resolves"},
 		{"a non-Vitest package the closure omits", func(r *SourceProfileReceipt) {
-			delete(r.Packages, "tinyrainbow")
-			delete(r.Integrities, "tinyrainbow")
+			delete(r.Packages, "tinyrainbow@2.0.0")
+			delete(r.Integrities, "tinyrainbow@2.0.0")
 		}, "the declared closure omits"},
 		{"an integrity the lock disagrees with", func(r *SourceProfileReceipt) {
-			r.Integrities["vitest"] = "sha512-somethingelse"
+			r.Integrities["vitest@4.1.10"] = "sha512-somethingelse"
 		}, "but the bound lockfile records"},
 		{"a Vitest-family package the closure omits", func(r *SourceProfileReceipt) {
-			delete(r.Packages, "@vitest/expect")
-			delete(r.Integrities, "@vitest/expect")
+			delete(r.Packages, "@vitest/expect@4.1.10(vite@7.0.0)")
+			delete(r.Integrities, "@vitest/expect@4.1.10(vite@7.0.0)")
 		}, "the declared closure omits"},
 	}
 	for _, tc := range cases {
@@ -131,7 +133,12 @@ func TestAWrongVitestVersionInTheLockStartsANewEpoch(t *testing.T) {
 	lock := strings.Replace(testPnpmLock, "vitest@4.1.10:", "vitest@4.1.11:", 1)
 	r.LockfileBytes = []byte(lock)
 	r.Lockfile = DigestBytes(r.LockfileBytes)
-	r.Packages["vitest"] = "4.1.11"
+	// The node's identity moves with its version, so the receipt declares the
+	// key the edited lock now resolves.
+	delete(r.Packages, "vitest@4.1.10")
+	delete(r.Integrities, "vitest@4.1.10")
+	r.Packages["vitest@4.1.11"] = "4.1.11"
+	r.Integrities["vitest@4.1.11"] = "sha512-vitest"
 	err := r.Validate()
 	if err == nil {
 		t.Fatal("a closure resolving the wrong Vitest version validated")

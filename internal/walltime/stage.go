@@ -541,6 +541,11 @@ type SourceProfileReceipt struct {
 // against.
 const RequiredVitest = "4.1.10"
 
+// FrozenProfileCommit is the Mandel commit the acceptance contract freezes the
+// profile at. It is named here so a test can read the real lockfile the
+// contract points at rather than an approximation of it.
+const FrozenProfileCommit = "d9ae1d433bb45012c04d567879b66fc4bf6112c6"
+
 // Validate proves the closure contains vitest and every @vitest/* package at
 // the recorded version. A missing @vitest/runner is the interesting case: the
 // façade loads it, so a closure without it has not proven what actually ran.
@@ -593,16 +598,19 @@ func (r SourceProfileReceipt) Validate() error {
 	if err != nil {
 		return fmt.Errorf("source profile: %w", err)
 	}
-	for _, n := range sortedStringKeys(r.Packages) {
-		d, ok := derived[n]
+	// Both maps are keyed by the lock's OWN node identity, so a receipt that
+	// declared one version of a name while the lock resolved two is a
+	// difference the comparison can see rather than one the schema hides.
+	for _, k := range sortedStringKeys(r.Packages) {
+		d, ok := derived[k]
 		if !ok {
-			return fmt.Errorf("source profile: the closure declares %s, which the bound lockfile does not resolve", n)
+			return fmt.Errorf("source profile: the closure declares %s, which the bound lockfile does not resolve", k)
 		}
-		if d.Version != r.Packages[n] {
-			return fmt.Errorf("source profile: the closure declares %s at %s but the bound lockfile resolves %s", n, r.Packages[n], d.Version)
+		if d.Version != r.Packages[k] {
+			return fmt.Errorf("source profile: the closure declares %s at %s but the bound lockfile resolves %s", k, r.Packages[k], d.Version)
 		}
-		if d.Integrity != r.Integrities[n] {
-			return fmt.Errorf("source profile: the closure records integrity %q for %s but the bound lockfile records %q", r.Integrities[n], n, d.Integrity)
+		if d.Integrity != r.Integrities[k] {
+			return fmt.Errorf("source profile: the closure records integrity %q for %s but the bound lockfile records %q", r.Integrities[k], k, d.Integrity)
 		}
 	}
 	// COMPLETE means complete. The closure is the sorted resolved
@@ -620,29 +628,41 @@ func (r SourceProfileReceipt) Validate() error {
 	// a package the same lockfile resolved.
 	var missing []string
 	sawRunner := false
-	for _, n := range sortedLockNames(derived) {
-		if _, ok := r.Packages[n]; !ok {
-			missing = append(missing, n)
+	for _, k := range sortedLockNames(derived) {
+		node := derived[k]
+		if _, ok := r.Packages[k]; !ok {
+			missing = append(missing, k)
 			continue
 		}
-		if !IsVitestPackage(n) {
+		// The version and integrity rules are about a PACKAGE; the closure is
+		// a multiset of NODES. Every node whose name is in the Vitest family
+		// has to be the frozen version, however many peer contexts or depths
+		// the lock resolved it at.
+		if !IsVitestPackage(node.Name) {
 			continue
 		}
-		if derived[n].Version != RequiredVitest {
-			return fmt.Errorf("source profile: %s is %s, not %s; this starts a new source-inventory epoch", n, derived[n].Version, RequiredVitest)
+		if node.Version != RequiredVitest {
+			return fmt.Errorf("source profile: %s is %s, not %s; this starts a new source-inventory epoch", k, node.Version, RequiredVitest)
 		}
-		if derived[n].Integrity == "" {
-			return fmt.Errorf("source profile: %s has no recorded lock integrity", n)
+		if node.Integrity == "" {
+			return fmt.Errorf("source profile: %s has no recorded lock integrity", k)
 		}
-		if n == "@vitest/runner" {
+		if node.Name == "@vitest/runner" {
 			sawRunner = true
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("source profile: the bound lockfile resolves %d package(s) the declared closure omits (%s); a partial closure cannot prove what the façade loads",
+		return fmt.Errorf("source profile: the bound lockfile resolves %d node(s) the declared closure omits (%s); a partial closure cannot prove what the façade loads",
 			len(missing), strings.Join(missing, ", "))
 	}
-	if r.Packages["vitest"] == "" {
+	sawVitest := false
+	for _, k := range sortedLockNames(derived) {
+		if derived[k].Name == "vitest" {
+			sawVitest = true
+			break
+		}
+	}
+	if !sawVitest {
 		return fmt.Errorf("source profile: the closure does not contain vitest")
 	}
 	if !sawRunner {

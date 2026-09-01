@@ -18,8 +18,25 @@ const (
 	LockParserPNPM = "pnpm-lock"
 )
 
-// LockedPackage is one resolved package as the LOCKFILE states it.
+// LockedPackage is one RESOLVED NODE as the LOCKFILE states it.
+//
+// The closure is keyed by Key — the lock's own identity for that node — and
+// not by Name. A real lockfile resolves the same package at several versions:
+// the frozen Mandel lock resolves `@ai-sdk/provider-utils` at both 2.2.8 and
+// 3.0.30, and a name-keyed map cannot represent that at all. It could only
+// report a conflict and refuse, which is what it did — the production parser
+// could not read the very lockfile the frozen profile names.
+//
+// A resolution is therefore a multiset over names, keyed by the full lock
+// identity: `name@version` for pnpm, plus any peer/snapshot suffix the lock
+// itself carries, and the packages-map path for npm, where depth is what
+// distinguishes two resolutions of one name.
 type LockedPackage struct {
+	// Key is the lock's own identity for this node, and the closure's key.
+	Key string
+	// Name and Version are parsed out of Key for the rules that are about a
+	// package rather than about a node.
+	Name      string
 	Version   string
 	Integrity string
 }
@@ -47,10 +64,11 @@ func DeriveLockClosure(parser string, lock []byte) (map[string]LockedPackage, er
 	}
 }
 
-// deriveNPMLock reads a package-lock.json v2/v3 `packages` map. Every key is a
-// path; the package NAME is what follows the last node_modules/ segment, so a
-// nested duplicate resolves to the package it actually is rather than to the
-// path it sits at.
+// deriveNPMLock reads a package-lock.json v2/v3 `packages` map. The map's own
+// key — the install path — IS the node's identity: npm expresses two
+// resolutions of one name as two paths at different depths, so keying by path
+// represents the graph the lock actually describes. The NAME is what follows
+// the last node_modules/ segment.
 func deriveNPMLock(lock []byte) (map[string]LockedPackage, error) {
 	var doc struct {
 		LockfileVersion int `json:"lockfileVersion"`
@@ -82,13 +100,11 @@ func deriveNPMLock(lock []byte) (map[string]LockedPackage, error) {
 		if name == "" || p.Version == "" {
 			continue
 		}
-		// A duplicate name at two depths is two resolutions. Keeping both is
-		// not representable in a name-keyed closure, so a disagreement is
-		// reported rather than silently resolved to whichever was read last.
-		if prev, ok := out[name]; ok && (prev.Version != p.Version || prev.Integrity != p.Integrity) {
-			return nil, fmt.Errorf("package-lock.json resolves %s to more than one version (%s and %s); the closure is not a single resolution", name, prev.Version, p.Version)
-		}
-		out[name] = LockedPackage{Version: p.Version, Integrity: p.Integrity}
+		// Keyed by the install PATH. A duplicate name at two depths is two
+		// resolutions and both are kept: they are two nodes in the graph the
+		// façade loads, and a closure that dropped one would not describe the
+		// tree that ran.
+		out[path] = LockedPackage{Key: path, Name: name, Version: p.Version, Integrity: p.Integrity}
 	}
 	return out, nil
 }
@@ -136,11 +152,14 @@ func derivePNPMLock(lock []byte) (map[string]LockedPackage, error) {
 			if name == "" || version == "" {
 				return nil, fmt.Errorf("pnpm-lock.yaml package key %q is not name@version", key)
 			}
-			current = name
-			if prev, ok := out[name]; ok && prev.Version != version {
-				return nil, fmt.Errorf("pnpm-lock.yaml resolves %s to more than one version (%s and %s); the closure is not a single resolution", name, prev.Version, version)
+			// Keyed by the lock's OWN key, peer/snapshot suffix and all. Two
+			// versions of one name are two nodes, and one name under two peer
+			// contexts is two nodes; both are what the lock resolved.
+			if prev, ok := out[key]; ok && prev.Version != version {
+				return nil, fmt.Errorf("pnpm-lock.yaml repeats key %q with two versions (%s and %s)", key, prev.Version, version)
 			}
-			out[name] = LockedPackage{Version: version, Integrity: out[name].Integrity}
+			current = key
+			out[key] = LockedPackage{Key: key, Name: name, Version: version, Integrity: out[key].Integrity}
 			continue
 		}
 		if current != "" && strings.Contains(line, "integrity:") {
@@ -157,9 +176,11 @@ func derivePNPMLock(lock []byte) (map[string]LockedPackage, error) {
 	return out, nil
 }
 
-// splitPnpmKey turns `@vitest/runner@4.1.10(vite@7.0.0)` into its name and
-// version. The peer suffix is dropped, and the split is at the LAST '@' so a
-// scoped name keeps its leading one.
+// splitPnpmKey reads the name and version OUT of a lock key, leaving the key
+// itself intact as the node's identity. A peer suffix is ignored for this
+// purpose only — `@vitest/runner@4.1.10(vite@7.0.0)` is version 4.1.10 of
+// @vitest/runner — and the split is at the LAST '@' so a scoped name keeps its
+// leading one.
 func splitPnpmKey(key string) (string, string) {
 	if i := strings.Index(key, "("); i >= 0 {
 		key = key[:i]
@@ -177,7 +198,7 @@ func IsVitestPackage(name string) bool {
 	return name == "vitest" || strings.HasPrefix(name, "@vitest/")
 }
 
-// sortedLockNames is the closure's sorted key list, so every message about it
+// sortedLockNames is the closure's sorted KEY list, so every message about it
 // reads the same way twice.
 func sortedLockNames(m map[string]LockedPackage) []string {
 	out := make([]string, 0, len(m))

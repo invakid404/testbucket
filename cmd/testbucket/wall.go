@@ -59,6 +59,11 @@ usage:
   testbucket wall train   [flags]  fit the frozen scorer from a sealed training
                                    receipt set of historical wrapper-qualified
                                    physical V labels
+  testbucket wall release-manifest [flags]
+                                   derive the canonical publish set from
+                                   goreleaser's own artifact manifest: every
+                                   asset a release uploads, hashed, plus the
+                                   digest of every file inside each archive
   testbucket wall campaign [flags] apply the frozen five-pair decision rule to a
                                    campaign of AUTHENTICATED rows: each arm's
                                    signed Stage-1 manifest and one eligible
@@ -100,6 +105,8 @@ func runWall(args []string) error {
 		return runWallTrain(args[1:])
 	case "campaign":
 		return runWallCampaign(args[1:])
+	case "release-manifest":
+		return runWallReleaseManifest(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, wallUsage)
 		return nil
@@ -449,6 +456,54 @@ func runWallTrain(args []string) error {
 	return nil
 }
 
+// runWallReleaseManifest derives the ONE publish set a release uses.
+//
+// It exists because the gate and the uploader used to choose their files
+// independently — the gate from goreleaser's Binary/Archive/Checksum rows, the
+// uploader from a `dist/*.tar.gz` glob — so the set that was checked and the
+// set that was published were not the same set. The difference was the raw
+// platform binaries: gated, never uploaded, and therefore able to satisfy the
+// campaign's delivered-binary match with a file no consumer receives.
+//
+// Deriving it once and handing the same document to both closes that by
+// construction rather than by convention.
+func runWallReleaseManifest(args []string) error {
+	fs := flag.NewFlagSet("wall release-manifest", flag.ExitOnError)
+	dist := fs.String("dist", "dist", "goreleaser output directory holding artifacts.json")
+	root := fs.String("root", ".", "directory the manifest's paths are relative to")
+	out := fs.String("out", "", "write the canonical publish set here (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("--out is required")
+	}
+	artifacts, err := os.ReadFile(filepath.Join(*dist, "artifacts.json"))
+	if err != nil {
+		return fmt.Errorf("read goreleaser's artifact manifest: %w", err)
+	}
+	m, err := walltime.DeriveReleaseManifest(*root, artifacts)
+	if err != nil {
+		return err
+	}
+	if err := walltime.WriteJSONFile(*out, m); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "testbucket wall: this release publishes %d asset(s)\n", len(m.Assets))
+	for _, a := range m.Assets {
+		fmt.Fprintf(os.Stderr, "  %s  %s\n", a.Digest, a.Name)
+		for _, mem := range a.Contains {
+			fmt.Fprintf(os.Stderr, "    contains %s  %s\n", mem.Digest, mem.Name)
+		}
+	}
+	// The upload list, one name per line, so a publisher can read the set
+	// rather than select it.
+	for _, name := range m.UploadNames() {
+		fmt.Println(name)
+	}
+	return nil
+}
+
 // runWallCampaign applies the frozen decision rule. It is deliberately a
 // separate command from `verify`: a per-run verdict says whether one row
 // qualifies, and this says whether five pairs of them decide anything.
@@ -459,8 +514,8 @@ func runWallCampaign(args []string) error {
 	asJSON := fs.Bool("json", false, "write the gate results as JSON")
 	authority := fs.String("authority", "", "protected environment each arm's manifest must name. A key says WHO signed; this says WHICH environment approved")
 	releaseSHA := fs.String("release-sha", "", "the full 40-hex commit the release ref resolves to. A campaign is evidence for the delivery it was produced for, so the release-binding gate does not pass without it — and every arm's reviewed tip and release ref must be this commit")
-	var releaseArtifacts stringList
-	fs.Var(&releaseArtifacts, "release-artifact", "path to one asset about to be published; repeatable, and its digest is computed HERE from the bytes on disk. A release publishes several files, and the campaign's delivered binary must be one of them. There is deliberately no flag that accepts a digest as a string: a gate that reads a declaration compares its manifests to a claim about the delivery rather than to the delivery")
+	releaseManifest := fs.String("release-manifest", "", "the canonical publish set (`wall release-manifest`): every asset this release will upload, with its digest and, for archives, the digest of every file inside. It is RE-VERIFIED against the bytes on disk before it is believed, and the publisher uploads exactly the assets it names — so the set that is gated and the set that is published are the same set by construction")
+	releaseDist := fs.String("release-dist", ".", "directory the release manifest's paths are relative to")
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable and required with --index")
 	if err := fs.Parse(args); err != nil {
@@ -470,14 +525,19 @@ func runWallCampaign(args []string) error {
 		return fmt.Errorf("pass exactly one of --index (a campaign) or --in (the calculator)")
 	}
 	release := walltime.CampaignRelease{SHA: strings.TrimSpace(*releaseSHA)}
-	for _, path := range releaseArtifacts {
-		d, err := walltime.FileDigest(path)
-		if err != nil {
-			return fmt.Errorf("digest the published artifact %s: %w", path, err)
+	if strings.TrimSpace(*releaseManifest) != "" {
+		var m walltime.ReleaseManifest
+		if err := walltime.ReadJSONFile(*releaseManifest, &m); err != nil {
+			return err
 		}
-		release.Artifacts = append(release.Artifacts, walltime.ReleaseArtifact{
-			Name: filepath.Base(path), Digest: d,
-		})
+		// The manifest is a document, and a document can be edited. Checking
+		// it against the files it describes is what stops a hand-written one
+		// claiming the campaign's binary is inside an archive that does not
+		// contain it.
+		if problems := m.Verify(*releaseDist); len(problems) > 0 {
+			return fmt.Errorf("the release manifest does not describe the files on disk:\n  %s", strings.Join(problems, "\n  "))
+		}
+		release.Manifest = &m
 	}
 	var gates []walltime.GateResult
 	calculatorOnly := false

@@ -61,23 +61,29 @@ func TestTheRealFixtureLockResolvesTheFrozenVitestClosure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("derive the fixture lock closure: %v", err)
 	}
-	seen := 0
-	for name, pkg := range closure {
-		if !walltime.IsVitestPackage(name) {
+	// The closure is a multiset of resolved NODES keyed by the lock's own
+	// identity, so the rule is applied to every node whose NAME is in the
+	// Vitest family — however many the lock resolved.
+	seen, sawRunner := 0, false
+	for key, pkg := range closure {
+		if !walltime.IsVitestPackage(pkg.Name) {
 			continue
 		}
 		seen++
 		if pkg.Version != walltime.RequiredVitest {
-			t.Errorf("the fixture lock resolves %s at %s, not the frozen %s", name, pkg.Version, walltime.RequiredVitest)
+			t.Errorf("the fixture lock resolves %s at %s, not the frozen %s", key, pkg.Version, walltime.RequiredVitest)
 		}
 		if pkg.Integrity == "" {
-			t.Errorf("the fixture lock records no integrity for %s", name)
+			t.Errorf("the fixture lock records no integrity for %s", key)
+		}
+		if pkg.Name == "@vitest/runner" {
+			sawRunner = true
 		}
 	}
 	if seen == 0 {
 		t.Fatal("the fixture lock resolves no vitest package at all")
 	}
-	if _, ok := closure["@vitest/runner"]; !ok {
+	if !sawRunner {
 		t.Error("the fixture lock does not resolve @vitest/runner, which the façade loads")
 	}
 }

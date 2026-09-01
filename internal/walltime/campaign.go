@@ -62,21 +62,16 @@ type CampaignIndex struct {
 type CampaignRelease struct {
 	// SHA is the full 40-hex commit the release ref resolves to.
 	SHA string
-	// Artifacts are the exact assets about to be published, each identified by
-	// the digest of its ACTUAL BYTES rather than by a claim about them.
+	// Manifest is THE canonical publish set, derived once and re-verified
+	// against the files on disk before it is believed.
 	//
-	// It is a LIST because a release is not one file. This project publishes
-	// four platform binaries and their archives, and a single digest could not
-	// identify any of them: it named one thing and said nothing about the
-	// other seven. The gate hashes and binds all of them, and the campaign's
-	// delivered binary must be one of them.
-	Artifacts []ReleaseArtifact
-}
-
-// ReleaseArtifact is one asset about to be published.
-type ReleaseArtifact struct {
-	Name   string
-	Digest Digest
+	// It replaced a bare list of hashed paths because a list said nothing
+	// about whether those paths were the ones being uploaded. The gate hashed
+	// goreleaser's Binary, Archive and Checksum rows while the uploader
+	// globbed archives and checksums, so the raw platform binaries were gated
+	// and never published — and the campaign's delivered-binary match could be
+	// satisfied by a file no consumer ever receives.
+	Manifest *ReleaseManifest
 }
 
 // Bound reports whether an expected delivery was supplied at all.
@@ -432,29 +427,19 @@ func releaseBindingGate(index CampaignIndex, loader CampaignLoader, release Camp
 		g.Detail = err.Error()
 		return g
 	}
-	if len(release.Artifacts) == 0 {
+	if release.Manifest == nil || len(release.Manifest.Assets) == 0 {
 		g.Observed = release.SHA
-		g.Detail = "no published artifact was hashed; a campaign that bound a binary nobody compared authorises an asset it never saw"
+		g.Detail = "no publish set was supplied; a campaign that bound a binary nobody compared authorises an asset it never saw"
 		return g
 	}
-	published := map[Digest]bool{}
-	var assets []string
-	for _, a := range release.Artifacts {
-		if strings.TrimSpace(string(a.Digest)) == "" {
-			g.Observed = release.SHA
-			g.Detail = fmt.Sprintf("published artifact %q was supplied with no digest", a.Name)
-			return g
-		}
-		published[a.Digest] = true
-		assets = append(assets, a.Name)
-	}
-	sort.Strings(assets)
+	assets := release.Manifest.UploadNames()
 	// The CANDIDATE arm is the delivery. A pair's baseline is the reference
 	// testbucket it was measured against, and a different source tip and
 	// binary there are the enumerated permitted difference the whole campaign
 	// exists to test — so requiring the baseline to be the released commit
 	// would refuse every genuine campaign.
 	var problems []string
+	var bound []string
 	arms := 0
 	for i, ref := range index.Pairs {
 		if strings.TrimSpace(ref.Candidate.Stage1Path) == "" {
@@ -474,11 +459,19 @@ func releaseBindingGate(index CampaignIndex, loader CampaignLoader, release Camp
 			problems = append(problems, fmt.Sprintf("%s reviewed tip %s, not the %s being released", where, m.Source.ReviewTip, release.SHA))
 		}
 		// The campaign ran on ONE platform, so its delivered binary must be
-		// one of the assets about to be published — not merely equal to a
-		// digest somebody wrote down beside them.
-		if !published[m.Source.BinaryDigest] {
-			problems = append(problems, fmt.Sprintf("%s delivered binary %s, which is not among the %d artifact(s) being published (%s)",
-				where, m.Source.BinaryDigest, len(release.Artifacts), strings.Join(assets, ", ")))
+		// reachable from something this release actually publishes: either an
+		// asset itself, or a file inside one. A raw goreleaser intermediate
+		// that nobody uploads does not count, which is precisely the hole this
+		// closes.
+		asset, member, ok := release.Manifest.Locate(m.Source.BinaryDigest)
+		switch {
+		case !ok:
+			problems = append(problems, fmt.Sprintf("%s delivered binary %s, which is not published by, or contained in, any of the %d asset(s) being released (%s)",
+				where, m.Source.BinaryDigest, len(assets), strings.Join(assets, ", ")))
+		case member != "":
+			bound = append(bound, fmt.Sprintf("%s: %s is published inside %s as %s", where, m.Source.BinaryDigest, asset, member))
+		default:
+			bound = append(bound, fmt.Sprintf("%s: %s is published as %s", where, m.Source.BinaryDigest, asset))
 		}
 	}
 	if arms == 0 {
@@ -493,8 +486,10 @@ func releaseBindingGate(index CampaignIndex, loader CampaignLoader, release Camp
 		g.Detail = strings.Join(problems, "; ")
 		return g
 	}
+	sort.Strings(bound)
 	g.Observed = fmt.Sprintf("all %d candidate arm(s) authorised %s", arms, release.SHA)
-	g.Detail = fmt.Sprintf("%d published artifact(s) hashed from their actual bytes: %s", len(release.Artifacts), strings.Join(assets, ", "))
+	g.Detail = fmt.Sprintf("%d published asset(s), verified against their actual bytes: %s. %s",
+		len(assets), strings.Join(assets, ", "), strings.Join(bound, "; "))
 	g.Pass = true
 	return g
 }

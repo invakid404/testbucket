@@ -8,19 +8,14 @@ import (
 )
 
 // A label the training surface accepts: historical, wrapper-qualified, causally
-// attributed, topology-validated, before the cutoff.
+// attributed, topology-validated, before the cutoff — and carrying the exact
+// bytes of all three, because the verifier loads and re-hashes them rather than
+// checking that the references are non-empty strings.
 func admissibleLabel(id string, runnables, atomSize float64, seconds float64) TrainingLabel {
-	return TrainingLabel{
-		ReceiptID: id, ReceiptHash: Digest("sha256:" + id), UnitID: id,
-		ObservedNs: int64(seconds * float64(second)), ObservedAt: "2026-08-01T00:00:00Z",
-		Provenance:         LabelProvenance,
-		SelectedWorkDigest: Digest("sha256:selected-" + id),
-		TopologyReceipt:    Digest("sha256:topology-" + id),
-		Features: []Feature{
-			{Name: "runnable_count", Value: runnables, Provenance: ProvRunnableSnapshot},
-			{Name: "atom_size", Value: atomSize, Provenance: ProvPreplanAtom},
-		},
-	}
+	return evidenceLabel(id, int64(seconds*float64(second)),
+		Feature{Name: "runnable_count", Value: runnables, Provenance: ProvRunnableSnapshot},
+		Feature{Name: "atom_size", Value: atomSize, Provenance: ProvPreplanAtom},
+	)
 }
 
 // trainingSealKey is the fixture's predeclared training authority: the offline
@@ -86,6 +81,7 @@ func admissibleSet() TrainingReceiptSet {
 		Kind: TrainingSetKind, Epoch: "vitest-4.1.10", Cutoff: "2026-08-30T00:00:00Z",
 		FeatureSchema: []string{"atom_size", "runnable_count"},
 		Algorithm:     "ridge-least-squares", Configuration: "lambda=0.01", Lambda: 0.01, Seed: 1,
+		EvidenceSigners: testEvidenceSigners(),
 		Labels: []TrainingLabel{
 			admissibleLabel("a", 10, 1, 12),
 			admissibleLabel("b", 20, 1, 22),

@@ -339,6 +339,12 @@ packages:
 
   tinyrainbow@2.0.0:
     resolution: {integrity: sha512-tinyrainbow}
+
+  '@ai-sdk/provider-utils@2.2.8':
+    resolution: {integrity: sha512-provider-utils-2}
+
+  '@ai-sdk/provider-utils@3.0.30':
+    resolution: {integrity: sha512-provider-utils-3}
 `
 
 const testFacade = "await import('vitest/node')\n"
@@ -356,17 +362,26 @@ func testSourceProfile() SourceProfileReceipt {
 		Lockfile:    DigestBytes(lock),
 		FacadeBytes: []byte(testFacade), ConfigBytes: []byte(testViteConfig), LockfileBytes: lock,
 		ParserID: ParserIdentity{Name: LockParserPNPM, Version: "9", Digest: "sha256:lockparser"},
-		// EXACTLY what the lockfile resolves — every package, not just the
-		// Vitest family. tinyrainbow is here because the lock resolves it: a
-		// fixture that called itself complete while omitting it is what let
-		// the partial-closure defect through.
+		// EXACTLY what the lockfile resolves — every NODE, keyed by the lock's
+		// own identity, not just the Vitest family keyed by name. tinyrainbow
+		// is here because the lock resolves it; @ai-sdk/provider-utils appears
+		// TWICE at two versions, which is the shape a name-keyed closure could
+		// not represent at all.
 		Packages: map[string]string{
-			"vitest": RequiredVitest, "@vitest/runner": RequiredVitest, "@vitest/expect": RequiredVitest,
-			"tinyrainbow": "2.0.0",
+			"vitest@" + RequiredVitest:                          RequiredVitest,
+			"@vitest/runner@" + RequiredVitest:                  RequiredVitest,
+			"@vitest/expect@" + RequiredVitest + "(vite@7.0.0)": RequiredVitest,
+			"tinyrainbow@2.0.0":                                 "2.0.0",
+			"@ai-sdk/provider-utils@2.2.8":                      "2.2.8",
+			"@ai-sdk/provider-utils@3.0.30":                     "3.0.30",
 		},
 		Integrities: map[string]string{
-			"vitest": "sha512-vitest", "@vitest/runner": "sha512-runner", "@vitest/expect": "sha512-expect",
-			"tinyrainbow": "sha512-tinyrainbow",
+			"vitest@" + RequiredVitest:                          "sha512-vitest",
+			"@vitest/runner@" + RequiredVitest:                  "sha512-runner",
+			"@vitest/expect@" + RequiredVitest + "(vite@7.0.0)": "sha512-expect",
+			"tinyrainbow@2.0.0":                                 "sha512-tinyrainbow",
+			"@ai-sdk/provider-utils@2.2.8":                      "sha512-provider-utils-2",
+			"@ai-sdk/provider-utils@3.0.30":                     "sha512-provider-utils-3",
 		},
 	}
 }
@@ -380,24 +395,90 @@ var testTrainingAuthority = mustSigningKey()
 
 func testTrainingKeys() []string { return []string{PublicKeyOf(testTrainingAuthority)} }
 
-// testTrainingSet is the sealed offline surface the fixture's scorer is fitted
-// from. It carries real admissible labels — wrapper-qualified, pre-cutoff,
-// causally attributed, topology-validated — because the verifier now REFITS
-// it, and a set of invented rows would not produce the model beside it.
-func testTrainingSet() TrainingReceiptSet {
-	label := func(id string, runnables float64, ns int64) TrainingLabel {
+// testEvidenceAuthority attests each label's physical-V receipt, selected-work
+// document and topology receipt. It is separate from the training authority
+// that seals the set: one party observed the historical runs, another sealed
+// the surface built from them, and collapsing the two would let the sealer
+// vouch for its own evidence.
+var testEvidenceAuthority = mustSigningKey()
+
+func testEvidenceSigners() []string { return []string{PublicKeyOf(testEvidenceAuthority)} }
+
+// signEvidence seals one evidence document and returns its exact bytes plus
+// the digest that addresses them. The BYTES are what a label references, so
+// they are produced once here and never re-serialised.
+func signEvidence[T any](doc *T, sign func(*T, Digest)) ([]byte, Digest) {
+	d, err := evidenceDigest(doc)
+	if err != nil {
+		panic(err)
+	}
+	sign(doc, d)
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		panic(err)
+	}
+	return raw, DigestBytes(raw)
+}
+
+func sig(d Digest) *Signature {
+	return &Signature{
+		Authority: "ewj2-observation", KeyID: PublicKeyOf(testEvidenceAuthority),
+		Digest: d, Value: SignDigest(testEvidenceAuthority, d),
+	}
+}
+
+// evidenceLabel builds one admissible label WITH the real bytes of its
+// physical-V receipt, its selected work and its topology validation. Every
+// fixture that needs a label goes through it, so no test can accidentally
+// exercise the old shape where the three references were strings pointing at
+// nothing.
+func evidenceLabel(id string, ns int64, features ...Feature) TrainingLabel {
+	{
+		const at = "2026-08-01T00:00:00Z"
+
+		work := &SelectedWorkDocument{Kind: SelectedWorkKind, UnitID: id, Units: []string{id + ".spec.ts"}}
+		workBytes, workDigest := signEvidence(work, func(d *SelectedWorkDocument, dg Digest) { d.Signature = sig(dg) })
+
+		topology := &TopologyValidationReceipt{
+			Kind: TopologyReceiptKind, UnitID: id, SelectedWorkDigest: workDigest,
+			Validated: true, Validator: "ewj2-topology",
+		}
+		topologyBytes, topologyDigest := signEvidence(topology, func(d *TopologyValidationReceipt, dg Digest) { d.Signature = sig(dg) })
+
+		receipt := &PhysicalVReceipt{
+			Kind: PhysicalVReceiptKind, ReceiptID: id, UnitID: id,
+			Level: LevelInvocation, Producer: ProducerPhysical, Source: SourceContainment,
+			Containment: ContainmentIdentity{
+				Primitive: PrimitiveCgroup2, ID: "tb-" + id, Inode: "9" + id, BootID: "boot-1",
+			},
+			Terminal: TerminalPassed, ObservedAt: at, DurationNs: ns,
+			SelectedWorkDigest: workDigest, TopologyReceipt: topologyDigest,
+		}
+		receiptBytes, receiptDigest := signEvidence(receipt, func(d *PhysicalVReceipt, dg Digest) { d.Signature = sig(dg) })
+
 		return TrainingLabel{
 			ReceiptID: id, UnitID: id, Provenance: LabelProvenance,
-			ReceiptHash: Digest("sha256:" + id), SelectedWorkDigest: Digest("sha256:work-" + id),
-			TopologyReceipt: Digest("sha256:topology-" + id),
-			ObservedAt:      "2026-08-01T00:00:00Z", ObservedNs: ns,
-			Features: []Feature{{Name: "runnable_count", Value: runnables, Provenance: ProvRunnableSnapshot}},
+			ReceiptHash: receiptDigest, SelectedWorkDigest: workDigest, TopologyReceipt: topologyDigest,
+			ObservedAt: at, ObservedNs: ns,
+			Features: features,
+			Evidence: &LabelEvidence{
+				ReceiptBytes: receiptBytes, SelectedWorkBytes: workBytes, TopologyBytes: topologyBytes,
+			},
 		}
+	}
+}
+
+// testTrainingSet is the sealed offline surface the fixture's scorer is fitted
+// from.
+func testTrainingSet() TrainingReceiptSet {
+	label := func(id string, runnables float64, ns int64) TrainingLabel {
+		return evidenceLabel(id, ns, Feature{Name: "runnable_count", Value: runnables, Provenance: ProvRunnableSnapshot})
 	}
 	set := TrainingReceiptSet{
 		Kind: TrainingSetKind, Epoch: "vitest-4.1.10", Cutoff: "2026-08-30T00:00:00Z",
 		FeatureSchema: []string{"runnable_count"},
 		Algorithm:     "ridge-least-squares", Configuration: "lambda=0.01", Lambda: 0.01, Seed: 1,
+		EvidenceSigners: testEvidenceSigners(),
 		Labels: []TrainingLabel{
 			label("h1", 1, 2*int64(second)),
 			label("h2", 2, 3*int64(second)),
@@ -1099,15 +1180,11 @@ func TestTheTrainingSurfaceIsIndependentlyReproved(t *testing.T) {
 		}, "signature"},
 		{"a set the scorer does not name", func(o *VerifyOptions, t *testing.T, dir string) {
 			set := testTrainingSet()
-			// One extra admissible label: a different sealed set, sealed by
-			// the same authority, that the bound lineage does not name.
-			set.Labels = append(set.Labels, TrainingLabel{
-				ReceiptID: "h9", UnitID: "h9", Provenance: LabelProvenance,
-				ReceiptHash: "sha256:h9", SelectedWorkDigest: "sha256:work-h9",
-				TopologyReceipt: "sha256:topology-h9",
-				ObservedAt:      "2026-08-02T00:00:00Z", ObservedNs: 6 * int64(second),
-				Features: []Feature{{Name: "runnable_count", Value: 5, Provenance: ProvRunnableSnapshot}},
-			})
+			// One extra FULLY ADMISSIBLE label — real evidence and all — so
+			// what this case isolates is the lineage mismatch and not a
+			// second defect in the row it appends.
+			set.Labels = append(set.Labels, evidenceLabel("h9", 6*int64(second),
+				Feature{Name: "runnable_count", Value: 5, Provenance: ProvRunnableSnapshot}))
 			if err := set.Seal("ewj2-training", testTrainingAuthority); err != nil {
 				t.Fatal(err)
 			}
