@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/invakid404/testbucket/internal/core"
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
@@ -278,5 +279,43 @@ func TestFrozenPlanRefusesAStaleStore(t *testing.T) {
 	})
 	if _, err := Plan(context.Background(), PlanOptions{Bundle: fresh, Stage1: "sha256:stage1"}); err != nil {
 		t.Errorf("a store inside the stale policy was refused: %v", err)
+	}
+}
+
+// The shard-plan artifact the workflow uploads, and the coverage audit later
+// reads, must be exactly the document the Stage-2 receipt's full-plan digest
+// was taken over.
+//
+// The verifier now refuses an audit whose plan does not match that digest. If
+// the planner wrote an artifact that canonicalised to anything else, the
+// binding would fire on every honest run — so the two are asserted to be the
+// same document at the point they are produced, not assumed to be.
+func TestTheShardPlanArtifactIsWhatTheReceiptBinds(t *testing.T) {
+	root := t.TempDir()
+	res := plan(t, acquire(t, root, nil))
+	// What `plan --shard-plan` writes is res.Doc; what the receipt froze is
+	// PlanDigest. A reader auditing the run has only these two.
+	artifact, err := walltime.DigestJSON(res.Doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact != res.Receipt.PlanDigest {
+		t.Fatalf("the artifact digests to %s but the receipt binds %s", artifact, res.Receipt.PlanDigest)
+	}
+
+	// And a document that differs at all is a different digest: the binding is
+	// only a control if narrowing the plan cannot preserve it.
+	narrowed := *res.Doc
+	narrowed.Buckets = append([]core.PlanBucket(nil), res.Doc.Buckets...)
+	if len(narrowed.Buckets) == 0 || len(narrowed.Buckets[0].Units) == 0 {
+		t.Fatalf("the fixture plan has nothing to narrow")
+	}
+	narrowed.Buckets[0].Units = narrowed.Buckets[0].Units[:len(narrowed.Buckets[0].Units)-1]
+	got, err := walltime.DigestJSON(&narrowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == res.Receipt.PlanDigest {
+		t.Errorf("a plan with a unit removed kept the authorised full-plan digest")
 	}
 }

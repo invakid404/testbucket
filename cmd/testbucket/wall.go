@@ -609,6 +609,15 @@ func coverageAudit(shardPlan, eventsDir, runnerKind string) walltime.AuditFunc {
 		return nil
 	}
 	return func(bucketID string) (*walltime.AuditEvidence, error) {
+		// The digest of the EXACT document this audit derives its expected
+		// population from, canonicalised with the frozen full-plan algorithm.
+		// The verifier compares it to the Stage-2 receipt: without that, a
+		// plan substituted after planning to describe only the work that ran
+		// audits as complete, and every other artifact stays valid.
+		planDigest, err := fullPlanDigest(shardPlan)
+		if err != nil {
+			return nil, err
+		}
 		index, err := core.BucketIndexOf(shardPlan, bucketID)
 		if err != nil {
 			return nil, err
@@ -643,7 +652,7 @@ func coverageAudit(shardPlan, eventsDir, runnerKind string) walltime.AuditFunc {
 			// An empty events directory is the exact failure the audit exists
 			// to catch — a bucket that produced nothing — so it is reported as
 			// a coverage problem rather than as a missing input.
-			return &walltime.AuditEvidence{Bucket: bucketID, Planned: planned.Units, Problems: []string{
+			return &walltime.AuditEvidence{Bucket: bucketID, PlanDigest: planDigest, Planned: planned.Units, Problems: []string{
 				fmt.Sprintf("bucket %s produced no runner events at all, so none of its %d planned unit(s) can be shown to have run", bucketID, planned.Units),
 			}}, nil
 		}
@@ -656,11 +665,34 @@ func coverageAudit(shardPlan, eventsDir, runnerKind string) walltime.AuditFunc {
 			return nil, err
 		}
 		var report strings.Builder
-		ev := &walltime.AuditEvidence{Bucket: bucketID, Planned: planned.Units, Reported: len(sum.PackageRuns)}
+		ev := &walltime.AuditEvidence{
+			Bucket: bucketID, PlanDigest: planDigest,
+			Planned: planned.Units, Reported: len(sum.PackageRuns),
+		}
 		if err := core.AuditCoverage(&report, planned, sum); err != nil {
 			ev.Problems = append(ev.Problems, err.Error())
 		}
 		ev.Report = report.String()
 		return ev, nil
 	}
+}
+
+// fullPlanDigest canonicalises a shard-plan artifact with the SAME algorithm
+// the Stage-2 receipt's full-plan digest was taken with: parse the document and
+// digest the parsed structure, not the file's bytes.
+//
+// Bytes would be the wrong thing to compare. The receipt digests the planner's
+// in-memory document; the artifact is written indented, and a re-serialisation
+// that differed only in whitespace would read as a substituted plan. Parsing
+// and re-canonicalising compares the plan, which is what is being bound.
+func fullPlanDigest(path string) (walltime.Digest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read shard plan: %w", err)
+	}
+	var doc core.PlanDocument
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return "", fmt.Errorf("parse shard plan %s: %w", path, err)
+	}
+	return walltime.DigestJSON(&doc)
 }

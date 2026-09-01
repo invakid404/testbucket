@@ -230,7 +230,8 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 		scorer:   filepath.Join(dir, "scorer.json"),
 		audit: func(bucket string) (*AuditEvidence, error) {
 			return &AuditEvidence{
-				Bucket: bucket, Planned: len(s.invocations), Reported: len(s.invocations),
+				Bucket: bucket, PlanDigest: receipt.PlanDigest,
+				Planned: len(s.invocations), Reported: len(s.invocations),
 				Report: "PASS — every planned package reported exactly the invocations the plan scheduled",
 			}, nil
 		},
@@ -2153,4 +2154,96 @@ func TestDerivedDocumentsMustBeBoundToStageTwo(t *testing.T) {
 			t.Errorf("no finding names the missing binding:\n%s", strings.Join(details, "\n"))
 		}
 	})
+}
+
+// The coverage audit compares what RAN to what was PLANNED, and the plan
+// reaches the verifier as a separate artifact. A plan substituted after Stage 2
+// to describe only the work that actually happened produces a complete audit
+// while the Stage-2 receipt, its sidecars, the invocation manifest and every
+// record stay valid — the invocation manifest says what was invoked and cannot
+// say what was left out.
+//
+// So the audit's plan is bound to the receipt, and a mismatch is TERMINAL: an
+// audit against an unauthorised plan is not a weaker audit but a different one.
+func TestTheAuditPlanMustBeTheOneStageTwoFroze(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		audit    func(docs frozenDocs) AuditFunc
+		terminal bool
+		want     string
+	}{
+		{
+			name: "a plan substituted after Stage 2",
+			audit: func(docs frozenDocs) AuditFunc {
+				return func(bucket string) (*AuditEvidence, error) {
+					// A clean audit, with no problems at all — which is
+					// exactly what the substitution buys.
+					return &AuditEvidence{
+						Bucket: bucket, PlanDigest: "sha256:the-plan-that-describes-only-what-ran",
+						Report: "PASS — every planned package reported exactly the invocations the plan scheduled",
+					}, nil
+				}
+			},
+			terminal: true,
+			want:     "but Stage 2 froze",
+		},
+		{
+			name: "an audit that reports no plan at all",
+			audit: func(docs frozenDocs) AuditFunc {
+				return func(bucket string) (*AuditEvidence, error) {
+					return &AuditEvidence{Bucket: bucket}, nil
+				}
+			},
+			terminal: true,
+			want:     "reports no full-plan digest",
+		},
+		{
+			name: "an audit with no Stage-2 receipt to bind against",
+			audit: func(docs frozenDocs) AuditFunc {
+				return func(bucket string) (*AuditEvidence, error) {
+					return &AuditEvidence{Bucket: bucket, PlanDigest: "sha256:anything"}, nil
+				}
+			},
+			want: "no Stage-2 receipt to bind its plan to",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "records")
+			s := newSynthRun(dir)
+			docs := writeFrozenDocs(t, t.TempDir(), s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+
+			opt := VerifyOptions{
+				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta,
+				PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: tc.audit(docs),
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			}
+			if tc.want == "no Stage-2 receipt to bind its plan to" {
+				opt.Stage2Path = ""
+			}
+			v, err := VerifyDir(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("a row audited against an unauthorised plan was scored")
+			}
+			// Audit failure is terminal in the frozen scope, so an audit
+			// against the wrong plan cannot be traded against anything.
+			if tc.terminal && v.Complete {
+				t.Errorf("an audit against an unauthorised plan left the row complete")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
 }

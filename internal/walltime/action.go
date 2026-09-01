@@ -48,10 +48,12 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	//
 	// The wrapper cannot read a clock before it exists, so under measurement
 	// it is installed by the CALLER, before the measured action starts, and
-	// `wall begin` is the action's first owned step. What remains before this
-	// reading is the runner's own step startup, which the verifier bounds
-	// against A_GH's one-second resolution rather than merely reporting: an
-	// unbounded prefix would mean A measured a different product.
+	// `wall begin` is the action's first owned step. That ordering is the
+	// control: there is no action-owned work left to precede this reading.
+	//
+	// The verifier REPORTS whatever still precedes it, from the GitHub step
+	// attempt, and scores none of it — A_GH is frozen as a diagnostic that
+	// never enters a success calculation, and eligibility is one.
 	clock := NewSystemClock()
 	start := clock.Now()
 	probe(atStartReading, dir)
