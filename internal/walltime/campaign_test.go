@@ -170,7 +170,10 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 						CampaignID: "ewj2", RunID: runID, BucketID: fmt.Sprint(b), Stage1: stage1,
 					},
 				}
-				if err := v.Sign("ewj2-campaign", key); err != nil {
+				// Signed by the VERDICT signer Stage 1 declares, not by the
+				// campaign authority. One key doing both would be the party
+				// judging a row also approving the inputs it judges.
+				if err := v.Sign("ewj2-campaign", testVerdictAuthority); err != nil {
 					t.Fatal(err)
 				}
 				loader.verdicts[path] = v
@@ -220,35 +223,35 @@ func TestCampaignIndexRefusals(t *testing.T) {
 		{
 			name: "a row whose verdict is not eligible",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["candidate-0-0.json"], key, func(v *Verdict) { v.Eligible = false })
+				resign(l.verdicts["candidate-0-0.json"], testVerdictAuthority, func(v *Verdict) { v.Eligible = false })
 			},
 			want: "not eligible",
 		},
 		{
 			name: "a row whose measurement is not complete",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["baseline-1-2.json"], key, func(v *Verdict) { v.Complete = false })
+				resign(l.verdicts["baseline-1-2.json"], testVerdictAuthority, func(v *Verdict) { v.Complete = false })
 			},
 			want: "not a complete measurement",
 		},
 		{
 			name: "a row borrowed from another campaign",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["baseline-2-0.json"], key, func(v *Verdict) { v.Run.CampaignID = "some-other-campaign" })
+				resign(l.verdicts["baseline-2-0.json"], testVerdictAuthority, func(v *Verdict) { v.Run.CampaignID = "some-other-campaign" })
 			},
 			want: "belongs to campaign",
 		},
 		{
 			name: "a row recorded under another run",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["candidate-3-1.json"], key, func(v *Verdict) { v.Run.RunID = "someone-elses-run" })
+				resign(l.verdicts["candidate-3-1.json"], testVerdictAuthority, func(v *Verdict) { v.Run.RunID = "someone-elses-run" })
 			},
 			want: "recorded under run",
 		},
 		{
 			name: "a row bound to another Stage-1 manifest",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["baseline-0-3.json"], key, func(v *Verdict) { v.Run.Stage1 = "sha256:elsewhere" })
+				resign(l.verdicts["baseline-0-3.json"], testVerdictAuthority, func(v *Verdict) { v.Run.Stage1 = "sha256:elsewhere" })
 			},
 			want: "names Stage-1",
 		},
@@ -328,14 +331,14 @@ func TestCampaignIndexRefusals(t *testing.T) {
 		{
 			name: "a verdict naming no records",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["candidate-4-3.json"], key, func(v *Verdict) { v.RecordsDigest = "" })
+				resign(l.verdicts["candidate-4-3.json"], testVerdictAuthority, func(v *Verdict) { v.RecordsDigest = "" })
 			},
 			want: "names no records digest",
 		},
 		{
 			name: "a verdict produced by an unapproved verifier",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["baseline-3-0.json"], key, func(v *Verdict) {
+				resign(l.verdicts["baseline-3-0.json"], testVerdictAuthority, func(v *Verdict) {
 					v.VerifierBinary = Digest("sha256:" + strings.Repeat("cc", 32))
 				})
 			},
@@ -344,7 +347,7 @@ func TestCampaignIndexRefusals(t *testing.T) {
 		{
 			name: "a verdict that retained no Aeta sample",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["candidate-2-5.json"], key, func(v *Verdict) { v.AetaSample = nil })
+				resign(l.verdicts["candidate-2-5.json"], testVerdictAuthority, func(v *Verdict) { v.AetaSample = nil })
 			},
 			want: "retains no Aeta sample",
 		},
@@ -500,6 +503,9 @@ func TestTheRightDeliveryPassesTheReleaseBinding(t *testing.T) {
 
 // resign applies an edit and re-signs, so a refusal case tests the field it
 // edits rather than tripping the signature check that has its own case.
+// resign applies an edit and re-signs AS THE VERDICT SIGNER, so a refusal case
+// tests the field it edits rather than tripping the role separation that has
+// its own case. A caller passing some other key is testing exactly that.
 func resign(v *Verdict, key ed25519.PrivateKey, edit func(*Verdict)) {
 	edit(v)
 	v.Signature = nil
@@ -530,13 +536,13 @@ func TestUnauthenticatedRowsNeverReachTheArithmetic(t *testing.T) {
 // each 15 seconds out would pass every row check and the campaign would have
 // nothing to say.
 func TestCampaignEnforcesThePopulationWideAetaMean(t *testing.T) {
-	idx, loader, keys, key := campaignFixture(t)
+	idx, loader, keys, _ := campaignFixture(t)
 
 	// Give every row a forecast that is 15 s out — inside the 20 s per-row
 	// limit, outside the 10 s population mean.
 	for path, v := range loader.verdicts {
 		_ = path
-		resign(v, key, func(v *Verdict) {
+		resign(v, testVerdictAuthority, func(v *Verdict) {
 			v.AetaSample.PointNs = v.ActionNs + 15*second
 			v.AetaSample.LowerNs = v.AetaSample.PointNs - 20*second
 			v.AetaSample.UpperNs = v.AetaSample.PointNs + 20*second
@@ -563,9 +569,9 @@ func TestCampaignEnforcesThePopulationWideAetaMean(t *testing.T) {
 	}
 
 	// And a well-calibrated population passes it.
-	idx, loader, keys, key = campaignFixture(t)
+	idx, loader, keys, _ = campaignFixture(t)
 	for _, v := range loader.verdicts {
-		resign(v, key, func(v *Verdict) { v.AetaSample.PointNs = v.ActionNs + 2*second })
+		resign(v, testVerdictAuthority, func(v *Verdict) { v.AetaSample.PointNs = v.ActionNs + 2*second })
 	}
 	gates, problems = EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
 	if len(problems) != 0 {
@@ -674,8 +680,8 @@ func TestCampaignRefusesAPopulationMissingItsEvidence(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			idx, loader, keys, key := campaignFixture(t)
-			resign(loader.verdicts["baseline-2-3.json"], key, tc.strip)
+			idx, loader, keys, _ := campaignFixture(t)
+			resign(loader.verdicts["baseline-2-3.json"], testVerdictAuthority, tc.strip)
 
 			_, problems := LoadCampaign(idx, loader, keys, "ewj2-campaign")
 			if len(problems) == 0 {
@@ -959,7 +965,7 @@ func TestTheIndexCannotRestateWhatTheRecordsShow(t *testing.T) {
 			name: "the index reports a cancelled run as passed",
 			edit: func(idx *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
 				for b := 0; b < BucketsPerRun; b++ {
-					resign(l.verdicts[fmt.Sprintf("candidate-3-%d.json", b)], key, func(v *Verdict) {
+					resign(l.verdicts[fmt.Sprintf("candidate-3-%d.json", b)], testVerdictAuthority, func(v *Verdict) {
 						v.Terminal = TerminalCancelled
 					})
 				}
@@ -970,21 +976,21 @@ func TestTheIndexCannotRestateWhatTheRecordsShow(t *testing.T) {
 		{
 			name: "a row carries no authenticated start at all",
 			edit: func(_ *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["baseline-0-2.json"], key, func(v *Verdict) { v.StartedAt = "" })
+				resign(l.verdicts["baseline-0-2.json"], testVerdictAuthority, func(v *Verdict) { v.StartedAt = "" })
 			},
 			want: "carries no authenticated start instant",
 		},
 		{
 			name: "a row carries no authenticated terminal state",
 			edit: func(_ *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["candidate-4-1.json"], key, func(v *Verdict) { v.Terminal = "" })
+				resign(l.verdicts["candidate-4-1.json"], testVerdictAuthority, func(v *Verdict) { v.Terminal = "" })
 			},
 			want: "carries no authenticated terminal state",
 		},
 		{
 			name: "two buckets of one run disagree about the outcome",
 			edit: func(_ *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["baseline-2-5.json"], key, func(v *Verdict) {
+				resign(l.verdicts["baseline-2-5.json"], testVerdictAuthority, func(v *Verdict) {
 					v.Terminal = TerminalCrashUnclosed
 				})
 			},
@@ -1012,9 +1018,9 @@ func TestTheIndexCannotRestateWhatTheRecordsShow(t *testing.T) {
 // while every signed record says the whole campaign ran on one afternoon. If
 // the gate read the index it would pass; it reads the records, so it fails.
 func TestThePopulationDatesComeFromTheRecords(t *testing.T) {
-	idx, loader, keys, key := campaignFixture(t)
+	idx, loader, keys, _ := campaignFixture(t)
 	for _, path := range sortedVerdictPaths(loader) {
-		resign(loader.verdicts[path], key, func(v *Verdict) {
+		resign(loader.verdicts[path], testVerdictAuthority, func(v *Verdict) {
 			v.StartedAt = "2026-09-01T01:00:00Z"
 		})
 	}

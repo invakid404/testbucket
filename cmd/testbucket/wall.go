@@ -18,13 +18,13 @@ import (
 // verifierKeyEnv is where the verifier's own signing key is read from, for
 // the same reason the authority key is: a key on a command line is a key in
 // the process table.
-const verifierKeyEnv = "TB_WALL_VERIFIER_KEY"
+const verifierKeyEnv = walltime.VerifierKeyEnv
 
 // replayKeyEnv is the INDEPENDENT replay party's own signing key. It is a
 // separate variable from the authority key because the whole value of a replay
 // is that a different party produced it; sharing one key would make the
 // distinction editorial.
-const replayKeyEnv = "TB_WALL_REPLAY_KEY"
+const replayKeyEnv = walltime.ReplayKeyEnv
 
 const wallUsage = `testbucket wall — complete-action wall-time measurement
 
@@ -466,7 +466,7 @@ func runWallTrain(args []string) error {
 // builderKeyEnv is where the builder's signing key is read from — an
 // environment variable rather than a flag, for the same reason the authority
 // key is: a key on a command line is a key in the process table.
-const builderKeyEnv = "TB_WALL_BUILDER_KEY"
+const builderKeyEnv = walltime.BuilderKeyEnv
 
 // runWallAttest produces the builder's signed statement about one artifact.
 //
@@ -483,8 +483,8 @@ func runWallAttest(args []string) error {
 	commit := fs.String("source-commit", "", "the full 40-hex commit it was built from (required)")
 	builderID := fs.String("builder-id", "", "the workload that produced it, e.g. the workflow ref (required)")
 	issuer := fs.String("issuer", "", "the identity vouching for that workload, e.g. the OIDC issuer (required)")
-	run := fs.String("build-run", "", "the run that produced it")
-	attempt := fs.String("build-attempt", "", "that run's attempt")
+	run := fs.String("build-run", "", "the run that produced it (required): the retained verification result is bound to it")
+	attempt := fs.String("build-attempt", "", "that run's attempt (required)")
 	verifierID := fs.String("verifier-id", "", "who checked the build (required)")
 	at := fs.String("verified-at", "", "RFC3339 instant the check was made (required)")
 	out := fs.String("out", "", "write the signed attestation here (required)")
@@ -495,6 +495,9 @@ func runWallAttest(args []string) error {
 		"--subject": *subject, "--source-repository": *repository, "--source-commit": *commit,
 		"--builder-id": *builderID, "--issuer": *issuer, "--verifier-id": *verifierID,
 		"--verified-at": *at, "--out": *out,
+		// The run and attempt are what bind the retained verification result
+		// to a run a reader can go and look at.
+		"--build-run": *run, "--build-attempt": *attempt,
 	}
 	names := make([]string, 0, len(required))
 	for name := range required {

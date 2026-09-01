@@ -71,7 +71,7 @@ func (r *Roster) Sign(authority string, key ed25519.PrivateKey) error {
 	if err != nil {
 		return err
 	}
-	r.Signature = &Signature{Authority: authority, KeyID: PublicKeyOf(key), Digest: d, Value: SignDigest(key, d)}
+	r.Signature = &Signature{Authority: authority, KeyID: PublicKeyOf(key), Digest: d, Value: SignApproval(authority, key, d)}
 	return nil
 }
 
@@ -122,7 +122,7 @@ func (s *Seal) Sign(authority string, key ed25519.PrivateKey) error {
 	if err != nil {
 		return err
 	}
-	s.Signature = &Signature{Authority: authority, KeyID: PublicKeyOf(key), Digest: d, Value: SignDigest(key, d)}
+	s.Signature = &Signature{Authority: authority, KeyID: PublicKeyOf(key), Digest: d, Value: SignApproval(authority, key, d)}
 	return nil
 }
 
@@ -289,7 +289,20 @@ func RunKeyFromEnv() (ed25519.PrivateKey, error) {
 // the window is open. What it cannot do is produce a roster, produce a seal,
 // or alter anything once the seal exists.
 func verifySignerSet(v *Verdict, opt VerifyOptions, declared []string, recs []Record) {
-	keys := append(append([]string(nil), opt.SignerKeys...), declared...)
+	// The AUTHORITY-SIGNED set wins outright. Caller-supplied keys used to be
+	// unioned with it, and `record-signer` is a caller input all the way down
+	// through the CLI, the composite action and the reusable workflow — so a
+	// caller could authorise a roster and seal key the authority-signed
+	// Stage-1 manifest never declared, while supplying the matching run-key
+	// secret itself. That is the measured work choosing who attests it.
+	//
+	// Caller keys remain useful where Stage 1 declares nothing: an unbound
+	// developer run has no authority to defer to, and its row is ineligible on
+	// other grounds anyway.
+	keys := declared
+	if len(keys) == 0 {
+		keys = opt.SignerKeys
+	}
 	if len(keys) == 0 {
 		v.add("WT-023", SeverityIneligible,
 			"no run-key signer was predeclared to this verifier, so a roster and seal signed by any self-generated key would pass and the record chain is self-authenticated")

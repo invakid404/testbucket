@@ -60,29 +60,46 @@ func TestThePreflightBindsTheIdentitiesStampedOnRecords(t *testing.T) {
 // TestTheReplayComparesTheExpectedRecordIdentities: the workflow can only pass
 // the four values along; something has to actually compare them. This is the
 // CLI half — `wall replay` refuses before it attests anything.
+//
+// Every one of the four is REQUIRED. An earlier version skipped a comparison
+// whose expected value was empty, which made all four optional: a scored
+// request could omit every one, pass pre-flight, open the envelope, run the
+// tests, and be refused only by verification afterwards. An identity nobody
+// supplied is not an identity that agrees.
 func TestTheReplayComparesTheExpectedRecordIdentities(t *testing.T) {
 	const derivedStage1 = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	const derivedRegistry = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	issued := walltime.Stage2Receipt{Kind: walltime.Stage2Kind}
+	derivedStage2, err := issued.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name                               string
 		stage1, stage2, registry, verifier string
 		wantErr                            string
 	}{
-		{"everything agrees", derivedStage1, "", derivedRegistry, "ewj2-verifier", ""},
-		{"nothing supplied", "", "", "", "", ""},
+		{"everything agrees", derivedStage1, string(derivedStage2), derivedRegistry, "ewj2-verifier", ""},
+		{"nothing supplied at all", "", "", "", "", "--expect-stage1"},
+		{"no Stage-2 identity", derivedStage1, "", derivedRegistry, "ewj2-verifier", "--expect-stage2"},
+		{"no registry identity", derivedStage1, string(derivedStage2), "", "ewj2-verifier", "--expect-registry"},
+		{"no verifier identity", derivedStage1, string(derivedStage2), derivedRegistry, "", "--expect-verifier-id"},
+		{"a blank verifier identity", derivedStage1, string(derivedStage2), derivedRegistry, "   ", "--expect-verifier-id"},
 		{"a Stage-1 identity the plan does not derive",
-			"sha256:9999999999999999999999999999999999999999999999999999999999999999", "", "", "", "--expect-stage1"},
+			"sha256:9999999999999999999999999999999999999999999999999999999999999999",
+			string(derivedStage2), derivedRegistry, "ewj2-verifier", "--expect-stage1"},
 		{"a registry identity the plan does not derive",
-			"", "", "sha256:8888888888888888888888888888888888888888888888888888888888888888", "", "--expect-registry"},
+			derivedStage1, string(derivedStage2),
+			"sha256:8888888888888888888888888888888888888888888888888888888888888888", "ewj2-verifier", "--expect-registry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkRecordIdentities(walltime.Stage2Receipt{Kind: walltime.Stage2Kind}, derivedStage1, derivedRegistry,
+			err := checkRecordIdentities(issued, derivedStage1, derivedRegistry,
 				tc.stage1, tc.stage2, tc.registry, tc.verifier)
 			switch {
 			case tc.wantErr == "" && err != nil:
 				t.Fatalf("agreeing identities were refused: %v", err)
 			case tc.wantErr != "" && err == nil:
-				t.Fatalf("a mismatched identity was accepted")
+				t.Fatalf("a missing or mismatched identity was accepted")
 			case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
 				t.Errorf("error %q does not name %q", err, tc.wantErr)
 			}

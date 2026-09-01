@@ -527,8 +527,13 @@ func runWallReplay(args []string) error {
 	}
 	// The identities the ACTION will stamp on every measured record, compared
 	// with the ones this replay just derived — BEFORE anything is measured.
-	if err := checkRecordIdentities(issued, stage1, registryDigest, *expectStage1, *expectStage2, *expectRegistry, *expectVerifier); err != nil {
-		return err
+	// Run whenever ANY of the four was supplied: binding some of the record
+	// identities and not the rest is the same hole in a smaller shape. The
+	// eligible guard makes a scored request supply all four.
+	if *expectStage1 != "" || *expectStage2 != "" || *expectRegistry != "" || *expectVerifier != "" {
+		if err := checkRecordIdentities(issued, stage1, registryDigest, *expectStage1, *expectStage2, *expectRegistry, *expectVerifier); err != nil {
+			return err
+		}
 	}
 	if *attest != "" {
 		if err := writeReplayAttestation(*attest, *verifierID, issued, bundle, res.Receipt); err != nil {
@@ -573,7 +578,13 @@ func checkRecordIdentities(issued walltime.Stage2Receipt, stage1, registry wallt
 		{"--expect-stage2", wantStage2, stage2},
 		{"--expect-registry", wantRegistry, registry},
 	} {
+		// MISSING IS A REFUSAL. Skipping an empty expectation made all four
+		// identities optional: a scored request could omit every one, pass
+		// pre-flight, open the envelope and run the tests, and be refused only
+		// by verification afterwards. An identity nobody supplied is not an
+		// identity that agrees.
 		if strings.TrimSpace(c.supplied) == "" {
+			problems = append(problems, fmt.Sprintf("%s was not supplied; the records will carry an identity this pre-flight never compared", c.what))
 			continue
 		}
 		if c.derived == "" {
@@ -587,8 +598,8 @@ func checkRecordIdentities(issued walltime.Stage2Receipt, stage1, registry wallt
 	// The verifier identity has no document to derive it from; what a
 	// pre-flight can prove about it is that it exists. A record naming no
 	// verifier is attributable to none, and that is decidable here.
-	if wantVerifier != "" && strings.TrimSpace(wantVerifier) == "" {
-		problems = append(problems, "--expect-verifier-id is blank; a record that names no verifier identity is attributable to nobody")
+	if strings.TrimSpace(wantVerifier) == "" {
+		problems = append(problems, "--expect-verifier-id is blank or absent; a record that names no verifier identity is attributable to nobody")
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("the identities the measured records will carry do not match the frozen plan, and no measured work may start:\n  %s", strings.Join(problems, "\n  "))
@@ -646,7 +657,7 @@ func writeReplayAttestation(path, verifierID string, issued walltime.Stage2Recei
 	}
 	a.Signature = &walltime.Signature{
 		Authority: "ewj2-campaign", KeyID: walltime.PublicKeyOf(key), Digest: d,
-		Value: walltime.SignDigest(key, d),
+		Value: walltime.SignApproval(verifierID, key, d),
 	}
 	if err := walltime.WriteJSONFile(path, a); err != nil {
 		return err

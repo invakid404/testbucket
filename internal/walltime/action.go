@@ -295,8 +295,16 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	if terminal == "" {
 		terminal = TerminalPassed
 	}
-	if emptyErr := enforceContainmentEmpty(cont, deadline); emptyErr != nil {
-		terminal, reason = TerminalCrashUnclosed, emptyErr.Error()
+	if reaped, emptyErr := enforceContainmentEmpty(cont, deadline); emptyErr != nil {
+		// Same rule as the exec path: a cancelled action whose containment the
+		// wrapper itself killed and then verified empty is cancelled, not
+		// escaped. Anything else — including a kill that did not empty it — is
+		// terminal crash_unclosed.
+		if terminal == TerminalCancelled && reaped {
+			reason = joinReason(reason, "the containment was verified empty after the cancellation kill: "+emptyErr.Error())
+		} else {
+			terminal, reason = TerminalCrashUnclosed, emptyErr.Error()
+		}
 	}
 	trace := &observerProc{producer: ProducerTrace, ctl: control{base: st.TraceControl},
 		stream: filepath.Join(dir, streamName(ProducerTrace, LevelAction, 0))}

@@ -83,6 +83,27 @@ func SignDigest(k ed25519.PrivateKey, d Digest) string {
 	return base64.StdEncoding.EncodeToString(ed25519.Sign(k, []byte(d)))
 }
 
+// SignApproval signs a document digest TOGETHER WITH the authority label that
+// will be recorded beside it.
+//
+// The label used to be outside everything signed: `DigestOf` excludes the
+// whole Signature struct, and `SignDigest` covers the digest alone. A valid
+// signature from an unprotected context could therefore be relabelled
+// `ewj2-campaign` after the fact, and every later check that compared the
+// protected authority name was reading a field its own signature did not
+// cover. Signing over `authority NUL digest` binds the two: the same bytes
+// under a different label do not verify.
+func SignApproval(authority string, k ed25519.PrivateKey, d Digest) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(k, approvalMessage(authority, d)))
+}
+
+// approvalMessage is the exact byte string an approval signature covers. The
+// NUL separator means an authority ending in the digest's first characters
+// cannot be confused with a shorter authority and a longer digest.
+func approvalMessage(authority string, d Digest) []byte {
+	return []byte(authority + "\x00" + string(d))
+}
+
 // PublicKeyOf renders a signer id (the hex public key) from a private key.
 func PublicKeyOf(k ed25519.PrivateKey) string {
 	return hex.EncodeToString(k.Public().(ed25519.PublicKey))

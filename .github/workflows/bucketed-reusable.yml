@@ -446,6 +446,15 @@ jobs:
           # SAME expression the `run-key:` input of `run-bucket` is given,
           # compared against empty. It yields `yes` or `no` and never the key.
           TB_RUN_KEY_SET: ${{ (secrets.run-key != '' && secrets.run-key || (inputs.run-key-secret != '' && secrets[inputs.run-key-secret] || '')) != '' && 'yes' || 'no' }}
+          # The four identities run-bucket stamps onto every measured record.
+          # They are resolved caller VALUES, so they are checked here for the
+          # same reason the run key is: the pre-flight appends its --expect-*
+          # flags only for values that are non-empty, so an omitted one is a
+          # comparison that never happens rather than one that fails.
+          TB_STAGE1_DIGEST: ${{ inputs.stage1-digest }}
+          TB_STAGE2_DIGEST: ${{ inputs.stage2-digest }}
+          TB_REGISTRY_DIGEST: ${{ inputs.registry-digest }}
+          TB_VERIFIER_ID: ${{ inputs.verifier-id }}
         run: |
           set -euo pipefail
           fail=0
@@ -463,8 +472,20 @@ jobs:
           if [ "$TB_RUN_KEY_SET" != "yes" ]; then
             say "needs a run key that RESOLVES here (the run-key secret, or run-key-secret naming one this workflow can actually read). Without a value the signer roster and the closing seal are written unsigned and every row is WT-023 ineligible; a secret name that maps to nothing is no key at all."
           fi
+          if [ -z "$TB_STAGE1_DIGEST" ]; then
+            say "needs stage1-digest. run-bucket stamps it onto every record; unsupplied, the pre-flight has nothing to compare and the row carries an identity nobody bound."
+          fi
+          if [ -z "$TB_STAGE2_DIGEST" ]; then
+            say "needs stage2-digest. A record that names no Stage-2 receipt might have measured a plan nobody authorised."
+          fi
+          if [ -z "$TB_REGISTRY_DIGEST" ]; then
+            say "needs registry-digest. Without it the Aeta registry stamped on the records is unbound to the one the plan was instantiated from."
+          fi
+          if [ -z "$TB_VERIFIER_ID" ]; then
+            say "needs verifier-id. A record that names no verifier identity is attributable to nobody."
+          fi
           [ "$fail" -eq 0 ] || exit 1
-          echo "eligible request: wall directory, frozen inputs, authority key and run key are all present"
+          echo "eligible request: wall directory, frozen inputs, authority key, run key and all four record identities are present"
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false

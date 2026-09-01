@@ -422,11 +422,35 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
 - The delivered binary needs a **signed build attestation**, not a sentence.
   Stage 1 verifies its subject digest against the binary it delivers, its
   source commit against the reviewed tip, its signature against a predeclared
-  builder key, and its retained result against the only value that admits a
-  delivery. `wall attest` produces one.
+  builder key, its signer against the builder it names, and its retained result
+  against the only value that admits a delivery. The GitHub run and attempt are
+  required, because a result bound to nothing is not provenance. `wall attest`
+  produces one, and the release workflow attests every published asset.
+- Every signature covers the **authority label recorded beside it**. The label
+  used to sit outside the signed bytes, so a valid approval from an
+  unprotected context could be relabelled as the protected campaign authority
+  after the fact and every later comparison read a field its own signature did
+  not cover.
+- Signed documents are decoded **strictly**: unknown fields and trailing
+  content are refused. Both are the same hazard — anything the decoder drops is
+  outside the canonical digest, outside the signature, and invisible to every
+  check downstream. For a training label, whose receipt hash addresses exact
+  bytes, an appended second JSON value changes the hash the sealed set admits
+  while the inner signature still covers only the first.
+- Three roles, three key sets, none of them caller-supplied. The campaign
+  authority approves Stage-1 inputs; the **verdict signers** Stage 1 declares
+  sign verifier verdicts; the run signers it declares sign the roster and seal.
+  A caller can no longer enlarge the signer set, and a verdict key cannot
+  approve the inputs it judges.
+- Every private signing capability is **scrubbed from observers**, and a test
+  scans the whole tree for `TB_WALL_*KEY` rather than reading the denylist, so
+  a capability introduced elsewhere and forgotten by the list is caught at the
+  commit that introduces it.
 - The **pre-flight** compares the Stage-1, Stage-2, registry and verifier
   identities the action will stamp on every record with the ones it derives
-  itself, and fails the bucket before `wall begin`. Refusing after the tests
+  itself, and fails the bucket before `wall begin`. All four are required, and
+  the eligible guard refuses a scored request that omits any of them: an
+  identity nobody supplied is not an identity that agrees. Refusing after the tests
   have run can invalidate a row; it cannot un-measure it.
 - The publisher **re-resolves the release tag** immediately before uploading
   and refuses unless it still points at the campaign-gated commit. A tag is

@@ -128,7 +128,7 @@ func TestEveryClauseOfTheLabelEvidenceChain(t *testing.T) {
 				t.Fatal(err)
 			}
 			other := mustSigningKey()
-			r.Signature = &Signature{Authority: "ewj2-observation", KeyID: PublicKeyOf(other), Digest: d, Value: SignDigest(other, d)}
+			r.Signature = &Signature{Authority: "ewj2-observation", KeyID: PublicKeyOf(other), Digest: d, Value: SignApproval("ewj2-observation", other, d)}
 			raw, err := json.Marshal(&r)
 			if err != nil {
 				t.Fatal(err)

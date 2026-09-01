@@ -16,7 +16,7 @@ import (
 // It is an environment variable and not a flag on purpose: a key on a command
 // line is a key in the process table, in the shell history, and in every `ps`
 // a co-tenant runs.
-const authorityKeyEnv = "TB_WALL_AUTHORITY_KEY"
+const authorityKeyEnv = walltime.AuthorityKeyEnv
 
 // runWallStage1 assembles and signs the Stage-1 input manifest.
 //

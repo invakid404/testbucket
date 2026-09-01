@@ -94,6 +94,57 @@ jobs:
           "$RUNNER_TEMP/testbucket-gate" wall release-manifest \
             --dist dist --root . --out "$TB_RELEASE_MANIFEST"
 
+      # ATTEST THE EXACT BYTES, before anything gates or publishes them.
+      #
+      # Stage 1 requires a signed build attestation for the delivered binary,
+      # and the release path produced none: `wall attest` existed as a
+      # subcommand that the workflow building the artifacts never invoked, so
+      # the exact goreleaser output was never attested on the path that
+      # actually ships it.
+      #
+      # It attests every asset in the canonical publish set, so the statement
+      # covers what is published rather than a binary built beside it. The
+      # builder key is a secret; without it this fails closed, which is correct
+      # — an unattested delivery is not a delivery this contract admits.
+      - name: Attest the release artifacts
+        env:
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+          TB_ATTESTATION_DIR: ${{ runner.temp }}/attestations
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_WALL_BUILDER_KEY: ${{ secrets.TB_WALL_BUILDER_KEY }}
+          TB_BUILDER_ID: ${{ github.repository }}/${{ github.workflow_ref }}
+          TB_ISSUER: https://token.actions.githubusercontent.com
+          TB_RUN: ${{ github.run_id }}
+          TB_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TB_WALL_BUILDER_KEY:-}" ]; then
+            echo "REFUSED: no builder signing key (secret TB_WALL_BUILDER_KEY)." >&2
+            echo "Stage 1 requires a SIGNED build attestation for the delivered binary," >&2
+            echo "and an unsigned claim about a build is prose." >&2
+            exit 1
+          fi
+          mkdir -p "$TB_ATTESTATION_DIR"
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_RELEASE_MANIFEST")
+          for a in "${assets[@]}"; do
+            name="$(basename "$a")"
+            "$RUNNER_TEMP/testbucket-gate" wall attest \
+              --subject "$a" \
+              --subject-name "$name" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-commit "$TB_RELEASE_SHA" \
+              --builder-id "$TB_BUILDER_ID" \
+              --issuer "$TB_ISSUER" \
+              --build-run "$TB_RUN" \
+              --build-attempt "$TB_ATTEMPT" \
+              --verifier-id "$TB_BUILDER_ID" \
+              --verified-at "$now" \
+              --out "$TB_ATTESTATION_DIR/$name.attestation.json"
+          done
+          echo "attested ${#assets[@]} released asset(s) from $TB_RELEASE_SHA"
+
       # THE CAMPAIGN GATE. The frozen acceptance contract prohibits release
       # until an authenticated five-pair / ten-run / eighty-action-row campaign
       # across at least three UTC dates has passed, assembled from eligible

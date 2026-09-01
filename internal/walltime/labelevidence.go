@@ -1,8 +1,6 @@
 package walltime
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -249,13 +247,15 @@ func decodeEvidence[T any](where, what string, raw []byte, want Digest, kind str
 		return nil, []string{fmt.Sprintf("%s: its %s digests to %s, not the %s it names", where, what, got, want)}
 	}
 	var doc T
-	// UNKNOWN FIELDS ARE REFUSED. Ordinary decoding discards them, and a
-	// security-relevant field the schema does not model is one no check can
-	// read: a receipt carrying an exclusion identity nobody decoded verified
-	// its own signature perfectly while the value it named went unexamined.
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&doc); err != nil {
+	// EXACTLY ONE DOCUMENT, with no unknown fields and nothing after it.
+	//
+	// Unknown fields are refused because a security-relevant field the schema
+	// does not model is one no check can read. Trailing content is refused for
+	// a sharper reason: the label's ReceiptHash addresses these EXACT BYTES,
+	// so appending a second JSON value changes the hash the sealed set admits
+	// while the inner signature still covers only the first value. The suffix
+	// is then inside the evidence and outside everything that signed it.
+	if err := DecodeStrictJSON(raw, &doc); err != nil {
 		return nil, []string{fmt.Sprintf("%s: its %s does not parse: %v", where, what, err)}
 	}
 	k, sig, err := evidenceIdentity(&doc)

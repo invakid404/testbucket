@@ -240,7 +240,20 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 			problems = append(problems, fmt.Sprintf("%s: %v", row, err))
 			continue
 		}
-		if err := VerifySigned(v.Signature, vd, authorityKeys); err != nil {
+		// VERDICT SIGNERS, not the campaign authority. The two used to share
+		// one key set, so a verdict-signing key was also a Stage-1 approval
+		// key: the party deciding whether a row is eligible could approve the
+		// inputs it was judging. The manifest this arm was authorised by is
+		// what declares who may sign its verdicts.
+		var verdictKeys []string
+		if manifest != nil {
+			verdictKeys = manifest.VerdictSigners
+		}
+		if len(verdictKeys) == 0 {
+			problems = append(problems, row+" has no predeclared verdict signer, so its verdict would be authenticated by the campaign authority's own key")
+			continue
+		}
+		if err := VerifySigned(v.Signature, vd, verdictKeys); err != nil {
 			problems = append(problems, fmt.Sprintf("%s verdict signature: %v", row, err))
 			continue
 		}

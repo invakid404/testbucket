@@ -2,7 +2,6 @@ package walltime
 
 import (
 	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -228,7 +227,7 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 	}
 	replay.Signature = &Signature{
 		Authority: "ewj2-campaign", KeyID: PublicKeyOf(replayKey), Digest: rd,
-		Value: signValue(replayKey, rd),
+		Value: signValue("ewj2-campaign", replayKey, rd),
 	}
 
 	docs := frozenDocs{
@@ -358,6 +357,13 @@ var testBuilderAuthority = mustSigningKey()
 
 func testBuilderKeys() []string { return []string{PublicKeyOf(testBuilderAuthority)} }
 
+// testVerdictAuthority signs verifier verdicts. It is a THIRD party: the
+// campaign authority approves the inputs, this one judges the rows, and one
+// key doing both is one party performing a two-party check.
+var testVerdictAuthority = mustSigningKey()
+
+func testVerdictSigners() []string { return []string{PublicKeyOf(testVerdictAuthority)} }
+
 // testBuildAttestation is a complete signed statement about one build: every
 // identity the contract asks to be retained, and a result that admits it.
 func testBuildAttestation(binary Digest, commit string) BuildAttestation {
@@ -370,7 +376,11 @@ func testBuildAttestation(binary Digest, commit string) BuildAttestation {
 		VerifierID: "ewj2-delivery", VerifierBinary: synthBinary, VerifierVersion: "v0.3.0",
 		VerifiedAt: "2026-08-31T12:00:00Z", Result: AttestationVerified,
 	}
-	if err := a.Sign("ewj2-builder", testBuilderAuthority); err != nil {
+	// Signed AS the builder it names: the signature's authority label is the
+	// only signer identity it carries, so a retained builder identity that
+	// disagreed with it would be an unchecked string beside an authenticated
+	// one.
+	if err := a.Sign(a.BuilderID, testBuilderAuthority); err != nil {
 		panic(err)
 	}
 	return a
@@ -459,7 +469,7 @@ func signEvidence[T any](doc *T, sign func(*T, Digest)) ([]byte, Digest) {
 func sig(d Digest) *Signature {
 	return &Signature{
 		Authority: "ewj2-observation", KeyID: PublicKeyOf(testEvidenceAuthority),
-		Digest: d, Value: SignDigest(testEvidenceAuthority, d),
+		Digest: d, Value: SignApproval("ewj2-observation", testEvidenceAuthority, d),
 	}
 }
 
@@ -600,6 +610,7 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 		m.TrainingLineage.ScorerDigest = d
 	}
 	m.TrainingAuthorityKeys = testTrainingKeys()
+	m.VerdictSigners = testVerdictSigners()
 	return m
 }
 
@@ -1095,9 +1106,10 @@ func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
 }
 
 // signValue signs a digest the way Sign does, for a document the fixture
-// assembles by hand.
-func signValue(key ed25519.PrivateKey, d Digest) string {
-	return base64.StdEncoding.EncodeToString(ed25519.Sign(key, []byte(d)))
+// assembles by hand. It covers the authority label as production does: a
+// signature is bound to the label recorded beside it.
+func signValue(authority string, key ed25519.PrivateKey, d Digest) string {
+	return SignApproval(authority, key, d)
 }
 
 // editJSON rewrites one field of a frozen document on disk, which is how a
@@ -1158,16 +1170,43 @@ func TestStage1BindsEveryRequiredIdentity(t *testing.T) {
 		{"a build attestation signed by an undeclared builder", func(m *Stage1Manifest) {
 			a := testBuildAttestation(synthBinary, testTip)
 			a.Signature = nil
-			if err := a.Sign("other-builder", mustSigningKey()); err != nil {
+			if err := a.Sign(a.BuilderID, mustSigningKey()); err != nil {
 				panic(err)
 			}
 			m.Source.BuildAttestation = a
 		}, "signature"},
+		{"a build attestation whose signer is not the builder it names", func(m *Stage1Manifest) {
+			a := testBuildAttestation(synthBinary, testTip)
+			a.Signature = nil
+			if err := a.Sign("somebody-else", testBuilderAuthority); err != nil {
+				panic(err)
+			}
+			m.Source.BuildAttestation = a
+		}, "must be the identity that signed"},
+		{"a build attestation with no build run", func(m *Stage1Manifest) {
+			a := testBuildAttestation(synthBinary, testTip)
+			a.BuildRun = ""
+			a.Signature = nil
+			if err := a.Sign(a.BuilderID, testBuilderAuthority); err != nil {
+				panic(err)
+			}
+			m.Source.BuildAttestation = a
+		}, "build run"},
+		{"no predeclared verdict signer", func(m *Stage1Manifest) { m.VerdictSigners = nil }, "no verdict signer is predeclared"},
+		{"a verdict signer that is also the approving authority", func(m *Stage1Manifest) {
+			// Signed here so the manifest carries the signature the
+			// disjointness check compares against.
+			approver := mustSigningKey()
+			if err := m.Sign("ewj2-campaign", approver); err != nil {
+				panic(err)
+			}
+			m.VerdictSigners = []string{PublicKeyOf(approver)}
+		}, "may not approve what it judges"},
 		{"a build attestation whose retained result is not a verification", func(m *Stage1Manifest) {
 			a := testBuildAttestation(synthBinary, testTip)
 			a.Result = "probably fine"
 			a.Signature = nil
-			if err := a.Sign("ewj2-builder", testBuilderAuthority); err != nil {
+			if err := a.Sign(a.BuilderID, testBuilderAuthority); err != nil {
 				panic(err)
 			}
 			m.Source.BuildAttestation = a

@@ -1,11 +1,13 @@
 package walltime
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -481,6 +483,15 @@ type Stage1Manifest struct {
 	// frozen scorer built from it. Runtime never reads a label; this is where
 	// the labels are allowed to have existed.
 	TrainingLineage TrainingLineageID `json:"training_lineage"`
+	// VerdictSigners are the PREDECLARED public keys allowed to sign a
+	// verifier VERDICT.
+	//
+	// They are separate from the campaign authority that signs this manifest,
+	// and must be disjoint from it. One shared key set meant a verdict-signing
+	// key also authorised Stage-1 inputs: the party that decides whether a row
+	// is eligible could approve the inputs it is judging, which is one
+	// signature doing both halves of a two-party check.
+	VerdictSigners []string `json:"verdict_signers"`
 	// TrainingAuthorityKeys are the PREDECLARED public keys allowed to seal
 	// that receipt set. They are here, inside the authority-signed manifest,
 	// for the same reason the record signers are: a set verified against
@@ -1094,7 +1105,7 @@ func (m *Stage1Manifest) Sign(authority string, key ed25519.PrivateKey) error {
 		Authority: authority,
 		KeyID:     PublicKeyOf(key),
 		Digest:    d,
-		Value:     SignDigest(key, d),
+		Value:     SignApproval(authority, key, d),
 	}
 	return nil
 }
@@ -1127,8 +1138,12 @@ func VerifySigned(sig *Signature, digest Digest, allowedKeys []string) error {
 	if err != nil {
 		return fmt.Errorf("malformed signature")
 	}
-	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(digest), raw) {
-		return fmt.Errorf("signature does not verify")
+	// The signature covers the authority label as well as the digest, so a
+	// valid approval cannot be relabelled as coming from a different protected
+	// environment. Documents signed before this binding existed do not verify,
+	// which is the correct outcome: their label was never attested.
+	if !ed25519.Verify(ed25519.PublicKey(pub), approvalMessage(sig.Authority, digest), raw) {
+		return fmt.Errorf("signature does not verify for authority %q; a signature is bound to the authority label recorded beside it, so relabelling one does not carry its approval", sig.Authority)
 	}
 	return nil
 }
@@ -1172,6 +1187,18 @@ func (m Stage1Manifest) Validate() error {
 	// nobody compared with anything.
 	if len(m.BuilderKeys) == 0 {
 		return fmt.Errorf("stage-1 manifest: no builder key is predeclared, so the build attestation would be authenticated by its own signature and any self-generated key could vouch for any build")
+	}
+	if len(m.VerdictSigners) == 0 {
+		return fmt.Errorf("stage-1 manifest: no verdict signer is predeclared, so a verifier verdict would be authenticated by the campaign authority's own key and the party judging a row could also approve its inputs")
+	}
+	// The two roles must be held by different keys. A campaign authority that
+	// can also sign verdicts is one party performing a two-party check.
+	if m.Signature != nil {
+		for _, k := range m.VerdictSigners {
+			if k == m.Signature.KeyID {
+				return fmt.Errorf("stage-1 manifest: %s is declared as a verdict signer and is also the key that approved these inputs; the party that judges a row may not approve what it judges", k)
+			}
+		}
 	}
 	if problems := m.Source.BuildAttestation.Verify(m.Source.BinaryDigest, m.Source.ReviewTip, m.BuilderKeys); len(problems) > 0 {
 		return fmt.Errorf("stage-1 manifest: %s", strings.Join(problems, "; "))
@@ -1331,6 +1358,7 @@ func (m Stage1Manifest) InvariantTuple() map[string]string {
 		"training_lineage":        string(mustDigestOf(m.TrainingLineage)),
 		"training_authority_keys": strings.Join(m.TrainingAuthorityKeys, ","),
 		"builder_keys":            strings.Join(m.BuilderKeys, ","),
+		"verdict_signers":         strings.Join(m.VerdictSigners, ","),
 		"component_registry":      string(m.Registry),
 		"store_receipt":           string(mustDigestOf(m.Store)),
 		"allowed_differences":     string(mustDigestOf(m.AllowedDifferences)),
@@ -1762,11 +1790,53 @@ func WriteJSONFile(path string, v any) error {
 	return f.Sync()
 }
 
-// ReadJSONFile loads a receipt, manifest or bundle.
+// ReadJSONFile loads a receipt, manifest or bundle STRICTLY.
+//
+// Unknown fields are refused and trailing content is refused. Both matter for
+// the same reason: these documents are checked by recomputing a canonical
+// digest over the DECODED value and comparing it with a signature. Anything
+// the decoder silently drops is therefore outside the digest, outside the
+// signature, and invisible to every check downstream — an unsigned field
+// travelling inside a signed document. `json.Unmarshal` dropped exactly that,
+// so a Stage-1 manifest could carry `{"unsigned_security_extension":true, …}`
+// and still verify.
 func ReadJSONFile(path string, v any) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(b, v)
+	return DecodeStrictJSON(b, v)
+}
+
+// DecodeStrictJSON decodes exactly one JSON value, refusing unknown fields and
+// anything after it.
+//
+// The trailing-content check is not pedantry: `Decode` reads one value and
+// stops, so a second value in the same byte string is accepted in silence
+// while the digest covers only the first. Where the bytes themselves are what
+// a hash addresses — a training label's evidence, say — that suffix changes
+// the hash the outer document admits while remaining outside the inner
+// signature entirely.
+func DecodeStrictJSON(b []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if err := endOfJSON(dec); err != nil {
+		return err
+	}
+	return nil
+}
+
+// endOfJSON reports whether a decoder is exhausted, so "one document" means
+// one document.
+func endOfJSON(dec *json.Decoder) error {
+	if _, err := dec.Token(); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("trailing content after the document: %w", err)
+		}
+		return fmt.Errorf("a second JSON value follows the document; only the first is covered by its signature")
+	}
+	return nil
 }

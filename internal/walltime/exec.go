@@ -242,7 +242,7 @@ func Exec(opt ExecOptions) (int, error) {
 	// observers still take their own reads, and the VERIFIER decides closure.
 	// Anything still alive is killed and reaped here rather than merely
 	// labelled, because the wrapper is the last thing that can reach it.
-	emptyErr := enforceContainmentEmpty(cont, deadline)
+	emptyReaped, emptyErr := enforceContainmentEmpty(cont, deadline)
 
 	// Trace closes first, then the peer: the resulting endpoint order is the
 	// contract's, and it is established by the protocol rather than asserted
@@ -261,7 +261,18 @@ func Exec(opt ExecOptions) (int, error) {
 	}
 
 	if emptyErr != nil {
-		termState, reason = TerminalCrashUnclosed, emptyErr.Error()
+		// An ESCAPE is a descendant that outlived a run which ended on its own
+		// terms. After a cancellation the wrapper has just killed the whole
+		// containment itself, so members still draining a moment later are the
+		// tail of that kill — and calling it `crash_unclosed` would report an
+		// escape the wrapper caused, hiding the cancellation that is the real
+		// terminal state. The distinction is exactly whether the containment
+		// was successfully reaped.
+		if termState == TerminalCancelled && emptyReaped {
+			reason = joinReason(reason, "the containment was verified empty after the cancellation kill: "+emptyErr.Error())
+		} else {
+			termState, reason = TerminalCrashUnclosed, emptyErr.Error()
+		}
 	}
 	for _, e := range []error{traceErr, peerErr} {
 		if e != nil && termState == TerminalPassed {
@@ -519,18 +530,22 @@ var errUnreaped = fmt.Errorf("the root was not reaped after the whole containmen
 // The returned error is the retained reason: it names the escape AND what the
 // forced reap achieved, because "it escaped" and "it escaped and is still
 // running" call for different responses from whoever reads the receipt.
-func enforceContainmentEmpty(cont Containment, deadline time.Time) error {
+func enforceContainmentEmpty(cont Containment, deadline time.Time) (reaped bool, err error) {
 	escape := waitContainmentEmpty(cont, deadline)
 	if escape == nil {
-		return nil
+		return true, nil
 	}
-	if err := cont.Signal(syscall.SIGKILL); err != nil {
-		return fmt.Errorf("%w; the whole-containment KILL failed: %v", escape, err)
+	if killErr := cont.Signal(syscall.SIGKILL); killErr != nil {
+		return false, fmt.Errorf("%w; the whole-containment KILL failed: %v", escape, killErr)
 	}
-	if err := waitContainmentEmpty(cont, time.Now().Add(reapGrace)); err != nil {
-		return fmt.Errorf("%w; the containment was killed and was STILL not empty after %s: %v", escape, reapGrace, err)
+	if waitErr := waitContainmentEmpty(cont, time.Now().Add(reapGrace)); waitErr != nil {
+		return false, fmt.Errorf("%w; the containment was killed and was STILL not empty after %s: %v", escape, reapGrace, waitErr)
 	}
-	return fmt.Errorf("%w; the whole containment was then killed and verified empty", escape)
+	// Reaped, but it should not have needed reaping. The caller decides what
+	// that means: after a cancellation the wrapper itself killed the
+	// containment, so members still draining are the END of that cancellation
+	// rather than an escape from a completed run.
+	return true, fmt.Errorf("%w; the whole containment was then killed and verified empty", escape)
 }
 
 // waitContainmentEmpty is the wrapper's own post-exit verification. A root
@@ -693,15 +708,37 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 // is 3 because Go places ExtraFiles immediately after stdin/stdout/stderr.
 const observerKeyFD = 3
 
+// The private signing capabilities this system reads from the environment.
+//
+// They are declared HERE, together, and every command that needs one refers to
+// the constant rather than writing the name out again. That is not tidiness:
+// the scrub list below is built from exactly these names, so a capability
+// cannot be introduced somewhere else and then be missing from it. The builder
+// key was introduced in another package and forgotten by the denylist, which
+// is precisely the failure this arrangement removes — and
+// TestEveryPrivateKeyEnvironmentVariableIsScrubbed scans the whole repository
+// for `TB_WALL_*_KEY` so a name declared anywhere else is still caught.
+const (
+	// AuthorityKeyEnv approves Stage-1 inputs.
+	AuthorityKeyEnv = "TB_WALL_AUTHORITY_KEY"
+	// VerifierKeyEnv signs a verifier verdict.
+	VerifierKeyEnv = "TB_WALL_VERIFIER_KEY"
+	// ReplayKeyEnv signs an independent replay attestation.
+	ReplayKeyEnv = "TB_WALL_REPLAY_KEY"
+	// BuilderKeyEnv signs a build attestation.
+	BuilderKeyEnv = "TB_WALL_BUILDER_KEY"
+)
+
 // WallTimeSecretEnv is every environment variable this package treats as a
 // secret. A process that does not need one must not carry one: these are
 // capabilities, and a capability that outlives the step it was granted to is
 // no longer scoped to that step.
 var WallTimeSecretEnv = []string{
-	RunKeyEnv,               // signs the roster and the closing seal
-	"TB_WALL_AUTHORITY_KEY", // approves Stage-1 inputs
-	"TB_WALL_VERIFIER_KEY",  // signs a verifier verdict
-	"TB_WALL_REPLAY_KEY",    // signs an independent replay attestation
+	RunKeyEnv,       // signs the roster and the closing seal
+	AuthorityKeyEnv, // approves Stage-1 inputs
+	VerifierKeyEnv,  // signs a verifier verdict
+	ReplayKeyEnv,    // signs an independent replay attestation
+	BuilderKeyEnv,   // signs a build attestation
 }
 
 // scrubSecrets removes every wall-time secret from an environment.

@@ -246,7 +246,7 @@ func (s *TrainingReceiptSet) Seal(authority string, key ed25519.PrivateKey) erro
 	if err != nil {
 		return err
 	}
-	s.Signature = &Signature{Authority: authority, KeyID: PublicKeyOf(key), Digest: d, Value: SignDigest(key, d)}
+	s.Signature = &Signature{Authority: authority, KeyID: PublicKeyOf(key), Digest: d, Value: SignApproval(authority, key, d)}
 	return nil
 }
 

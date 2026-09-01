@@ -42,9 +42,11 @@ type BuildAttestation struct {
 	BuilderID string `json:"builder_id"`
 	Issuer    string `json:"issuer"`
 	// BuildRun and BuildAttempt bind the attestation to the run that made it,
-	// which is what lets a reader go and look.
-	BuildRun     string `json:"build_run,omitempty"`
-	BuildAttempt string `json:"build_attempt,omitempty"`
+	// which is what lets a reader go and look. They are REQUIRED: the contract
+	// asks the verification result to be bound to the GitHub run and attempt,
+	// and an optional empty string binds it to nothing.
+	BuildRun     string `json:"build_run"`
+	BuildAttempt string `json:"build_attempt"`
 	// VerifierID, VerifierBinary and VerifierVersion are WHO checked it, and
 	// Result is what they concluded. The contract asks for the verification
 	// result to be retained; retaining it is only meaningful if the identity
@@ -74,7 +76,7 @@ func (a *BuildAttestation) Sign(builder string, key ed25519.PrivateKey) error {
 	if err != nil {
 		return err
 	}
-	a.Signature = &Signature{Authority: builder, KeyID: PublicKeyOf(key), Digest: d, Value: SignDigest(key, d)}
+	a.Signature = &Signature{Authority: builder, KeyID: PublicKeyOf(key), Digest: d, Value: SignApproval(builder, key, d)}
 	return nil
 }
 
@@ -101,6 +103,8 @@ func (a BuildAttestation) Verify(binary Digest, reviewTip string, builderKeys []
 		{"verifier version", a.VerifierVersion},
 		{"verification instant", a.VerifiedAt},
 		{"result", a.Result},
+		{"build run", a.BuildRun},
+		{"build attempt", a.BuildAttempt},
 	} {
 		if strings.TrimSpace(f.value) == "" {
 			problems = append(problems, "the build attestation records no "+f.what)
@@ -131,6 +135,15 @@ func (a BuildAttestation) Verify(binary Digest, reviewTip string, builderKeys []
 	if len(builderKeys) == 0 {
 		problems = append(problems, "no builder key was predeclared, so the attestation's own signature would authenticate it and any self-generated key would vouch for any build")
 		return problems
+	}
+	// The SIGNER must be the builder it names. Signature.Authority is the only
+	// signer identity a signature carries, and it is now bound into the signed
+	// bytes; leaving it unequal to BuilderID would make the retained builder
+	// identity an unchecked string beside an authenticated one.
+	if a.Signature.Authority != a.BuilderID {
+		problems = append(problems, fmt.Sprintf(
+			"the build attestation is signed by authority %q but names builder %q; the retained builder identity must be the identity that signed",
+			a.Signature.Authority, a.BuilderID))
 	}
 	d, err := a.DigestOf()
 	if err != nil {
