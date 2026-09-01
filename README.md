@@ -61,6 +61,12 @@ testbucket audit --shard-plan plan.json /tmp/ev/*.ndjson
 
 `--k` is the **single knob**: adding a lane is bumping K and nothing else.
 
+The matrix and shard-plan JSON are **additive**: every field a consumer reads
+today (`bucket`, `name`, numeric one-decimal `est_seconds`, `needs_node`,
+`script`, `units`, `invocations`) keeps its meaning. Each `invocation` gained
+`units`, `selector` and `atoms`, which is worth knowing if you validate the
+plan artifact against a strict schema.
+
 ## How it works
 
 **Karmarkar-Karp k-way partition.** The balancer is Karmarkar-Karp (largest
@@ -403,7 +409,8 @@ testbucket wall bundle --out bundle.json --root . --k 8 --wall-dir /tmp/tb-wall
 testbucket wall stage1 --bundle bundle.json --out stage1.json --role candidate \
   --action-commit "$SHA" --review-tip "$SHA" --release-sha "$SHA" \
   --binary ./testbucket --build-attestation "$ATTESTATION" \
-  --source-profile profile.json --scorer scorer.json --registry registry.json \
+  --source-profile profile.json --store-receipt store-receipt.json \
+  --scorer scorer.json --registry registry.json \
   --runner-image "ubuntu-24.04@sha256:…" --consumer-repository owner/repo \
   --consumer-commit "$CONSUMER_SHA" --caller-workflow-sha "$WORKFLOW_SHA" \
   --downstream-ref "$REF"
@@ -475,8 +482,8 @@ with:
   runner: vitest
   wall-time-dir: /tmp/testbucket-wall
   cgroup-root: /sys/fs/cgroup/testbucket
-  verify-require: eligible          # also refuses a moving version alias
-  testbucket-version: v0.3.0        # an exact tag or a full SHA, never v1
+  verify-require: eligible          # refuses an unmeasured or mutably-delivered row
+  testbucket-version: v0.3.0        # an EXACT published tag; never an alias
   campaign-id: ewj2
   stage1-digest: sha256:…
   stage2-digest: sha256:…
@@ -488,7 +495,20 @@ with:
 
 Without that artifact, `verify-require: eligible` fails closed — the verifier
 is being asked to prove something it has not been given, and saying so is the
-right answer.
+right answer. So does an `eligible` request with no `wall-time-dir`: an
+eligible row is a *measured* row, and the workflow refuses that contradiction
+before any bucket runs rather than finishing green having proven nothing.
+
+A_GH is not in that artifact and cannot be: `step-attempt.json` describes the
+bucket step, which has not finished when the artifact is built. The workflow
+reads it back from the Actions API after the run — which is why the test job
+needs `actions: read` — and hands it to the verifier.
+
+**On `version`:** every action defaults to `v1`, which resolves only once a 1.x
+release exists. While this project is on 0.x, pin an exact tag (or `v0`). A
+scored arm *must* pin an exact `vX.Y.Z`: the installer downloads and
+checksum-verifies a release asset, and there is no asset at an arbitrary commit
+SHA, so a SHA is refused rather than advertised as deliverable.
 
 Wall-time measurement is Vitest-only today. `--wall-dir` with `--runner go` is
 **refused**, not ignored: a flag that silently does nothing is how a consumer

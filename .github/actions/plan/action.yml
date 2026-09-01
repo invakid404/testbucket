@@ -38,7 +38,11 @@ inputs:
     description: 'Path to write the full shard-plan JSON (upload it for the record job to audit).'
     default: /tmp/testbucket-shard-plan.json
   version:
-    description: 'testbucket binary to install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. NOTE: the
+      default `v1` resolves only once a 1.x release is published; while this
+      project is on 0.x, pin an exact tag (or `v0`).
     default: v1
   working-directory:
     description: 'Directory to plan in (where the tests live).'

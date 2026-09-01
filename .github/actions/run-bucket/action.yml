@@ -25,7 +25,12 @@ inputs:
       before the run so the script's `tee` has somewhere to write.
     default: /tmp/testbucket-events
   version:
-    description: 'testbucket binary to install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. NOTE: the
+      default `v1` resolves only once a 1.x release is published; while this
+      project is on 0.x, pin an exact tag (or `v0`). A scored row requires an
+      exact `vX.Y.Z`.
     default: v1
   working-directory:
     description: 'Directory to run the bucket in.'
@@ -58,8 +63,10 @@ inputs:
     default: ""
   scored:
     description: >-
-      Set to "true" for a campaign arm. It refuses a moving version alias,
-      because a row delivered through one has no immutable delivery identity.
+      Set to "true" for a campaign arm. It refuses a bucket that is not
+      measured (no `wall-time-dir`) and one that is not immutably delivered
+      (anything but an exact published `vX.Y.Z`), because a scored row must
+      have produced evidence and must say which bytes produced it.
       Verification itself is a SEPARATE action (`verify-wall`) run after this
       one: the contract puts AT_end after the final action epilogue, so
       verification cannot be a later step of the same action.
@@ -94,19 +101,34 @@ runs:
     # explicit that a moving tag is descriptive metadata, not an identity. The
     # opt-in measured run may still use the alias, because it only ever claims
     # `complete`.
-    - name: Refuse a moving alias for a scored row
+    # A scored row must be measured and immutably delivered. Both are checked
+    # HERE, before anything runs, because the alternative is a job that finishes
+    # green having proven neither.
+    - name: Refuse an unmeasurable or mutably-delivered scored row
       if: inputs.scored == 'true'
       shell: bash
       env:
         TB_VERSION: ${{ inputs.version }}
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
       run: |
         set -euo pipefail
+        # Without a records directory nothing is measured, so `scored` would be
+        # a claim about a row that produced no evidence at all.
+        if [ -z "$TB_WALL_DIR" ]; then
+          echo "scored=true needs a wall-time-dir: a scored row is a MEASURED row, and with no records directory this bucket produces no evidence to verify." >&2
+          exit 1
+        fi
+        # The installer resolves `local`, a moving `vX`/`vX.Y` alias, or an
+        # exact `vX.Y.Z` — and nothing else. A commit SHA is not deliverable
+        # here (there is no release asset at an arbitrary SHA), so accepting
+        # one would advertise a delivery path that does not exist. An exact
+        # published tag is the only immutable identity this installer can
+        # actually fetch and checksum-verify.
         case "$TB_VERSION" in
           v[0-9]*.[0-9]*.[0-9]*) ;;
-          [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
           *)
-            echo "scored=true needs an immutable testbucket version (an exact vX.Y.Z or a full commit SHA), got '$TB_VERSION'." >&2
-            echo "A moving alias is descriptive metadata, not a delivery identity, and a row delivered through one cannot be scored." >&2
+            echo "scored=true needs an exact published release tag (vX.Y.Z), got '$TB_VERSION'." >&2
+            echo "A moving alias is descriptive metadata rather than a delivery identity; a commit SHA has no release asset to download and checksum-verify." >&2
             exit 1
             ;;
         esac

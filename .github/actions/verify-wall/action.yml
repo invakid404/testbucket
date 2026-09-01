@@ -19,7 +19,11 @@ inputs:
       uses `eligible`.
     default: complete
   version:
-    description: 'testbucket binary to install; the verifier''s own delivery identity.'
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. NOTE: the
+      default `v1` resolves only once a 1.x release is published; while this
+      project is on 0.x, pin an exact tag (or `v0`).
     default: v1
   stage1-file:
     description: 'The signed Stage-1 input manifest.'

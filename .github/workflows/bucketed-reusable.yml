@@ -154,11 +154,15 @@ on:
           the signed Stage-1 manifest (`stage1.json`), the Stage-2 derived-plan
           receipt (`stage2.json`), the independent replay attestation
           (`replay.json`), the Aeta component registry (`registry.json`), and
-          per-bucket `aeta-<n>.json` / `pcheck-<n>.json`. The campaign harness
-          produces and uploads it; this workflow downloads it and hands each
-          bucket its own files. Without it `verify-require: eligible` fails
-          closed, because the verifier is being asked to prove something it has
-          not been given.
+          per-bucket `aeta-<n>.json`, `pcheck-<n>.json` and
+          `invocations-<n>.json`. The campaign harness produces and uploads it;
+          this workflow downloads it and hands each bucket its own files.
+          A_GH is deliberately NOT in it: `step-attempt.json` describes the
+          bucket step, which has not finished when the artifact is built, so
+          this workflow collects it from the Actions API after the run instead.
+          Without the artifact `verify-require: eligible` fails closed, because
+          the verifier is being asked to prove something it has not been
+          given.
         type: string
         default: ""
       runs-on:
@@ -239,16 +243,34 @@ jobs:
   test:
     needs: plan
     runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      # The A_GH diagnostic reads this job's own step timestamps back from the
+      # Actions API. Without it a measured row cannot say which step it
+      # measured, and the verifier reports the row ineligible.
+      actions: read
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
+      # A scored arm must actually be measured. Deriving `scored` from
+      # verify-require while running verification only when a records directory
+      # is set would let `verify-require: eligible` finish green having proven
+      # nothing, so the contradiction is refused here, before any bucket runs.
+      - name: Refuse an unmeasurable scored request
+        if: inputs.verify-require == 'eligible' && inputs.wall-time-dir == ''
+        shell: bash
+        run: |
+          echo "verify-require: eligible needs wall-time-dir: an eligible row is a MEASURED row, and with no records directory this workflow would verify nothing and pass." >&2
+          exit 1
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
-        if: inputs.runner == 'go'
+        # Also for a MEASURED Vitest bucket built from source: run-bucket
+        # installs the wrapper here, and `local` means `go build`.
+        if: inputs.runner == 'go' || (inputs.wall-time-dir != '' && inputs.testbucket-version == 'local')
         uses: actions/setup-go@v7.0.0
         with:
           go-version: ${{ inputs.go-version }}
@@ -277,6 +299,7 @@ jobs:
           path: ${{ runner.temp }}/testbucket-frozen
 
       - name: Run bucket ${{ matrix.bucket }}
+        id: run-bucket
         uses: $/.github/actions/run-bucket
         with:
           runner: ${{ inputs.runner }}
@@ -295,6 +318,58 @@ jobs:
           registry-digest: ${{ inputs.registry-digest }}
           verifier-id: ${{ inputs.verifier-id }}
           scored: ${{ inputs.verify-require == 'eligible' }}
+
+      # A_GH can only be collected AFTER the step it describes: it is that
+      # step's own start and completion, and while the step is running they do
+      # not exist yet. So the frozen-documents artifact cannot carry it — it is
+      # read back from the Actions API here, between the action and its
+      # verification.
+      #
+      # A failure to collect is NOT fatal: the diagnostic is non-gating, and a
+      # missing one already makes the row ineligible through the verifier
+      # rather than through a red step. Fabricating one would be worse than
+      # not having it.
+      - name: Collect the A_GH step diagnostic
+        if: always() && inputs.wall-time-dir != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+          TB_STEP_NAME: Run bucket ${{ matrix.bucket }}
+        run: |
+          set -uo pipefail
+          out="$TB_WALL_DIR/step-attempt.json"
+          jobs_url="/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs"
+
+          # Identify THIS job by the runner executing it: a matrix job's API
+          # name is not the workflow's job id, and every leg of one matrix
+          # shares the same name shape.
+          job=$(gh api --paginate "$jobs_url" \
+                  --jq ".jobs[] | select(.runner_name == \"${RUNNER_NAME:-}\")" 2>/dev/null | tail -c 400000)
+          if [ -z "$job" ]; then
+            echo "could not identify this job from the Actions API; A_GH will be absent and the row unscorable" >&2
+            exit 0
+          fi
+
+          printf '%s' "$job" | jq \
+            --arg step "$TB_STEP_NAME" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg run "${GITHUB_RUN_ID}" \
+            --arg job_name "${GITHUB_JOB}" \
+            --arg attempt "${GITHUB_RUN_ATTEMPT}" \
+            '.steps[] | select(.name == $step) |
+             {kind: "tb.walltime.step-attempt/v1",
+              attempt: {repository: $repo, workflow_run: $run, job: $job_name,
+                        step: "run-bucket", attempt: $attempt, precision: "1s",
+                        started_at: .started_at, completed_at: .completed_at}}' \
+            > "$out" 2>/dev/null
+          if [ ! -s "$out" ]; then
+            rm -f "$out"
+            echo "the '$TB_STEP_NAME' step was not found in this job's API record; A_GH will be absent and the row unscorable" >&2
+            exit 0
+          fi
+          echo "collected A_GH for '$TB_STEP_NAME':"
+          cat "$out"
 
       # Verification is its OWN action, run after run-bucket rather than inside
       # it. The contract puts AT_end after the final action epilogue, so a
@@ -318,7 +393,7 @@ jobs:
           aeta-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/aeta-{1}.json', runner.temp, matrix.bucket) || '' }}
           pcheck-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/pcheck-{1}.json', runner.temp, matrix.bucket) || '' }}
           invocations-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/invocations-{1}.json', runner.temp, matrix.bucket) || '' }}
-          step-attempt-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/step-attempt-{1}.json', runner.temp, matrix.bucket) || '' }}
+          step-attempt-file: ${{ inputs.wall-time-dir != '' && format('{0}/step-attempt.json', inputs.wall-time-dir) || '' }}
 
       # The raw records and the verdict ARE the evidence: a campaign assembles
       # its population from them, and a row whose records were discarded with

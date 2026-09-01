@@ -60,7 +60,8 @@ func runWallStage1(args []string) error {
 	required := map[string]string{
 		"--bundle": *bundlePath, "--out": *out, "--role": *role,
 		"--action-commit": *actionCommit, "--review-tip": *reviewTip,
-		"--release-sha": *releaseSHA, "--binary": *binary,
+		"--store-receipt": *storeReceipt,
+		"--release-sha":   *releaseSHA, "--binary": *binary,
 		"--build-attestation": *attestation, "--source-profile": *sourceProfile,
 		"--scorer": *scorerPath, "--registry": *registryPath,
 		"--runner-image": *runnerImage, "--consumer-repository": *consumerRepo,
