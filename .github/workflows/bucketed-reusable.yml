@@ -240,6 +240,20 @@ on:
           measured weights, which is a good split and is not campaign eligible.
         type: string
         default: ""
+      frozen-training-set-file:
+        description: >-
+          File name of the SEALED TRAINING RECEIPT SET inside
+          `frozen-inputs-artifact` — the exact offline surface the frozen
+          scorer was fitted from. The verifier revalidates it under the
+          training authority the Stage-1 manifest predeclares and REFITS the
+          scorer from it, so a model whose coefficients did not come from this
+          evidence is refused rather than believed.
+
+          Without it a scored row is INELIGIBLE: the scorer's lineage would
+          then be a digest the scorer states about itself, and an
+          independently written model could claim any sealed set at all.
+        type: string
+        default: ""
       frozen-documents-artifact:
         description: >-
           Name of an artifact holding the frozen documents a scored row needs:
@@ -667,6 +681,7 @@ jobs:
           shard-plan-file: ${{ inputs.wall-time-dir != '' && format('{0}/testbucket-plan/shard-plan.json', runner.temp) || '' }}
           events-dir: /tmp/testbucket-events
           scorer-file: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
+          training-set-file: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-training-set-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-training-set-file) || '' }}
 
       # The raw records and the verdict ARE the evidence: a campaign assembles
       # its population from them, and a row whose records were discarded with

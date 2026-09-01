@@ -357,6 +357,15 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
 - A missing endpoint is a **missing interval**, never a shorter one. A crash, a
   cancellation, an escaped descendant, or a root that exited with live children
   stays terminal and retained; it never becomes a duration.
+- Cancellation is **bounded and reaped**. A signal or the deadline sends
+  SIGTERM to the whole containment, a 30s grace follows, and anything still
+  alive is killed and reaped within 10s. A root that ignores TERM no longer
+  hangs the job, and a descendant that outlived its root is killed rather than
+  merely labelled — the escape stays terminal either way.
+- Every record repeats the **full delivery identity**, and the verifier
+  compares all of it across every record, the signer roster and the closing
+  seal. A stream that is intact, signed and sealed but names another run,
+  bucket, attempt, job or plan is two measurements in one directory, not one.
 - A rewritten record breaks a hash chain the verifier recomputes.
 - `wall verify --require complete` asks whether the records are well formed;
   `--require eligible` asks whether this **row** may be scored, which
@@ -394,6 +403,24 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   enumerated candidate tuple. `--in` still runs the arithmetic on a
   hand-written file and always exits non-zero, because a number in a JSON file
   is not an observation.
+- A campaign authorises the **delivery it was produced for**. `wall campaign`
+  takes `--release-sha` and the delivered artifact's digest, and every pair's
+  candidate arm must have reviewed, been released from, and delivered exactly
+  that commit and that binary. With no expected delivery supplied the
+  release-binding gate does not pass: historical evidence stays auditable, and
+  authorises nothing else.
+- Scoring needs the **sealed training set**, not a digest of it. `wall verify
+  --training-set` revalidates it under the training authority the Stage-1
+  manifest predeclares and REFITS the scorer from it. A model that cites this
+  evidence and a model built from it are otherwise indistinguishable, because
+  the receipt-set digest is a string the model states about itself.
+- Every frozen listing binds the **closure of its own argv**: the exact
+  command, cwd, planning-relevant environment, resolved executable path and a
+  complete tool/version/integrity closure. An unresolved or empty identity is a
+  bound fact about a failure, and `wall bundle` refuses to freeze one rather
+  than planning on it. The source profile carries the exact façade, config and
+  lockfile bytes, and its package closure is re-derived from the lock instead
+  of read back from the receipt.
 
 ### A reproducible plan
 
@@ -410,7 +437,8 @@ testbucket wall stage1 --bundle bundle.json --out stage1.json --role candidate \
   --action-commit "$SHA" --review-tip "$SHA" --release-sha "$SHA" \
   --binary ./testbucket --build-attestation "$ATTESTATION" \
   --source-profile profile.json --store-receipt store-receipt.json \
-  --scorer scorer.json --registry registry.json \
+  --scorer scorer.json --training-set training-set.json \
+  --training-authority-key "$TRAINING_KEY" --registry registry.json \
   --runner-image "ubuntu-24.04@sha256:…" --consumer-repository owner/repo \
   --consumer-commit "$CONSUMER_SHA" --caller-workflow-sha "$WORKFLOW_SHA" \
   --downstream-ref "$REF"

@@ -174,8 +174,15 @@ type TrainingReceiptSet struct {
 	Labels        []TrainingLabel `json:"labels"`
 	Algorithm     string          `json:"algorithm"`
 	Configuration string          `json:"configuration"`
-	Seed          int64           `json:"seed"`
-	Signature     *Signature      `json:"signature,omitempty"`
+	// Lambda is the ridge regularisation the fit uses. It lives in the SEALED
+	// SET rather than on the command line that fits it, because it decides the
+	// coefficients: a verifier handed the set, the algorithm and the seed but
+	// not the lambda could not recompute the scorer, and "recompute it and
+	// compare" is the only check that distinguishes a model built from this
+	// evidence from one that merely cites it.
+	Lambda    float64    `json:"ridge_lambda"`
+	Seed      int64      `json:"seed"`
+	Signature *Signature `json:"signature,omitempty"`
 }
 
 // PermanentExclusions are the anti-overfit examples the contract names. They
@@ -227,6 +234,21 @@ func (s TrainingReceiptSet) Validate(sealKeys []string) error {
 	}
 	if s.Cutoff == "" {
 		return fmt.Errorf("training receipt set has no observation cutoff")
+	}
+	// The frozen fit, in full. Every one of these decides the coefficients, so
+	// a set that leaves one unbound cannot be recomputed — and an offline
+	// surface nobody can recompute is a citation, not a lineage.
+	if strings.TrimSpace(s.Epoch) == "" {
+		return fmt.Errorf("training receipt set names no epoch")
+	}
+	if strings.TrimSpace(s.Algorithm) == "" || strings.TrimSpace(s.Configuration) == "" {
+		return fmt.Errorf("training receipt set names no training algorithm or configuration")
+	}
+	if s.Lambda < 0 {
+		return fmt.Errorf("training receipt set has ridge lambda %v; it must be >= 0", s.Lambda)
+	}
+	if len(s.FeatureSchema) == 0 {
+		return fmt.Errorf("training receipt set freezes no feature schema")
 	}
 	cutoff, err2 := parseInstant(s.Cutoff)
 	if err2 != nil {
@@ -332,13 +354,11 @@ func (s Scorer) Score(v FeatureVector) (float64, error) {
 //
 // It refuses an unvalidated set. Training is where labels are allowed to
 // exist; it is not where the rules about them stop applying.
-func TrainScorer(set TrainingReceiptSet, id string, lambda float64, sealKeys []string) (*Scorer, error) {
+func TrainScorer(set TrainingReceiptSet, id string, sealKeys []string) (*Scorer, error) {
 	if err := set.Validate(sealKeys); err != nil {
 		return nil, err
 	}
-	if lambda < 0 {
-		return nil, fmt.Errorf("ridge lambda must be >= 0, got %v", lambda)
-	}
+	lambda := set.Lambda
 	schema := append([]string(nil), set.FeatureSchema...)
 	sort.Strings(schema)
 	n := len(schema) + 1 // + intercept
@@ -388,7 +408,7 @@ func TrainScorer(set TrainingReceiptSet, id string, lambda float64, sealKeys []s
 		Lineage: TrainingLineageID{
 			ReceiptSetDigest: digestSet, Cutoff: set.Cutoff, Epoch: set.Epoch,
 			ScorerID: id, Algorithm: set.Algorithm, Configuration: set.Configuration,
-			Seed: set.Seed, TieBreak: "unit_id_ascending",
+			Seed: set.Seed, TieBreak: ScorerTieBreak,
 		},
 	}
 	d, err := sc.DigestOf()
@@ -397,6 +417,117 @@ func TrainScorer(set TrainingReceiptSet, id string, lambda float64, sealKeys []s
 	}
 	sc.Lineage.ScorerDigest = d
 	return sc, nil
+}
+
+// ScorerTieBreak is the frozen ordering the scorer is fitted and read under.
+const ScorerTieBreak = "unit_id_ascending"
+
+// VerifyTrainingSurface is the INDEPENDENT check of the offline surface.
+//
+// Everything the offline constructor proves — the signature against a
+// predeclared training authority, the cutoff, the exclusions, the causal
+// selected-work attribution, the topology receipts, uniqueness, the feature
+// schema — was proved at construction time and then thrown away. What reached
+// Stage 1 and verification was a scorer carrying a receipt-set DIGEST, and the
+// only thing checked about it was that the string was not empty. An
+// independently written scorer could therefore claim any digest at all, get a
+// signed Stage-1 binding, and allocate the whole campaign without anyone ever
+// reading the set it named — which is the "signed Palloc training receipt set
+// not independently verified" defect.
+//
+// This closes it by doing the construction again from the exact sealed bytes:
+// validate the set under the predeclared authority, recompute its digest,
+// refit the scorer deterministically, and require every lineage field and
+// every coefficient to be the one that fit produces. A model that cites this
+// evidence and a model built from it are then distinguishable.
+//
+// It returns every problem rather than the first: a lineage that disagrees in
+// four places should say so once.
+func VerifyTrainingSurface(set TrainingReceiptSet, lineage TrainingLineageID, sc Scorer, sealKeys []string) []string {
+	var problems []string
+	if err := set.Validate(sealKeys); err != nil {
+		return []string{err.Error()}
+	}
+	digest, err := set.DigestOf()
+	if err != nil {
+		return []string{err.Error()}
+	}
+	if lineage.ReceiptSetDigest != digest {
+		problems = append(problems, fmt.Sprintf(
+			"Stage 1 binds training receipt set %s but the supplied sealed set digests to %s", lineage.ReceiptSetDigest, digest))
+	}
+	if sc.Lineage.ReceiptSetDigest != digest {
+		problems = append(problems, fmt.Sprintf(
+			"the frozen scorer claims training receipt set %s but the supplied sealed set digests to %s", sc.Lineage.ReceiptSetDigest, digest))
+	}
+	// Every lineage field is taken from the SET, never from the claim. A
+	// scorer that named the right digest and the wrong cutoff would otherwise
+	// be admitting labels the authority excluded.
+	for _, f := range []struct {
+		name        string
+		claim, want string
+	}{
+		{"cutoff instant", lineage.Cutoff, set.Cutoff},
+		{"epoch", lineage.Epoch, set.Epoch},
+		{"algorithm", lineage.Algorithm, set.Algorithm},
+		{"configuration", lineage.Configuration, set.Configuration},
+		{"seed", fmt.Sprint(lineage.Seed), fmt.Sprint(set.Seed)},
+		{"tie-break", lineage.TieBreak, ScorerTieBreak},
+	} {
+		if f.claim != f.want {
+			problems = append(problems, fmt.Sprintf(
+				"the bound training lineage names %s %q, but the sealed set fixes %q", f.name, f.claim, f.want))
+		}
+	}
+	if strings.TrimSpace(lineage.ScorerID) == "" {
+		problems = append(problems, "the bound training lineage names no scorer id, so the fit cannot be reproduced")
+		return problems
+	}
+	// THE RECOMPUTATION. Same sealed labels, same frozen configuration, same
+	// deterministic closed-form fit: the coefficients are a function of the
+	// evidence, so a scorer that did not come from this set cannot survive it.
+	refit, err := TrainScorer(set, lineage.ScorerID, sealKeys)
+	if err != nil {
+		return append(problems, "the sealed training set does not refit: "+err.Error())
+	}
+	refitDigest, err := refit.DigestOf()
+	if err != nil {
+		return append(problems, err.Error())
+	}
+	supplied, err := sc.DigestOf()
+	if err != nil {
+		return append(problems, err.Error())
+	}
+	if supplied != refitDigest {
+		problems = append(problems, fmt.Sprintf(
+			"the frozen scorer digests to %s, but refitting the sealed training set produces %s; its coefficients did not come from the set it names",
+			supplied, refitDigest))
+	}
+	if lineage.ScorerDigest != refitDigest {
+		problems = append(problems, fmt.Sprintf(
+			"Stage 1 binds scorer %s, but refitting the sealed training set produces %s", lineage.ScorerDigest, refitDigest))
+	}
+	// Named comparisons in addition to the digest. The digest catches
+	// everything; these say WHAT differs, which is what a reader needs.
+	if !equalStrings(sc.FeatureSchema, refit.FeatureSchema) {
+		problems = append(problems, fmt.Sprintf(
+			"the frozen scorer reads feature schema %v; the sealed set fixes %v", sc.FeatureSchema, refit.FeatureSchema))
+	}
+	for _, name := range refit.FeatureSchema {
+		if sc.Coefficients[name] != refit.Coefficients[name] {
+			problems = append(problems, fmt.Sprintf(
+				"the frozen scorer weights %q at %v; refitting the sealed set gives %v", name, sc.Coefficients[name], refit.Coefficients[name]))
+		}
+	}
+	if sc.Intercept != refit.Intercept {
+		problems = append(problems, fmt.Sprintf(
+			"the frozen scorer's intercept is %v; refitting the sealed set gives %v", sc.Intercept, refit.Intercept))
+	}
+	if sc.Floor != refit.Floor {
+		problems = append(problems, fmt.Sprintf(
+			"the frozen scorer's floor is %v; the fit fixes %v", sc.Floor, refit.Floor))
+	}
+	return problems
 }
 
 // solve does Gaussian elimination with partial pivoting. It is written out

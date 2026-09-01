@@ -147,8 +147,7 @@ func runWallBundle(args []string) error {
 		StorePath: *store, StoreBytes: storeBytes, StoreAbsent: storeAbsent,
 		DiscoveryArgv: discoveryArgv(*vitestCommand, *vitestDiscovery, *vitestDiscoveryCommand),
 		Discovery:     discovery, Runnables: runnables, RunnableArgv: runnableArgv,
-		Env: planningEnv(), Executables: resolvedExecutables(*vitestCommand),
-		Tools:      resolvedTools(*root),
+		Env: planningEnv(), Resolve: closureResolver(*root),
 		Repository: *repository, Commit: *commit, Tree: *tree,
 		EventsDir: *eventsDir, FileParallelism: *fileParallelism, WallDir: *wallDir,
 	})
@@ -199,45 +198,112 @@ func planningEnv() map[string]string {
 	return out
 }
 
-// resolvedExecutables records where the discovery program actually resolved
-// to, so "npx" naming two different binaries on two runners is visible.
-func resolvedExecutables(command string) map[string]string {
-	out := map[string]string{}
-	base := splitCommand(command)
-	if len(base) == 0 {
-		base = []string{"npx"}
+// closureResolver resolves the executable and tool closure FOR ONE ARGV.
+//
+// The closure is a function of the argv the snapshot was actually taken by,
+// not of the configured Vitest command. Those are the same thing only until
+// somebody passes --vitest-discovery-command, and the old resolver kept
+// answering about the ordinary command: the bundle then carried a resolution
+// of a program that had not run, which a replay would follow to the wrong
+// binary with nothing to explain the difference.
+//
+// It FAILS rather than recording `unresolved`. A resolution nobody could make
+// is an unbound input, and `wall bundle` is the one place that can still
+// refuse to freeze one; a bundle that carried it would be signed by Stage 1
+// before anybody noticed.
+func closureResolver(root string) func([]string) (map[string]string, map[string]walltime.ToolIdentity, error) {
+	return func(argv []string) (map[string]string, map[string]walltime.ToolIdentity, error) {
+		if len(argv) == 0 {
+			return nil, nil, fmt.Errorf("no argv to resolve")
+		}
+		head := argv[0]
+		path, err := resolveProgram(head)
+		if err != nil {
+			return nil, nil, err
+		}
+		execs := map[string]string{head: path}
+		tools := map[string]walltime.ToolIdentity{}
+		// The head is the program that ran; node and npm are the toolchain it
+		// ran on. All three are bound, deduplicated by name, because the same
+		// resolved path under two toolchains is two different observations.
+		for _, name := range dedupe([]string{head, "node", "npm"}) {
+			t, err := resolveTool(root, name)
+			if err != nil {
+				return nil, nil, err
+			}
+			tools[name] = t
+		}
+		return execs, tools, nil
 	}
-	if p, err := exec.LookPath(base[0]); err == nil {
-		out[base[0]] = p
-	} else {
-		out[base[0]] = "unresolved"
-	}
-	return out
 }
 
-// resolvedTools records the versions of the tools that produced the discovery
-// snapshot. An executable PATH says which file ran; a version says what it
-// was, and the same path on two runners can be two different toolchains.
-//
-// A tool that cannot be interrogated is recorded as unresolved rather than
-// omitted: "we could not tell" is a bound fact, and a missing key is not.
-func resolvedTools(root string) map[string]string {
-	out := map[string]string{}
-	for _, tool := range []struct {
-		name string
-		argv []string
-	}{
-		{"node", []string{"node", "--version"}},
-		{"npm", []string{"npm", "--version"}},
-	} {
-		cmd := exec.Command(tool.argv[0], tool.argv[1:]...)
-		cmd.Dir = root
-		b, err := cmd.Output()
+// resolveProgram finds the exact file a program name runs. `testbucket` names
+// THIS process: it is the program that took the snapshot, and asking PATH for
+// it would resolve whatever copy happens to be installed instead.
+func resolveProgram(name string) (string, error) {
+	if name == "testbucket" {
+		self, err := os.Executable()
 		if err != nil {
-			out[tool.name] = "unresolved"
+			return "", fmt.Errorf("resolve this executable: %w", err)
+		}
+		return self, nil
+	}
+	p, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w; a plan may not be derived from an unresolved program", name, err)
+	}
+	return p, nil
+}
+
+// resolveTool records what a tool IS: its resolved path, the version it
+// reports, and the SHA-256 of the exact bytes that reported it. A version
+// alone is a program's own account of itself, and two builds can tell the
+// same story.
+func resolveTool(root, name string) (walltime.ToolIdentity, error) {
+	path, err := resolveProgram(name)
+	if err != nil {
+		return walltime.ToolIdentity{}, err
+	}
+	integrity, err := walltime.FileDigest(path)
+	if err != nil {
+		return walltime.ToolIdentity{}, fmt.Errorf("digest %s at %s: %w", name, path, err)
+	}
+	version, err := toolVersion(root, name, path)
+	if err != nil {
+		return walltime.ToolIdentity{}, err
+	}
+	return walltime.ToolIdentity{Version: version, Path: path, Integrity: integrity}, nil
+}
+
+// toolVersion asks a tool what it is. This binary answers for itself rather
+// than re-executing: `wall bundle` is already running it, and a subprocess
+// would be a second, unbound observation of the same program.
+func toolVersion(root, name, path string) (string, error) {
+	if name == "testbucket" {
+		return version, nil
+	}
+	cmd := exec.Command(path, "--version")
+	cmd.Dir = root
+	b, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ask %s at %s for its version: %w", name, path, err)
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return "", fmt.Errorf("%s at %s reported an empty version", name, path)
+	}
+	return v, nil
+}
+
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range in {
+		if v == "" || seen[v] {
 			continue
 		}
-		out[tool.name] = strings.TrimSpace(string(b))
+		seen[v] = true
+		out = append(out, v)
 	}
 	return out
 }

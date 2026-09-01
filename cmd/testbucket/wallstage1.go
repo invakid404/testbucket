@@ -41,6 +41,9 @@ func runWallStage1(args []string) error {
 	sourceProfile := fs.String("source-profile", "", "source-profile receipt JSON (required): the resolved Vitest closure")
 	storeReceipt := fs.String("store-receipt", "", "store receipt JSON (required): the admitted store's exact bytes, migration epoch, restore method, stale instant, and the classification of every row — including observed_zero, which is not a gap")
 	scorerPath := fs.String("scorer", "", "frozen scorer whose sealed training lineage this manifest binds")
+	trainingSet := fs.String("training-set", "", "the EXACT signed training receipt set the scorer was fitted from (required). The manifest refits it and refuses a scorer whose coefficients did not come from it: a receipt-set digest nobody read is a citation, not a lineage")
+	var trainingKeys stringList
+	fs.Var(&trainingKeys, "training-authority-key", "a PREDECLARED public key (hex) allowed to seal the training receipt set; repeatable and required. It is separate from the campaign authority: the offline surface is sealed once, long before any campaign")
 	registryPath := fs.String("registry", "", "frozen Aeta component-registry template")
 	runnerImage := fs.String("runner-image", "", "immutable runner image identity, e.g. ubuntu-24.04@sha256:… — never an alias such as ubuntu-latest, which two arms could resolve differently")
 	consumerRepo := fs.String("consumer-repository", "", "consumer repository")
@@ -67,6 +70,7 @@ func runWallStage1(args []string) error {
 		"--release-sha":   *releaseSHA, "--binary": *binary,
 		"--build-attestation": *attestation, "--source-profile": *sourceProfile,
 		"--scorer": *scorerPath, "--registry": *registryPath,
+		"--training-set": *trainingSet,
 		"--runner-image": *runnerImage, "--consumer-repository": *consumerRepo,
 		"--consumer-commit": *consumerCommit, "--caller-workflow-sha": *workflowSHA,
 		"--downstream-ref": *downstreamRef,
@@ -131,16 +135,41 @@ func runWallStage1(args []string) error {
 	m.Consumer.Config = profile.Config
 	m.Consumer.Lockfile = profile.Lockfile
 
+	if len(trainingKeys) == 0 {
+		return fmt.Errorf("--training-authority-key is required: a training receipt set verified against whatever signed it accepts any self-generated key, and a lineage nobody can attribute is the claim that somebody, somewhere, ran the right procedure")
+	}
 	var sc walltime.Scorer
 	if err := walltime.ReadJSONFile(*scorerPath, &sc); err != nil {
 		return err
 	}
-	m.TrainingLineage = sc.Lineage
-	if d, err := sc.DigestOf(); err == nil {
-		// Bind the scorer by its own digest rather than by whatever the
-		// lineage claims, so a scorer whose lineage was edited cannot be
-		// bound under the identity it names.
-		m.TrainingLineage.ScorerDigest = d
+	var set walltime.TrainingReceiptSet
+	if err := walltime.ReadJSONFile(*trainingSet, &set); err != nil {
+		return err
+	}
+	// The lineage is DERIVED from the sealed set, not copied from the scorer's
+	// account of itself. Copying it is how a scorer nobody could attribute
+	// obtained a signed Stage-1 binding: the manifest repeated whatever the
+	// model claimed, and every later check compared that claim to itself.
+	setDigest, err := set.DigestOf()
+	if err != nil {
+		return err
+	}
+	scorerDigest, err := sc.DigestOf()
+	if err != nil {
+		return err
+	}
+	m.TrainingAuthorityKeys = trainingKeys
+	m.TrainingLineage = walltime.TrainingLineageID{
+		ReceiptSetDigest: setDigest, Cutoff: set.Cutoff, Epoch: set.Epoch,
+		ScorerID: sc.ID, ScorerDigest: scorerDigest,
+		Algorithm: set.Algorithm, Configuration: set.Configuration,
+		Seed: set.Seed, TieBreak: walltime.ScorerTieBreak,
+	}
+	// Refit HERE, before signing. A manifest that bound a scorer the sealed
+	// set does not produce would be authorising a model built from evidence
+	// nobody approved, and the campaign would discover it eighty rows later.
+	if problems := walltime.VerifyTrainingSurface(set, m.TrainingLineage, sc, trainingKeys); len(problems) > 0 {
+		return fmt.Errorf("the frozen scorer is not the one this sealed training set produces:\n  %s", strings.Join(problems, "\n  "))
 	}
 	var reg walltime.AetaRegistry
 	if err := walltime.ReadJSONFile(*registryPath, &reg); err != nil {
@@ -173,7 +202,7 @@ func runWallStage1(args []string) error {
 		ContainmentPolicy:  "dedicated cgroup-v2 subtree per level; membership not modifiable by the workload",
 		ChildAdmission:     "clone-into-cgroup before exec; no child starts before its peer's admission receipt",
 		EndpointOrder:      "physical <= peer <= trace <= trace <= peer <= physical, on fresh non-copied reads",
-		CancellationPolicy: "signal the containment, wait and reap, retain the incomplete receipt",
+		CancellationPolicy: walltime.CancellationPolicyID,
 		RawSourceTaxonomy: []string{
 			walltime.SourceContainment, walltime.SourceProcessLifecycle,
 			walltime.SourceReporter, walltime.SourceWrapper,

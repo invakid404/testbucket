@@ -295,7 +295,7 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	if terminal == "" {
 		terminal = TerminalPassed
 	}
-	if emptyErr := waitContainmentEmpty(cont, deadline); emptyErr != nil {
+	if emptyErr := enforceContainmentEmpty(cont, deadline); emptyErr != nil {
 		terminal, reason = TerminalCrashUnclosed, emptyErr.Error()
 	}
 	trace := &observerProc{producer: ProducerTrace, ctl: control{base: st.TraceControl},

@@ -45,6 +45,32 @@ type CampaignIndex struct {
 	Pairs       []CampaignPairRef `json:"pairs"`
 }
 
+// CampaignRelease is the IMMUTABLE delivery a campaign is being asked to
+// authorise: the exact commit the tag resolves to and the exact bytes of the
+// binary that will be published from it.
+//
+// It is supplied by the party doing the release, never read out of the
+// evidence. Without it a campaign proves only that some five pairs passed at
+// some tip: `LoadCampaign` required each arm's ReviewTip to equal its own
+// ReleaseRefSHA, which two arms of a historical campaign satisfy perfectly
+// while describing a commit that has nothing to do with the tag being cut. A
+// valid campaign committed at campaign/index.json could therefore authorise
+// every later release.
+//
+// Historical evidence stays auditable — nothing here deletes or rewrites it —
+// but it authorises exactly the delivery it was produced for.
+type CampaignRelease struct {
+	// SHA is the full 40-hex commit the release ref resolves to.
+	SHA string
+	// BinaryDigest is the SHA-256 of the exact binary asset being published.
+	// An empty digest is not "any binary": it is a missing identity, and the
+	// gate refuses it.
+	BinaryDigest Digest
+}
+
+// Bound reports whether an expected delivery was supplied at all.
+func (r CampaignRelease) Bound() bool { return strings.TrimSpace(r.SHA) != "" }
+
 // CampaignLoader reads the artifacts an index names. It is an interface so a
 // test can supply documents without a filesystem; production uses
 // FileCampaignLoader.
@@ -340,10 +366,14 @@ func checkArmClaims(where string, arm CampaignArm, run CampaignRun) []string {
 // population, then apply the frozen rule to it. A campaign that cannot be
 // authenticated does not reach the arithmetic, because a ratio over
 // unauthenticated rows answers a question nobody asked.
-func EvaluateCampaignIndex(index CampaignIndex, loader CampaignLoader, authorityKeys []string, authority string) ([]GateResult, []string) {
+func EvaluateCampaignIndex(index CampaignIndex, loader CampaignLoader, authorityKeys []string, authority string, release CampaignRelease) ([]GateResult, []string) {
 	pairs, problems := LoadCampaign(index, loader, authorityKeys, authority)
 	sort.Strings(problems)
 	if len(problems) > 0 {
+		// Authentication first, and alone. A campaign whose rows are not
+		// authenticated reports exactly that: reporting further gates
+		// alongside it — passing or failing — would invite reading one of them
+		// as a result over a population that does not exist.
 		return []GateResult{{
 			Name: "campaign:authenticated-population", Scope: ScopeCampaign,
 			Required: "every row an eligible verifier verdict, every arm an authorised Stage-1 manifest, every pair equal outside the allowed-difference matrix",
@@ -351,11 +381,85 @@ func EvaluateCampaignIndex(index CampaignIndex, loader CampaignLoader, authority
 			Detail:   strings.Join(problems, "; "),
 		}}, problems
 	}
+	binding := releaseBindingGate(index, loader, release)
 	authenticated := GateResult{
 		Name: "campaign:authenticated-population", Scope: ScopeCampaign,
 		Required: "every row an eligible verifier verdict, every arm an authorised Stage-1 manifest, every pair equal outside the allowed-difference matrix",
 		Observed: fmt.Sprintf("%d pair(s) authenticated", len(pairs)),
 		Pass:     true, Population: len(pairs),
 	}
-	return append([]GateResult{authenticated}, EvaluateCampaign(pairs)...), nil
+	return append([]GateResult{authenticated, binding}, EvaluateCampaign(pairs)...), nil
+}
+
+// releaseBindingGate decides whether this campaign authorises THIS delivery.
+//
+// It fails closed in both directions. With no expected release identity
+// supplied it does not pass: a campaign evaluated against no particular
+// delivery cannot authorise one, and treating "nothing was asked" as "anything
+// is allowed" is exactly how historical evidence came to authorise later tags.
+// With one supplied, every arm's reviewed tip, release ref and delivered
+// binary digest must be that delivery.
+func releaseBindingGate(index CampaignIndex, loader CampaignLoader, release CampaignRelease) GateResult {
+	g := GateResult{
+		Name: "campaign:release-binding", Scope: ScopeCampaign,
+		Required: "every pair's CANDIDATE arm reviewed, was released from, and delivered the exact commit and binary being published",
+	}
+	if !release.Bound() {
+		g.Observed = "no expected release identity was supplied"
+		g.Detail = "a campaign is evidence for the delivery it was produced for; without the tagged SHA and the exact built artifact this campaign cannot authorise any release"
+		return g
+	}
+	if err := requireFullSHA("the expected release SHA", release.SHA); err != nil {
+		g.Observed = release.SHA
+		g.Detail = err.Error()
+		return g
+	}
+	if strings.TrimSpace(string(release.BinaryDigest)) == "" {
+		g.Observed = release.SHA
+		g.Detail = "no digest was supplied for the binary being published; a campaign that bound a binary nobody compared authorises an asset it never saw"
+		return g
+	}
+	// The CANDIDATE arm is the delivery. A pair's baseline is the reference
+	// testbucket it was measured against, and a different source tip and
+	// binary there are the enumerated permitted difference the whole campaign
+	// exists to test — so requiring the baseline to be the released commit
+	// would refuse every genuine campaign.
+	var problems []string
+	arms := 0
+	for i, ref := range index.Pairs {
+		if strings.TrimSpace(ref.Candidate.Stage1Path) == "" {
+			continue
+		}
+		m, err := loader.Manifest(ref.Candidate.Stage1Path)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("pair %d candidate: %v", i, err))
+			continue
+		}
+		arms++
+		where := fmt.Sprintf("pair %d candidate", i)
+		if m.Source.ReleaseRefSHA != release.SHA {
+			problems = append(problems, fmt.Sprintf("%s was authorised for release ref %s, not the %s being released", where, m.Source.ReleaseRefSHA, release.SHA))
+		}
+		if m.Source.ReviewTip != release.SHA {
+			problems = append(problems, fmt.Sprintf("%s reviewed tip %s, not the %s being released", where, m.Source.ReviewTip, release.SHA))
+		}
+		if m.Source.BinaryDigest != release.BinaryDigest {
+			problems = append(problems, fmt.Sprintf("%s delivered binary %s, not the %s being published", where, m.Source.BinaryDigest, release.BinaryDigest))
+		}
+	}
+	if arms == 0 {
+		g.Observed = "no candidate arm named a Stage-1 manifest"
+		g.Detail = "there is nothing in this campaign to bind to the release"
+		return g
+	}
+	g.Population = arms
+	if len(problems) > 0 {
+		sort.Strings(problems)
+		g.Observed = fmt.Sprintf("%d candidate arm(s) bound to another delivery", len(problems))
+		g.Detail = strings.Join(problems, "; ")
+		return g
+	}
+	g.Observed = fmt.Sprintf("all %d arm(s) authorised %s", arms, release.SHA)
+	g.Pass = true
+	return g
 }

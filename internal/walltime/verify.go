@@ -213,6 +213,14 @@ type VerifyOptions struct {
 	// the projection is only checked against its own arithmetic, which a
 	// substituted allocation map satisfies.
 	ScorerPath string
+	// TrainingSetPath is the EXACT sealed training receipt set the scorer was
+	// fitted from. Without it the offline surface is checked only by its own
+	// digest — a string the scorer supplies about itself — so the run is
+	// ineligible rather than trusted. With it the verifier revalidates the
+	// set under the authority Stage 1 declared and REFITS the scorer, which is
+	// the only check that separates a model built from this evidence from one
+	// that merely cites it.
+	TrainingSetPath string
 	// Audit runs the exact-run coverage audit for the measured bucket. A nil
 	// Audit is not "no audit needed": it makes the row ineligible, because a
 	// row nobody audited cannot be shown to have run its plan.
@@ -266,6 +274,7 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 			break
 		}
 	}
+	verifyRunIdentity(v, recs)
 
 	bound := verifyStageBinding(v, opt, recs)
 	registry := loadRegistry(v, opt)
@@ -293,6 +302,78 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	// claim one of them.
 	v.Eligible = v.Complete && !v.has(SeverityIneligible) && allGatesPass(RowScope(v.Gates))
 	return v, nil
+}
+
+// verifyRunIdentity requires the REPEATED delivery identity to be the same on
+// every record.
+//
+// RunIdentity is written onto every line on purpose: a record has to be
+// attributable without trusting a file name or a directory layout. That only
+// works if the repetition is checked. The chain, the signatures and the
+// closing seal all check integrity — that nobody edited what was written — and
+// a stream whose trace records name a different run is perfectly intact by all
+// three: the writer signed it, the chain covers it, the seal fixes it. It is
+// simply not one measurement.
+//
+// The Stage-2 binding check next door is not this check. It compares one field
+// against one frozen document, so two streams could agree about which plan
+// they measured while disagreeing about which run, bucket, attempt, job or
+// step they belong to — which is exactly how a trace from another run gets
+// scored beside a physical envelope from this one.
+//
+// The identity is taken from the action boundary, because that is the record
+// the row's identity is defined by; with no action boundary the first record
+// establishes it, so a directory with no action level is still checked for
+// internal agreement rather than skipped.
+func verifyRunIdentity(v *Verdict, recs []Record) {
+	established, where := RunIdentity{}, ""
+	for _, r := range recs {
+		if r.Level == LevelAction && r.Kind == "boundary" {
+			established, where = r.Run, fmt.Sprintf("the %s/%s boundary", r.Producer, r.Level)
+			break
+		}
+	}
+	if where == "" {
+		established, where = recs[0].Run, fmt.Sprintf("the first %s/%s record", recs[0].Producer, recs[0].Level)
+	}
+	for _, r := range recs {
+		if diff := runIdentityDiff(established, r.Run); diff != "" {
+			v.add("WT-026", SeverityTerminal, fmt.Sprintf(
+				"%s/%s record %d repeats a different delivery identity than %s (%s); every record carries the full identity so that it can be attributed on its own, and two identities in one directory are two measurements",
+				r.Producer, r.Level, r.Seq, where, diff))
+			return
+		}
+	}
+}
+
+// runIdentityDiff names the FIRST field two identities disagree about, or "".
+// Every field is compared: a check that looked at three of them would accept a
+// record that agreed about the campaign and the run while naming another
+// attempt, job, step, plan or verifier.
+func runIdentityDiff(want, got RunIdentity) string {
+	for _, f := range []struct {
+		name      string
+		want, got string
+	}{
+		{"campaign_id", want.CampaignID, got.CampaignID},
+		{"run_id", want.RunID, got.RunID},
+		{"attempt_id", want.AttemptID, got.AttemptID},
+		{"bucket_id", want.BucketID, got.BucketID},
+		{"repository", want.Repository, got.Repository},
+		{"workflow_run", want.WorkflowRun, got.WorkflowRun},
+		{"job", want.Job, got.Job},
+		{"step", want.Step, got.Step},
+		{"step_attempt", want.StepAttempt, got.StepAttempt},
+		{"stage1_digest", string(want.Stage1), string(got.Stage1)},
+		{"stage2_digest", string(want.Stage2), string(got.Stage2)},
+		{"component_registry_digest", string(want.ComponentRegistry), string(got.ComponentRegistry)},
+		{"verifier_id", want.VerifierID, got.VerifierID},
+	} {
+		if f.want != f.got {
+			return fmt.Sprintf("%s is %q, not %q", f.name, f.got, f.want)
+		}
+	}
+	return ""
 }
 
 // add records a finding, collapsing an exact repeat. The same defect reached
@@ -911,6 +992,8 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 	if stage1 != nil {
 		bound.registry = stage1.Registry
 		bound.scorer = stage1.TrainingLineage.ScorerDigest
+		bound.lineage = stage1.TrainingLineage
+		bound.trainingKeys = stage1.TrainingAuthorityKeys
 	}
 	if stage2 != nil {
 		bound.membership = stage2.MembershipDigest
@@ -972,7 +1055,55 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 		bound.replaySigners = stage1.Instrumentation.ReplaySigners
 	}
 	verifyReplay(v, opt, stage1, stage2, bound)
+	verifyTrainingSurface(v, opt, stage1, bound)
 	return bound
+}
+
+// verifyTrainingSurface independently reproves the offline surface.
+//
+// The contract asks the verifier to prove the training set's
+// signature/hash/cutoff/exclusion/causal/topology lineage and to recompute the
+// frozen training and scorer identity as specified. None of that was happening:
+// verification checked that the scorer's receipt-set digest string was
+// non-empty, recomputed the runtime projections from the scorer, and stopped.
+// An independently written scorer could therefore claim any digest, obtain a
+// signed Stage-1 binding and allocate the entire campaign without the claimed
+// set's bytes ever being read.
+//
+// Absence is a refusal, not a skip: a set nobody supplied cannot be checked,
+// and a row whose allocation surface is unattributable is ineligible.
+func verifyTrainingSurface(v *Verdict, opt VerifyOptions, stage1 *Stage1Manifest, bound boundIdentities) {
+	if stage1 == nil {
+		return
+	}
+	if len(bound.trainingKeys) == 0 {
+		v.add("WT-027", SeverityIneligible,
+			"the Stage-1 manifest predeclares no training authority key, so the sealed training set would authenticate itself and any self-generated key could seal a lineage")
+		return
+	}
+	if opt.TrainingSetPath == "" {
+		v.add("WT-027", SeverityIneligible,
+			"no sealed training receipt set was supplied; the scorer's lineage is then a digest it states about itself, and its coefficients are attributable to no admissible evidence")
+		return
+	}
+	if opt.ScorerPath == "" {
+		v.add("WT-027", SeverityIneligible,
+			"no frozen scorer was supplied, so the sealed training set cannot be refitted and compared to the model that allocated this run")
+		return
+	}
+	var set TrainingReceiptSet
+	if err := ReadJSONFile(opt.TrainingSetPath, &set); err != nil {
+		v.add("WT-027", SeverityIneligible, fmt.Sprintf("sealed training receipt set: %v", err))
+		return
+	}
+	var sc Scorer
+	if err := ReadJSONFile(opt.ScorerPath, &sc); err != nil {
+		v.add("WT-027", SeverityIneligible, fmt.Sprintf("frozen scorer: %v", err))
+		return
+	}
+	for _, p := range VerifyTrainingSurface(set, bound.lineage, sc, bound.trainingKeys) {
+		v.add("WT-027", SeverityIneligible, "the training surface does not independently verify: "+p)
+	}
 }
 
 // verifyReplay requires an INDEPENDENT re-derivation of the plan.
@@ -1294,6 +1425,11 @@ type boundIdentities struct {
 	membership Digest
 	scorer     Digest
 	registry   Digest
+	// lineage is the whole training lineage Stage 1 bound, and trainingKeys
+	// the authority that may have sealed the set it names. Both are needed to
+	// reprove the offline surface rather than read its own account of itself.
+	lineage      TrainingLineageID
+	trainingKeys []string
 }
 
 func evaluateGates(v *Verdict, opt VerifyOptions, aeta *AetaInstance, bound boundIdentities) {

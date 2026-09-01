@@ -419,7 +419,6 @@ func runWallTrain(args []string) error {
 	fs := flag.NewFlagSet("wall train", flag.ExitOnError)
 	labels := fs.String("labels", "", "sealed training receipt set (required)")
 	id := fs.String("id", "", "identity to give the frozen scorer (required)")
-	lambda := fs.Float64("lambda", 0.01, "ridge regularisation; 0 is plain least squares")
 	out := fs.String("out", "", "write the frozen scorer here (required)")
 	sealKeys := fs.String("training-authority-key", "", "comma-separated PREDECLARED public keys allowed to seal a training receipt set (required): a lineage nobody can attribute is the claim that somebody ran the right procedure")
 	if err := fs.Parse(args); err != nil {
@@ -435,7 +434,10 @@ func runWallTrain(args []string) error {
 	if err := walltime.ReadJSONFile(*labels, &set); err != nil {
 		return err
 	}
-	scorer, err := walltime.TrainScorer(set, *id, *lambda, splitList(*sealKeys))
+	// The ridge lambda comes from the SEALED SET, not from a flag here: it
+	// decides the coefficients, and a verifier handed everything except the
+	// lambda could not refit the scorer to check it.
+	scorer, err := walltime.TrainScorer(set, *id, splitList(*sealKeys))
 	if err != nil {
 		return err
 	}
@@ -456,6 +458,9 @@ func runWallCampaign(args []string) error {
 	in := fs.String("in", "", "CALCULATOR ONLY: a JSON array of baseline/candidate pairs with durations already filled in. It exercises the arithmetic and can never pass, because nothing about those numbers is authenticated")
 	asJSON := fs.Bool("json", false, "write the gate results as JSON")
 	authority := fs.String("authority", "", "protected environment each arm's manifest must name. A key says WHO signed; this says WHICH environment approved")
+	releaseSHA := fs.String("release-sha", "", "the full 40-hex commit the release ref resolves to. A campaign is evidence for the delivery it was produced for, so the release-binding gate does not pass without it — and every arm's reviewed tip and release ref must be this commit")
+	releaseBinary := fs.String("release-binary", "", "path to the EXACT binary asset being published; its digest is computed here. Use this when the asset is in hand")
+	releaseBinaryDigest := fs.String("release-binary-digest", "", "SHA-256 of the exact binary asset being published, when the asset itself is not in hand — e.g. a release gate reading the digest its own immutable tagged tree declares. Exactly one of --release-binary and --release-binary-digest may be given")
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable and required with --index")
 	if err := fs.Parse(args); err != nil {
@@ -464,6 +469,20 @@ func runWallCampaign(args []string) error {
 	if (*index == "") == (*in == "") {
 		return fmt.Errorf("pass exactly one of --index (a campaign) or --in (the calculator)")
 	}
+	release := walltime.CampaignRelease{SHA: strings.TrimSpace(*releaseSHA)}
+	if strings.TrimSpace(*releaseBinary) != "" && strings.TrimSpace(*releaseBinaryDigest) != "" {
+		return fmt.Errorf("pass at most one of --release-binary and --release-binary-digest; two statements of the delivered artifact can disagree")
+	}
+	switch {
+	case strings.TrimSpace(*releaseBinary) != "":
+		d, err := walltime.FileDigest(*releaseBinary)
+		if err != nil {
+			return fmt.Errorf("digest the binary asset being released: %w", err)
+		}
+		release.BinaryDigest = d
+	case strings.TrimSpace(*releaseBinaryDigest) != "":
+		release.BinaryDigest = walltime.Digest(strings.TrimSpace(*releaseBinaryDigest))
+	}
 	var gates []walltime.GateResult
 	calculatorOnly := false
 	if *index != "" {
@@ -471,7 +490,7 @@ func runWallCampaign(args []string) error {
 		if err := walltime.ReadJSONFile(*index, &idx); err != nil {
 			return err
 		}
-		gates, _ = walltime.EvaluateCampaignIndex(idx, walltime.FileCampaignLoader{}, authorityKeys, *authority)
+		gates, _ = walltime.EvaluateCampaignIndex(idx, walltime.FileCampaignLoader{}, authorityKeys, *authority, release)
 	} else {
 		// The calculator path. It prints the arithmetic and ALWAYS fails: a
 		// number in a JSON file is not an observation, and the one thing this
@@ -533,6 +552,7 @@ func runWallVerify(args []string) error {
 	require := fs.String("require", "complete", "verdict this command exits non-zero below: complete (well-formed records) or eligible (scorable under every frozen ROW gate; the campaign-scope gates are decided by `wall campaign`)")
 	authority := fs.String("authority", "", "the protected environment the Stage-1 manifest must name")
 	scorer := fs.String("scorer", "", "the frozen scorer the Pcheck projection claims. Without it the projection is only checked against its own arithmetic, which a substituted allocation map satisfies")
+	trainingSet := fs.String("training-set", "", "the EXACT sealed training receipt set the scorer was fitted from. The verifier revalidates it under the training authority Stage 1 declared and REFITS the scorer: without it the model's lineage is a digest the model states about itself, and the row is ineligible")
 	shardPlan := fs.String("shard-plan", "", "the authorised plan artifact, for the exact-run coverage audit")
 	eventsDir := fs.String("events", "", "this bucket's runner events directory, for the exact-run coverage audit. Without --events and --shard-plan nothing checks that the measured script ran the work the plan gave it")
 	runnerKind := fs.String("runner", "go", "which adapter's event parser reads --events: go or vitest")
@@ -549,7 +569,8 @@ func runWallVerify(args []string) error {
 	v, err := walltime.VerifyDir(walltime.VerifyOptions{
 		Dir: *dir, Stage1Path: *stage1, Stage2Path: *stage2,
 		AetaPath: *aeta, PcheckPath: *pcheck, RegistryPath: *registry, ScorerPath: *scorer,
-		ReplayPath: *replay, InvocationsPath: *invocations, StepAttemptPath: *stepAttempt,
+		TrainingSetPath: *trainingSet,
+		ReplayPath:      *replay, InvocationsPath: *invocations, StepAttemptPath: *stepAttempt,
 		Audit:         coverageAudit(*shardPlan, *eventsDir, *runnerKind),
 		AuthorityKeys: authorityKeys, Authority: *authority, SignerKeys: recordSigners,
 	})

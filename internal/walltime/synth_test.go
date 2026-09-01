@@ -75,6 +75,13 @@ type synthRun struct {
 	// declares in the roster; everything below action level registers in the
 	// key log instead, because it is minted after the roster is sealed.
 	rosterKeys []RosterEntry
+	// rosterRun and sealRun edit the identity a SIDECAR repeats, leaving the
+	// records untouched. Both documents are still signed with the run key over
+	// their own digests, so what a test built this way isolates is the
+	// semantic invariant — the sidecar belongs to this measurement — rather
+	// than signature or chain integrity.
+	rosterRun func(*RunIdentity)
+	sealRun   func(*RunIdentity)
 }
 
 // RunSigner is the public half a Stage-1 manifest must declare for this run's
@@ -162,7 +169,11 @@ func (s *synthRun) write(t *testing.T, mutate mutation) {
 func (s *synthRun) attest(t *testing.T) {
 	t.Helper()
 	run := s.run()
-	roster := Roster{Kind: RosterKind, Run: run, Entries: s.rosterKeys}
+	rosterID := run
+	if s.rosterRun != nil {
+		s.rosterRun(&rosterID)
+	}
+	roster := Roster{Kind: RosterKind, Run: rosterID, Entries: s.rosterKeys}
 	if err := roster.Sign(run.CampaignID, s.runKey); err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +192,11 @@ func (s *synthRun) attest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	seal := Seal{Kind: SealKind, Run: run, RosterDigest: rd, KeyLogDigest: keyLog, Streams: streams}
+	sealID := run
+	if s.sealRun != nil {
+		s.sealRun(&sealID)
+	}
+	seal := Seal{Kind: SealKind, Run: sealID, RosterDigest: rd, KeyLogDigest: keyLog, Streams: streams}
 	if err := seal.Sign(run.CampaignID, s.runKey); err != nil {
 		t.Fatal(err)
 	}

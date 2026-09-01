@@ -60,6 +60,14 @@ jobs:
       # assembles its population from signed verdicts and exits non-zero unless
       # every frozen gate passes, so this delegates the decision to the same
       # code a validator runs rather than reimplementing it here.
+      #
+      # It is also bound to THIS release. The gate used to run the evaluator
+      # with no expected delivery at all, and the evaluator only asked each arm
+      # to agree with itself — so a valid campaign committed once at
+      # campaign/index.json authorised every later tag, and the binary built
+      # here was never compared to the one the campaign was measured with.
+      # `--release-sha` and `--release-binary` supply both, and the
+      # release-binding gate does not pass without them.
       - name: Refuse a release with no passing campaign
         env:
           # Path, inside the tagged tree, to the campaign index naming the
@@ -69,6 +77,19 @@ jobs:
           TB_CAMPAIGN_INDEX: campaign/index.json
           TB_CAMPAIGN_AUTHORITY: ewj2-campaign
           TB_CAMPAIGN_AUTHORITY_KEY: ${{ vars.TB_CAMPAIGN_AUTHORITY_KEY }}
+          # The immutable commit this tag resolves to. github.sha on a tag push
+          # is the tagged commit, and it is read here rather than derived from
+          # the tag NAME: a tag is descriptive metadata that can be moved, and
+          # a moved tag must not inherit another commit's evidence.
+          TB_RELEASE_SHA: ${{ github.sha }}
+          # The digest of the binary asset the campaign's candidate arms were
+          # actually delivered with, declared inside the tagged tree beside the
+          # index it belongs to. It is a committed, reviewed file rather than a
+          # repository variable so it is immutable at the tag, and rather than
+          # the digest of the binary built two lines below because that one is
+          # an ordinary `go build` of the gate's own tool, not the published
+          # release artifact.
+          TB_CAMPAIGN_BINARY_DIGEST_FILE: campaign/release-binary.sha256
         run: |
           set -euo pipefail
           if [ ! -f "$TB_CAMPAIGN_INDEX" ]; then
@@ -83,13 +104,28 @@ jobs:
             echo "A campaign verified against whatever signed it accepts any self-generated key." >&2
             exit 1
           fi
+          if [ ! -f "$TB_CAMPAIGN_BINARY_DIGEST_FILE" ]; then
+            echo "REFUSED: no delivered-binary digest at $TB_CAMPAIGN_BINARY_DIGEST_FILE." >&2
+            echo "A campaign that bound a binary nobody compared authorises an asset it never saw." >&2
+            exit 1
+          fi
+          TB_RELEASE_BINARY_DIGEST="$(tr -d ' \t\n\r' < "$TB_CAMPAIGN_BINARY_DIGEST_FILE")"
+          if [ -z "$TB_RELEASE_BINARY_DIGEST" ]; then
+            echo "REFUSED: $TB_CAMPAIGN_BINARY_DIGEST_FILE is empty." >&2
+            exit 1
+          fi
           go build -o "$RUNNER_TEMP/testbucket" ./cmd/testbucket
-          # Non-zero unless every frozen gate passes over the full population.
+          # Non-zero unless every frozen gate passes over the full population
+          # AND every candidate arm of that population reviewed, was released
+          # from, and delivered exactly this commit and this binary.
           "$RUNNER_TEMP/testbucket" wall campaign \
             --index "$TB_CAMPAIGN_INDEX" \
             --authority "$TB_CAMPAIGN_AUTHORITY" \
-            --authority-key "$TB_CAMPAIGN_AUTHORITY_KEY"
-          echo "campaign gate: the frozen decision rule passes over the retained population"
+            --authority-key "$TB_CAMPAIGN_AUTHORITY_KEY" \
+            --release-sha "$TB_RELEASE_SHA" \
+            --release-binary-digest "$TB_RELEASE_BINARY_DIGEST"
+          echo "campaign gate: the frozen decision rule passes over the retained population,"
+          echo "and that population authorises exactly $TB_RELEASE_SHA"
 
 
       - name: Run goreleaser

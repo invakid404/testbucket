@@ -23,8 +23,11 @@ type frozenDocs struct {
 	aeta     string
 	pcheck   string
 	replay   string
-	// scorer is the frozen model the Pcheck projection must re-derive from.
+	// scorer is the frozen model the Pcheck projection must re-derive from,
+	// and trainingSet is the sealed offline surface the verifier REFITS to
+	// prove the model came from it.
 	scorer      string
+	trainingSet string
 	invocations string
 	stepAttempt string
 	digest      Digest
@@ -229,13 +232,14 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 	}
 
 	docs := frozenDocs{
-		stage1:   filepath.Join(dir, "stage1.json"),
-		stage2:   filepath.Join(dir, "stage2.json"),
-		registry: filepath.Join(dir, "registry.json"),
-		aeta:     filepath.Join(dir, "aeta.json"),
-		pcheck:   filepath.Join(dir, "pcheck.json"),
-		replay:   filepath.Join(dir, "replay.json"),
-		scorer:   filepath.Join(dir, "scorer.json"),
+		stage1:      filepath.Join(dir, "stage1.json"),
+		stage2:      filepath.Join(dir, "stage2.json"),
+		registry:    filepath.Join(dir, "registry.json"),
+		aeta:        filepath.Join(dir, "aeta.json"),
+		pcheck:      filepath.Join(dir, "pcheck.json"),
+		replay:      filepath.Join(dir, "replay.json"),
+		scorer:      filepath.Join(dir, "scorer.json"),
+		trainingSet: filepath.Join(dir, "training-set.json"),
 		audit: func(bucket string) (*AuditEvidence, error) {
 			return &AuditEvidence{
 				Bucket: bucket, PlanDigest: receipt.PlanDigest,
@@ -251,6 +255,7 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 	for path, v := range map[string]any{
 		docs.stage1: m, docs.stage2: receipt, docs.registry: reg,
 		docs.aeta: aeta, docs.pcheck: pcheck, docs.replay: replay, docs.scorer: scorer,
+		docs.trainingSet: testTrainingSet(),
 		docs.invocations: manifest, docs.stepAttempt: step,
 	} {
 		if err := WriteJSONFile(path, v); err != nil {
@@ -258,6 +263,15 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 		}
 	}
 	return docs
+}
+
+// testTools is a complete tool closure: every entry has a version AND the
+// integrity of the bytes that reported it.
+func testTools(head string) map[string]ToolIdentity {
+	return map[string]ToolIdentity{
+		head:   {Version: "4.1.10", Path: "/repo/node_modules/.bin/" + head, Integrity: "sha256:head"},
+		"node": {Version: "24.19.0", Path: "/usr/bin/node", Integrity: "sha256:node"},
+	}
 }
 
 func testBundle() PlanningInputBundle {
@@ -268,7 +282,15 @@ func testBundle() PlanningInputBundle {
 		Precision: "1ns", TimeZone: "UTC", PermittedSources: []string{"stage1_bundle"},
 		StaleThreshold: "336h0m0s",
 	}
-	b.Discovery = []RawSnapshot{NewRawSnapshot("vitest-list", []string{"vitest", "list", "--filesOnly", "--json"}, "/repo", []byte(`[{"file":"/repo/t0.spec.ts"}]`))}
+	disc := NewRawSnapshot("vitest-list", []string{"vitest", "list", "--filesOnly", "--json"}, "/repo", []byte(`[{"file":"/repo/t0.spec.ts"}]`))
+	// The snapshot's OWN closure, for the argv it was taken by. A discovery
+	// listing with no bound environment or no resolved binary is not a frozen
+	// input, and the fixture must not be able to pass on evidence the
+	// contract refuses.
+	disc.Env = map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": "shared/f/lib/cases/"}
+	disc.Executables = map[string]string{"vitest": "/repo/node_modules/.bin/vitest"}
+	disc.Tools = testTools("vitest")
+	b.Discovery = []RawSnapshot{disc}
 	// A store whose BYTES match the receipt that describes them. It used to be
 	// an empty store beside a receipt claiming five classified rows, which is
 	// exactly the disagreement the receipt is now derived-checked for.
@@ -279,8 +301,8 @@ func testBundle() PlanningInputBundle {
 	b.Acquisition.Argv = []string{"testbucket", "wall", "bundle"}
 	b.Acquisition.Cwd = "/repo"
 	b.Acquisition.Env = map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": "shared/f/lib/cases/"}
-	b.Acquisition.Executables = map[string]string{"node": "/usr/bin/node"}
-	b.Acquisition.Tools = map[string]string{"node": "24.19.0"}
+	b.Acquisition.Executables = map[string]string{"testbucket": "/usr/local/bin/testbucket"}
+	b.Acquisition.Tools = testTools("testbucket")
 	b.Parsers = []ParserIdentity{{Name: "vitest-discovery", Version: "v0.2.2", Digest: "sha256:parser"}}
 	b.Algorithms.FullPlan = AlgorithmIdentity{Name: FullPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: "testbucket"}
 	b.Algorithms.SemanticPlan = AlgorithmIdentity{Name: SemanticPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: "testbucket"}
@@ -294,20 +316,105 @@ func testBundle() PlanningInputBundle {
 	return b
 }
 
-// testScorer is the frozen scorer the synthetic Pcheck came from; Stage 1
-// binds its digest through the training lineage.
-func testScorer() Scorer {
-	return Scorer{
-		Kind: ScorerKind, ID: "synthetic", Version: "1",
-		FeatureSchema: []string{"runnable_count"},
-		Coefficients:  map[string]float64{"runnable_count": 1},
-		Intercept:     1, Floor: 0.1,
-		Lineage: TrainingLineageID{
-			ReceiptSetDigest: "sha256:sealed", Cutoff: "2026-08-30T00:00:00Z",
-			Epoch: "vitest-4.1.10", ScorerID: "synthetic",
-			Algorithm: "ridge-least-squares", TieBreak: "unit_id_ascending",
+// testPnpmLock is a pnpm-lock.yaml v9 fragment in exactly the shape pnpm
+// writes. The receipt's declared closure is checked AGAINST it rather than
+// beside it, so the fixture has to name every Vitest-family package the lock
+// resolves — which is the property the check exists to enforce.
+const testPnpmLock = `lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+
+packages:
+
+  vitest@4.1.10:
+    resolution: {integrity: sha512-vitest}
+    engines: {node: ^20.0.0}
+
+  '@vitest/runner@4.1.10':
+    resolution: {integrity: sha512-runner}
+
+  '@vitest/expect@4.1.10(vite@7.0.0)':
+    resolution: {integrity: sha512-expect}
+
+  tinyrainbow@2.0.0:
+    resolution: {integrity: sha512-tinyrainbow}
+`
+
+const testFacade = "await import('vitest/node')\n"
+const testViteConfig = "export default { test: { fileParallelism: false } }\n"
+
+// testSourceProfile is the complete, lock-derivable source profile: the exact
+// façade, config and lockfile bytes, and a closure that is exactly what the
+// lockfile resolves.
+func testSourceProfile() SourceProfileReceipt {
+	lock := []byte(testPnpmLock)
+	return SourceProfileReceipt{
+		Repository: "example/mandel", Commit: testConsumerCommit,
+		Facade:      DigestBytes([]byte(testFacade)),
+		Config:      DigestBytes([]byte(testViteConfig)),
+		Lockfile:    DigestBytes(lock),
+		FacadeBytes: []byte(testFacade), ConfigBytes: []byte(testViteConfig), LockfileBytes: lock,
+		ParserID: ParserIdentity{Name: LockParserPNPM, Version: "9", Digest: "sha256:lockparser"},
+		Packages: map[string]string{
+			"vitest": RequiredVitest, "@vitest/runner": RequiredVitest, "@vitest/expect": RequiredVitest,
+		},
+		Integrities: map[string]string{
+			"vitest": "sha512-vitest", "@vitest/runner": "sha512-runner", "@vitest/expect": "sha512-expect",
 		},
 	}
+}
+
+// testTrainingAuthority is the party that sealed the fixture's offline
+// surface. It is separate from the campaign authority on purpose: the contract
+// seals the training set once, long before any campaign, and a verifier that
+// accepted the campaign's own key here would be letting the planner attest its
+// own model.
+var testTrainingAuthority = mustSigningKey()
+
+func testTrainingKeys() []string { return []string{PublicKeyOf(testTrainingAuthority)} }
+
+// testTrainingSet is the sealed offline surface the fixture's scorer is fitted
+// from. It carries real admissible labels — wrapper-qualified, pre-cutoff,
+// causally attributed, topology-validated — because the verifier now REFITS
+// it, and a set of invented rows would not produce the model beside it.
+func testTrainingSet() TrainingReceiptSet {
+	label := func(id string, runnables float64, ns int64) TrainingLabel {
+		return TrainingLabel{
+			ReceiptID: id, UnitID: id, Provenance: LabelProvenance,
+			ReceiptHash: Digest("sha256:" + id), SelectedWorkDigest: Digest("sha256:work-" + id),
+			TopologyReceipt: Digest("sha256:topology-" + id),
+			ObservedAt:      "2026-08-01T00:00:00Z", ObservedNs: ns,
+			Features: []Feature{{Name: "runnable_count", Value: runnables, Provenance: ProvRunnableSnapshot}},
+		}
+	}
+	set := TrainingReceiptSet{
+		Kind: TrainingSetKind, Epoch: "vitest-4.1.10", Cutoff: "2026-08-30T00:00:00Z",
+		FeatureSchema: []string{"runnable_count"},
+		Algorithm:     "ridge-least-squares", Configuration: "lambda=0.01", Lambda: 0.01, Seed: 1,
+		Labels: []TrainingLabel{
+			label("h1", 1, 2*int64(second)),
+			label("h2", 2, 3*int64(second)),
+			label("h3", 3, 4*int64(second)),
+			label("h4", 4, 5*int64(second)),
+		},
+	}
+	if err := set.Seal("ewj2-training", testTrainingAuthority); err != nil {
+		panic(err)
+	}
+	return set
+}
+
+// testScorer is the frozen scorer the synthetic Pcheck came from; Stage 1
+// binds its digest through the training lineage. It is FITTED rather than
+// written out, so the fixture exercises the same recomputation the verifier
+// performs instead of a model nobody could reproduce.
+func testScorer() Scorer {
+	sc, err := TrainScorer(testTrainingSet(), "synthetic", testTrainingKeys())
+	if err != nil {
+		panic(err)
+	}
+	return *sc
 }
 
 // testTip and testConsumerCommit are FULL commit SHAs, because that is what
@@ -338,9 +445,10 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	m.Consumer.WorkflowSHA = testWorkflowSHA
 	m.Consumer.DownstreamRef = "refs/heads/main@" + testConsumerCommit
 	m.Consumer.RunnerImage = "ubuntu-24.04@sha256:" + strings.Repeat("cd", 32)
-	m.Consumer.Facade = "sha256:facade"
-	m.Consumer.Config = "sha256:config"
-	m.Consumer.Lockfile = "sha256:lock"
+	profile := testSourceProfile()
+	m.Consumer.Facade = profile.Facade
+	m.Consumer.Config = profile.Config
+	m.Consumer.Lockfile = profile.Lockfile
 	m.Store = StoreReceipt{
 		Digest: b.Store.Digest, Schema: 1, MigrationID: "store/v1", Token: "vitest",
 		CacheKey: "testbucket-timings-demo-v1", RestoreMethod: "exact-key",
@@ -352,18 +460,12 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 		Rows:     5,
 		Coverage: []string{"tests/alpha.spec.ts"},
 	}
-	m.SourceProfile = SourceProfileReceipt{
-		Repository: "example/mandel", Commit: testConsumerCommit, Facade: "sha256:facade",
-		Config: "sha256:config", Lockfile: "sha256:lock",
-		ParserID:    ParserIdentity{Name: "pnpm-lock", Version: "9", Digest: "sha256:lockparser"},
-		Packages:    map[string]string{"vitest": RequiredVitest, "@vitest/runner": RequiredVitest},
-		Integrities: map[string]string{"vitest": "sha512-a", "@vitest/runner": "sha512-b"},
-	}
+	m.SourceProfile = testSourceProfile()
 	m.Instrumentation = InstrumentationIdentity{
 		Schema: SchemaVersion, PhysicalBinary: synthBinary, PeerBinary: synthBinary,
 		TraceBinary: synthBinary, VerifierBinary: synthBinary,
 		ContainmentPolicy: "cgroup2-dedicated-subtree", ChildAdmission: "clone-into-cgroup",
-		EndpointOrder: "physical<=peer<=trace", CancellationPolicy: "signal-containment-wait-reap",
+		EndpointOrder: "physical<=peer<=trace", CancellationPolicy: CancellationPolicyID,
 		RawSourceTaxonomy: []string{SourceContainment, SourceProcessLifecycle, SourceReporter, SourceWrapper},
 	}
 	m.AllowedDifferences = []string{"testbucket source/action/binary tuple"}
@@ -373,6 +475,7 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	if d, err := sc.DigestOf(); err == nil {
 		m.TrainingLineage.ScorerDigest = d
 	}
+	m.TrainingAuthorityKeys = testTrainingKeys()
 	return m
 }
 
@@ -441,7 +544,8 @@ func verifySynth(t *testing.T, mutate mutation, tweak func(*synthRun)) *Verdict 
 	s.write(t, mutate)
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		ScorerPath: docs.scorer, TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 		StepAttemptPath: docs.stepAttempt,
 		AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -802,7 +906,8 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			}
 			opts := VerifyOptions{
 				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+				TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -842,7 +947,8 @@ func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
 	})
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+		TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 		StepAttemptPath: docs.stepAttempt,
 		AuthorityKeys:   []string{docs.authority},
@@ -953,6 +1059,225 @@ func TestStage1BindsEveryRequiredIdentity(t *testing.T) {
 	}
 }
 
+// TestTheTrainingSurfaceIsIndependentlyReproved is the F5 regression.
+//
+// The offline constructor was already strong: signature, cutoff, exclusions,
+// causal attribution, topology, uniqueness, schema. All of it was thrown away
+// after `wall train`. What reached Stage 1 and verification was a scorer
+// carrying a receipt-set digest string, and the only thing ever checked about
+// it was that the string was not empty — so an independently written scorer
+// could claim any sealed set and allocate the whole campaign.
+//
+// Each case below is the accepted run with the offline surface falsified in
+// one way. Every one of them scored before.
+func TestTheTrainingSurfaceIsIndependentlyReproved(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*VerifyOptions, *testing.T, string)
+		want string
+	}{
+		{"no sealed set at all", func(o *VerifyOptions, t *testing.T, dir string) {
+			o.TrainingSetPath = ""
+		}, "no sealed training receipt set was supplied"},
+		{"a set sealed by nobody", func(o *VerifyOptions, t *testing.T, dir string) {
+			set := testTrainingSet()
+			set.Signature = nil
+			o.TrainingSetPath = writeDoc(t, dir, "unsigned-set.json", set)
+		}, "unsigned"},
+		{"a set sealed by a key the authority did not declare", func(o *VerifyOptions, t *testing.T, dir string) {
+			set := testTrainingSet()
+			if err := set.Seal("ewj2-training", mustSigningKey()); err != nil {
+				t.Fatal(err)
+			}
+			o.TrainingSetPath = writeDoc(t, dir, "foreign-set.json", set)
+		}, "signature"},
+		{"a set the scorer does not name", func(o *VerifyOptions, t *testing.T, dir string) {
+			set := testTrainingSet()
+			// One extra admissible label: a different sealed set, sealed by
+			// the same authority, that the bound lineage does not name.
+			set.Labels = append(set.Labels, TrainingLabel{
+				ReceiptID: "h9", UnitID: "h9", Provenance: LabelProvenance,
+				ReceiptHash: "sha256:h9", SelectedWorkDigest: "sha256:work-h9",
+				TopologyReceipt: "sha256:topology-h9",
+				ObservedAt:      "2026-08-02T00:00:00Z", ObservedNs: 6 * int64(second),
+				Features: []Feature{{Name: "runnable_count", Value: 5, Provenance: ProvRunnableSnapshot}},
+			})
+			if err := set.Seal("ewj2-training", testTrainingAuthority); err != nil {
+				t.Fatal(err)
+			}
+			o.TrainingSetPath = writeDoc(t, dir, "other-set.json", set)
+		}, "digests to"},
+		{"a scorer whose coefficients the set does not produce", func(o *VerifyOptions, t *testing.T, dir string) {
+			sc := testScorer()
+			sc.Coefficients["runnable_count"] += 5
+			o.ScorerPath = writeDoc(t, dir, "tampered-scorer.json", sc)
+		}, "did not come from the set it names"},
+		{"a scorer with a fabricated intercept", func(o *VerifyOptions, t *testing.T, dir string) {
+			sc := testScorer()
+			sc.Intercept += 1
+			o.ScorerPath = writeDoc(t, dir, "intercept-scorer.json", sc)
+		}, "intercept"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := newSynthRun(filepath.Join(dir, "records"))
+			docs := writeFrozenDocs(t, dir, s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+			opt := VerifyOptions{
+				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+				ScorerPath: docs.scorer, TrainingSetPath: docs.trainingSet, Audit: docs.audit,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			}
+			tc.edit(&opt, t, dir)
+			v, err := VerifyDir(opt)
+			if err != nil {
+				t.Fatalf("VerifyDir: %v", err)
+			}
+			if v.Eligible {
+				t.Fatalf("a row allocated by an unverifiable training surface was scored (%s)", tc.name)
+			}
+			found := ""
+			for _, f := range v.Findings {
+				if f.Code == "WT-027" {
+					found += f.Detail + "\n"
+				}
+			}
+			if found == "" {
+				t.Fatalf("no WT-027 finding; got %v", v.Findings)
+			}
+			if !strings.Contains(found, tc.want) {
+				t.Errorf("no WT-027 finding mentions %q:\n%s", tc.want, found)
+			}
+		})
+	}
+}
+
+// TestAVerifiedTrainingSurfaceLeavesTheRowScorable is the positive control for
+// the check above: the real sealed set, refitted, must produce no finding at
+// all. Without this the test beside it would pass just as happily if the
+// verifier refused every run.
+func TestAVerifiedTrainingSurfaceLeavesTheRowScorable(t *testing.T) {
+	v := verifySynth(t, nil, nil)
+	if hasFinding(v, "WT-027") {
+		t.Errorf("the genuine sealed training surface did not verify: %v", v.Findings)
+	}
+	if !v.Eligible {
+		t.Errorf("Eligible = false on a fully bound run: %v", v.Findings)
+	}
+}
+
+// TestStage1RefusesAScorerItsSealedSetDoesNotProduce: the manifest refits
+// before signing, so a scorer built from other evidence never obtains a
+// signed Stage-1 binding in the first place.
+func TestStage1RefusesAScorerItsSealedSetDoesNotProduce(t *testing.T) {
+	set := testTrainingSet()
+	sc := testScorer()
+	sc.Coefficients["runnable_count"] += 3
+	lineage := sc.Lineage
+	if d, err := sc.DigestOf(); err == nil {
+		lineage.ScorerDigest = d
+	}
+	problems := VerifyTrainingSurface(set, lineage, sc, testTrainingKeys())
+	if len(problems) == 0 {
+		t.Fatal("a scorer the sealed set does not produce passed the refit")
+	}
+	// And the genuine pair passes, so the check is not simply always failing.
+	good := testScorer()
+	goodLineage := good.Lineage
+	if d, err := good.DigestOf(); err == nil {
+		goodLineage.ScorerDigest = d
+	}
+	if p := VerifyTrainingSurface(set, goodLineage, good, testTrainingKeys()); len(p) > 0 {
+		t.Errorf("the genuine scorer failed its own refit: %v", p)
+	}
+}
+
+// writeDoc writes one JSON document into dir and returns its path.
+func writeDoc(t *testing.T, dir, name string, v any) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := WriteJSONFile(path, v); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// hasFinding reports whether the verdict carries a finding with this code.
+func hasFinding(v *Verdict, code string) bool {
+	for _, f := range v.Findings {
+		if f.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+// TestMixedRepeatedRunIdentityIsRefused is the F2 regression.
+//
+// Each case takes the accepted synthetic run and changes ONE field of the
+// repeated identity on one producer's stream, then lets the production writer
+// sign it, chain it, register its key and seal it. Nothing is tampered with:
+// every signature verifies, every hash chain closes, and the closing run-key
+// seal covers the exact bytes on disk. What is wrong is semantic — two
+// identities in one directory are two measurements — and before this the
+// verifier scored them as one.
+func TestMixedRepeatedRunIdentityIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*RunIdentity)
+	}{
+		{"a different run", func(r *RunIdentity) { r.RunID = "different-run" }},
+		{"a different attempt", func(r *RunIdentity) { r.AttemptID = "2" }},
+		{"a different bucket", func(r *RunIdentity) { r.BucketID = "bucket-2" }},
+		{"a different job", func(r *RunIdentity) { r.Job = "other-job" }},
+		{"a different step attempt", func(r *RunIdentity) { r.StepAttempt = "7" }},
+		{"a different workflow run", func(r *RunIdentity) { r.WorkflowRun = "run-2" }},
+		{"a different Stage-1 manifest", func(r *RunIdentity) { r.Stage1 = Digest("sha256:" + strings.Repeat("9", 64)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := verifySynth(t, func(level Level, seq int, producer Producer, boundary string, r *Record) {
+				if level == LevelScript && producer == ProducerTrace {
+					tc.edit(&r.Run)
+				}
+			}, nil)
+			if v.Eligible {
+				t.Fatal("the verifier scored a sealed stream carrying a different repeated run identity")
+			}
+			if !hasFinding(v, "WT-026") {
+				t.Errorf("no WT-026 finding; got %v", v.Findings)
+			}
+		})
+	}
+}
+
+// TestTheRosterAndSealMustNameTheMeasuredRun: the sidecars repeat the same
+// identity, and a sidecar for another run decides the signer set — or fixes
+// the stream bytes — of a measurement it does not belong to.
+func TestTheRosterAndSealMustNameTheMeasuredRun(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		tweak func(*synthRun)
+	}{
+		{"a roster for another job", func(s *synthRun) { s.rosterRun = func(r *RunIdentity) { r.Job = "other-job" } }},
+		{"a seal for another attempt", func(s *synthRun) { s.sealRun = func(r *RunIdentity) { r.AttemptID = "2" } }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := verifySynth(t, nil, tc.tweak)
+			if v.Eligible {
+				t.Fatal("the verifier scored a run whose sidecar names a different delivery identity")
+			}
+			if !hasFinding(v, "WT-023") {
+				t.Errorf("no WT-023 finding; got %v", v.Findings)
+			}
+		})
+	}
+}
+
 // TestBundleBindsItsAcquisitionClosure: a bundle that names no tree, no argv
 // and no resolved executables cannot say what reproducing its inputs would
 // take, which is the whole reason it exists.
@@ -964,9 +1289,9 @@ func TestBundleBindsItsAcquisitionClosure(t *testing.T) {
 	}{
 		{"no source tree", func(b *PlanningInputBundle) { b.Source.Tree = "" }, "source tree"},
 		{"an abbreviated source commit", func(b *PlanningInputBundle) { b.Source.Commit = "d9ae1d43" }, "source commit"},
-		{"no acquisition argv", func(b *PlanningInputBundle) { b.Acquisition.Argv = nil }, "acquisition argv"},
+		{"no acquisition argv", func(b *PlanningInputBundle) { b.Acquisition.Argv = nil }, "does not record how it was acquired"},
 		{"no resolved executable", func(b *PlanningInputBundle) { b.Acquisition.Executables = nil }, "resolved executable"},
-		{"an unbound environment", func(b *PlanningInputBundle) { b.Acquisition.Env = nil }, "environment is unbound"},
+		{"an unbound environment", func(b *PlanningInputBundle) { b.Acquisition.Env = nil }, "does not record how it was acquired"},
 		{"no comparability token", func(b *PlanningInputBundle) { b.Selection.Token = "" }, "comparability token"},
 		{"no tie-break order", func(b *PlanningInputBundle) { b.Selection.TieBreak = "" }, "tie-break"},
 		{"K of zero", func(b *PlanningInputBundle) { b.Selection.K = 0 }, "K is 0"},
@@ -985,6 +1310,106 @@ func TestBundleBindsItsAcquisitionClosure(t *testing.T) {
 			err := b.Validate()
 			if err == nil {
 				t.Fatalf("the bundle validated")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestEverySnapshotBindsTheClosureOfItsOwnArgv is the F1/F6 regression.
+//
+// Each frozen listing must bind the exact argv, cwd, planning-relevant
+// environment, resolved executable path, and complete tool/version/integrity
+// closure THAT LISTING was taken by. Before this the discovery snapshot was
+// checked for name, argv and cwd only: a snapshot with no environment
+// validated, and the resolved-executable map — which lived on the bundle, not
+// on the snapshot — could describe a program that had not run, or say
+// `unresolved` and still be planned on.
+//
+// Every case below is an accepted bundle with exactly one clause of that
+// closure removed or falsified. All of them used to validate.
+func TestEverySnapshotBindsTheClosureOfItsOwnArgv(t *testing.T) {
+	// withRunnable adds an otherwise-complete runnable listing, so the
+	// runnable cases start from a bundle the validator accepts.
+	withRunnable := func(b *PlanningInputBundle, edit func(*RunnableSnapshot)) {
+		raw := []byte(`[{"name":"a","file":"x.spec.ts"}]`)
+		r := RunnableSnapshot{
+			TargetID: "x.spec.ts", Argv: []string{"vitest", "list", "x.spec.ts", "--json"},
+			Cwd: "/repo", Env: map[string]string{},
+			Executables: map[string]string{"vitest": "/repo/node_modules/.bin/vitest"},
+			Tools:       testTools("vitest"),
+			Names:       []string{"a"}, Bytes: raw, Digest: DigestBytes(raw),
+		}
+		edit(&r)
+		b.Runnables = []RunnableSnapshot{r}
+		b.AbsentInputs = nil
+	}
+	cases := []struct {
+		name string
+		edit func(*PlanningInputBundle)
+		want string
+	}{
+		{"a discovery snapshot with no environment", func(b *PlanningInputBundle) {
+			b.Discovery[0].Env = nil
+		}, "does not record how it was acquired"},
+		{"a discovery snapshot with no resolved executable", func(b *PlanningInputBundle) {
+			b.Discovery[0].Executables = nil
+		}, "binds no resolved executable path"},
+		{"a discovery closure that resolves another program", func(b *PlanningInputBundle) {
+			b.Discovery[0].Executables = map[string]string{"npx": "/usr/local/bin/npx"}
+		}, "did not run"},
+		{"a discovery executable that resolved to nothing", func(b *PlanningInputBundle) {
+			b.Discovery[0].Executables = map[string]string{"vitest": ""}
+		}, "resolves executable"},
+		{"a discovery executable recorded as unresolved", func(b *PlanningInputBundle) {
+			b.Discovery[0].Executables = map[string]string{"vitest": Unresolved}
+		}, "could not resolve executable"},
+		{"a discovery snapshot with no tool closure", func(b *PlanningInputBundle) {
+			b.Discovery[0].Tools = nil
+		}, "binds no tool version"},
+		{"a discovery tool with no integrity", func(b *PlanningInputBundle) {
+			b.Discovery[0].Tools = map[string]ToolIdentity{"node": {Version: "24.19.0"}}
+		}, "no version or integrity"},
+		{"a discovery tool with no version", func(b *PlanningInputBundle) {
+			b.Discovery[0].Tools = map[string]ToolIdentity{"node": {Integrity: "sha256:node"}}
+		}, "no version or integrity"},
+		{"a discovery tool recorded as unresolved", func(b *PlanningInputBundle) {
+			b.Discovery[0].Tools = map[string]ToolIdentity{"node": {Version: Unresolved, Integrity: "sha256:node"}}
+		}, "could not resolve tool"},
+		{"a runnable listing with no environment", func(b *PlanningInputBundle) {
+			withRunnable(b, func(r *RunnableSnapshot) { r.Env = nil })
+		}, "does not record how it was acquired"},
+		{"a runnable closure that resolves another program", func(b *PlanningInputBundle) {
+			withRunnable(b, func(r *RunnableSnapshot) {
+				r.Executables = map[string]string{"npx": "/usr/local/bin/npx"}
+			})
+		}, "did not run"},
+		{"a runnable tool recorded as unresolved", func(b *PlanningInputBundle) {
+			withRunnable(b, func(r *RunnableSnapshot) {
+				r.Tools = map[string]ToolIdentity{"vitest": {Version: "4.1.10", Integrity: Unresolved}}
+			})
+		}, "could not resolve tool"},
+		{"an acquisition closure that resolves another program", func(b *PlanningInputBundle) {
+			b.Acquisition.Executables = map[string]string{"npx": "/usr/local/bin/npx"}
+		}, "did not run"},
+		{"an acquisition tool with no integrity", func(b *PlanningInputBundle) {
+			b.Acquisition.Tools = map[string]ToolIdentity{"testbucket": {Version: "0.2.2"}}
+		}, "no version or integrity"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testBundle()
+			// The starting point must be accepted, or the case below proves
+			// nothing about the clause it removed.
+			if err := b.Validate(); err != nil {
+				t.Fatalf("the unedited fixture does not validate: %v", err)
+			}
+			tc.edit(&b)
+			err := b.Validate()
+			if err == nil {
+				t.Fatalf("the bundle validated with %s", tc.name)
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
@@ -1318,7 +1743,8 @@ func TestStepAttemptIsIdentityNotAGate(t *testing.T) {
 
 	opts := VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+		TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 		StepAttemptPath: docs.stepAttempt,
 		AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -1492,7 +1918,8 @@ func TestProducerBinaryIsExactNotAPrefix(t *testing.T) {
 			s.write(t, nil)
 			v, err := VerifyDir(VerifyOptions{
 				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+				TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -1683,7 +2110,8 @@ func TestForgedEvidenceIsRefused(t *testing.T) {
 
 			v, err := VerifyDir(VerifyOptions{
 				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+				TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -1873,7 +2301,8 @@ func TestPerBucketDocumentsAreBoundToTheMeasuredBucket(t *testing.T) {
 
 			v, err := VerifyDir(VerifyOptions{
 				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+				TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -2026,7 +2455,8 @@ func TestTheStepDiagnosticNeverDecidesEligibility(t *testing.T) {
 			v, err := VerifyDir(VerifyOptions{
 				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 				RegistryPath: docs.registry, AetaPath: docs.aeta,
-				PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+				TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -2109,7 +2539,8 @@ func TestDerivedDocumentsMustBeBoundToStageTwo(t *testing.T) {
 			v, err := VerifyDir(VerifyOptions{
 				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 				RegistryPath: docs.registry, AetaPath: docs.aeta,
-				PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+				TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -2143,7 +2574,8 @@ func TestDerivedDocumentsMustBeBoundToStageTwo(t *testing.T) {
 		v, err := VerifyDir(VerifyOptions{
 			Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 			RegistryPath: docs.registry, AetaPath: docs.aeta,
-			PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+			PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+			TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 			ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 			StepAttemptPath: docs.stepAttempt,
 			AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -2312,7 +2744,8 @@ func TestAPlanMustHaveBeenAuthorisedBeforeItExisted(t *testing.T) {
 			v, err := VerifyDir(VerifyOptions{
 				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 				RegistryPath: docs.registry, AetaPath: docs.aeta,
-				PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+				TrainingSetPath: docs.trainingSet, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",

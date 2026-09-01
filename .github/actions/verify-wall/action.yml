@@ -106,6 +106,15 @@ inputs:
       arithmetic, which an allocation map no model produced satisfies
       perfectly.
     default: ""
+  training-set-file:
+    description: >-
+      The EXACT sealed training receipt set the scorer was fitted from. The
+      verifier revalidates it under the training authority the Stage-1 manifest
+      predeclares and REFITS the scorer from it, so a model whose coefficients
+      did not come from this evidence is refused. Without it the scorer's
+      lineage is a digest the scorer states about itself, and the row is
+      ineligible — which is the correct answer, not a gap to paper over.
+    default: ""
   shard-plan-file:
     description: >-
       The authorised plan artifact, for the exact-run coverage audit. With
@@ -155,6 +164,7 @@ runs:
         TB_INVOCATIONS_FILE: ${{ inputs.invocations-file }}
         TB_STEP_ATTEMPT_FILE: ${{ inputs.step-attempt-file }}
         TB_SCORER_FILE: ${{ inputs.scorer-file }}
+        TB_TRAINING_SET_FILE: ${{ inputs.training-set-file }}
         TB_SHARD_PLAN_FILE: ${{ inputs.shard-plan-file }}
         TB_EVENTS_DIR: ${{ inputs.events-dir }}
         TB_RUNNER: ${{ inputs.runner }}
@@ -179,6 +189,7 @@ runs:
         if [ -n "$TB_INVOCATIONS_FILE" ]; then args+=(--invocations "$TB_INVOCATIONS_FILE"); fi
         if [ -n "$TB_STEP_ATTEMPT_FILE" ]; then args+=(--step-attempt "$TB_STEP_ATTEMPT_FILE"); fi
         if [ -n "$TB_SCORER_FILE" ]; then args+=(--scorer "$TB_SCORER_FILE"); fi
+        if [ -n "$TB_TRAINING_SET_FILE" ]; then args+=(--training-set "$TB_TRAINING_SET_FILE"); fi
         if [ -n "$TB_SHARD_PLAN_FILE" ]; then args+=(--shard-plan "$TB_SHARD_PLAN_FILE"); fi
         if [ -n "$TB_EVENTS_DIR" ]; then args+=(--events "$TB_EVENTS_DIR" --runner "$TB_RUNNER"); fi
         if [ -n "$TB_AUTHORITY" ]; then args+=(--authority "$TB_AUTHORITY"); fi

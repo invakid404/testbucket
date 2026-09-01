@@ -20,7 +20,13 @@ const (
 	Stage1Kind = "tb.walltime.stage1/v1"
 	Stage2Kind = "tb.walltime.stage2/v1"
 	// BundleKind is the versioned planning-input bundle inside Stage 1.
-	BundleKind = "tb.walltime.planning-input-bundle/v1"
+	//
+	// v2 is an INCOMPATIBLE schema change from v1: every snapshot now binds
+	// its own resolved-executable and tool closure, and a tool is a version
+	// plus an integrity rather than a bare string. A v1 bundle cannot be read
+	// as a v2 one — it would present an unbound closure as a satisfied
+	// schema — so the kind is bumped rather than widened in place.
+	BundleKind = "tb.walltime.planning-input-bundle/v2"
 )
 
 // AlgorithmIdentity names a versioned algorithm and the implementation that
@@ -30,6 +36,23 @@ type AlgorithmIdentity struct {
 	Name           string `json:"name"`
 	Canonicalizer  string `json:"canonicalizer"`
 	Implementation string `json:"implementation"`
+}
+
+// Unresolved is the literal a resolver used to write when it could not find
+// the thing it was asked about. It is retained as a NAMED value so the
+// validator can refuse it: "we could not tell" is a bound fact only while
+// something refuses to plan on it, and a closure whose entries all say
+// `unresolved` is indistinguishable from no closure at all.
+const Unresolved = "unresolved"
+
+// ToolIdentity is one tool in an acquisition closure. A version alone says
+// what a program CALLED itself; the integrity says which bytes said it, so the
+// same reported version on two runners is still two checkable facts rather
+// than one claim repeated.
+type ToolIdentity struct {
+	Version   string `json:"version"`
+	Path      string `json:"path,omitempty"`
+	Integrity Digest `json:"integrity"`
 }
 
 // RawSnapshot is one byte-exact frozen input. Bytes are carried INLINE (base64
@@ -43,6 +66,13 @@ type RawSnapshot struct {
 	Argv []string          `json:"argv,omitempty"`
 	Cwd  string            `json:"cwd,omitempty"`
 	Env  map[string]string `json:"env,omitempty"`
+	// Executables and Tools are THIS snapshot's own resolved closure, for the
+	// argv above. They used to live only on the bundle, where one closure
+	// described every snapshot: a discovery command that was overridden then
+	// carried the resolution of a program that had not run, which is a
+	// provenance record naming the wrong binary.
+	Executables map[string]string       `json:"executables,omitempty"`
+	Tools       map[string]ToolIdentity `json:"tools,omitempty"`
 	// Empty is explicit: "this input is absent" is a bound fact, not a
 	// missing field that a later reader may fill in.
 	Empty  bool   `json:"empty"`
@@ -64,13 +94,17 @@ type RunnableSnapshot struct {
 	// taken from a different directory or under a different environment is a
 	// different observation, and the bundle's promise is that a replay could
 	// say what taking it again would require.
-	Argv   []string          `json:"argv"`
-	Cwd    string            `json:"cwd"`
-	Env    map[string]string `json:"env"`
-	Names  []string          `json:"names"`
-	Empty  bool              `json:"empty"`
-	Bytes  []byte            `json:"bytes,omitempty"`
-	Digest Digest            `json:"digest"`
+	Argv []string          `json:"argv"`
+	Cwd  string            `json:"cwd"`
+	Env  map[string]string `json:"env"`
+	// Executables and Tools are this listing's own resolved closure, for the
+	// argv above.
+	Executables map[string]string       `json:"executables"`
+	Tools       map[string]ToolIdentity `json:"tools"`
+	Names       []string                `json:"names"`
+	Empty       bool                    `json:"empty"`
+	Bytes       []byte                  `json:"bytes,omitempty"`
+	Digest      Digest                  `json:"digest"`
 }
 
 // ClockPolicy freezes the canonical planning instant. Ambient time.Now() is
@@ -124,11 +158,11 @@ type PlanningInputBundle struct {
 	} `json:"source"`
 	// Acquisition is the closure that produced the snapshots.
 	Acquisition struct {
-		Argv        []string          `json:"argv"`
-		Cwd         string            `json:"cwd"`
-		Env         map[string]string `json:"env"`
-		Executables map[string]string `json:"executables"`
-		Tools       map[string]string `json:"tools"`
+		Argv        []string                `json:"argv"`
+		Cwd         string                  `json:"cwd"`
+		Env         map[string]string       `json:"env"`
+		Executables map[string]string       `json:"executables"`
+		Tools       map[string]ToolIdentity `json:"tools"`
 	} `json:"acquisition"`
 	Parsers    []ParserIdentity `json:"parsers"`
 	Algorithms struct {
@@ -162,6 +196,83 @@ type PlanningInputBundle struct {
 
 // Digest is the bundle's canonical identity.
 func (b PlanningInputBundle) DigestOf() (Digest, error) { return DigestJSON(b) }
+
+// ValidateAcquisitionClosure refuses a snapshot whose provenance is a
+// description rather than an identity.
+//
+// The contract asks each frozen listing to bind the exact argv, cwd,
+// planning-relevant environment, RESOLVED EXECUTABLE PATHS, and a complete
+// tool/version/integrity closure. Every clause here is one of those, and each
+// exists because the weaker form is satisfiable by evidence that names the
+// wrong thing:
+//
+//   - a nil environment is not an empty one. An empty map says "nothing here
+//     can change the plan"; a missing map says nothing at all, and the two
+//     were previously indistinguishable for a discovery snapshot.
+//   - a closure that does not resolve the argv HEAD resolves some other
+//     program. That is exactly what an overridden discovery command produced:
+//     a map describing `npx` beside a listing taken by something else.
+//   - `unresolved` is a bound fact about a failure, and planning on it is
+//     planning on an unbound input. Recording it is right; accepting it is
+//     not.
+//   - a tool with a version and no integrity is a program's own account of
+//     itself. Two runners can report one version from two different builds.
+func ValidateAcquisitionClosure(what string, argv []string, cwd string, env map[string]string, execs map[string]string, tools map[string]ToolIdentity) error {
+	if len(argv) == 0 || cwd == "" || env == nil {
+		return fmt.Errorf("%s does not record how it was acquired (argv, cwd, environment)", what)
+	}
+	if len(execs) == 0 {
+		return fmt.Errorf("%s binds no resolved executable path, so %q could name two different binaries on two runners", what, argv[0])
+	}
+	head := argv[0]
+	if _, ok := execs[head]; !ok {
+		names := make([]string, 0, len(execs))
+		for n := range execs {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		return fmt.Errorf("%s was taken by %q but its executable closure resolves %v; a resolution of a program that did not run is not provenance", what, head, names)
+	}
+	for _, name := range sortedStringKeys(execs) {
+		switch path := execs[name]; {
+		case strings.TrimSpace(path) == "":
+			return fmt.Errorf("%s resolves executable %q to nothing", what, name)
+		case path == Unresolved:
+			return fmt.Errorf("%s could not resolve executable %q; %q is a bound fact about a failure, not a path a plan may be derived from", what, name, Unresolved)
+		}
+	}
+	if len(tools) == 0 {
+		return fmt.Errorf("%s binds no tool version, so the same executable path could be two different toolchains", what)
+	}
+	for _, name := range sortedToolKeys(tools) {
+		t := tools[name]
+		switch {
+		case strings.TrimSpace(t.Version) == "" || strings.TrimSpace(string(t.Integrity)) == "":
+			return fmt.Errorf("%s binds tool %q with no version or integrity", what, name)
+		case t.Version == Unresolved || string(t.Integrity) == Unresolved:
+			return fmt.Errorf("%s could not resolve tool %q; %q cannot stand in for a toolchain identity", what, name, Unresolved)
+		}
+	}
+	return nil
+}
+
+func sortedStringKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedToolKeys(m map[string]ToolIdentity) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // Validate refuses a bundle that leaves an input unbound. It is deliberately
 // strict about emptiness: an empty discovery snapshot is admissible only when
@@ -197,10 +308,17 @@ func (b PlanningInputBundle) Validate() error {
 			return fmt.Errorf("planning-input bundle: discovery snapshot %q disagrees with its own empty flag", s.Name)
 		}
 		// Each snapshot carries its OWN acquisition closure, not just the
-		// bundle's: two listings taken from different directories are
+		// bundle's: two listings taken from different directories, under
+		// different environments, or through different resolved binaries are
 		// different observations.
-		if s.Name == "" || len(s.Argv) == 0 || s.Cwd == "" {
-			return fmt.Errorf("planning-input bundle: discovery snapshot %q does not record how it was acquired (name, argv, cwd)", s.Name)
+		if s.Name == "" {
+			return fmt.Errorf("planning-input bundle: a discovery snapshot has no name")
+		}
+		if err := ValidateAcquisitionClosure(
+			fmt.Sprintf("discovery snapshot %q", s.Name),
+			s.Argv, s.Cwd, s.Env, s.Executables, s.Tools,
+		); err != nil {
+			return fmt.Errorf("planning-input bundle: %w", err)
 		}
 	}
 	for _, s := range b.Runnables {
@@ -217,8 +335,11 @@ func (b PlanningInputBundle) Validate() error {
 		if len(s.Bytes) > 0 && len(s.Names) == 0 {
 			return fmt.Errorf("planning-input bundle: runnable snapshot %q carries bytes but no parsed names", s.TargetID)
 		}
-		if len(s.Argv) == 0 || s.Cwd == "" || s.Env == nil {
-			return fmt.Errorf("planning-input bundle: runnable snapshot %q does not record how it was acquired (argv, cwd, environment)", s.TargetID)
+		if err := ValidateAcquisitionClosure(
+			fmt.Sprintf("runnable snapshot %q", s.TargetID),
+			s.Argv, s.Cwd, s.Env, s.Executables, s.Tools,
+		); err != nil {
+			return fmt.Errorf("planning-input bundle: %w", err)
 		}
 	}
 	if b.Store.Digest != DigestBytes(b.Store.Bytes) {
@@ -281,17 +402,12 @@ func (b PlanningInputBundle) Validate() error {
 	if err := requireFullSHA("the source commit", b.Source.Commit); err != nil {
 		return fmt.Errorf("planning-input bundle: %w", err)
 	}
-	if len(b.Acquisition.Argv) == 0 {
-		return fmt.Errorf("planning-input bundle: the acquisition argv is empty")
-	}
-	if len(b.Acquisition.Executables) == 0 {
-		return fmt.Errorf("planning-input bundle: no resolved executable path is bound, so \"npx\" could name two different binaries on two runners")
-	}
-	if len(b.Acquisition.Tools) == 0 {
-		return fmt.Errorf("planning-input bundle: no tool version is bound, so the same executable path could be two different toolchains")
-	}
-	if b.Acquisition.Env == nil {
-		return fmt.Errorf("planning-input bundle: the planning-relevant environment is unbound (an empty map is a bound fact; a missing one is not)")
+	if err := ValidateAcquisitionClosure(
+		"the bundle acquisition closure",
+		b.Acquisition.Argv, b.Acquisition.Cwd, b.Acquisition.Env,
+		b.Acquisition.Executables, b.Acquisition.Tools,
+	); err != nil {
+		return fmt.Errorf("planning-input bundle: %w", err)
 	}
 	// The selection closure the plan is a function of.
 	if b.Selection.K < 1 {
@@ -357,6 +473,16 @@ type Stage1Manifest struct {
 	// frozen scorer built from it. Runtime never reads a label; this is where
 	// the labels are allowed to have existed.
 	TrainingLineage TrainingLineageID `json:"training_lineage"`
+	// TrainingAuthorityKeys are the PREDECLARED public keys allowed to seal
+	// that receipt set. They are here, inside the authority-signed manifest,
+	// for the same reason the record signers are: a set verified against
+	// whatever signed it accepts any self-generated key, and the verifier must
+	// be told which authority to believe by the same document that approves
+	// the inputs — not by one of its own flags.
+	//
+	// They are deliberately separate from the campaign authority. The offline
+	// surface is sealed once, long before any campaign, by a different party.
+	TrainingAuthorityKeys []string `json:"training_authority_keys"`
 	// Instrumentation binds the schema and binary identity of every producer
 	// and of the verifier itself.
 	Instrumentation InstrumentationIdentity `json:"instrumentation"`
@@ -389,11 +515,23 @@ type ActionIdentity struct {
 // lifecycle claims depend on. A different version does not inherit them: it
 // starts a new source-inventory epoch.
 type SourceProfileReceipt struct {
-	Repository  string            `json:"repository"`
-	Commit      string            `json:"commit"`
-	Facade      Digest            `json:"facade_digest"`
-	Config      Digest            `json:"config_digest"`
-	Lockfile    Digest            `json:"lockfile_digest"`
+	Repository string `json:"repository"`
+	Commit     string `json:"commit"`
+	Facade     Digest `json:"facade_digest"`
+	Config     Digest `json:"config_digest"`
+	Lockfile   Digest `json:"lockfile_digest"`
+	// FacadeBytes, ConfigBytes and LockfileBytes are the EXACT bytes those
+	// digests address, carried inline for the same reason the planning-input
+	// bundle carries its snapshots inline: a digest beside a package map
+	// proves that somebody wrote both down, and nothing else. With the bytes
+	// present the closure below stops being a claim and becomes something an
+	// independent reader can re-derive.
+	FacadeBytes   []byte `json:"facade_bytes,omitempty"`
+	ConfigBytes   []byte `json:"config_bytes,omitempty"`
+	LockfileBytes []byte `json:"lockfile_bytes,omitempty"`
+	// ParserID names the lock parser. It must be one this verifier implements,
+	// because a parser nobody here can run leaves the closure exactly as
+	// unchecked as a bare digest.
 	ParserID    ParserIdentity    `json:"lock_parser"`
 	Packages    map[string]string `json:"packages"`
 	Integrities map[string]string `json:"integrities"`
@@ -426,20 +564,59 @@ func (r SourceProfileReceipt) Validate() error {
 	if len(r.Packages) == 0 {
 		return fmt.Errorf("source profile: the resolved package closure is empty")
 	}
-	names := make([]string, 0, len(r.Packages))
-	for n := range r.Packages {
-		names = append(names, n)
+	// The bound bytes must be the bytes the digests name. A receipt carrying
+	// one document and the digest of another would let every derivation below
+	// run against evidence nobody approved.
+	for _, b := range []struct {
+		what   string
+		bytes  []byte
+		digest Digest
+	}{
+		{"façade", r.FacadeBytes, r.Facade},
+		{"config", r.ConfigBytes, r.Config},
+		{"lockfile", r.LockfileBytes, r.Lockfile},
+	} {
+		if len(b.bytes) == 0 {
+			return fmt.Errorf("source profile: the exact %s bytes are not bound, so its digest names a document nobody supplied", b.what)
+		}
+		if d := DigestBytes(b.bytes); d != b.digest {
+			return fmt.Errorf("source profile: the bound %s bytes digest to %s, not the recorded %s", b.what, d, b.digest)
+		}
 	}
-	sort.Strings(names)
+	// INDEPENDENTLY DERIVED, not read back. The closure is recomputed from the
+	// bound lockfile bytes with the declared parser, and the receipt's own map
+	// is then checked against it in both directions: no package it invented,
+	// and no Vitest-family package it left out. A supplied two-entry map used
+	// to satisfy every rule below while saying nothing about the rest of the
+	// tree the façade actually loads.
+	derived, err := DeriveLockClosure(r.ParserID.Name, r.LockfileBytes)
+	if err != nil {
+		return fmt.Errorf("source profile: %w", err)
+	}
+	for _, n := range sortedStringKeys(r.Packages) {
+		d, ok := derived[n]
+		if !ok {
+			return fmt.Errorf("source profile: the closure declares %s, which the bound lockfile does not resolve", n)
+		}
+		if d.Version != r.Packages[n] {
+			return fmt.Errorf("source profile: the closure declares %s at %s but the bound lockfile resolves %s", n, r.Packages[n], d.Version)
+		}
+		if d.Integrity != r.Integrities[n] {
+			return fmt.Errorf("source profile: the closure records integrity %q for %s but the bound lockfile records %q", r.Integrities[n], n, d.Integrity)
+		}
+	}
 	sawRunner := false
-	for _, n := range names {
-		if n != "vitest" && !hasPrefix(n, "@vitest/") {
+	for _, n := range sortedLockNames(derived) {
+		if !IsVitestPackage(n) {
 			continue
 		}
-		if r.Packages[n] != RequiredVitest {
-			return fmt.Errorf("source profile: %s is %s, not %s; this starts a new source-inventory epoch", n, r.Packages[n], RequiredVitest)
+		if _, ok := r.Packages[n]; !ok {
+			return fmt.Errorf("source profile: the bound lockfile resolves %s but the declared closure omits it; a partial closure cannot prove what the façade loads", n)
 		}
-		if r.Integrities[n] == "" {
+		if derived[n].Version != RequiredVitest {
+			return fmt.Errorf("source profile: %s is %s, not %s; this starts a new source-inventory epoch", n, derived[n].Version, RequiredVitest)
+		}
+		if derived[n].Integrity == "" {
 			return fmt.Errorf("source profile: %s has no recorded lock integrity", n)
 		}
 		if n == "@vitest/runner" {
@@ -454,8 +631,6 @@ func (r SourceProfileReceipt) Validate() error {
 	}
 	return nil
 }
-
-func hasPrefix(s, p string) bool { return len(s) >= len(p) && s[:len(p)] == p }
 
 // parsedStoreIdentity reads the schema and comparability token out of the
 // exact frozen store bytes, so a receipt is checked against what the store
@@ -984,6 +1159,10 @@ func (m Stage1Manifest) Validate() error {
 
 	// The sealed training lineage and the frozen component registry.
 	if err := requireSet(map[string]string{
+		"the training scorer id":          m.TrainingLineage.ScorerID,
+		"the training algorithm":          m.TrainingLineage.Algorithm,
+		"the training configuration":      m.TrainingLineage.Configuration,
+		"the training tie-break":          m.TrainingLineage.TieBreak,
 		"the training receipt-set digest": string(m.TrainingLineage.ReceiptSetDigest),
 		"the training cutoff instant":     m.TrainingLineage.Cutoff,
 		"the training epoch":              m.TrainingLineage.Epoch,
@@ -991,6 +1170,9 @@ func (m Stage1Manifest) Validate() error {
 		"the component registry digest":   string(m.Registry),
 	}); err != nil {
 		return fmt.Errorf("stage-1 manifest %w", err)
+	}
+	if len(m.TrainingAuthorityKeys) == 0 {
+		return fmt.Errorf("stage-1 manifest: no training authority key is predeclared, so the sealed training receipt set would be authenticated by its own signature and any self-generated key would seal a lineage")
 	}
 	if _, err := parseInstant(m.TrainingLineage.Cutoff); err != nil {
 		return fmt.Errorf("stage-1 manifest: training %w", err)
@@ -1044,6 +1226,7 @@ func (m Stage1Manifest) InvariantTuple() map[string]string {
 		"consumer.lockfile":       string(m.Consumer.Lockfile),
 		"source_profile":          string(mustDigestOf(m.SourceProfile)),
 		"training_lineage":        string(mustDigestOf(m.TrainingLineage)),
+		"training_authority_keys": strings.Join(m.TrainingAuthorityKeys, ","),
 		"component_registry":      string(m.Registry),
 		"store_receipt":           string(mustDigestOf(m.Store)),
 		"allowed_differences":     string(mustDigestOf(m.AllowedDifferences)),

@@ -85,7 +85,7 @@ func admissibleSet() TrainingReceiptSet {
 	return TrainingReceiptSet{
 		Kind: TrainingSetKind, Epoch: "vitest-4.1.10", Cutoff: "2026-08-30T00:00:00Z",
 		FeatureSchema: []string{"atom_size", "runnable_count"},
-		Algorithm:     "ridge-least-squares", Configuration: "lambda=0.01", Seed: 1,
+		Algorithm:     "ridge-least-squares", Configuration: "lambda=0.01", Lambda: 0.01, Seed: 1,
 		Labels: []TrainingLabel{
 			admissibleLabel("a", 10, 1, 12),
 			admissibleLabel("b", 20, 1, 22),
@@ -157,7 +157,7 @@ func TestTrainingSurfaceAdmissionRules(t *testing.T) {
 // plan time and it is built from reporter outcomes, so it is exactly what a
 // well-meaning implementation would reach for.
 func TestRuntimeSurfaceExcludesOutcomes(t *testing.T) {
-	scorer, err := TrainScorer(sealedSet(), "test-scorer", 0.01, sealKeys())
+	scorer, err := TrainScorer(sealedSet(), "test-scorer", sealKeys())
 	if err != nil {
 		t.Fatalf("TrainScorer: %v", err)
 	}
@@ -191,11 +191,11 @@ func TestRuntimeSurfaceExcludesOutcomes(t *testing.T) {
 // the same coefficients and therefore the same scorer digest, or Stage 1
 // cannot bind a scorer at all.
 func TestScorerIsDeterministic(t *testing.T) {
-	a, err := TrainScorer(sealedSet(), "test-scorer", 0.01, sealKeys())
+	a, err := TrainScorer(sealedSet(), "test-scorer", sealKeys())
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := TrainScorer(sealedSet(), "test-scorer", 0.01, sealKeys())
+	b, err := TrainScorer(sealedSet(), "test-scorer", sealKeys())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestScorerIsDeterministic(t *testing.T) {
 // has to be packed somewhere, and a zero-weight unit would make the partition
 // think it is free.
 func TestScorerFloorKeepsUnitsSchedulable(t *testing.T) {
-	scorer, err := TrainScorer(sealedSet(), "test-scorer", 0.01, sealKeys())
+	scorer, err := TrainScorer(sealedSet(), "test-scorer", sealKeys())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestScorerFloorKeepsUnitsSchedulable(t *testing.T) {
 // the renderer's membership. It cannot score, so a unit with no frozen value
 // is an error rather than a silent zero.
 func TestPcheckProjectsFrozenValues(t *testing.T) {
-	scorer, err := TrainScorer(sealedSet(), "test-scorer", 0.01, sealKeys())
+	scorer, err := TrainScorer(sealedSet(), "test-scorer", sealKeys())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestPcheckProjectsFrozenValues(t *testing.T) {
 // that check. Digesting the unit NAMES alone — which is what the projection
 // used to do — would let the same membership carry any prediction at all.
 func TestPcheckRecomputes(t *testing.T) {
-	scorer, err := TrainScorer(sealedSet(), "test-scorer", 0.01, sealKeys())
+	scorer, err := TrainScorer(sealedSet(), "test-scorer", sealKeys())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestTrainingSetMustBeAttributable(t *testing.T) {
 			} else if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
-			if _, err := TrainScorer(set, "test-scorer", 0.01, tc.keys); err == nil {
+			if _, err := TrainScorer(set, "test-scorer", tc.keys); err == nil {
 				t.Errorf("a scorer was trained from an unattributable set")
 			}
 		})
@@ -403,7 +403,7 @@ func TestTrainingSetMustBeAttributable(t *testing.T) {
 // not prove any model produced the numbers being added, because a substituted
 // allocation map is perfectly self-consistent.
 func TestPcheckIsReDerivedFromTheFrozenScorer(t *testing.T) {
-	scorer, err := TrainScorer(sealedSet(), "test-scorer", 0.01, sealKeys())
+	scorer, err := TrainScorer(sealedSet(), "test-scorer", sealKeys())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +496,12 @@ func TestPcheckIsReDerivedFromTheFrozenScorer(t *testing.T) {
 
 	// A different model is a different projection, even when the numbers happen
 	// to be self-consistent.
-	other, err := TrainScorer(sealedSet(), "other-scorer", 0.5, sealKeys())
+	otherSet := admissibleSet()
+	otherSet.Lambda, otherSet.Configuration = 0.5, "lambda=0.5"
+	if err := otherSet.Seal("ewj2-training", trainingSealKey); err != nil {
+		t.Fatal(err)
+	}
+	other, err := TrainScorer(otherSet, "other-scorer", sealKeys())
 	if err != nil {
 		t.Fatal(err)
 	}

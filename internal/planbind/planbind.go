@@ -80,12 +80,25 @@ type AcquireOptions struct {
 	// provenance record naming a command nobody executed would send a replay
 	// after the wrong bytes with nothing to explain the difference.
 	RunnableArgv map[string][]string
-	// Env is the planning-relevant environment, Executables the resolved tool
-	// paths, Tools their versions. They are recorded so an independent
-	// verifier can say what it would take to reproduce the acquisition.
-	Env         map[string]string
-	Executables map[string]string
-	Tools       map[string]string
+	// Env is the planning-relevant environment. It is recorded so an
+	// independent verifier can say what it would take to reproduce the
+	// acquisition.
+	Env map[string]string
+	// Resolve returns the resolved-executable and tool closure for ONE exact
+	// argv, and is called once per snapshot with the argv that snapshot was
+	// actually taken by.
+	//
+	// It is a function rather than two maps because a single closure supplied
+	// for the whole bundle describes one command, and the bundle can hold
+	// several: an overridden discovery command used to be frozen beside the
+	// resolution of the ordinary Vitest command — a provenance record naming a
+	// binary that had not run. Making the closure a function OF the argv makes
+	// that mismatch unrepresentable rather than merely discouraged.
+	//
+	// It must fail rather than return a placeholder: a closure that could not
+	// be resolved is an unbound input, and planning on one is exactly what the
+	// bundle exists to prevent.
+	Resolve func(argv []string) (map[string]string, map[string]walltime.ToolIdentity, error)
 	// Repository, Commit and Tree identify the source the inputs came from.
 	Repository string
 	Commit     string
@@ -115,6 +128,7 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 		return nil, fmt.Errorf("planbind: the discovery snapshot is empty; an absent discovery must be recorded as such, not left blank")
 	}
 
+	var err error
 	var b walltime.PlanningInputBundle
 	b.Kind = walltime.BundleKind
 	b.Clock = walltime.ClockPolicy{
@@ -125,8 +139,15 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 		PermittedSources: []string{"stage1_planning_input_bundle"},
 		StaleThreshold:   opt.StaleAfter.String(),
 	}
+	if opt.Resolve == nil {
+		return nil, fmt.Errorf("planbind: no executable/tool resolver was supplied; a snapshot whose resolved closure is invented cannot be replayed")
+	}
 	discovery := walltime.NewRawSnapshot("vitest-discovery", opt.DiscoveryArgv, opt.Root, opt.Discovery)
 	discovery.Env = copyMap(opt.Env)
+	// The closure for the argv that ACTUALLY took this listing.
+	if discovery.Executables, discovery.Tools, err = resolveFor(opt, opt.DiscoveryArgv, "the discovery snapshot"); err != nil {
+		return nil, err
+	}
 	b.Discovery = []walltime.RawSnapshot{discovery}
 	for _, id := range sortedKeys(opt.Runnables) {
 		raw := opt.Runnables[id]
@@ -146,15 +167,21 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 		if len(argv) == 0 {
 			return nil, fmt.Errorf("planbind: the runnable listing for %s records no acquisition argv; a frozen input whose provenance is invented cannot be replayed", id)
 		}
+		execs, tools, err := resolveFor(opt, argv, "the runnable listing for "+id)
+		if err != nil {
+			return nil, err
+		}
 		b.Runnables = append(b.Runnables, walltime.RunnableSnapshot{
-			TargetID: id,
-			Argv:     append([]string(nil), argv...),
-			Cwd:      opt.Root,
-			Env:      copyMap(opt.Env),
-			Names:    names,
-			Empty:    len(raw) == 0,
-			Bytes:    raw,
-			Digest:   walltime.DigestBytes(raw),
+			TargetID:    id,
+			Argv:        append([]string(nil), argv...),
+			Cwd:         opt.Root,
+			Env:         copyMap(opt.Env),
+			Executables: execs,
+			Tools:       tools,
+			Names:       names,
+			Empty:       len(raw) == 0,
+			Bytes:       raw,
+			Digest:      walltime.DigestBytes(raw),
 		})
 	}
 	if len(b.Runnables) == 0 {
@@ -184,10 +211,8 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 	b.Acquisition.Argv = append([]string{"testbucket", "wall", "bundle"}, opt.DiscoveryArgv...)
 	b.Acquisition.Cwd = opt.Root
 	b.Acquisition.Env = copyMap(opt.Env)
-	b.Acquisition.Executables = copyMap(opt.Executables)
-	b.Acquisition.Tools = copyMap(opt.Tools)
-	if len(b.Acquisition.Tools) == 0 {
-		return nil, fmt.Errorf("planbind: no tool version was captured; the same executable path can be two different toolchains")
+	if b.Acquisition.Executables, b.Acquisition.Tools, err = resolveFor(opt, b.Acquisition.Argv, "the bundle acquisition closure"); err != nil {
+		return nil, err
 	}
 	b.Parsers = []walltime.ParserIdentity{
 		{Name: "vitest-discovery-parser", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("vitest-discovery-parser/" + ParserVersion))},
@@ -573,6 +598,25 @@ func sortedKeys(m map[string][]byte) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// resolveFor asks the caller's resolver for one argv's closure and refuses
+// anything short of a resolved answer. `unresolved` is retained by the
+// resolver as a bound fact about a failure; it is not a value a plan may be
+// derived from, so it is rejected HERE rather than at verification time, where
+// the bundle has already been signed.
+func resolveFor(opt AcquireOptions, argv []string, what string) (map[string]string, map[string]walltime.ToolIdentity, error) {
+	if len(argv) == 0 {
+		return nil, nil, fmt.Errorf("planbind: %s has no argv to resolve", what)
+	}
+	execs, tools, err := opt.Resolve(append([]string(nil), argv...))
+	if err != nil {
+		return nil, nil, fmt.Errorf("planbind: resolve %s: %w", what, err)
+	}
+	if err := walltime.ValidateAcquisitionClosure(what, argv, opt.Root, copyMap(opt.Env), execs, tools); err != nil {
+		return nil, nil, fmt.Errorf("planbind: %w", err)
+	}
+	return execs, tools, nil
 }
 
 func copyMap(m map[string]string) map[string]string {

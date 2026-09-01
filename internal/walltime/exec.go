@@ -21,6 +21,47 @@ import (
 // that never closes must become a terminal record rather than a hung job.
 const DefaultTimeout = 30 * time.Minute
 
+// The frozen cancellation policy. Stage 1 declares it as an instrumentation
+// identity, and both arms of a pair must run the same one, so the numbers live
+// here as constants rather than as knobs a caller could pass.
+//
+// A cancelled containment gets exactly one bounded chance to exit on its own,
+// then the whole containment is killed and reaped. The wrapper used to send
+// SIGTERM and then wait for `cmd.Wait` forever: a root that ignores TERM hung
+// the job indefinitely, and a detached descendant that outlived its root was
+// LABELLED `crash_unclosed` and left running. Both are the same defect — the
+// wrapper had no bound and no second step — and the contract asks for the
+// bound, the escalation and the reap by name.
+const (
+	// CancellationGrace is how long the containment has to exit after the
+	// whole-containment TERM before the KILL. It is generous, because a
+	// worker flushing a report is not a defect, and FINITE, because a
+	// lifecycle that never closes must become a terminal record rather than a
+	// hung job.
+	CancellationGrace = 30 * time.Second
+	// ReapGrace bounds the wait AFTER the whole-containment KILL. Nothing
+	// survives SIGKILL, so exceeding this means the wrapper could not reap
+	// what it killed, which is itself terminal and must be recorded rather
+	// than waited on.
+	ReapGrace = 10 * time.Second
+)
+
+// CancellationPolicyID is the frozen policy Stage 1 declares. It is derived
+// from the constants above rather than written out beside them, so a manifest
+// cannot declare a policy the wrapper does not implement.
+var CancellationPolicyID = fmt.Sprintf(
+	"whole-containment SIGTERM on signal or deadline; SIGKILL after a %s grace; verified empty and reaped within %s; the incomplete receipt is retained",
+	CancellationGrace, ReapGrace)
+
+// The same two values as variables, so a test can shorten the policy without
+// waiting out a real cancellation. Production never assigns them; every
+// assignment in the tree is in a _test file, exactly as the probe hooks below
+// are.
+var (
+	cancellationGrace = CancellationGrace
+	reapGrace         = ReapGrace
+)
+
 // ExecOptions describes one physical wrapper: the exact command it starts, the
 // level it measures, and the campaign identity it records.
 type ExecOptions struct {
@@ -195,11 +236,13 @@ func Exec(opt ExecOptions) (int, error) {
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
 	}
 
-	code, proc, termState, reason := runChild(opt, cont)
+	code, proc, termState, reason := runChild(opt, cont, deadline)
 
 	// The wrapper's own view of emptiness is physical suffix work; the
 	// observers still take their own reads, and the VERIFIER decides closure.
-	emptyErr := waitContainmentEmpty(cont, deadline)
+	// Anything still alive is killed and reaped here rather than merely
+	// labelled, because the wrapper is the last thing that can reach it.
+	emptyErr := enforceContainmentEmpty(cont, deadline)
 
 	// Trace closes first, then the peer: the resulting endpoint order is the
 	// contract's, and it is established by the protocol rather than asserted
@@ -255,7 +298,7 @@ func Exec(opt ExecOptions) (int, error) {
 // child is created in the containment (never moved into it afterwards), so
 // there is no window in which action-owned work exists outside the lifecycle
 // the peer and trace are bracketing.
-func runChild(opt ExecOptions, cont Containment) (int, ProcIdentity, string, string) {
+func runChild(opt ExecOptions, cont Containment, deadline time.Time) (int, ProcIdentity, string, string) {
 	cmd := exec.Command(opt.Argv[0], opt.Argv[1:]...)
 	cmd.Dir = opt.Cwd
 	// Assign the concrete *os.File values, not the struct fields directly: a
@@ -294,24 +337,9 @@ func runChild(opt ExecOptions, cont Containment) (int, ProcIdentity, string, str
 		return 1, ProcIdentity{PID: cmd.Process.Pid}, TerminalSpawnError, "admit child: " + err.Error()
 	}
 
-	cancelled := ""
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	var waitErr error
-	for waitErr == nil {
-		select {
-		case s := <-sigs:
-			cancelled = s.String()
-			_ = cont.Signal(syscall.SIGTERM)
-		case waitErr = <-done:
-			if waitErr == nil {
-				waitErr = errNoError
-			}
-		}
-	}
-	if waitErr == errNoError {
-		waitErr = nil
-	}
+	cancelled, escalation, waitErr := awaitChild(cont, sigs, done, deadline)
 
 	proc := ProcIdentity{
 		PID:       cmd.Process.Pid,
@@ -322,6 +350,18 @@ func runChild(opt ExecOptions, cont Containment) (int, ProcIdentity, string, str
 	code := 0
 	state := TerminalPassed
 	reason := ""
+	if waitErr == errUnreaped {
+		// cmd.Wait has NOT returned, so cmd.ProcessState is still being
+		// written by the goroutine waiting on it and must not be read here.
+		// The envelope did not end where a closing record would claim it did,
+		// which is exactly what crash_unclosed means.
+		proc.ExitKind = TerminalCrashUnclosed
+		reason = joinReason(escalation, "the root was not reaped within "+reapGrace.String()+" of the whole-containment KILL")
+		if cancelled != "" {
+			reason = joinReason("wrapper received "+cancelled, reason)
+		}
+		return 1, proc, TerminalCrashUnclosed, reason
+	}
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
 		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
@@ -336,11 +376,86 @@ func runChild(opt ExecOptions, cont Containment) (int, ProcIdentity, string, str
 	proc.ExitKind = state
 	if cancelled != "" {
 		state, reason = TerminalCancelled, "wrapper received "+cancelled
+		if escalation != "" {
+			// The escalation is RETAINED, not summarised away. "cancelled"
+			// and "cancelled after the containment had to be killed" are
+			// different facts about the same run, and only the second one
+			// says the workload did not stop when it was asked to.
+			reason += "; " + escalation
+		}
+	} else if escalation != "" {
+		state, reason = TerminalCancelled, escalation
 	}
 	if waitErr != nil && state == TerminalPassed {
 		state, reason = TerminalWrapperError, waitErr.Error()
 	}
 	return code, proc, state, reason
+}
+
+// awaitChild waits for the child under the frozen bounded cancellation policy.
+//
+// There are three sources of an ending and they are deliberately not
+// interchangeable: the child exiting, a signal reaching the wrapper, and the
+// deadline passing. The last two both mean "stop", and both used to mean
+// "send SIGTERM and then wait forever" — the deadline did not even reach here,
+// so a child that simply never exited hung the wrapper with no record.
+//
+// It returns what cancelled the run, what escalation was needed, and the
+// wait error (errUnreaped when the root outlived a whole-containment KILL).
+func awaitChild(cont Containment, sigs <-chan os.Signal, done <-chan error, deadline time.Time) (cancelled, escalation string, waitErr error) {
+	// Phase 0: ordinary running. The deadline is a real endpoint, not a
+	// suggestion: the contract makes a cancellation timeout terminal.
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return "", "", err
+	case s := <-sigs:
+		cancelled = s.String()
+	case <-timer.C:
+		escalation = "the run did not finish before its cancellation deadline"
+	}
+
+	// Phase 1: the bounded grace. TERM reaches the WHOLE containment, not just
+	// the root: a root that exits while its workers keep running has not
+	// stopped, and the containment is the only thing that names all of them.
+	_ = cont.Signal(syscall.SIGTERM)
+	grace := cancellationGrace
+	if until := time.Until(deadline); until > 0 && until < grace {
+		grace = until
+	}
+	graceTimer := time.NewTimer(grace)
+	defer graceTimer.Stop()
+	select {
+	case err := <-done:
+		return cancelled, escalation, err
+	case <-graceTimer.C:
+	}
+
+	// Phase 2: escalation. Nothing survives a whole-containment SIGKILL, and
+	// on Linux cgroup.kill makes it atomic — there is no window for a
+	// descendant to fork out from under the enumeration.
+	_ = cont.Signal(syscall.SIGKILL)
+	escalation = joinReason(escalation, "the containment did not exit within "+grace.String()+" of SIGTERM and was killed")
+	reapTimer := time.NewTimer(reapGrace)
+	defer reapTimer.Stop()
+	select {
+	case err := <-done:
+		return cancelled, escalation, err
+	case <-reapTimer.C:
+		return cancelled, escalation, errUnreaped
+	}
+}
+
+func joinReason(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "; " + b
+	}
 }
 
 // atStartReading and atEndReading are called at the exact moments the physical
@@ -384,9 +499,39 @@ func probeErr(hook func(string) error, dir string) error {
 	return hook(dir)
 }
 
-// errNoError distinguishes "Wait returned nil" from "Wait has not returned" in
-// the select above without a second channel.
-var errNoError = fmt.Errorf("ok")
+// errUnreaped is returned when the root outlived a whole-containment SIGKILL
+// long enough for the bounded reap window to expire. It is a distinct value
+// because "the child failed" and "the wrapper could not reap the child" are
+// different terminal states.
+var errUnreaped = fmt.Errorf("the root was not reaped after the whole containment was killed")
+
+// enforceContainmentEmpty waits for the containment to drain and, if it does
+// not, KILLS AND REAPS what is left.
+//
+// The escape is still terminal — a descendant that outlived its root means the
+// envelope did not end where the closing record would claim, and no amount of
+// cleanup changes that. What changes is that the descendant no longer survives
+// the wrapper. Callers used to take `waitContainmentEmpty`'s error, write
+// `crash_unclosed` and return, leaving the process running on the runner for
+// whatever came next; the contract asks for a guaranteed reap, and recording
+// an escape is not reaping it.
+//
+// The returned error is the retained reason: it names the escape AND what the
+// forced reap achieved, because "it escaped" and "it escaped and is still
+// running" call for different responses from whoever reads the receipt.
+func enforceContainmentEmpty(cont Containment, deadline time.Time) error {
+	escape := waitContainmentEmpty(cont, deadline)
+	if escape == nil {
+		return nil
+	}
+	if err := cont.Signal(syscall.SIGKILL); err != nil {
+		return fmt.Errorf("%w; the whole-containment KILL failed: %v", escape, err)
+	}
+	if err := waitContainmentEmpty(cont, time.Now().Add(reapGrace)); err != nil {
+		return fmt.Errorf("%w; the containment was killed and was STILL not empty after %s: %v", escape, reapGrace, err)
+	}
+	return fmt.Errorf("%w; the whole containment was then killed and verified empty", escape)
+}
 
 // waitContainmentEmpty is the wrapper's own post-exit verification. A root
 // that returned while a descendant is still alive is an escape, and an escape

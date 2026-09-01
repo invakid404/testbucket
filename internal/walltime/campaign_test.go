@@ -33,6 +33,17 @@ func (m memoryLoader) Manifest(path string) (*Stage1Manifest, error) {
 	return &c, nil
 }
 
+// candidateBinaryDigest is the exact asset the candidate arm delivers, and
+// therefore the one a release cut from this campaign publishes.
+var candidateBinaryDigest = DigestBytes([]byte("candidate testbucket binary"))
+
+// testRelease is the delivery the fixture campaign was produced for: the
+// candidate arm's reviewed tip and its exact built binary. A campaign
+// authorises this delivery and no other.
+func testRelease() CampaignRelease {
+	return CampaignRelease{SHA: testTip, BinaryDigest: candidateBinaryDigest}
+}
+
 // campaignFixture builds a fully authenticated five-pair campaign: signed
 // manifests for both arms, and eight eligible verdicts per run.
 func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed25519.PrivateKey) {
@@ -58,7 +69,7 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 		if candidateTuple {
 			// The enumerated permitted difference: a different testbucket
 			// source/action/binary, and the wrappers that come with it.
-			candidateBinary := DigestBytes([]byte("candidate testbucket binary"))
+			candidateBinary := candidateBinaryDigest
 			m.Source.BinaryDigest = candidateBinary
 			m.Instrumentation.PhysicalBinary = candidateBinary
 			m.Instrumentation.PeerBinary = candidateBinary
@@ -152,7 +163,7 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 // and passes it.
 func TestCampaignIndexAuthenticatesEveryRow(t *testing.T) {
 	idx, loader, keys, _ := campaignFixture(t)
-	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign")
+	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
 	if len(problems) != 0 {
 		t.Fatalf("an authenticated campaign reported problems: %v", problems)
 	}
@@ -322,7 +333,7 @@ func TestCampaignIndexRefusals(t *testing.T) {
 			if tc.keys != nil {
 				keys = tc.keys(keys)
 			}
-			gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign")
+			gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
 			if len(problems) == 0 {
 				t.Fatalf("the campaign authenticated")
 			}
@@ -336,6 +347,82 @@ func TestCampaignIndexRefusals(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestACampaignAuthorisesOnlyTheDeliveryItWasProducedFor is the F3 regression.
+//
+// The release gate ran `wall campaign` and nothing else: the evaluator was
+// never told which commit was being tagged, and `LoadCampaign` only required
+// each arm's ReviewTip to equal its OWN ReleaseRefSHA — which a historical
+// campaign satisfies perfectly while describing a commit unrelated to the tag.
+// A valid campaign committed at campaign/index.json therefore authorised every
+// later release, and the locally built binary was never compared to the one
+// the campaign was measured with.
+func TestACampaignAuthorisesOnlyTheDeliveryItWasProducedFor(t *testing.T) {
+	otherSHA := "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c"
+	for _, tc := range []struct {
+		name    string
+		release CampaignRelease
+		want    string
+	}{
+		{"no expected delivery at all", CampaignRelease{},
+			"cannot authorise any release"},
+		{"an abbreviated release SHA", CampaignRelease{SHA: "693a1998", BinaryDigest: candidateBinaryDigest},
+			"full 40"},
+		{"no binary identity", CampaignRelease{SHA: testTip},
+			"authorises an asset it never saw"},
+		{"another commit", CampaignRelease{SHA: otherSHA, BinaryDigest: candidateBinaryDigest},
+			"not the " + otherSHA + " being released"},
+		{"another binary from the right commit", CampaignRelease{SHA: testTip, BinaryDigest: "sha256:locally-built"},
+			"not the sha256:locally-built being published"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, loader, keys, _ := campaignFixture(t)
+			gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", tc.release)
+			if len(problems) != 0 {
+				t.Fatalf("the fixture campaign is not authenticated: %v", problems)
+			}
+			var binding *GateResult
+			for i := range gates {
+				if gates[i].Name == "campaign:release-binding" {
+					binding = &gates[i]
+				}
+			}
+			if binding == nil {
+				t.Fatal("no release-binding gate was reported")
+			}
+			if binding.Pass {
+				t.Fatalf("a campaign authorised a delivery it was not produced for (%s)", tc.name)
+			}
+			if !strings.Contains(binding.Observed+" "+binding.Detail, tc.want) {
+				t.Errorf("the gate does not mention %q: %s / %s", tc.want, binding.Observed, binding.Detail)
+			}
+		})
+	}
+}
+
+// TestTheRightDeliveryPassesTheReleaseBinding is the positive control: the
+// campaign's own candidate tip and its own built binary authorise exactly that
+// release, so the gate above is refusing the wrong delivery rather than every
+// delivery.
+func TestTheRightDeliveryPassesTheReleaseBinding(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
+	if len(problems) != 0 {
+		t.Fatalf("the fixture campaign is not authenticated: %v", problems)
+	}
+	for _, g := range gates {
+		if g.Name == "campaign:release-binding" {
+			if !g.Pass {
+				t.Fatalf("the campaign did not authorise its own delivery: %s (%s)", g.Observed, g.Detail)
+			}
+			if g.Population != CampaignPairs {
+				t.Errorf("the gate bound %d candidate arm(s), want %d", g.Population, CampaignPairs)
+			}
+			return
+		}
+	}
+	t.Fatal("no release-binding gate was reported")
 }
 
 // resign applies an edit and re-signs, so a refusal case tests the field it
@@ -355,7 +442,7 @@ func resign(v *Verdict, key ed25519.PrivateKey, edit func(*Verdict)) {
 func TestUnauthenticatedRowsNeverReachTheArithmetic(t *testing.T) {
 	idx, loader, keys, _ := campaignFixture(t)
 	loader.verdicts["candidate-0-0.json"].Eligible = false
-	gates, _ := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign")
+	gates, _ := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
 	if len(gates) != 1 || gates[0].Name != "campaign:authenticated-population" {
 		t.Fatalf("the arithmetic ran on an unauthenticated population: %d gate(s)", len(gates))
 	}
@@ -382,7 +469,7 @@ func TestCampaignEnforcesThePopulationWideAetaMean(t *testing.T) {
 			v.AetaSample.UpperNs = v.AetaSample.PointNs + 20*second
 		})
 	}
-	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign")
+	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
 	if len(problems) != 0 {
 		t.Fatalf("the population failed authentication: %v", problems)
 	}
@@ -407,7 +494,7 @@ func TestCampaignEnforcesThePopulationWideAetaMean(t *testing.T) {
 	for _, v := range loader.verdicts {
 		resign(v, key, func(v *Verdict) { v.AetaSample.PointNs = v.ActionNs + 2*second })
 	}
-	gates, problems = EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign")
+	gates, problems = EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
 	if len(problems) != 0 {
 		t.Fatalf("the population failed authentication: %v", problems)
 	}

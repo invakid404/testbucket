@@ -306,11 +306,14 @@ func verifySignerSet(v *Verdict, opt VerifyOptions, declared []string, recs []Re
 	if roster.Kind != RosterKind {
 		v.add("WT-023", SeverityIneligible, fmt.Sprintf("signer roster kind %q, want %q", roster.Kind, RosterKind))
 	}
-	if roster.Run.CampaignID != v.Run.CampaignID || roster.Run.RunID != v.Run.RunID || roster.Run.BucketID != v.Run.BucketID {
+	// The FULL repeated identity, not three fields of it. A roster that agreed
+	// about the campaign, the run and the bucket while naming another attempt,
+	// job, step or plan would authorise the signer set of a different
+	// measurement — and the roster is what decides which keys may sign this
+	// one.
+	if diff := runIdentityDiff(v.Run, roster.Run); diff != "" {
 		v.add("WT-023", SeverityIneligible,
-			fmt.Sprintf("the signer roster is for run %s/%s/%s, not the measured %s/%s/%s",
-				roster.Run.CampaignID, roster.Run.RunID, roster.Run.BucketID,
-				v.Run.CampaignID, v.Run.RunID, v.Run.BucketID))
+			fmt.Sprintf("the signer roster repeats a different delivery identity than the measured records (%s)", diff))
 	}
 	rosterDigest := Digest("")
 	if d, err := roster.DigestOf(); err == nil {
@@ -349,6 +352,13 @@ func verifySignerSet(v *Verdict, opt VerifyOptions, declared []string, recs []Re
 	}
 	if seal.Kind != SealKind {
 		v.add("WT-023", SeverityIneligible, fmt.Sprintf("closing seal kind %q, want %q", seal.Kind, SealKind))
+	}
+	// The seal is what fixes the exact bytes of every stream at AT_end. A seal
+	// for another run fixes another run's streams, and comparing it to these
+	// would be checking the wrong document's promise.
+	if diff := runIdentityDiff(v.Run, seal.Run); diff != "" {
+		v.add("WT-023", SeverityIneligible,
+			fmt.Sprintf("the closing seal repeats a different delivery identity than the measured records (%s)", diff))
 	}
 	sealDigest := Digest("")
 	if d, err := seal.DigestOf(); err == nil {

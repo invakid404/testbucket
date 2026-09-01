@@ -71,15 +71,26 @@ func baseAcquire(t *testing.T, root string, mutate func(*AcquireOptions)) Acquir
 		RunnableArgv: map[string][]string{
 			"tests/alpha.spec.ts": {"npx", "vitest", "list", "tests/alpha.spec.ts", "--json"},
 		},
-		Env:         map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": ""},
-		Executables: map[string]string{"npx": "/usr/local/bin/npx"},
-		Tools:       map[string]string{"node": "24.19.0"},
-		Repository:  "example/mandel", Commit: testCommit, Tree: "sha256:tree",
+		Env:        map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": ""},
+		Resolve:    testResolver,
+		Repository: "example/mandel", Commit: testCommit, Tree: "sha256:tree",
 	}
 	if mutate != nil {
 		mutate(&opt)
 	}
 	return opt
+}
+
+// testResolver answers for whatever argv it is handed, which is what makes it
+// useful here: a test that asserted the closure of one fixed command could not
+// tell a per-snapshot resolution from a single shared one.
+func testResolver(argv []string) (map[string]string, map[string]walltime.ToolIdentity, error) {
+	head := argv[0]
+	return map[string]string{head: "/usr/local/bin/" + filepath.Base(head)},
+		map[string]walltime.ToolIdentity{
+			head:   {Version: "1.0.0", Path: "/usr/local/bin/" + filepath.Base(head), Integrity: "sha256:head"},
+			"node": {Version: "24.19.0", Path: "/usr/local/bin/node", Integrity: "sha256:node"},
+		}, nil
 }
 
 func plan(t *testing.T, b *walltime.PlanningInputBundle) *Result {
@@ -203,8 +214,7 @@ func TestColdStartIsBoundAsAColdStart(t *testing.T) {
 		StorePath: filepath.Join(root, "absent.json"), StoreAbsent: true,
 		Discovery:     []byte(discoveryJSON),
 		DiscoveryArgv: []string{"npx", "vitest", "list", "--filesOnly", "--json"},
-		Executables:   map[string]string{"npx": "/usr/local/bin/npx"},
-		Tools:         map[string]string{"node": "24.19.0"},
+		Resolve:       testResolver,
 		Env:           map[string]string{},
 		Repository:    "example/mandel", Commit: testCommit, Tree: "sha256:tree",
 	})
