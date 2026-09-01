@@ -40,6 +40,7 @@ testbucket plan   [flags]   compute K buckets and emit a GH-Actions matrix
 testbucket ingest [flags]   fold a run's timings back into the store
 testbucket whales [flags]   show the per-runnable distribution behind each split
 testbucket audit  [flags]   check a finished run's events against its plan
+testbucket wall   <sub>     complete-action wall-time measurement (opt-in)
 ```
 
 A run of the loop, by hand:
@@ -300,13 +301,129 @@ subcommand and flags; testbucket appends nothing) and must print the same
 `[{file}]` / `[{name,file}]` JSON on stdout — letting a run-wrapper be paired with
 a separate discovery command without a second façade.
 
+## Complete-action wall time
+
+Everything above balances buckets by the timing store: a rolling EWMA of what
+the *reporter* said each file took. That is a good split and a bad measurement.
+It cannot tell you how long the **action** took — install, setup, script
+preparation, every invocation and its whole process tree, the gaps between
+them, the epilogue — and a number that leaves work out cannot be the thing you
+optimise.
+
+`testbucket wall` measures the complete action, and it is **opt-in**: without
+`--wall-dir` / `wall-time-dir`, every rendered byte, every matrix field and
+every action step is exactly what it was.
+
+### What it records
+
+Three producers, three ledgers, one lifecycle, at each of three levels:
+
+| Level | Physical envelope | Containment peer | Independent trace |
+| --- | --- | --- | --- |
+| the whole action | `AT` | `CPA` | `VTA` |
+| the generated bucket script | `VB` | `CPB` | `VTB` |
+| each rendered invocation | `V` | `CPV` | `VT` |
+
+The **physical wrapper** owns the complete envelope, including every cost
+inside it: creating the containment, starting the two observers, waiting,
+reaping, flushing. The **containment peer** and the **trace collector** are
+separate processes with their own signing keys; each takes its own
+`clock_gettime(CLOCK_MONOTONIC)` reads and its own raw `cgroup.events`
+observations, and neither can see the other's records. The wrapper drives them
+in an order that makes the endpoint containment hold by construction:
+
+```text
+AT_start <= CPA_start <= VTA_start <= VTA_end <= CPA_end <= AT_end
+```
+
+The reconciliation gate then compares **like for like** — a trace against its
+own peer, both bracketing the same admission-to-verified-empty lifecycle —
+never a trace against the longer physical envelope, which would fail a
+correctly instrumented run for the crime of accounting for its own bootstrap.
+
+### It fails closed
+
+- No delegated cgroup-v2 subtree (`TB_WALL_CGROUP_ROOT`)? The run is recorded
+  in full and reported **INELIGIBLE**. A process group cannot prove that no
+  descendant escaped.
+- Not Linux? Same answer, for the same reason, plus a clock that is not
+  `CLOCK_MONOTONIC`.
+- A missing endpoint is a **missing interval**, never a shorter one. A crash, a
+  cancellation, an escaped descendant, or a root that exited with live children
+  stays terminal and retained; it never becomes a duration.
+- A rewritten record breaks a hash chain the verifier recomputes.
+- `wall verify --require complete` asks whether the records are well formed;
+  `--require eligible` asks whether they may be **scored**, which additionally
+  needs a real clock, a real containment, signatures, the frozen Stage-1 and
+  Stage-2 documents, and every gate inside its threshold. Absent evidence never
+  passes either.
+
+### A reproducible plan
+
+```sh
+# Freeze every planning input — the canonical instant, the raw discovery and
+# runnable bytes, the store bytes, the acquisition closure. The ONLY live read.
+testbucket wall bundle --out bundle.json --root . --k 8 --wall-dir /tmp/tb-wall
+
+# Authorise it (the key comes from TB_WALL_AUTHORITY_KEY, never a flag).
+testbucket wall stage1 --bundle bundle.json --out stage1.json --role candidate \
+  --action-commit "$SHA" --review-tip "$SHA" --source-profile profile.json
+
+# Plan from the bundle and nothing else: no clock, no discovery, no listing.
+testbucket plan --wall-bundle bundle.json --wall-stage1 stage1.json \
+  --wall-stage2 stage2.json --shard-plan plan.json --json > matrix.json
+
+# Replay it independently: this refuses to agree unless EVERY digest matches.
+testbucket wall replay --bundle bundle.json --stage2 stage2.json --stage1 stage1.json
+```
+
+Two plan digests are recorded because they answer different questions. Moving
+the canonical instant three days changes the **full-document** digest (the
+store is older and the summary says so) and leaves the **semantic projection**
+identical; renaming one discovered file changes both.
+
+The Stage-2 receipt is written with `O_EXCL`. That is the exactly-once rule
+made mechanical: the bound planner runs once, and a second run that quietly
+replaced the first receipt would be indistinguishable from the first.
+
+### Allocation, forecast and audit are three different numbers
+
+- **`Palloc`** is the allocation score: `frozen_scorer(frozen_preplan_features)`,
+  and nothing else. It is fitted offline from a sealed set of historical,
+  wrapper-qualified `V` receipts (`wall train`); at runtime it may read no
+  label and no outcome — including the timing store's own EWMA weight, which is
+  reporter-derived and would leak an outcome into allocation through the side
+  door. Pass `--palloc-scorer` and KK packs by it.
+- **`est_seconds`** is unchanged: the store's measured weights, one decimal,
+  numeric. Consumers read it; the split no longer has to.
+- **`Pcheck`** is the post-render audit projection of those same frozen values
+  over the renderer's membership. It cannot re-plan.
+- **`Aeta`** is the pre-action forecast: a Stage-1 component template
+  instantiated per bucket before the action starts. A phase nobody predicted is
+  an ETA-completeness failure even when the trace agreed with itself to the
+  microsecond.
+
+### In a workflow
+
+```yaml
+uses: invakid404/testbucket/.github/workflows/bucketed-reusable.yml@<sha>
+with:
+  runner: vitest
+  wall-time-dir: /tmp/testbucket-wall
+  cgroup-root: /sys/fs/cgroup/testbucket   # create it in a prior step
+```
+
+Wall-time measurement is Vitest-only today. `--wall-dir` with `--runner go` is
+**refused**, not ignored: a flag that silently does nothing is how a consumer
+ends up believing a campaign was instrumented when it was not.
+
 ## Development
 
 ```sh
 gofmt -l .          # formatting
 go vet ./...        # vet
 go build ./...      # build
-go test ./... -race # the full suite (~124 tests)
+go test ./... -race # the full suite (~210 tests)
 ```
 
 ## License

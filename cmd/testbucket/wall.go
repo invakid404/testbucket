@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/invakid404/testbucket/internal/walltime"
 )
@@ -34,6 +35,18 @@ usage:
   testbucket wall replay  [flags]  independently replay a bundle through the
                                    planner and refuse to agree unless every
                                    digest matches the issued Stage-2 receipt
+  testbucket wall stage1  [flags]  assemble and sign the Stage-1 input manifest
+                                   that authorises a bundle (the signing key
+                                   comes from TB_WALL_AUTHORITY_KEY, never a
+                                   flag)
+  testbucket wall digest  [flags]  print the canonical digest of a manifest,
+                                   receipt, bundle, registry or scorer — the
+                                   identity every record has to bind to
+  testbucket wall train   [flags]  fit the frozen scorer from a sealed training
+                                   receipt set of historical wrapper-qualified
+                                   physical V labels
+  testbucket wall campaign [flags] apply the frozen five-pair decision rule to a
+                                   campaign's observed action times
 
 Every endpoint is a fresh CLOCK_MONOTONIC read taken by the producer that
 records it. A host with no delegated cgroup-v2 subtree (TB_WALL_CGROUP_ROOT)
@@ -63,6 +76,14 @@ func runWall(args []string) error {
 		return runWallBundle(args[1:])
 	case "replay":
 		return runWallReplay(args[1:])
+	case "stage1":
+		return runWallStage1(args[1:])
+	case "digest":
+		return runWallDigest(args[1:])
+	case "train":
+		return runWallTrain(args[1:])
+	case "campaign":
+		return runWallCampaign(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, wallUsage)
 		return nil
@@ -275,6 +296,151 @@ func runWallObserve(args []string) error {
 		Dir: *dir, ControlBase: *control, Containment: ident, Run: run, Key: priv,
 		Timeout: *timeout,
 	})
+}
+
+// runWallTrain is the OFFLINE surface: the one place a historical V label is
+// allowed to exist. It refuses an unvalidated receipt set, and an empty set is
+// the expected answer today — no wrapper-qualified historical label exists
+// yet, so no scorer can honestly be trained, and inventing one from reporter
+// data is the leak the two surfaces exist to prevent.
+// runWallDigest prints a document's canonical identity. The wrapper's records
+// have to name the Stage-1 and Stage-2 digests, and a workflow that had to
+// recompute them by hand would eventually compute them differently.
+func runWallDigest(args []string) error {
+	fs := flag.NewFlagSet("wall digest", flag.ExitOnError)
+	file := fs.String("file", "", "the document to digest (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *file == "" {
+		return fmt.Errorf("--file is required")
+	}
+	var probe struct {
+		Kind string `json:"kind"`
+	}
+	if err := walltime.ReadJSONFile(*file, &probe); err != nil {
+		return err
+	}
+	var (
+		d   walltime.Digest
+		err error
+	)
+	switch probe.Kind {
+	case walltime.Stage1Kind:
+		var v walltime.Stage1Manifest
+		if err = walltime.ReadJSONFile(*file, &v); err == nil {
+			d, err = v.DigestOf()
+		}
+	case walltime.Stage2Kind:
+		var v walltime.Stage2Receipt
+		if err = walltime.ReadJSONFile(*file, &v); err == nil {
+			d, err = v.DigestOf()
+		}
+	case walltime.BundleKind:
+		var v walltime.PlanningInputBundle
+		if err = walltime.ReadJSONFile(*file, &v); err == nil {
+			d, err = v.DigestOf()
+		}
+	case walltime.RegistryKind:
+		var v walltime.AetaRegistry
+		if err = walltime.ReadJSONFile(*file, &v); err == nil {
+			d, err = v.DigestOf()
+		}
+	case walltime.ScorerKind:
+		var v walltime.Scorer
+		if err = walltime.ReadJSONFile(*file, &v); err == nil {
+			d, err = v.DigestOf()
+		}
+	case walltime.TrainingSetKind:
+		var v walltime.TrainingReceiptSet
+		if err = walltime.ReadJSONFile(*file, &v); err == nil {
+			d, err = v.DigestOf()
+		}
+	default:
+		return fmt.Errorf("%s has kind %q, which is not a document this verifier digests", *file, probe.Kind)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Println(d)
+	return nil
+}
+
+func runWallTrain(args []string) error {
+	fs := flag.NewFlagSet("wall train", flag.ExitOnError)
+	labels := fs.String("labels", "", "sealed training receipt set (required)")
+	id := fs.String("id", "", "identity to give the frozen scorer (required)")
+	lambda := fs.Float64("lambda", 0.01, "ridge regularisation; 0 is plain least squares")
+	out := fs.String("out", "", "write the frozen scorer here (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *labels == "" || *id == "" || *out == "" {
+		return fmt.Errorf("--labels, --id and --out are all required")
+	}
+	var set walltime.TrainingReceiptSet
+	if err := walltime.ReadJSONFile(*labels, &set); err != nil {
+		return err
+	}
+	scorer, err := walltime.TrainScorer(set, *id, *lambda)
+	if err != nil {
+		return err
+	}
+	if err := walltime.WriteJSONFile(*out, scorer); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "testbucket wall: fitted %s from %d sealed label(s)\n  scorer digest: %s\n  receipt set:   %s\n",
+		scorer.ID, len(set.Labels), scorer.Lineage.ScorerDigest, scorer.Lineage.ReceiptSetDigest)
+	return nil
+}
+
+// runWallCampaign applies the frozen decision rule. It is deliberately a
+// separate command from `verify`: a per-run verdict says whether one row
+// qualifies, and this says whether five pairs of them decide anything.
+func runWallCampaign(args []string) error {
+	fs := flag.NewFlagSet("wall campaign", flag.ExitOnError)
+	in := fs.String("in", "", "JSON array of baseline/candidate pairs (required)")
+	asJSON := fs.Bool("json", false, "write the gate results as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *in == "" {
+		return fmt.Errorf("--in is required")
+	}
+	var pairs []walltime.CampaignPair
+	if err := walltime.ReadJSONFile(*in, &pairs); err != nil {
+		return err
+	}
+	gates := walltime.EvaluateCampaign(pairs)
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(gates); err != nil {
+			return err
+		}
+	} else {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintf(w, "gate\trequired\tobserved\tn\tresult\n")
+		for _, g := range gates {
+			result := "FAIL"
+			if g.Pass {
+				result = "pass"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", g.Name, g.Required, g.Observed, g.Population, result)
+			if g.Detail != "" {
+				fmt.Fprintf(w, "\t\t%s\n", g.Detail)
+			}
+		}
+		if err := w.Flush(); err != nil {
+			return err
+		}
+	}
+	for _, g := range gates {
+		if !g.Pass {
+			return fmt.Errorf("wall campaign: the decision rule is not satisfied (%s)", g.Name)
+		}
+	}
+	return nil
 }
 
 func runWallVerify(args []string) error {

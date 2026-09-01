@@ -51,6 +51,7 @@ func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
 	out := runner.Rendered{NeedsNode: true}
 
 	var wholeFiles []string
+	var wholeUnits []string
 	type slice struct {
 		id    string
 		file  string
@@ -63,6 +64,7 @@ func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
 			slices = append(slices, slice{id: u.ID, file: u.Packages[0].ID, names: append([]string(nil), u.Run...)})
 			continue
 		}
+		wholeUnits = append(wholeUnits, u.ID)
 		for _, p := range u.Packages {
 			wholeFiles = append(wholeFiles, p.ID)
 		}
@@ -72,11 +74,16 @@ func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
 	if len(wholeFiles) > 0 {
 		sort.Strings(wholeFiles)
 		wholeFiles = dedupe(wholeFiles)
-		invs = append(invs, vitestInvocation(cfg, wholeFiles, nil))
+		sort.Strings(wholeUnits)
+		inv := vitestInvocation(cfg, wholeFiles, nil)
+		inv.Units = wholeUnits
+		invs = append(invs, inv)
 	}
 	sort.Slice(slices, func(i, j int) bool { return slices[i].id < slices[j].id })
 	for _, s := range slices {
-		invs = append(invs, vitestInvocation(cfg, []string{s.file}, s.names))
+		inv := vitestInvocation(cfg, []string{s.file}, s.names)
+		inv.Units = []string{s.id}
+		invs = append(invs, inv)
 	}
 
 	out.Invocations = invs

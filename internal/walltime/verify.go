@@ -166,7 +166,15 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	return v, nil
 }
 
+// add records a finding, collapsing an exact repeat. The same defect reached
+// through several endpoints is one defect, and a report that says it six times
+// buries the other five findings under it.
 func (v *Verdict) add(code, severity, detail string) {
+	for _, f := range v.Findings {
+		if f.Code == code && f.Detail == detail {
+			return
+		}
+	}
 	v.Findings = append(v.Findings, Finding{Code: code, Severity: severity, Detail: detail})
 }
 
@@ -403,7 +411,7 @@ func verifyEndpoints(v *Verdict, envs []Envelope) {
 		for _, r := range []Record{e.Physical.start, e.Physical.end, e.Peer.start, e.Peer.end, e.Trace.start, e.Trace.end} {
 			if !r.Instant.Scorable() {
 				v.add("WT-010", SeverityIneligible,
-					fmt.Sprintf("%s: a %s endpoint was read from %s, which has no shared epoch across producers", label, r.Producer, r.Instant.ClockID))
+					fmt.Sprintf("%s: a %s endpoint was read from %s, which is not the clock the contract scores", label, r.Producer, r.Instant.ClockID))
 			}
 			if boot == "" {
 				boot = r.Instant.BootID

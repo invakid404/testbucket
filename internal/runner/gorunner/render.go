@@ -117,6 +117,7 @@ func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
 		}
 		sort.Strings(g.ids)
 		inv.Desc = strings.Join(g.ids, " ")
+		inv.Units = append([]string(nil), g.ids...)
 		out.Invocations = append(out.Invocations, inv)
 		lines = append(lines, shellLine(inv, cfg, b.Index, len(lines)))
 	}

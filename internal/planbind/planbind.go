@@ -186,6 +186,11 @@ type Result struct {
 	// Bundle is the bundle the plan was derived from, echoed so a caller does
 	// not have to hold it alongside.
 	Bundle *walltime.PlanningInputBundle
+	// Allocator holds the frozen Palloc values the partition used, when one
+	// was supplied. The audit projection is taken over exactly these numbers
+	// rather than recomputed, so a scorer that moved afterwards cannot make a
+	// prediction look better than it was.
+	Allocator *Allocator
 }
 
 // PlanOptions configures the replay.
@@ -193,6 +198,12 @@ type PlanOptions struct {
 	Bundle *walltime.PlanningInputBundle
 	// Stage1 is the parent manifest digest the receipt records.
 	Stage1 walltime.Digest
+	// Scorer, when set, makes the frozen pre-plan score the ALLOCATION input:
+	// KK packs by Palloc while every reported est_seconds keeps summing the
+	// store's measured weights. Without it the partition uses the store weights
+	// as it always has — which is a perfectly good split and is NOT campaign
+	// eligible, because a reporter-derived weight is an outcome.
+	Scorer *walltime.Scorer
 }
 
 // Plan replays the frozen bundle through the real planner and returns the
@@ -245,7 +256,7 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 		return nil, err
 	}
 
-	doc, err := core.BuildPlan(ctx, rnr, st, reason, core.PlanOptions{
+	planOpt := core.PlanOptions{
 		K:          b.Selection.K,
 		StorePath:  b.Store.Name,
 		Count:      b.Selection.Count,
@@ -253,7 +264,14 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 		Now:        instant,
 		Live:       live,
 		Token:      b.Selection.Token,
-	})
+	}
+	var allocator *Allocator
+	if opt.Scorer != nil {
+		allocator = NewAllocator(*opt.Scorer, NewFeatureBuilder(b, live, opt.Stage1))
+		planOpt.AllocationScore = allocator.Score
+	}
+
+	doc, err := core.BuildPlan(ctx, rnr, st, reason, planOpt)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +280,10 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Doc: doc, Receipt: *receipt, Bundle: b}, nil
+	if opt.Scorer != nil {
+		receipt.PlannerResult += fmt.Sprintf(" allocation=palloc scorer=%s", opt.Scorer.ID)
+	}
+	return &Result{Doc: doc, Receipt: *receipt, Bundle: b, Allocator: allocator}, nil
 }
 
 // deriveReceipt computes every digest the Stage-2 receipt carries, plus the

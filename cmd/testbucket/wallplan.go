@@ -191,6 +191,7 @@ func runWallReplay(args []string) error {
 	bundlePath := fs.String("bundle", "", "planning-input bundle to replay (required)")
 	receiptPath := fs.String("stage2", "", "Stage-2 derived-plan receipt to check against (required)")
 	stage1Path := fs.String("stage1", "", "Stage-1 manifest whose digest the receipt must name")
+	scorerPath := fs.String("scorer", "", "the frozen scorer the plan allocated with; its digest must match the training lineage Stage 1 bound")
 	shardPlan := fs.String("shard-plan", "", "also write the replayed plan here")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -212,6 +213,7 @@ func runWallReplay(args []string) error {
 	}
 
 	stage1 := issued.Stage1Digest
+	var lineage walltime.TrainingLineageID
 	if *stage1Path != "" {
 		var m walltime.Stage1Manifest
 		if err := walltime.ReadJSONFile(*stage1Path, &m); err != nil {
@@ -231,9 +233,32 @@ func runWallReplay(args []string) error {
 			return fmt.Errorf("stage-1 authority signature: %w", err)
 		}
 		stage1 = d
+		lineage = m.TrainingLineage
 	}
 
-	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{Bundle: &bundle, Stage1: stage1})
+	// The scorer is a delivery-bound identity: Stage 1 names its digest, and a
+	// replay that used different coefficients would produce a different plan
+	// for a reason nobody authorised. Supplying the wrong bytes is caught here
+	// rather than showing up as an unexplained digest mismatch below.
+	var scorer *walltime.Scorer
+	if *scorerPath != "" {
+		var sc walltime.Scorer
+		if err := walltime.ReadJSONFile(*scorerPath, &sc); err != nil {
+			return err
+		}
+		d, err := sc.DigestOf()
+		if err != nil {
+			return err
+		}
+		if lineage.ScorerDigest != "" && lineage.ScorerDigest != d {
+			return fmt.Errorf("the supplied scorer digests to %s but Stage 1 binds %s", d, lineage.ScorerDigest)
+		}
+		scorer = &sc
+	} else if lineage.ScorerDigest != "" {
+		return fmt.Errorf("Stage 1 binds scorer %s but none was supplied; pass --scorer so the replay allocates the way the plan did", lineage.ScorerDigest)
+	}
+
+	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{Bundle: &bundle, Stage1: stage1, Scorer: scorer})
 	if err != nil {
 		return err
 	}
@@ -256,7 +281,25 @@ func runWallReplay(args []string) error {
 // The receipt is written with O_EXCL. That is the exactly-once rule made
 // mechanical: the bound planner runs once, and a second run that quietly
 // replaced the first receipt would be indistinguishable from the first.
-func planFromBundle(bundlePath, stage1Path, stage2Path, shardPlan string, asJSON bool) error {
+// frozenPlanOptions is what the frozen `plan` path needs beyond the bundle.
+type frozenPlanOptions struct {
+	bundlePath string
+	stage1Path string
+	stage2Path string
+	shardPlan  string
+	asJSON     bool
+	// scorerPath, when set, makes the frozen pre-plan score the ALLOCATION
+	// input. Without it the partition uses the store's measured weights, which
+	// is a perfectly good split and is not campaign eligible.
+	scorerPath string
+	// registryPath is the frozen Aeta component template; outDir is where the
+	// per-bucket derived documents (Palloc, Pcheck, Aeta) are written.
+	registryPath string
+	outDir       string
+}
+
+func planFromBundle(o frozenPlanOptions) error {
+	bundlePath, stage1Path, stage2Path, shardPlan, asJSON := o.bundlePath, o.stage1Path, o.stage2Path, o.shardPlan, o.asJSON
 	var bundle walltime.PlanningInputBundle
 	if err := walltime.ReadJSONFile(bundlePath, &bundle); err != nil {
 		return err
@@ -286,9 +329,29 @@ func planFromBundle(bundlePath, stage1Path, stage2Path, shardPlan string, asJSON
 		stage1 = d
 	}
 
-	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{Bundle: &bundle, Stage1: stage1})
+	var scorer *walltime.Scorer
+	if o.scorerPath != "" {
+		var sc walltime.Scorer
+		if err := walltime.ReadJSONFile(o.scorerPath, &sc); err != nil {
+			return err
+		}
+		if sc.Kind != walltime.ScorerKind {
+			return fmt.Errorf("%s is not a frozen scorer (kind %q)", o.scorerPath, sc.Kind)
+		}
+		if sc.Lineage.ReceiptSetDigest == "" {
+			return fmt.Errorf("%s names no sealed training receipt set; a scorer with no lineage cannot allocate", o.scorerPath)
+		}
+		scorer = &sc
+	}
+
+	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{Bundle: &bundle, Stage1: stage1, Scorer: scorer})
 	if err != nil {
 		return err
+	}
+	if o.outDir != "" {
+		if err := writeDerivedDocuments(o, res); err != nil {
+			return err
+		}
 	}
 	if shardPlan != "" {
 		if err := writeJSONFile(shardPlan, res.Doc); err != nil {
@@ -322,5 +385,65 @@ func planFromBundle(bundlePath, stage1Path, stage2Path, shardPlan string, asJSON
 	}
 	fmt.Fprintf(os.Stderr, "testbucket plan: derived from frozen inputs\n  full document: %s\n  semantic:      %s\n",
 		res.Receipt.PlanDigest, res.Receipt.SemanticDigest)
+	return nil
+}
+
+// writeDerivedDocuments emits the per-bucket Palloc projection and pre-action
+// forecast. Both are Stage-2 instantiations: they happen after the one
+// authorised plan and before any bucket action starts, and neither can change
+// the plan they describe.
+func writeDerivedDocuments(o frozenPlanOptions, res *planbind.Result) error {
+	if err := os.MkdirAll(o.outDir, 0o755); err != nil {
+		return err
+	}
+	stage2, err := res.Receipt.DigestOf()
+	if err != nil {
+		return err
+	}
+	if res.Allocator != nil {
+		if err := walltime.WriteJSONFile(filepath.Join(o.outDir, "palloc.json"), res.Allocator.Values()); err != nil {
+			return err
+		}
+	}
+	var registry *walltime.AetaRegistry
+	if o.registryPath != "" {
+		var r walltime.AetaRegistry
+		if err := walltime.ReadJSONFile(o.registryPath, &r); err != nil {
+			return err
+		}
+		if err := r.Validate(); err != nil {
+			return err
+		}
+		registry = &r
+	}
+	for _, b := range res.Doc.Buckets {
+		if res.Allocator != nil {
+			pcheck, err := planbind.PcheckFor(res.Doc, b.Index, stage2, res.Allocator)
+			if err != nil {
+				return err
+			}
+			if err := walltime.WriteJSONFile(filepath.Join(o.outDir, fmt.Sprintf("pcheck-%d.json", b.Index)), pcheck); err != nil {
+				return err
+			}
+		}
+		if registry == nil {
+			continue
+		}
+		palloc := 0.0
+		if res.Allocator != nil {
+			if palloc, err = planbind.PallocTotal(res.Doc, b.Index, res.Allocator); err != nil {
+				return err
+			}
+		}
+		aeta, err := registry.Instantiate(walltime.AetaInputs{
+			BucketID: b.Name, PallocSeconds: palloc, Invocations: len(b.Invocations), Stage2: stage2,
+		})
+		if err != nil {
+			return fmt.Errorf("instantiate Aeta for bucket %d: %w", b.Index, err)
+		}
+		if err := walltime.WriteJSONFile(filepath.Join(o.outDir, fmt.Sprintf("aeta-%d.json", b.Index)), aeta); err != nil {
+			return err
+		}
+	}
 	return nil
 }

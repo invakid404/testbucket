@@ -132,4 +132,11 @@ type Invocation struct {
 	Env  map[string]string `json:"env,omitempty"`
 	Args []string          `json:"args"`
 	Desc string            `json:"desc"`
+	// Units is the ids of the scheduled units this one call covers. The
+	// adapter knows the grouping — which units merged into a shared command
+	// and which had to be their own — and nothing downstream can re-derive it
+	// reliably, since two name slices of one file are indistinguishable from
+	// their descriptions alone. The audit and the predictor projection both
+	// read it.
+	Units []string `json:"units,omitempty"`
 }

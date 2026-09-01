@@ -101,9 +101,10 @@ func (v FeatureVector) Validate(schema []string) error {
 			return fmt.Errorf("feature vector for %q is missing schema feature %q", v.UnitID, name)
 		}
 	}
-	if len(schema) > 0 && len(seen) != len(schema) {
-		return fmt.Errorf("feature vector for %q carries features outside the frozen schema", v.UnitID)
-	}
+	// A feature outside the schema is allowed through — it has already passed
+	// the provenance check above and the scorer has no coefficient for it, so
+	// it cannot influence a score. Refusing it would only force the builder
+	// and every frozen scorer to be versioned in lockstep.
 	return nil
 }
 
