@@ -24,7 +24,12 @@ type cgroup2 struct {
 	ident ContainmentIdentity
 }
 
-func newContainment(name string) (Containment, error) {
+func newContainment(name string, parent *ContainmentIdentity) (Containment, error) {
+	// A nested level is created inside its parent, so the child's processes
+	// stay inside the parent's lifecycle.
+	if parent != nil && parent.Primitive == PrimitiveCgroup2 {
+		return newCgroupUnder(parent.ID, name)
+	}
 	root := strings.TrimSpace(os.Getenv(cgroupRootEnv))
 	if root == "" {
 		return newProcessGroupContainment(name, fmt.Sprintf("%s is unset: no delegated cgroup-v2 subtree", cgroupRootEnv))
@@ -36,6 +41,13 @@ func newContainment(name string) (Containment, error) {
 	if st.Type != cgroup2SuperMagic {
 		return newProcessGroupContainment(name, fmt.Sprintf("%s is not a cgroup-v2 mount", root))
 	}
+	return newCgroupUnder(root, name)
+}
+
+// newCgroupUnder creates one containment directory under an existing
+// cgroup-v2 directory and reads back its inode, which is what makes the
+// identity survive a path being reused.
+func newCgroupUnder(root, name string) (Containment, error) {
 	dir := filepath.Join(root, name)
 	if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
 		return newProcessGroupContainment(name, fmt.Sprintf("mkdir %s: %v", dir, err))

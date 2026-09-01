@@ -513,14 +513,18 @@ func (r Stage2Receipt) Matches(other Stage2Receipt) error {
 	return nil
 }
 
-// WriteJSONFile writes a receipt or manifest, refusing to overwrite. Refusal
-// is the point: the planner may run EXACTLY ONCE, and a second run that
-// silently replaced the first receipt would look identical to the first.
+// WriteJSONFile writes a receipt, manifest or bundle, refusing to overwrite.
+//
+// Refusal is the point. These documents are identities: the bound planner runs
+// exactly once, a manifest authorises one set of inputs, and a scorer is the
+// scorer a campaign froze. A second write that silently replaced the first
+// would be indistinguishable from the first, which is the one thing a receipt
+// must never be.
 func WriteJSONFile(path string, v any) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		if os.IsExist(err) {
-			return fmt.Errorf("walltime: %s already exists: the bound planner runs exactly once, and a replan is not admissible", path)
+			return fmt.Errorf("walltime: %s already exists and these documents are identities, not outputs; write the new one to a new path", path)
 		}
 		return err
 	}

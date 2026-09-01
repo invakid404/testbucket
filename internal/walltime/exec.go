@@ -43,10 +43,16 @@ type ExecOptions struct {
 	UnitDigest Digest
 	AtomDigest Digest
 
-	// Parent, when set, is a containment this wrapper joins before creating
-	// its own: a script wrapper joins the action containment so its work is
-	// inside A, and an invocation wrapper joins the script containment.
+	// Parent, when set, is the ENCLOSING containment: this wrapper's own
+	// containment is created inside it, so a nested envelope's processes stay
+	// inside the lifecycle that is supposed to contain them.
 	Parent *ContainmentIdentity
+	// JoinParent additionally moves THIS process into the parent containment
+	// before it does any work. It is true for a script wrapper, which an
+	// Actions step starts fresh from outside the action containment, and false
+	// for an invocation wrapper, which is already inside the script
+	// containment by inheritance and would be moved OUT by joining.
+	JoinParent bool
 
 	Timeout time.Duration
 	Stdin   *os.File
@@ -100,13 +106,20 @@ func Exec(opt ExecOptions) (int, error) {
 	// Joining the parent containment before doing anything else is what makes
 	// this wrapper's own work — not just its child's — part of the enclosing
 	// envelope's containment lifecycle.
-	if opt.Parent != nil {
+	//
+	// JoinParent is separate from Parent because they are different questions.
+	// A script wrapper is a fresh process started by an Actions step, so it has
+	// to join. An invocation wrapper is already inside the script containment
+	// by inheritance, and joining would MOVE it out — a process belongs to
+	// exactly one cgroup — taking the invocation's work out of the script
+	// lifecycle that is supposed to contain it.
+	if opt.Parent != nil && opt.JoinParent {
 		if err := joinContainment(*opt.Parent, os.Getpid()); err != nil {
 			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "join parent containment: "+err.Error())
 		}
 	}
 
-	cont, err := NewContainment(containmentName(opt))
+	cont, err := NewContainment(containmentName(opt), opt.Parent)
 	if err != nil {
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "create containment: "+err.Error())
 	}
@@ -118,6 +131,16 @@ func Exec(opt ExecOptions) (int, error) {
 		Run: opt.Run, Containment: cont.Identity(), Instant: start, Spec: spec,
 	}); err != nil {
 		return 1, err
+	}
+	if opt.Level == LevelScript {
+		// The invocation wrappers the script is about to start are separate
+		// processes; this is how they find the containment they must nest
+		// inside. It is removed when the script closes, so a later run cannot
+		// nest under a containment that no longer exists.
+		if err := writeContainmentHandoff(opt.Dir, cont.Identity()); err != nil {
+			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
+		}
+		defer os.Remove(scriptHandoffPath(opt.Dir))
 	}
 
 	deadline := time.Now().Add(opt.Timeout)
@@ -451,6 +474,36 @@ func terminalExec(w *Writer, opt ExecOptions, spec *SpecIdentity, start Instant,
 		Spec: spec, Terminal: state, Reason: reason,
 	})
 	return fmt.Errorf("walltime: %s", reason)
+}
+
+// scriptHandoffPath is where a script wrapper leaves its containment identity
+// for the invocation wrappers its own script starts.
+func scriptHandoffPath(dir string) string { return filepath.Join(dir, "script-containment.json") }
+
+func writeContainmentHandoff(dir string, ident ContainmentIdentity) error {
+	b, err := json.MarshalIndent(ident, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(scriptHandoffPath(dir), b, 0o644); err != nil {
+		return fmt.Errorf("write the script containment handoff: %w", err)
+	}
+	return nil
+}
+
+// ScriptContainment reads that handoff. A missing one is not an error: an
+// invocation run outside a measured script simply has no enclosing script
+// containment.
+func ScriptContainment(dir string) (*ContainmentIdentity, bool) {
+	b, err := os.ReadFile(scriptHandoffPath(dir))
+	if err != nil {
+		return nil, false
+	}
+	var ident ContainmentIdentity
+	if err := json.Unmarshal(b, &ident); err != nil {
+		return nil, false
+	}
+	return &ident, true
 }
 
 func containmentName(opt ExecOptions) string {

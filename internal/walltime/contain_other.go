@@ -11,7 +11,7 @@ import (
 // use, so it returns the unscored process-group fallback. The contract already
 // says as much: a different OS needs its own predeclared containment primitive
 // before it can score, and until one exists the honest answer is INELIGIBLE.
-func newContainment(name string) (Containment, error) {
+func newContainment(name string, parent *ContainmentIdentity) (Containment, error) {
 	return newProcessGroupContainment(name, "no cgroup-v2 containment on "+runtime.GOOS)
 }
 

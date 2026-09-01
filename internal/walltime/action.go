@@ -56,7 +56,7 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	defer w.Close()
 
 	start := clock.Now()
-	cont, err := NewContainment(containmentName(ExecOptions{Level: LevelAction, Run: run}))
+	cont, err := NewContainment(containmentName(ExecOptions{Level: LevelAction, Run: run}), nil)
 	if err != nil {
 		return nil, err
 	}

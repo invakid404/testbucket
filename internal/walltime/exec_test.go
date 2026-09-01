@@ -224,9 +224,15 @@ func TestActionEnvelopeSpansSteps(t *testing.T) {
 	ident := st.Containment
 	if _, err := Exec(ExecOptions{
 		Level: LevelScript, Dir: dir, Run: run, Argv: []string{"sh", "-c", "sleep 0.02"}, Cwd: dir,
-		Parent: &ident, Timeout: 30 * time.Second,
+		Parent: &ident, JoinParent: true, Timeout: 30 * time.Second,
 	}); err != nil {
 		t.Fatalf("Exec(script): %v", err)
+	}
+	// The handoff a script leaves for its invocation wrappers must not outlive
+	// it: nesting under a containment that no longer exists would attribute an
+	// invocation to a lifecycle that had already closed.
+	if _, ok := ScriptContainment(dir); ok {
+		t.Errorf("the script containment handoff outlived the script")
 	}
 	if _, err := EndAction(dir, TerminalPassed, ""); err != nil {
 		t.Fatalf("EndAction: %v", err)
@@ -342,5 +348,40 @@ func TestExecPassesTheChildOutputThrough(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("the child's output did not reach the caller: wanted %q in %q", want, b)
 		}
+	}
+}
+
+// TestScriptPublishesItsContainmentWhileItRuns: an invocation wrapper is a
+// separate process, and this handoff is how it finds the containment it must
+// nest inside. Nesting is not decoration — an invocation containment created
+// BESIDE the script's would take the invocation's processes out of the
+// lifecycle the script's trace claims to bracket.
+func TestScriptPublishesItsContainmentWhileItRuns(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "seen.json")
+	// The child copies the handoff, so the test observes what an invocation
+	// wrapper would have seen mid-script.
+	script := "cat " + filepath.Join(dir, "script-containment.json") + " > " + probe
+	if _, err := Exec(ExecOptions{
+		Level: LevelScript, Dir: dir, Cwd: dir, Timeout: 30 * time.Second,
+		Argv: []string{"sh", "-c", script},
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	b, err := os.ReadFile(probe)
+	if err != nil {
+		t.Fatalf("the script could not read its own containment handoff: %v", err)
+	}
+	var seen ContainmentIdentity
+	if err := json.Unmarshal(b, &seen); err != nil {
+		t.Fatalf("the handoff is not a containment identity: %v", err)
+	}
+	recs, err := ReadRecords(filepath.Join(dir, streamName(ProducerPhysical, LevelScript, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !seen.Same(recs[0].Containment) {
+		t.Errorf("the handoff names %s/%s but the script recorded %s/%s",
+			seen.ID, seen.Inode, recs[0].Containment.ID, recs[0].Containment.Inode)
 	}
 }

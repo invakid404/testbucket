@@ -180,7 +180,7 @@ func runWallExec(args []string) error {
 	spec := fs.String("spec", "", "read the invocation spec (argv, cwd, selector, digests) from this JSON file instead of flags")
 	unit := fs.String("unit-digest", "", "digest of the planned unit this invocation renders")
 	atom := fs.String("atom-digest", "", "digest of the atom membership this invocation covers")
-	joinAction := fs.Bool("join-action", true, "join the enclosing action containment recorded by `wall begin`, when present")
+	joinAction := fs.Bool("join-action", true, "for --level script, join the enclosing action containment recorded by `wall begin`. An invocation wrapper is already inside the script containment by inheritance, so it never joins — joining would move it out")
 	timeout := fs.Duration("timeout", walltime.DefaultTimeout, "bound on every wait")
 	var selector stringList
 	fs.Var(&selector, "selector", "a test-selection token this invocation applies; repeatable")
@@ -219,18 +219,34 @@ func runWallExec(args []string) error {
 	if len(opt.Argv) == 0 {
 		return fmt.Errorf("no command: pass it after -- or supply --spec")
 	}
-	if *joinAction {
-		if st, err := walltime.LoadActionState(*dir); err == nil {
-			ident := st.Containment
-			opt.Parent = &ident
-			if opt.Run.CampaignID == "" {
-				opt.Run = st.Run
-			}
+	// The enclosing containment differs by level, and so does whether this
+	// process joins it. A script wrapper is started fresh by an Actions step
+	// and joins the ACTION containment; an invocation wrapper is already
+	// inside the SCRIPT containment by inheritance and only needs to nest its
+	// own containment under it.
+	if st, err := walltime.LoadActionState(*dir); err == nil {
+		ident := st.Containment
+		opt.Parent = &ident
+		opt.JoinParent = *joinAction
+		if opt.Run.CampaignID == "" && opt.Run.Stage2 == "" {
+			opt.Run = st.Run
+		}
+	}
+	if opt.Level == walltime.LevelInvocation {
+		opt.JoinParent = false
+		if ident, ok := walltime.ScriptContainment(*dir); ok {
+			opt.Parent = ident
 		}
 	}
 	code, err := walltime.Exec(opt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "testbucket wall: %v\n", err)
+		if code == 0 {
+			// A wrapper failure with a successful child is still a failure:
+			// the measurement did not close, and reporting success would make
+			// a missing row look like a recorded one.
+			code = 1
+		}
 	}
 	// The measured command's status is the status of this process: a wrapper
 	// that swallowed a failing bucket would make a red run look green.

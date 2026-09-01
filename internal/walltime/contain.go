@@ -60,11 +60,20 @@ type Containment interface {
 	Destroy() error
 }
 
-// NewContainment creates a dedicated containment for one level. name is the
-// level-unique containment name. A host with no delegated cgroup-v2 tree gets
-// the unscored process-group fallback rather than an error: the run still
-// produces a full receipt, and the verifier is what refuses to score it.
-func NewContainment(name string) (Containment, error) { return newContainment(name) }
+// NewContainment creates a dedicated containment for one level.
+//
+// parent, when set, is the enclosing containment this one is created INSIDE.
+// That nesting is not decoration: an invocation containment created beside the
+// script containment instead of under it would take the invocation's processes
+// out of the script's lifecycle, and the trace would then be bracketing work
+// that had left the interval it claims to measure.
+//
+// A host with no delegated cgroup-v2 tree gets the unscored process-group
+// fallback rather than an error: the run still produces a full receipt, and
+// the verifier is what refuses to score it.
+func NewContainment(name string, parent *ContainmentIdentity) (Containment, error) {
+	return newContainment(name, parent)
+}
 
 // newRawEventID mints an observation id that no other producer can reproduce.
 func newRawEventID(observer string) string {
