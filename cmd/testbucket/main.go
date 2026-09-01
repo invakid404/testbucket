@@ -56,6 +56,11 @@ usage:
                               the plan it was fanned out from: every target
                               covered exactly as scheduled, shards and slices
                               accounted for
+  testbucket wall    <sub>    complete-action wall-time measurement: open and
+                              close the physical action envelope, run a command
+                              under a physical envelope with its own containment
+                              peer and independent trace, and verify a records
+                              directory against every frozen gate
   testbucket render           replay a "go test -json" stream from stdin as the
                               plain log it would have printed; a pure filter that
                               never changes an exit status
@@ -83,6 +88,8 @@ func main() {
 		err = runAudit(os.Args[2:])
 	case "render":
 		err = runRender(os.Args[2:])
+	case "wall":
+		err = runWall(os.Args[2:])
 	case "version", "--version", "-v":
 		printVersion()
 		return

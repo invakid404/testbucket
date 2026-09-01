@@ -1,0 +1,94 @@
+package walltime
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"syscall"
+)
+
+// Containment primitives. Only PrimitiveCgroup2 can delimit a SCORED
+// lifecycle: it is the one primitive here whose membership the workload cannot
+// modify and whose emptiness the kernel reports as an event rather than as a
+// guess.
+const (
+	// PrimitiveCgroup2 is a dedicated cgroup-v2 subtree.
+	PrimitiveCgroup2 = "cgroup2"
+	// PrimitiveProcessGroup is the diagnostic fallback for a platform or a
+	// runner with no delegated cgroup tree. A workload can leave a process
+	// group at will, so a lifecycle delimited by one is NEVER scored — it
+	// exists so a developer run still produces an honest, complete, ineligible
+	// receipt.
+	PrimitiveProcessGroup = "process_group_unscored"
+)
+
+// RawEvent is one producer's OWN observation of a containment transition. Two
+// producers watching the same transition each take their own read and mint
+// their own event id: the contract requires the peer and the trace to agree
+// about the lifecycle without either copying the other's evidence.
+type RawEvent struct {
+	// ID is unique to this observation — never shared between producers.
+	ID string
+	// Digest covers the raw bytes read together with the observer identity, so
+	// two independent reads of the same kernel file still yield distinct
+	// evidence digests.
+	Digest Digest
+	// Source is the taxonomy class; only SourceContainment and
+	// SourceProcessLifecycle may delimit a lifecycle.
+	Source string
+}
+
+// Containment is the level-owned process container. The physical wrapper
+// creates it, admits the child before the child can run, and the verifier —
+// never the wrapper — decides when it is empty.
+type Containment interface {
+	// Identity is the stable containment identity every producer must name.
+	Identity() ContainmentIdentity
+	// Admit places a process in the containment. It is called BEFORE the child
+	// is allowed to execute; a child that starts first is unaccounted, which is
+	// terminal.
+	Admit(pid int) error
+	// Procs snapshots current membership.
+	Procs() ([]int, error)
+	// Observe takes one fresh raw read of the containment state and returns
+	// both the observation and whether the containment is populated. observer
+	// distinguishes the producers so their event ids can never collide.
+	Observe(observer string) (RawEvent, bool, error)
+	// Signal forwards a signal to every member.
+	Signal(sig syscall.Signal) error
+	// Destroy removes the containment after it is verified empty.
+	Destroy() error
+}
+
+// NewContainment creates a dedicated containment for one level. name is the
+// level-unique containment name. A host with no delegated cgroup-v2 tree gets
+// the unscored process-group fallback rather than an error: the run still
+// produces a full receipt, and the verifier is what refuses to score it.
+func NewContainment(name string) (Containment, error) { return newContainment(name) }
+
+// newRawEventID mints an observation id that no other producer can reproduce.
+func newRawEventID(observer string) string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// A failure here would make two observations indistinguishable, which
+		// is exactly the substitution the verifier must be able to detect.
+		panic(fmt.Sprintf("walltime: raw event id: %v", err))
+	}
+	return observer + ":" + hex.EncodeToString(b[:])
+}
+
+// AttachContainment binds an ALREADY CREATED containment by its identity. It
+// is how an independent observer watches the same lifecycle the physical
+// wrapper created without being handed the wrapper's object — and how a
+// mismatched inode (a containment that was destroyed and re-created under the
+// same path) is caught rather than silently observed.
+func AttachContainment(ident ContainmentIdentity) (Containment, error) {
+	switch ident.Primitive {
+	case PrimitiveProcessGroup:
+		return &processGroup{pgid: ident.RootPID, ident: ident, reason: "attached"}, nil
+	case PrimitiveCgroup2:
+		return attachCgroup2(ident)
+	default:
+		return nil, fmt.Errorf("walltime: unknown containment primitive %q", ident.Primitive)
+	}
+}

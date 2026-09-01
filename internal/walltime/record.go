@@ -1,0 +1,411 @@
+package walltime
+
+import (
+	"bufio"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+)
+
+// Level is a nesting level of the measurement. The three levels are measured
+// independently and their gates are evaluated separately: an aggregate that
+// mixes levels does not qualify.
+type Level string
+
+const (
+	// LevelAction is the complete testbucket-controlled Run-bucket action, the
+	// product outcome A.
+	LevelAction Level = "action"
+	// LevelScript is the complete generated bucket script, VB.
+	LevelScript Level = "script"
+	// LevelInvocation is one exact rendered invocation and its waited process
+	// tree, V.
+	LevelInvocation Level = "invocation"
+)
+
+// Role is the ledger a record belongs to. The three ledgers at each level are
+// deliberately distinct types rather than one interval with a flag: the
+// physical envelope is the product, the peer is its reconciliation partner,
+// and the trace is an independent reconstruction. Mixing them is the failure
+// mode the whole schema exists to prevent.
+type Role string
+
+const (
+	RolePhysicalAction     Role = "AT"
+	RolePhysicalScript     Role = "VB"
+	RolePhysicalInvocation Role = "V"
+	RolePeerAction         Role = "CPA"
+	RolePeerScript         Role = "CPB"
+	RolePeerInvocation     Role = "CPV"
+	RoleTraceAction        Role = "VTA"
+	RoleTraceScript        Role = "VTB"
+	RoleTraceInvocation    Role = "VT"
+)
+
+// Producer is which of the three independent producers wrote a record. A peer
+// and a trace that share a producer are not independent, and the verifier says
+// so.
+type Producer string
+
+const (
+	ProducerPhysical Producer = "physical_wrapper"
+	ProducerPeer     Producer = "containment_peer"
+	ProducerTrace    Producer = "trace_collector"
+)
+
+// Source taxonomy. Only an independently observed os_containment or
+// os_process_lifecycle event may DELIMIT a peer or trace lifecycle; a wrapper
+// or reporter event may annotate one but can never supply an endpoint.
+const (
+	SourceContainment      = "os_containment"
+	SourceProcessLifecycle = "os_process_lifecycle"
+	SourceReporter         = "reporter_annotation"
+	SourceWrapper          = "wrapper_annotation"
+)
+
+// Terminal states. Every one of them is retained: an incomplete row stays in
+// the ledger with its reason and never becomes a duration.
+const (
+	TerminalPassed        = "passed"
+	TerminalFailed        = "failed"
+	TerminalSignalled     = "signalled"
+	TerminalCancelled     = "cancelled"
+	TerminalSpawnError    = "spawn_error"
+	TerminalWrapperError  = "wrapper_error"
+	TerminalCrashUnclosed = "crash_unclosed"
+)
+
+// RoleFor maps a producer and level to the ledger role, so the three producers
+// cannot disagree about what they are writing.
+func RoleFor(p Producer, l Level) (Role, error) {
+	switch p {
+	case ProducerPhysical:
+		switch l {
+		case LevelAction:
+			return RolePhysicalAction, nil
+		case LevelScript:
+			return RolePhysicalScript, nil
+		case LevelInvocation:
+			return RolePhysicalInvocation, nil
+		}
+	case ProducerPeer:
+		switch l {
+		case LevelAction:
+			return RolePeerAction, nil
+		case LevelScript:
+			return RolePeerScript, nil
+		case LevelInvocation:
+			return RolePeerInvocation, nil
+		}
+	case ProducerTrace:
+		switch l {
+		case LevelAction:
+			return RoleTraceAction, nil
+		case LevelScript:
+			return RoleTraceScript, nil
+		case LevelInvocation:
+			return RoleTraceInvocation, nil
+		}
+	}
+	return "", fmt.Errorf("walltime: no role for producer %q at level %q", p, l)
+}
+
+// RunIdentity is the campaign/delivery keying every record carries. It is
+// repeated on every line on purpose: a record must be independently
+// attributable without trusting a file name or a directory layout.
+type RunIdentity struct {
+	CampaignID  string `json:"campaign_id,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
+	AttemptID   string `json:"attempt_id,omitempty"`
+	BucketID    string `json:"bucket_id,omitempty"`
+	Repository  string `json:"repository,omitempty"`
+	WorkflowRun string `json:"workflow_run,omitempty"`
+	Job         string `json:"job,omitempty"`
+	Step        string `json:"step,omitempty"`
+	StepAttempt string `json:"step_attempt,omitempty"`
+	// Stage1 and Stage2 bind the record to the frozen planning inputs and the
+	// single derived plan. A record that names no Stage-2 receipt cannot be
+	// scored: it might have measured a plan nobody authorised.
+	Stage1 Digest `json:"stage1_digest,omitempty"`
+	Stage2 Digest `json:"stage2_digest,omitempty"`
+	// ComponentRegistry is the Aeta registry template digest in force.
+	ComponentRegistry Digest `json:"component_registry_digest,omitempty"`
+	// VerifierID is the delivery-bound verifier identity the run expects.
+	VerifierID string `json:"verifier_id,omitempty"`
+}
+
+// ContainmentIdentity is the stable containment the physical wrapper, its peer
+// and the trace must all name. Inode and PID-start are strings: they are
+// identities, not quantities, and an inode can exceed the exact float64 range
+// that the canonical digest allows.
+type ContainmentIdentity struct {
+	// Primitive is the containment mechanism, e.g. "cgroup2". Anything other
+	// than a real containment primitive is unscorable by construction.
+	Primitive string `json:"primitive"`
+	// ID is the containment path/name.
+	ID string `json:"id"`
+	// Inode is the containment inode, which distinguishes a re-created
+	// containment that reused a path.
+	Inode string `json:"inode,omitempty"`
+	// BootID ties the identity to one boot.
+	BootID string `json:"boot_id,omitempty"`
+	// RootPID and RootStart are the process-start identity of the root the
+	// containment was created for: a PID alone is reusable, a PID plus its
+	// start time is not.
+	RootPID   int    `json:"root_pid,omitempty"`
+	RootStart string `json:"root_start,omitempty"`
+}
+
+// Scorable reports whether this containment can delimit a scored lifecycle.
+func (c ContainmentIdentity) Scorable() bool {
+	return c.Primitive == PrimitiveCgroup2 && c.ID != "" && c.Inode != "" && c.BootID != ""
+}
+
+// Same reports whether two records name the same stable containment. Identity
+// is the pair (id, inode) plus boot: a path that was destroyed and re-created
+// is a DIFFERENT containment even though its name is unchanged.
+func (c ContainmentIdentity) Same(o ContainmentIdentity) bool {
+	return c.Primitive == o.Primitive && c.ID == o.ID && c.Inode == o.Inode && c.BootID == o.BootID
+}
+
+// ProcIdentity is the process-tree fact a record carries.
+type ProcIdentity struct {
+	PID       int    `json:"pid,omitempty"`
+	PGID      int    `json:"pgid,omitempty"`
+	StartID   string `json:"start_id,omitempty"`
+	ParentPID int    `json:"ppid,omitempty"`
+	ExitKind  string `json:"exit_kind,omitempty"`
+	ExitCode  int    `json:"exit_code,omitempty"`
+	Signal    string `json:"signal,omitempty"`
+}
+
+// Record is one append-only JSONL line. Hash and Signature are excluded from
+// the hashed payload; everything else is in it, so a rewritten field breaks
+// the chain.
+type Record struct {
+	Schema   string   `json:"schema"`
+	Seq      int      `json:"seq"`
+	Kind     string   `json:"kind"`
+	Role     Role     `json:"role,omitempty"`
+	Level    Level    `json:"level,omitempty"`
+	Boundary string   `json:"boundary,omitempty"`
+	Producer Producer `json:"producer"`
+	// ProducerID is the execution context of the writer: which binary, which
+	// process. Peer and trace records that share it are not independent.
+	ProducerID string `json:"producer_id"`
+	// Source is the taxonomy class of the underlying event.
+	Source string `json:"source"`
+	// RawEventID and RawEventDigest identify the raw event this endpoint was
+	// derived from. A peer and its trace observe the SAME lifecycle through
+	// DIFFERENT raw reads, so these must differ even though the containment
+	// identity matches.
+	RawEventID     string `json:"raw_event_id,omitempty"`
+	RawEventDigest Digest `json:"raw_event_digest,omitempty"`
+	// Phase names a trace phase (invocation lifecycle, inter-invocation gap,
+	// script epilogue).
+	Phase string `json:"phase,omitempty"`
+	// Seqno is the stable ordinal of an invocation within its bucket script.
+	Seqno int `json:"invocation_seq,omitempty"`
+
+	Run         RunIdentity         `json:"run"`
+	Containment ContainmentIdentity `json:"containment"`
+	Proc        ProcIdentity        `json:"proc,omitzero"`
+	Instant     Instant             `json:"instant"`
+
+	// Spec is the invocation identity: serialised argv, cwd and selector
+	// digests. It is what makes "this V measured that invocation" checkable
+	// rather than assumed.
+	Spec *SpecIdentity `json:"spec,omitzero"`
+
+	// Terminal is set on a terminal record; Reason explains a missing or
+	// abnormal closure and is retained forever.
+	Terminal string `json:"terminal,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+
+	// Note carries wrapper/reporter annotations. An annotation may never
+	// delimit a scored interval; it exists so that discarded context is still
+	// recorded rather than lost.
+	Note string `json:"note,omitempty"`
+
+	PrevHash  Digest `json:"prev_hash"`
+	Hash      Digest `json:"hash"`
+	SignerID  string `json:"signer_id,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
+// SpecIdentity is the digest-bound identity of an invocation: what was run,
+// from where, selecting what.
+type SpecIdentity struct {
+	ArgvDigest     Digest `json:"argv_digest"`
+	Cwd            string `json:"cwd"`
+	SelectorDigest Digest `json:"selector_digest,omitempty"`
+	UnitDigest     Digest `json:"unit_digest,omitempty"`
+	AtomDigest     Digest `json:"atom_digest,omitempty"`
+	Desc           string `json:"desc,omitempty"`
+}
+
+// payload is the record minus the fields that authenticate it. Hashing this
+// (rather than the marshalled line) is what makes the chain independent of
+// field order and of encoding/json's future output choices.
+func (r Record) payload() Record {
+	c := r
+	c.Hash, c.Signature = "", ""
+	return c
+}
+
+// computeHash chains this record to its predecessor.
+func (r Record) computeHash() (Digest, error) { return DigestJSON(r.payload()) }
+
+// Writer appends hash-chained records to one producer's JSONL stream.
+//
+// Every Append fsyncs before returning. That is deliberately the slow choice:
+// a record whose purpose is to prove that a child had not started yet is
+// worthless if it is still in a page cache when the machine is cancelled.
+type Writer struct {
+	mu       sync.Mutex
+	f        *os.File
+	seq      int
+	prev     Digest
+	producer Producer
+	id       string
+	key      ed25519.PrivateKey
+	signer   string
+}
+
+// NewWriter opens (creating) the append-only stream for one producer.
+// producerID is the writer's execution-context identity; signing key may be
+// nil, in which case records are hash-chained but unsigned and the verifier
+// will refuse to SCORE them (it still verifies their structure).
+func NewWriter(path string, p Producer, producerID string, key ed25519.PrivateKey) (*Writer, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("walltime: records dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("walltime: open records %s: %w", path, err)
+	}
+	w := &Writer{f: f, producer: p, id: producerID, key: key}
+	if key != nil {
+		w.signer = hex.EncodeToString(key.Public().(ed25519.PublicKey))
+	}
+	// Resume an existing stream rather than restarting its sequence: the
+	// action level writes its start and end from two different processes.
+	if seq, prev, err := tailChain(path); err == nil {
+		w.seq, w.prev = seq, prev
+	}
+	return w, nil
+}
+
+// Append stamps, chains, signs and durably writes one record.
+func (w *Writer) Append(r Record) (Record, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	r.Schema = SchemaVersion
+	r.Producer = w.producer
+	r.ProducerID = w.id
+	r.Seq = w.seq
+	r.PrevHash = w.prev
+	r.SignerID = w.signer
+	h, err := r.computeHash()
+	if err != nil {
+		return Record{}, err
+	}
+	r.Hash = h
+	if w.key != nil {
+		r.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(w.key, []byte(h)))
+	}
+	line, err := json.Marshal(r)
+	if err != nil {
+		return Record{}, fmt.Errorf("walltime: marshal record: %w", err)
+	}
+	if _, err := w.f.Write(append(line, '\n')); err != nil {
+		return Record{}, fmt.Errorf("walltime: write record: %w", err)
+	}
+	if err := w.f.Sync(); err != nil {
+		return Record{}, fmt.Errorf("walltime: sync record: %w", err)
+	}
+	w.seq++
+	w.prev = h
+	return r, nil
+}
+
+// Close flushes and closes the stream.
+func (w *Writer) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.f.Close()
+}
+
+// tailChain reads an existing stream to recover its sequence and last hash.
+func tailChain(path string) (int, Digest, error) {
+	recs, err := ReadRecords(path)
+	if err != nil || len(recs) == 0 {
+		return 0, "", err
+	}
+	last := recs[len(recs)-1]
+	return last.Seq + 1, last.Hash, nil
+}
+
+// ReadRecords parses one stream. It does NOT verify the chain — VerifyChain
+// does, and keeping them apart lets the verifier report a broken chain as a
+// finding rather than as a read error.
+func ReadRecords(path string) ([]Record, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return decodeRecords(f)
+}
+
+func decodeRecords(r io.Reader) ([]Record, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	var out []Record
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var rec Record
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return nil, fmt.Errorf("walltime: malformed record: %w", err)
+		}
+		out = append(out, rec)
+	}
+	return out, sc.Err()
+}
+
+// ReadDir loads every record stream in a directory, sorted by file name so the
+// result is deterministic.
+func ReadDir(dir string) ([]Record, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	var out []Record
+	for _, n := range names {
+		recs, err := ReadRecords(filepath.Join(dir, n))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, recs...)
+	}
+	return out, nil
+}
