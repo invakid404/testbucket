@@ -149,8 +149,13 @@ on:
         default: ""
       authority-key:
         description: >-
-          PREDECLARED authority public key (hex). The verifier will not treat a
-          Stage-1 signature as authority approval without one.
+          PREDECLARED authority public key (hex). It is used TWICE and both
+          uses are load-bearing: the plan job verifies the Stage-1 signature
+          before it derives a plan, and each bucket verifies the same signature
+          in its pre-flight before `wall begin` opens the action envelope. The
+          verifier will not treat a Stage-1 signature as authority approval
+          without one. It is a public key, so it is an input rather than a
+          secret.
         type: string
         default: ""
       verifier-key-secret:
@@ -288,6 +293,8 @@ jobs:
           scorer: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
           registry: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-frozen-inputs/registry.json', runner.temp) || '' }}
           derived-out: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived', runner.temp) || '' }}
+          authority-key: ${{ inputs.authority-key }}
+          authority: ${{ inputs.authority }}
 
       # The Stage-2 receipt and the per-bucket documents the frozen planner
       # just derived. A bucket downloads them and is verified against them;
@@ -391,7 +398,7 @@ jobs:
       # checked only against its own arithmetic is satisfied by an allocation
       # map no model produced.
       - name: Download the frozen planning inputs
-        if: inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != ''
+        if: inputs.frozen-inputs-artifact != ''
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ inputs.frozen-inputs-artifact }}
@@ -403,6 +410,26 @@ jobs:
         with:
           name: testbucket-shard-plan-${{ inputs.cache-scope }}
           path: ${{ runner.temp }}/testbucket-plan
+
+      # PRE-FLIGHT, before `wall begin` opens the action envelope.
+      #
+      # The contract puts an independent re-derivation of the plan, and the
+      # authority approval of its inputs, BEFORE AT_start. Verification after
+      # the action can refuse the row; it cannot un-run it. This step re-plans
+      # from the frozen bundle, checks it reproduces the issued receipt exactly
+      # — bindings and pre-plan approval included — and fails the bucket closed
+      # if it does not, so no envelope opens over an unauthorised plan.
+      - name: Pre-flight the frozen plan
+        if: inputs.wall-time-dir != '' && inputs.frozen-inputs-artifact != ''
+        uses: $/.github/actions/preflight
+        with:
+          version: ${{ inputs.testbucket-version }}
+          bundle: ${{ runner.temp }}/testbucket-frozen-inputs/bundle.json
+          stage1: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
+          stage2: ${{ runner.temp }}/testbucket-derived/stage2.json
+          registry: ${{ runner.temp }}/testbucket-frozen-inputs/registry.json
+          scorer: ${{ inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
+          authority-key: ${{ inputs.authority-key }}
 
       # The wrapper is installed BEFORE the measured action, by the caller.
       # The physical action envelope opens on run-bucket's first owned

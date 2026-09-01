@@ -1154,6 +1154,10 @@ type Stage2Receipt struct {
 	ScriptDigest     Digest `json:"generated_script_digest"`
 	MatrixDigest     Digest `json:"matrix_digest"`
 
+	// Stage1Approval is the authority approval the planner SAW before it
+	// planned. Stage1Digest names which manifest; this names the approval on
+	// it, which the digest cannot, because a detached signature is outside it.
+	Stage1Approval Stage1Approval `json:"stage1_approval"`
 	// Sidecars binds every per-bucket document this plan derived, by name and
 	// digest.
 	//
@@ -1189,6 +1193,64 @@ func (r Stage2Receipt) PlanDigestOf() (Digest, error) {
 	c := r
 	c.Signature, c.Sidecars = nil, nil
 	return DigestJSON(c)
+}
+
+// Stage1Approval is the authority approval the PLANNER saw, recorded in the
+// Stage-2 receipt.
+//
+// It exists because a detached signature is deliberately outside
+// Stage1Manifest.DigestOf — which is correct for a signature, and means a
+// manifest signed AFTER planning has the same Stage-1 digest as the unsigned
+// one the planner actually read. Recording the approval here makes the
+// difference visible: a plan derived from an unauthorised manifest carries no
+// approval, and no later signature can put one in a receipt that was already
+// written and independently replayed.
+type Stage1Approval struct {
+	// Authority is the protected environment that approved the inputs.
+	Authority string `json:"authority"`
+	// KeyID is the public key that signed them.
+	KeyID string `json:"key_id"`
+	// SignatureDigest covers the whole detached Signature, so the receipt
+	// names the exact approval rather than merely asserting one existed.
+	SignatureDigest Digest `json:"signature_digest"`
+}
+
+// ApprovalOf reads the approval a signed manifest carries.
+func ApprovalOf(m Stage1Manifest) (Stage1Approval, error) {
+	if m.Signature == nil {
+		return Stage1Approval{}, fmt.Errorf("the Stage-1 manifest is unsigned")
+	}
+	d, err := DigestJSON(m.Signature)
+	if err != nil {
+		return Stage1Approval{}, err
+	}
+	return Stage1Approval{Authority: m.Signature.Authority, KeyID: m.Signature.KeyID, SignatureDigest: d}, nil
+}
+
+// RequireApproval is the PRE-PLAN authorisation check.
+//
+// Validate answers "is this manifest well formed"; this answers "did the
+// authority approve it", which is a different question and the one the
+// contract puts before planning. It is separate from Validate because a
+// manifest is validated while it is being BUILT, before it can be signed.
+func (m Stage1Manifest) RequireApproval(authorityKeys []string, authority string) error {
+	if m.Signature == nil {
+		return fmt.Errorf("the Stage-1 manifest is unsigned, so nothing authorised these planning inputs")
+	}
+	if len(authorityKeys) == 0 {
+		return fmt.Errorf("no authority key was predeclared, so a self-generated signature on the Stage-1 manifest would pass")
+	}
+	d, err := m.DigestOf()
+	if err != nil {
+		return err
+	}
+	if err := VerifySigned(m.Signature, d, authorityKeys); err != nil {
+		return fmt.Errorf("stage-1 authority signature: %w", err)
+	}
+	if authority != "" && m.Signature.Authority != authority {
+		return fmt.Errorf("the Stage-1 manifest names authority %q, not the required %q", m.Signature.Authority, authority)
+	}
+	return nil
 }
 
 // SidecarName is the stable key a derived per-bucket document is bound under.
@@ -1297,6 +1359,15 @@ func (r Stage2Receipt) Matches(other Stage2Receipt) error {
 		if p.a != p.b {
 			return fmt.Errorf("%s digest mismatch: %s vs %s", p.name, p.a, p.b)
 		}
+	}
+	// The APPROVAL is compared too. It is the receipt's claim that the inputs
+	// were authorised before they were planned, and a claim no independent
+	// party re-derived is exactly the kind of assertion the replay exists to
+	// remove.
+	if r.Stage1Approval != other.Stage1Approval {
+		return fmt.Errorf("stage-1 approval mismatch: the receipt records %s/%s, the replay observed %s/%s",
+			r.Stage1Approval.Authority, r.Stage1Approval.KeyID,
+			other.Stage1Approval.Authority, other.Stage1Approval.KeyID)
 	}
 	// The per-bucket bindings are compared too. Aggregate digests say the two
 	// parties derived the same plan; only these say they derived the same

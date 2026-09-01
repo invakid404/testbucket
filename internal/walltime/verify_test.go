@@ -105,6 +105,14 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 		t.Fatal(err)
 	}
 	receipt := testReceipt(m1, bd)
+	// The approval the planner saw BEFORE it planned. The fixture used to omit
+	// it, which is exactly the gap: an unsigned Stage-1 could drive planning
+	// and be signed afterwards without changing the digest Stage 2 records.
+	approval, err := ApprovalOf(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.Stage1Approval = approval
 	// The PLAN identity, which is what the derived documents cite. The receipt
 	// binds those documents and they name it back, so one side of the circle
 	// has to cite an identity that excludes the binding — exactly as the
@@ -2245,5 +2253,153 @@ func TestTheAuditPlanMustBeTheOneStageTwoFroze(t *testing.T) {
 				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
 			}
 		})
+	}
+}
+
+// The contract puts an owner-authority signature on the planning inputs BEFORE
+// the plan exists. A post-run verifier can refuse a row, but it cannot un-run
+// an action or restore an approval that never happened — so the approval has
+// to be evidenced by the plan itself.
+//
+// The difficulty is that a detached signature is outside the Stage-1 digest,
+// correctly: an unsigned manifest and the same manifest signed afterwards have
+// the same digest, so the Stage-2 receipt's Stage1Digest cannot tell them
+// apart. The receipt therefore records the approval the planner saw, and this
+// is what catches a plan that ran first and was authorised later.
+func TestAPlanMustHaveBeenAuthorisedBeforeItExisted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(t *testing.T, docs frozenDocs)
+		want string
+	}{
+		{
+			// The exact attack: plan from an unsigned manifest, then sign it.
+			// Stage1Digest still matches, every other binding still holds, and
+			// only the absent approval says the order was wrong.
+			name: "the manifest was signed after the plan was derived",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.stage2, func(m map[string]any) { delete(m, "stage1_approval") })
+			},
+			want: "records no pre-plan authority approval",
+		},
+		{
+			name: "the receipt records an approval the manifest does not carry",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.stage2, func(m map[string]any) {
+					m["stage1_approval"] = map[string]any{
+						"authority": "ewj2-campaign", "key_id": "beef", "signature_digest": "sha256:invented",
+					}
+				})
+			},
+			want: "but the supplied Stage-1 manifest is signed by",
+		},
+		{
+			name: "the manifest is unsigned at verification time",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.stage1, func(m map[string]any) { delete(m, "signature") })
+			},
+			want: "the Stage-1 manifest is unsigned",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "records")
+			s := newSynthRun(dir)
+			docs := writeFrozenDocs(t, t.TempDir(), s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+			tc.edit(t, docs)
+
+			v, err := VerifyDir(VerifyOptions{
+				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta,
+				PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("a plan derived from inputs nobody had approved was scored")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+}
+
+// RequireApproval is the pre-plan gate itself, separate from Validate: a
+// manifest is VALIDATED while it is being built, before it can be signed, so
+// the two questions cannot be the same method.
+func TestRequireApprovalIsSeparateFromValidate(t *testing.T) {
+	key, err := NewSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := NewSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := func() Stage1Manifest {
+		m := testManifest(testBundle(), "sha256:registry")
+		m.Schedule = CampaignSchedule{}
+		return m
+	}
+
+	// A well-formed unsigned manifest still validates — that is what lets
+	// `wall stage1` build one before signing it.
+	unsigned := base()
+	if err := unsigned.RequireApproval([]string{PublicKeyOf(key)}, "ewj2-campaign"); err == nil {
+		t.Errorf("an unsigned manifest was treated as approved")
+	} else if !strings.Contains(err.Error(), "is unsigned") {
+		t.Errorf("error %q does not say it is unsigned", err)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		signWith  ed25519.PrivateKey
+		authority string
+		keys      func() []string
+		want      string
+	}{
+		{
+			name: "no predeclared key", signWith: key, authority: "ewj2-campaign",
+			keys: func() []string { return nil }, want: "no authority key was predeclared",
+		},
+		{
+			name: "signed by an undeclared key", signWith: other, authority: "ewj2-campaign",
+			keys: func() []string { return []string{PublicKeyOf(key)} }, want: "authority signature",
+		},
+		{
+			name: "approved by a different environment", signWith: key, authority: "some-other-environment",
+			keys: func() []string { return []string{PublicKeyOf(key)} }, want: "not the required",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base()
+			if err := m.Sign(tc.authority, tc.signWith); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.RequireApproval(tc.keys(), "ewj2-campaign"); err == nil {
+				t.Fatalf("an unapproved manifest passed")
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+
+	// And the approved case, so the gate is not simply refusing everything.
+	good := base()
+	if err := good.Sign("ewj2-campaign", key); err != nil {
+		t.Fatal(err)
+	}
+	if err := good.RequireApproval([]string{PublicKeyOf(key)}, "ewj2-campaign"); err != nil {
+		t.Errorf("a properly approved manifest was refused: %v", err)
 	}
 }

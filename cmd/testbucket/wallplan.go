@@ -273,6 +273,10 @@ func runWallReplay(args []string) error {
 
 	stage1 := issued.Stage1Digest
 	var lineage walltime.TrainingLineageID
+	// The approval this replay independently observed on the Stage-1 manifest.
+	// An empty one means no manifest was supplied, and Matches then reports
+	// the receipt's claim as unre-derived rather than agreeing with it.
+	var replayApproval walltime.Stage1Approval
 	if *stage1Path != "" {
 		var m walltime.Stage1Manifest
 		if err := walltime.ReadJSONFile(*stage1Path, &m); err != nil {
@@ -299,6 +303,9 @@ func runWallReplay(args []string) error {
 		}
 		stage1 = d
 		lineage = m.TrainingLineage
+		if replayApproval, err = walltime.ApprovalOf(m); err != nil {
+			return err
+		}
 	}
 
 	// The scorer is a delivery-bound identity: Stage 1 names its digest, and a
@@ -327,6 +334,10 @@ func runWallReplay(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The replay re-derives the approval too: it is a field of the receipt it
+	// is checking, so leaving it out would let a receipt claim an approval no
+	// independent party ever saw.
+	res.Receipt.Stage1Approval = replayApproval
 	// The replay re-derives the PER-BUCKET documents too. Comparing only the
 	// aggregate digests would leave the Pcheck projections, forecasts and
 	// invocation manifests — the documents the buckets actually run against —
@@ -432,6 +443,11 @@ type frozenPlanOptions struct {
 	// per-bucket derived documents (Palloc, Pcheck, Aeta) are written.
 	registryPath string
 	outDir       string
+	// authorityKeys are the PREDECLARED public keys allowed to approve the
+	// Stage-1 inputs, and authority the protected environment they must name.
+	// Both are required: the frozen path plans only from authorised inputs.
+	authorityKeys []string
+	authority     string
 }
 
 func planFromBundle(o frozenPlanOptions) error {
@@ -440,29 +456,46 @@ func planFromBundle(o frozenPlanOptions) error {
 	if err := walltime.ReadJSONFile(bundlePath, &bundle); err != nil {
 		return err
 	}
-	stage1 := walltime.Digest("")
-	if stage1Path != "" {
-		var m walltime.Stage1Manifest
-		if err := walltime.ReadJSONFile(stage1Path, &m); err != nil {
-			return err
-		}
-		if err := m.Validate(); err != nil {
-			return err
-		}
-		d, err := m.DigestOf()
+	// AUTHORISATION BEFORE PLANNING. The contract puts an owner-authority
+	// signature on the inputs before the plan exists, and the planner is where
+	// that has to be enforced: a post-run verifier can refuse the row, but it
+	// cannot un-run an action or restore an approval that never happened.
+	//
+	// Both are required on the frozen path. A frozen plan with no Stage-1 is
+	// an unauthorised plan wearing the frozen path's determinism, and a
+	// signature checked against whatever signed it is not an authority check.
+	if stage1Path == "" {
+		return fmt.Errorf("--wall-stage1 is required: planning from a frozen bundle with no Stage-1 manifest is planning from inputs nobody authorised")
+	}
+	if len(o.authorityKeys) == 0 {
+		return fmt.Errorf("--wall-authority-key is required with --wall-stage1: verifying a signature against whatever signed the document accepts any self-generated key")
+	}
+	var m walltime.Stage1Manifest
+	if err := walltime.ReadJSONFile(stage1Path, &m); err != nil {
+		return err
+	}
+	if err := m.Validate(); err != nil {
+		return err
+	}
+	if err := m.RequireApproval(o.authorityKeys, o.authority); err != nil {
+		return err
+	}
+	approval, err := walltime.ApprovalOf(m)
+	if err != nil {
+		return err
+	}
+	stage1, err := m.DigestOf()
+	if err != nil {
+		return err
+	}
+	if bd, err := bundle.DigestOf(); err == nil && m.Bundle.Kind != "" {
+		mbd, err := m.Bundle.DigestOf()
 		if err != nil {
 			return err
 		}
-		if bd, err := bundle.DigestOf(); err == nil && m.Bundle.Kind != "" {
-			mbd, err := m.Bundle.DigestOf()
-			if err != nil {
-				return err
-			}
-			if mbd != bd {
-				return fmt.Errorf("the Stage-1 manifest authorises input bundle %s, not the supplied %s", mbd, bd)
-			}
+		if mbd != bd {
+			return fmt.Errorf("the Stage-1 manifest authorises input bundle %s, not the supplied %s", mbd, bd)
 		}
-		stage1 = d
 	}
 
 	var scorer *walltime.Scorer
@@ -484,6 +517,10 @@ func planFromBundle(o frozenPlanOptions) error {
 	if err != nil {
 		return err
 	}
+	// The approval as the PLANNER saw it. Stage-1's digest excludes the
+	// detached signature, so a manifest signed after this point carries the
+	// same digest — this is the field that says the approval came first.
+	res.Receipt.Stage1Approval = approval
 	// The derived documents are written BEFORE the receipt, because the
 	// receipt binds them: a per-bucket projection or forecast that the one
 	// authorised plan does not name is a document anybody could have written,

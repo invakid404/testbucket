@@ -1,0 +1,84 @@
+name: testbucket pre-flight
+description: >-
+  Independently re-derive the frozen plan and verify its authority approval
+  BEFORE the measured action starts.
+
+  It is its own action, and it runs before run-bucket, because the contract
+  puts the independent replay and the owner-authority check ahead of AT_start.
+  Verification after the action can refuse the row; it cannot un-run it, and it
+  cannot restore an approval that never happened. A failure here fails the
+  bucket closed, so no envelope ever opens over an unauthorised plan.
+
+inputs:
+  bundle:
+    description: 'The frozen planning-input bundle the plan was derived from.'
+    required: true
+  stage1:
+    description: 'The authority-signed Stage-1 manifest that authorised it.'
+    required: true
+  stage2:
+    description: >-
+      The issued Stage-2 derived-plan receipt. This step re-plans from the
+      bundle and requires an exact match — every digest, the per-bucket
+      document bindings, and the pre-plan approval the receipt records.
+    required: true
+  authority-key:
+    description: >-
+      PREDECLARED authority public key (hex) that must have signed `stage1`.
+      Required: a signature checked against whatever signed it accepts any
+      self-generated key, which is the same as not checking.
+    required: true
+  registry:
+    description: >-
+      The frozen Aeta component-registry template. Needed because the receipt
+      binds per-bucket documents, and a replay that skipped them would leave
+      exactly those documents re-derived by nobody.
+    default: ""
+  scorer:
+    description: >-
+      The frozen scorer the plan allocated by, when Stage 1 binds one.
+    default: ""
+  version:
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. NOTE: the
+      default `v1` resolves only once a 1.x release is published; while this
+      project is on 0.x, pin an exact tag (or `v0`).
+    default: v1
+
+runs:
+  using: composite
+  steps:
+    - name: Install testbucket
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    - name: Re-derive the plan and check its approval
+      shell: bash
+      env:
+        TB_BUNDLE: ${{ inputs.bundle }}
+        TB_STAGE1: ${{ inputs.stage1 }}
+        TB_STAGE2: ${{ inputs.stage2 }}
+        TB_REGISTRY: ${{ inputs.registry }}
+        TB_SCORER: ${{ inputs.scorer }}
+        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+      run: |
+        set -euo pipefail
+        if [ -z "$TB_AUTHORITY_KEY" ]; then
+          echo "pre-flight needs an authority-key: without a predeclared key the Stage-1 signature would be checked against whatever signed it, which accepts any self-generated key." >&2
+          exit 1
+        fi
+        args=(--bundle "$TB_BUNDLE" --stage2 "$TB_STAGE2" --stage1 "$TB_STAGE1"
+              --authority-key "$TB_AUTHORITY_KEY")
+        if [ -n "$TB_REGISTRY" ]; then args+=(--registry "$TB_REGISTRY"); fi
+        if [ -n "$TB_SCORER" ]; then args+=(--scorer "$TB_SCORER"); fi
+
+        # No `|| true`. This step exists to stop the bucket, and a pre-flight
+        # that reported a problem and continued would be a log line.
+        testbucket wall replay "${args[@]}"
+        echo "pre-flight: the plan re-derives from its frozen inputs and its authority approval verifies"

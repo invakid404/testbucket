@@ -113,6 +113,19 @@ inputs:
   registry:
     description: 'Frozen Aeta component-registry template.'
     default: ""
+  authority-key:
+    description: >-
+      PREDECLARED authority public key (hex) that must have signed `stage1`.
+      REQUIRED with `bundle`. The contract puts an owner-authority signature on
+      the planning inputs BEFORE the plan exists: a post-run verifier can
+      refuse a row, but it cannot un-run an action or restore an approval that
+      never happened. Pass a secret, never a literal.
+    default: ""
+  authority:
+    description: >-
+      Protected environment the Stage-1 manifest must name. A key says WHO
+      signed; this says WHICH environment approved.
+    default: ""
   derived-out:
     description: >-
       Directory for the per-bucket derived documents (Palloc, Pcheck, forecast,
@@ -175,6 +188,8 @@ runs:
         TB_SCORER: ${{ inputs.scorer }}
         TB_REGISTRY: ${{ inputs.registry }}
         TB_DERIVED_OUT: ${{ inputs.derived-out }}
+        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_AUTHORITY: ${{ inputs.authority }}
       run: |
         set -euo pipefail
 
@@ -189,7 +204,13 @@ runs:
             echo "a frozen bundle needs --stage1: a plan derived from inputs nobody authorised is frozen and unaccountable." >&2
             exit 1
           fi
+          if [ -z "$TB_AUTHORITY_KEY" ]; then
+            echo "a frozen bundle needs an authority-key: an owner-authority signature must be VERIFIED before the plan exists, and checking a signature against whatever signed it accepts any self-generated key." >&2
+            exit 1
+          fi
           frozen=(--wall-bundle "$TB_BUNDLE" --wall-stage1 "$TB_STAGE1" --shard-plan "$TB_SHARD_PLAN")
+          frozen+=(--wall-authority-key "$TB_AUTHORITY_KEY")
+          if [ -n "$TB_AUTHORITY" ]; then frozen+=(--wall-authority "$TB_AUTHORITY"); fi
           if [ -n "$TB_STAGE2_OUT" ]; then frozen+=(--wall-stage2 "$TB_STAGE2_OUT"); fi
           if [ -n "$TB_SCORER" ]; then frozen+=(--palloc-scorer "$TB_SCORER"); fi
           if [ -n "$TB_REGISTRY" ]; then frozen+=(--wall-registry "$TB_REGISTRY"); fi

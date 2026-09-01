@@ -955,6 +955,9 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 			}
 		}
 	}
+	if stage1 != nil && stage2 != nil {
+		verifyPrePlanApproval(v, *stage1, *stage2)
+	}
 	if stage1 != nil {
 		verifyProducerBinaries(v, stage1.Instrumentation, recs)
 		// Stage 1 is where the run-key signer set is DECLARED. Taking it from
@@ -1624,5 +1627,37 @@ func deriveOutcome(v *Verdict, envs []Envelope) {
 			}
 		}
 		return
+	}
+}
+
+// verifyPrePlanApproval checks that the plan was authorised BEFORE it existed.
+//
+// The Stage-2 receipt names the Stage-1 manifest by digest, and that digest
+// excludes the detached signature — correctly, but it means an unsigned
+// manifest and the same manifest signed afterwards are indistinguishable by
+// digest alone. A plan derived from an unauthorised manifest would then carry
+// a Stage-1 reference that a later signature appears to satisfy.
+//
+// So the planner records the approval it saw, the independent replay
+// re-derives it, and this compares that record to the signature the manifest
+// actually carries now. A receipt with no approval is a plan that ran before
+// anyone approved its inputs; a receipt whose approval names a different key
+// or authority is a plan approved by someone else.
+func verifyPrePlanApproval(v *Verdict, stage1 Stage1Manifest, stage2 Stage2Receipt) {
+	if stage2.Stage1Approval == (Stage1Approval{}) {
+		v.add("WT-018", SeverityIneligible,
+			"the Stage-2 receipt records no pre-plan authority approval, so the plan may have been derived before anyone approved its inputs; a signature added afterwards leaves the Stage-1 digest unchanged and cannot restore an approval that did not happen")
+		return
+	}
+	got, err := ApprovalOf(stage1)
+	if err != nil {
+		v.add("WT-018", SeverityIneligible,
+			fmt.Sprintf("the Stage-2 receipt records a pre-plan approval but %v", err))
+		return
+	}
+	if got != stage2.Stage1Approval {
+		v.add("WT-018", SeverityIneligible,
+			fmt.Sprintf("the plan was approved by %s/%s but the supplied Stage-1 manifest is signed by %s/%s",
+				stage2.Stage1Approval.Authority, stage2.Stage1Approval.KeyID, got.Authority, got.KeyID))
 	}
 }

@@ -323,6 +323,9 @@ func runPlan(args []string) error {
 	pallocScorer := fs.String("palloc-scorer", "", "frozen pre-plan scorer (--wall-bundle): KK then packs by Palloc while est_seconds keeps reporting the store's measured weights. Without it the partition uses the store weights, which is not campaign eligible")
 	wallRegistry := fs.String("wall-registry", "", "frozen Aeta component-registry template (--wall-bundle), instantiated per bucket into --wall-out-dir")
 	wallOutDir := fs.String("wall-out-dir", "", "write the per-bucket derived documents (Palloc, Pcheck, Aeta) here (--wall-bundle)")
+	wallAuthority := fs.String("wall-authority", "", "the protected environment the Stage-1 manifest must name (--wall-bundle)")
+	var wallAuthorityKeys stringList
+	fs.Var(&wallAuthorityKeys, "wall-authority-key", "a PREDECLARED authority public key (hex); repeatable. REQUIRED with --wall-bundle: the contract puts an owner-authority signature on the planning inputs BEFORE the plan exists, and a post-run verifier can refuse a row but cannot un-run an action or restore an approval that never happened")
 	nodePrefixes := fs.String("node-prefixes", "", "comma-separated package-dir prefixes whose buckets need Node set up (empty = none; a consumer opts in)")
 	eventsDir := fs.String("events-dir", "", "if set, emitted invocations add -json and tee events into this directory")
 	fileParallelism := fs.Int("file-parallelism", 1, "intra-bucket file/package concurrency (#22): 1 keeps a bucket serial (the sum-of-weights model the balancer packs to); N>1 renders `-p=N` (Go) / `--maxWorkers=N` (Vitest), trading that estimate for more cores")
@@ -349,6 +352,7 @@ func runPlan(args []string) error {
 			bundlePath: *wallBundle, stage1Path: *wallStage1, stage2Path: *wallStage2,
 			shardPlan: *shardPlan, asJSON: *asJSON,
 			scorerPath: *pallocScorer, registryPath: *wallRegistry, outDir: *wallOutDir,
+			authorityKeys: wallAuthorityKeys, authority: *wallAuthority,
 		})
 	}
 
