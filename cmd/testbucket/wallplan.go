@@ -249,7 +249,8 @@ func runWallReplay(args []string) error {
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex) the Stage-1 signature must come from; repeatable and required with --stage1")
 	scorerPath := fs.String("scorer", "", "the frozen scorer the plan allocated with; its digest must match the training lineage Stage 1 bound")
 	shardPlan := fs.String("shard-plan", "", "also write the replayed plan here")
-	attest := fs.String("attest", "", "write a SIGNED replay attestation here (signing key from TB_WALL_AUTHORITY_KEY). `wall verify` requires one: comparing the planner's account of its own output to itself proves nothing")
+	registryPath := fs.String("registry", "", "frozen Aeta component-registry template. Required when the issued receipt binds per-bucket documents: an independent replay that skipped them would leave exactly those documents unre-derived")
+	attest := fs.String("attest", "", "write a SIGNED replay attestation here (signing key from TB_WALL_REPLAY_KEY). `wall verify` requires one, signed by a key Stage 1 declared as a replay signer and distinct from the authority key: comparing the planner's account of its own output to itself proves nothing, and neither does having the issuer of the plan re-check it")
 	verifierID := fs.String("verifier-id", "", "identity of the party running this replay (required with --attest)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -326,6 +327,13 @@ func runWallReplay(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The replay re-derives the PER-BUCKET documents too. Comparing only the
+	// aggregate digests would leave the Pcheck projections, forecasts and
+	// invocation manifests — the documents the buckets actually run against —
+	// re-derived by nobody.
+	if err := deriveDocuments(res, *registryPath, ""); err != nil {
+		return err
+	}
 	if err := issued.Matches(res.Receipt); err != nil {
 		return fmt.Errorf("the replayed plan does not match the issued receipt: %w", err)
 	}
@@ -355,9 +363,13 @@ func writeReplayAttestation(path, verifierID string, issued walltime.Stage2Recei
 	if strings.TrimSpace(verifierID) == "" {
 		return fmt.Errorf("--attest needs --verifier-id: an attestation nobody can attribute is an assertion")
 	}
-	key, err := walltime.DecodeKey(strings.TrimSpace(os.Getenv(authorityKeyEnv)))
+	// A key of the replay party's OWN, not the campaign authority's. Signing
+	// an "independent" re-derivation with the key that authorised the plan
+	// would make independence a label on a document rather than a property of
+	// who produced it, and the verifier now refuses that pairing outright.
+	key, err := walltime.DecodeKey(strings.TrimSpace(os.Getenv(replayKeyEnv)))
 	if err != nil {
-		return fmt.Errorf("%s: %w (an attestation must be signed)", authorityKeyEnv, err)
+		return fmt.Errorf("%s: %w (an independent attestation must be signed by the replaying party, not by the plan's authority)", replayKeyEnv, err)
 	}
 	self, err := os.Executable()
 	if err != nil {
@@ -472,6 +484,10 @@ func planFromBundle(o frozenPlanOptions) error {
 	if err != nil {
 		return err
 	}
+	// The derived documents are written BEFORE the receipt, because the
+	// receipt binds them: a per-bucket projection or forecast that the one
+	// authorised plan does not name is a document anybody could have written,
+	// and the verifier now refuses it.
 	if o.outDir != "" {
 		if err := writeDerivedDocuments(o, res); err != nil {
 			return err
@@ -517,22 +533,56 @@ func planFromBundle(o frozenPlanOptions) error {
 // authorised plan and before any bucket action starts, and neither can change
 // the plan they describe.
 func writeDerivedDocuments(o frozenPlanOptions, res *planbind.Result) error {
-	if err := os.MkdirAll(o.outDir, 0o755); err != nil {
-		return err
+	return deriveDocuments(res, o.registryPath, o.outDir)
+}
+
+// deriveDocuments derives every per-bucket document this plan implies, binds
+// each into the Stage-2 receipt by digest, and — when outDir is set — writes
+// them.
+//
+// The binding is the point. A Pcheck projection, a forecast and an invocation
+// manifest used to be written beside the receipt carrying nothing but a
+// Stage-2 string, which any substituted document can also carry; naming them
+// in the receipt puts them inside the one document that is signed and
+// independently replayed. outDir is optional so the REPLAY can derive the same
+// bindings and compare them without writing a second copy of the plan's
+// output.
+func deriveDocuments(res *planbind.Result, registryPath, outDir string) error {
+	if outDir != "" {
+		if err := os.MkdirAll(outDir, 0o755); err != nil {
+			return err
+		}
 	}
-	stage2, err := res.Receipt.DigestOf()
+	// The PLAN identity, not the full receipt digest: the receipt binds these
+	// documents and these documents name the receipt, so one side of that
+	// circle has to cite an identity that excludes the binding. A sidecar is
+	// derived from the plan, so the plan is what it cites.
+	stage2, err := res.Receipt.PlanDigestOf()
 	if err != nil {
 		return err
 	}
-	if res.Allocator != nil {
-		if err := walltime.WriteJSONFile(filepath.Join(o.outDir, "palloc.json"), res.Allocator.Values()); err != nil {
+	res.Receipt.Sidecars = map[string]walltime.Digest{}
+	emit := func(kind string, bucket int, doc any) error {
+		d, err := walltime.DigestJSON(doc)
+		if err != nil {
+			return err
+		}
+		res.Receipt.Sidecars[walltime.SidecarName(kind, bucket)] = d
+		if outDir == "" {
+			return nil
+		}
+		return walltime.WriteJSONFile(filepath.Join(outDir, fmt.Sprintf("%s-%d.json", kind, bucket)), doc)
+	}
+
+	if res.Allocator != nil && outDir != "" {
+		if err := walltime.WriteJSONFile(filepath.Join(outDir, "palloc.json"), res.Allocator.Values()); err != nil {
 			return err
 		}
 	}
 	var registry *walltime.AetaRegistry
-	if o.registryPath != "" {
+	if registryPath != "" {
 		var r walltime.AetaRegistry
-		if err := walltime.ReadJSONFile(o.registryPath, &r); err != nil {
+		if err := walltime.ReadJSONFile(registryPath, &r); err != nil {
 			return err
 		}
 		if err := r.Validate(); err != nil {
@@ -546,7 +596,7 @@ func writeDerivedDocuments(o frozenPlanOptions, res *planbind.Result) error {
 			if err != nil {
 				return err
 			}
-			if err := walltime.WriteJSONFile(filepath.Join(o.outDir, fmt.Sprintf("pcheck-%d.json", b.Index)), pcheck); err != nil {
+			if err := emit(walltime.SidecarPcheck, b.Index, pcheck); err != nil {
 				return err
 			}
 		}
@@ -556,7 +606,7 @@ func writeDerivedDocuments(o frozenPlanOptions, res *planbind.Result) error {
 		if err != nil {
 			return err
 		}
-		if err := walltime.WriteJSONFile(filepath.Join(o.outDir, fmt.Sprintf("invocations-%d.json", b.Index)), manifest); err != nil {
+		if err := emit(walltime.SidecarInvocations, b.Index, manifest); err != nil {
 			return err
 		}
 		if registry == nil {
@@ -569,12 +619,13 @@ func writeDerivedDocuments(o frozenPlanOptions, res *planbind.Result) error {
 			}
 		}
 		aeta, err := registry.Instantiate(walltime.AetaInputs{
-			BucketID: b.Name, PallocSeconds: palloc, Invocations: len(b.Invocations), Stage2: stage2,
+			BucketID: b.Name, BucketIndex: b.Index, PallocSeconds: palloc,
+			Invocations: len(b.Invocations), Stage2: stage2,
 		})
 		if err != nil {
 			return fmt.Errorf("instantiate Aeta for bucket %d: %w", b.Index, err)
 		}
-		if err := walltime.WriteJSONFile(filepath.Join(o.outDir, fmt.Sprintf("aeta-%d.json", b.Index)), aeta); err != nil {
+		if err := emit(walltime.SidecarAeta, b.Index, aeta); err != nil {
 			return err
 		}
 	}

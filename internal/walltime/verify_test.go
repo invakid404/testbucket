@@ -17,12 +17,14 @@ import (
 // component registry, the instantiated pre-action forecast, and the
 // post-render Pcheck projection.
 type frozenDocs struct {
-	stage1      string
-	stage2      string
-	registry    string
-	aeta        string
-	pcheck      string
-	replay      string
+	stage1   string
+	stage2   string
+	registry string
+	aeta     string
+	pcheck   string
+	replay   string
+	// scorer is the frozen model the Pcheck projection must re-derive from.
+	scorer      string
 	invocations string
 	stepAttempt string
 	digest      Digest
@@ -30,6 +32,40 @@ type frozenDocs struct {
 	// The verifier refuses to treat a signature as authority approval without
 	// one, so the fixture has to carry it the way a campaign would.
 	authority string
+	// audit is a coverage audit that passes for this bucket. Supplying one is
+	// what a real measured row does; the tests that omit it are testing the
+	// omission.
+	audit AuditFunc
+}
+
+// testStoreBytes is an admitted store the fixture receipt genuinely describes:
+// three rows with positive weight, two measured rows weighing zero, and one
+// recorded coverage target.
+func testStoreBytes() []byte {
+	return storeBytesFor(3, 2, 0, []string{"tests/alpha.spec.ts"})
+}
+
+// storeBytesFor writes a store holding exactly the rows asked for, so a test
+// can state a classification and get bytes that support it rather than
+// hand-maintaining two halves that must agree.
+func storeBytesFor(positive, zero, unmeasured int, coverage []string) []byte {
+	units := map[string]map[string]any{}
+	for i := 0; i < positive; i++ {
+		units[fmt.Sprintf("p%d", i)] = map[string]any{"seconds": 1.5, "samples": 3}
+	}
+	for i := 0; i < zero; i++ {
+		units[fmt.Sprintf("z%d", i)] = map[string]any{"seconds": 0, "samples": 2}
+	}
+	for i := 0; i < unmeasured; i++ {
+		units[fmt.Sprintf("m%d", i)] = map[string]any{"seconds": 0, "samples": 0}
+	}
+	b, err := json.Marshal(map[string]any{
+		"schema": 1, "flags": "vitest", "coverage": coverage, "units": units,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
@@ -49,6 +85,18 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A key of the REPLAY party's own. The fixture used to sign the
+	// attestation with the authority key, which is precisely the pairing an
+	// independent replay is supposed to exclude — so the fixture now models
+	// two parties, and the verifier refuses them being one.
+	replayKey, err := NewSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stage 1 is where both signer sets are declared: the run key its roster
+	// and seal were actually signed with, and the separate replay signer.
+	m.Instrumentation.Signers = []string{s.RunSigner()}
+	m.Instrumentation.ReplaySigners = []string{PublicKeyOf(replayKey)}
 	if err := m.Sign("ewj2-campaign", key); err != nil {
 		t.Fatal(err)
 	}
@@ -57,52 +105,58 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 		t.Fatal(err)
 	}
 	receipt := testReceipt(m1, bd)
-	r2, err := receipt.DigestOf()
+	// The PLAN identity, which is what the derived documents cite. The receipt
+	// binds those documents and they name it back, so one side of the circle
+	// has to cite an identity that excludes the binding — exactly as the
+	// planner does.
+	plan2, err := receipt.PlanDigestOf()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	aeta, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 5.18, Invocations: len(s.invocations), Stage2: r2})
+	aeta, err := reg.Instantiate(AetaInputs{
+		BucketID: "bucket-1", BucketIndex: 1, PallocSeconds: 5.18,
+		Invocations: len(s.invocations), Stage2: plan2,
+	})
 	if err != nil {
 		t.Fatalf("Instantiate: %v", err)
 	}
 	// The projection is built the way production builds it, so the verifier's
 	// recomputation is exercised against a real document rather than a
 	// hand-written one that happens to agree.
+	// Every Palloc value is SCORED, not chosen: the fixture builds the feature
+	// vector that yields the number it wants and runs the frozen scorer over
+	// it, exactly as the allocator does. A fixture that wrote the numbers
+	// directly could not exercise a check that re-derives them.
+	scorer := testScorer()
 	palloc := map[string]float64{}
+	var features []FeatureVector
 	var invocations []PcheckInvocation
 	for i, inv := range s.invocations {
 		unit := fmt.Sprintf("t%d.spec.ts", i)
-		palloc[unit] = float64(inv[1]-inv[0]+250_000_000) / float64(second)
+		want := float64(inv[1]-inv[0]+250_000_000) / float64(second)
+		fv := FeatureVector{UnitID: unit, Features: []Feature{
+			// testScorer is 1 + runnable_count, so this is the vector whose
+			// score is `want`.
+			{Name: "runnable_count", Value: want - scorer.Intercept, Provenance: ProvRunnableSnapshot},
+		}}
+		scored, err := scorer.Score(fv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		palloc[unit], features = scored, append(features, fv)
 		invocations = append(invocations, PcheckInvocation{Seq: i, BucketIndex: 1, Units: []string{unit}})
 	}
-	pcheck, err := BuildPcheck(r2, receipt.MembershipDigest, testScorer(), palloc, invocations)
+	pcheck, err := BuildPcheck(plan2, receipt.MembershipDigest, scorer, palloc, features, invocations, 1, "bucket-1")
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	// The independent replay attestation: a separate party re-derived the plan
-	// from the frozen bundle and got the same receipt. Signed by the same
-	// authority in the fixture; in a campaign it is the verifier's own key,
-	// predeclared alongside it.
-	replay := ReplayAttestation{
-		Kind: ReplayKind, Stage1Digest: m1, Stage2Digest: r2, BundleDigest: bd,
-		Recomputed: receipt, VerifierID: "synthetic-verifier", VerifierBinary: synthBinary,
-	}
-	rd, err := replay.DigestOf()
-	if err != nil {
-		t.Fatal(err)
-	}
-	replay.Signature = &Signature{
-		Authority: "ewj2-campaign", KeyID: PublicKeyOf(key), Digest: rd,
-		Value: signValue(key, rd),
 	}
 
 	// What the plan rendered for this bucket. The synthetic run's specs are
 	// built from the same values, so the verifier's comparison is exercised
 	// against a manifest that genuinely describes it.
 	manifest := InvocationManifest{
-		Kind: InvocationManifestKind, Stage2: r2, BucketIndex: 1, BucketName: "bucket-1",
+		Kind: InvocationManifestKind, Stage2: plan2, BucketIndex: 1, BucketName: "bucket-1",
 	}
 	for i := range s.invocations {
 		spec := s.spec(i)
@@ -123,19 +177,63 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 	step := StepAttemptDocument{Kind: AGHKind, Attempt: StepAttempt{
 		Repository: "example/mandel", WorkflowRun: "run-1", Job: "test",
 		Step: "run-bucket", Attempt: "1", Precision: "1s",
-		// The step starts before AT_start (the wrapper install) and ends after
-		// AT_end, which is what a real step attempt looks like.
-		StartedAt:   time.Unix(0, actionStart).UTC().Add(-3 * time.Second).Format(time.RFC3339),
+		// The step starts just before AT_start and ends after AT_end, which is
+		// what a MEASURED step attempt looks like now that the wrapper is
+		// installed by the caller: what precedes the envelope is the runner's
+		// own step startup, inside A_GH's one-second resolution. The fixture
+		// used to model a three-second wrapper install, which is exactly the
+		// prefix the gate now refuses.
+		StartedAt:   time.Unix(0, actionStart).UTC().Format(time.RFC3339),
 		CompletedAt: time.Unix(0, actionEnd).UTC().Add(2 * time.Second).Format(time.RFC3339),
 	}}
 
+	// The receipt BINDS every derived document by digest, the way the planner
+	// does. Without it each sidecar would carry nothing but a Stage-2 string,
+	// which any substituted document can also carry.
+	receipt.Sidecars = map[string]Digest{
+		SidecarName(SidecarInvocations, manifest.BucketIndex): DigestJSONOrEmpty(manifest),
+		SidecarName(SidecarPcheck, pcheck.BucketIndex):        DigestJSONOrEmpty(pcheck),
+		SidecarName(SidecarAeta, aeta.Inputs.BucketIndex):     DigestJSONOrEmpty(aeta),
+	}
+	// The receipt's FULL identity, covering the binding. This is what the
+	// records and the independent attestation name.
+	r2, err := receipt.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The independent replay attestation, built LAST: a separate party
+	// re-derived the plan from the frozen bundle, derived the same per-bucket
+	// documents, and got the same receipt — binding and all. It signs with ITS
+	// OWN key, one Stage 1 declared as a replay signer and which is not the
+	// authority's.
+	replay := ReplayAttestation{
+		Kind: ReplayKind, Stage1Digest: m1, Stage2Digest: r2, BundleDigest: bd,
+		Recomputed: receipt, VerifierID: "synthetic-verifier", VerifierBinary: synthBinary,
+	}
+	rd, err := replay.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay.Signature = &Signature{
+		Authority: "ewj2-campaign", KeyID: PublicKeyOf(replayKey), Digest: rd,
+		Value: signValue(replayKey, rd),
+	}
+
 	docs := frozenDocs{
-		stage1:      filepath.Join(dir, "stage1.json"),
-		stage2:      filepath.Join(dir, "stage2.json"),
-		registry:    filepath.Join(dir, "registry.json"),
-		aeta:        filepath.Join(dir, "aeta.json"),
-		pcheck:      filepath.Join(dir, "pcheck.json"),
-		replay:      filepath.Join(dir, "replay.json"),
+		stage1:   filepath.Join(dir, "stage1.json"),
+		stage2:   filepath.Join(dir, "stage2.json"),
+		registry: filepath.Join(dir, "registry.json"),
+		aeta:     filepath.Join(dir, "aeta.json"),
+		pcheck:   filepath.Join(dir, "pcheck.json"),
+		replay:   filepath.Join(dir, "replay.json"),
+		scorer:   filepath.Join(dir, "scorer.json"),
+		audit: func(bucket string) (*AuditEvidence, error) {
+			return &AuditEvidence{
+				Bucket: bucket, Planned: len(s.invocations), Reported: len(s.invocations),
+				Report: "PASS — every planned package reported exactly the invocations the plan scheduled",
+			}, nil
+		},
 		invocations: filepath.Join(dir, "invocations.json"),
 		stepAttempt: filepath.Join(dir, "step-attempt.json"),
 		digest:      r2,
@@ -143,7 +241,7 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 	}
 	for path, v := range map[string]any{
 		docs.stage1: m, docs.stage2: receipt, docs.registry: reg,
-		docs.aeta: aeta, docs.pcheck: pcheck, docs.replay: replay,
+		docs.aeta: aeta, docs.pcheck: pcheck, docs.replay: replay, docs.scorer: scorer,
 		docs.invocations: manifest, docs.stepAttempt: step,
 	} {
 		if err := WriteJSONFile(path, v); err != nil {
@@ -162,7 +260,10 @@ func testBundle() PlanningInputBundle {
 		StaleThreshold: "336h0m0s",
 	}
 	b.Discovery = []RawSnapshot{NewRawSnapshot("vitest-list", []string{"vitest", "list", "--filesOnly", "--json"}, "/repo", []byte(`[{"file":"/repo/t0.spec.ts"}]`))}
-	b.Store = NewRawSnapshot("test-timings.json", nil, "/repo", []byte(`{"schema":1,"flags":"vitest","units":{}}`))
+	// A store whose BYTES match the receipt that describes them. It used to be
+	// an empty store beside a receipt claiming five classified rows, which is
+	// exactly the disagreement the receipt is now derived-checked for.
+	b.Store = NewRawSnapshot("test-timings.json", nil, "/repo", testStoreBytes())
 	b.Source.Repository = "example/mandel"
 	b.Source.Commit = testConsumerCommit
 	b.Source.Tree = "sha256:tree"
@@ -331,7 +432,7 @@ func verifySynth(t *testing.T, mutate mutation, tweak func(*synthRun)) *Verdict 
 	s.write(t, mutate)
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
 		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 		StepAttemptPath: docs.stepAttempt,
 		AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -692,7 +793,7 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			}
 			opts := VerifyOptions{
 				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -732,7 +833,7 @@ func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
 	})
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
 		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 		StepAttemptPath: docs.stepAttempt,
 		AuthorityKeys:   []string{docs.authority},
@@ -1054,7 +1155,7 @@ func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
 	// The receipt is checked against the EXACT bytes it describes, at the
 	// canonical planning instant — not against fields that merely look filled
 	// in.
-	storeBytes := []byte(`{"schema":1,"flags":"vitest","units":{}}`)
+	storeBytes := storeBytesFor(3, 1, 1, nil)
 	instant := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	base := func() StoreReceipt {
 		return StoreReceipt{
@@ -1073,16 +1174,24 @@ func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
 		t.Fatalf("a complete store receipt was rejected: %v", err)
 	}
 	// Every state the contract names is admissible and separately counted.
+	// The four RESIDENT states have to match the bytes; the four that describe
+	// rows the ingest declined to admit cannot, because such a row is not in
+	// the store to be counted.
 	all := base()
 	all.Classifications = map[string]int{}
 	for i, state := range StoreRowStates {
 		all.Classifications[state] = i + 1
 	}
+	allBytes := storeBytesFor(
+		all.Classifications[RowObservedPositive],
+		all.Classifications[RowObservedZero]+all.Classifications[RowNoTests],
+		all.Classifications[RowMissing], nil)
+	all.Digest = DigestBytes(allBytes)
 	all.Rows = 0
 	for _, n := range all.Classifications {
 		all.Rows += n
 	}
-	if err := check(all, instant); err != nil {
+	if err := all.Validate(allBytes, 1, "vitest", instant); err != nil {
 		t.Errorf("the full set of row states was rejected: %v", err)
 	}
 
@@ -1100,6 +1209,15 @@ func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
 		{"a classification nobody defined", func(r *StoreReceipt) { r.Classifications["probably_fine"] = 1; r.Rows++ },
 			instant, "unknown row classification"},
 		{"counts that do not add up", func(r *StoreReceipt) { r.Rows = 99 }, instant, "count 6 rows but the store has 99"},
+		{"a row count the frozen bytes do not support",
+			func(r *StoreReceipt) { r.Classifications[RowObservedPositive] = 4; r.Rows++ },
+			instant, "present in the store but the frozen bytes hold"},
+		{"a coverage set the frozen bytes never recorded",
+			func(r *StoreReceipt) { r.Coverage = []string{"tests/invented.spec.ts"} },
+			instant, "the two sets are not the same"},
+		{"a measured zero relabelled as a gap",
+			func(r *StoreReceipt) { r.Classifications[RowObservedZero] = 0; r.Classifications[RowMissing] = 2 },
+			instant, "carry no sample"},
 		{"a digest for some other store", func(r *StoreReceipt) { r.Digest = "sha256:elsewhere" }, instant, "the bundle froze"},
 		{"the wrong schema", func(r *StoreReceipt) { r.Schema = 99 }, instant, "frozen bytes are schema"},
 		{"the wrong comparability token", func(r *StoreReceipt) { r.Token = "-race -count=100" }, instant, "measured under"},
@@ -1191,7 +1309,7 @@ func TestStepAttemptIsIdentityNotAGate(t *testing.T) {
 
 	opts := VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
 		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 		StepAttemptPath: docs.stepAttempt,
 		AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -1365,7 +1483,7 @@ func TestProducerBinaryIsExactNotAPrefix(t *testing.T) {
 			s.write(t, nil)
 			v, err := VerifyDir(VerifyOptions{
 				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
-				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
 				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
 				StepAttemptPath: docs.stepAttempt,
 				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
@@ -1435,4 +1553,606 @@ func TestVerdictSignsWithEpochScaleInstants(t *testing.T) {
 	if err := VerifySigned(got.Signature, d, []string{PublicKeyOf(key)}); err != nil {
 		t.Errorf("the round-tripped verdict no longer verifies: %v", err)
 	}
+}
+
+// The whole point of a predeclared signer set: a party that can write the
+// records directory must not be able to authenticate what it wrote. Each case
+// is a forgery a self-authenticated verifier would have accepted, because the
+// forger signs its own records with its own key and the old check verified
+// exactly that.
+func TestForgedEvidenceIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// tamper acts on a complete, correctly attested directory.
+		tamper func(t *testing.T, dir string, s *synthRun)
+		want   string
+	}{
+		{
+			name: "a stream is rewritten after the measurement closed",
+			tamper: func(t *testing.T, dir string, s *synthRun) {
+				// A consistent rewrite: chain, sequence numbers and signatures
+				// all rebuilt, which is what an attacker who owns the
+				// directory produces. Only the seal notices.
+				path := filepath.Join(dir, streamName(ProducerPhysical, LevelAction, 0))
+				b, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "rewritten after the measurement closed",
+		},
+		{
+			name: "a signer nobody declared appends a record",
+			tamper: func(t *testing.T, dir string, s *synthRun) {
+				key, err := NewSigningKey()
+				if err != nil {
+					t.Fatal(err)
+				}
+				w, err := NewWriter(filepath.Join(dir, streamName(ProducerPeer, LevelScript, 0)),
+					ProducerPeer, "containment_peer#9.9", key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer w.Close()
+				if _, err := w.Append(Record{
+					Kind: "boundary", Role: RolePeerScript, Level: LevelScript, Boundary: "start",
+					Source: SourceContainment, Run: s.run(),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "neither the roster declared nor the key log registered",
+		},
+		{
+			name: "a key is registered after the seal",
+			tamper: func(t *testing.T, dir string, s *synthRun) {
+				key, err := NewSigningKey()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := RegisterKey(dir, KeyLogEntry{
+					Producer: ProducerPeer, Level: LevelInvocation, Seq: 0,
+					PublicKey: PublicKeyOf(key), Binary: synthBinary,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "a signer was added or removed after the measurement closed",
+		},
+		{
+			name: "the roster is replaced by one the forger signed",
+			tamper: func(t *testing.T, dir string, s *synthRun) {
+				key, err := NewSigningKey()
+				if err != nil {
+					t.Fatal(err)
+				}
+				r, err := ReadRoster(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := r.Sign("ewj2-campaign", key); err != nil {
+					t.Fatal(err)
+				}
+				b, err := json.MarshalIndent(r, "", "  ")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, rosterFile), b, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "signer roster signature",
+		},
+		{
+			name: "the whole directory is rebuilt with the forger's own keys",
+			tamper: func(t *testing.T, dir string, s *synthRun) {
+				// The strongest forgery available to a process that owns the
+				// directory, and the one the old check could not tell from a
+				// real run: every artefact internally consistent, signed
+				// throughout, and attested by a key of the forger's own making.
+				for _, name := range []string{rosterFile, sealFile} {
+					if err := os.Remove(filepath.Join(dir, name)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				forged := newSynthRun(dir)
+				forged.attest(t)
+			},
+			want: "signer roster signature",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "records")
+			s := newSynthRun(dir)
+			docs := writeFrozenDocs(t, t.TempDir(), s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+			tc.tamper(t, dir, s)
+
+			v, err := VerifyDir(VerifyOptions{
+				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("forged evidence was scored")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+}
+
+// A run whose Stage-1 manifest declares no signers cannot be scored: there is
+// nothing to check the roster and the seal against, so they authenticate only
+// themselves — which is the state this whole mechanism exists to leave.
+func TestUndeclaredSignerSetIsNotScorable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "records")
+	s := newSynthRun(dir)
+	docsDir := t.TempDir()
+	docs := writeFrozenDocs(t, docsDir, s)
+	s.stage2 = docs.digest
+	s.write(t, nil)
+
+	var m Stage1Manifest
+	if err := ReadJSONFile(docs.stage1, &m); err != nil {
+		t.Fatal(err)
+	}
+	m.Instrumentation.Signers = nil
+	key, err := NewSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sign("ewj2-campaign", key); err != nil {
+		t.Fatal(err)
+	}
+	// A new path: these documents are identities, not outputs, so they are
+	// written O_EXCL and a variant is a different document.
+	stage1 := filepath.Join(docsDir, "stage1-no-signers.json")
+	if err := WriteJSONFile(stage1, m); err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := VerifyDir(VerifyOptions{
+		Dir: dir, Stage1Path: stage1, RegistryPath: docs.registry,
+		AuthorityKeys: []string{PublicKeyOf(key)}, Authority: "ewj2-campaign",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Eligible {
+		t.Errorf("a run with no declared signer set was scored")
+	}
+	var details []string
+	for _, f := range v.Findings {
+		details = append(details, f.Detail)
+	}
+	if !strings.Contains(strings.Join(details, "\n"), "declares no record signers") {
+		t.Errorf("no finding names the undeclared signer set:\n%s", strings.Join(details, "\n"))
+	}
+}
+
+// "Independent" has to mean a different party, not a different document. A
+// replay attestation signed by the key that authorised the plan is the
+// planner re-checking its own work, and the contract's separate-party
+// requirement is unenforced unless the verifier says so.
+func TestReplaySignedByTheAuthorityIsNotIndependent(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		arrange func(t *testing.T, m *Stage1Manifest, authority ed25519.PrivateKey)
+		want    string
+	}{
+		{
+			name: "no replay signer is declared at all",
+			arrange: func(t *testing.T, m *Stage1Manifest, _ ed25519.PrivateKey) {
+				m.Instrumentation.ReplaySigners = nil
+			},
+			want: "declares no independent replay signer",
+		},
+		{
+			name: "the declared replay signer IS the authority",
+			arrange: func(t *testing.T, m *Stage1Manifest, authority ed25519.PrivateKey) {
+				m.Instrumentation.ReplaySigners = []string{PublicKeyOf(authority)}
+			},
+			want: "is also the campaign authority key",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "records")
+			s := newSynthRun(dir)
+			docsDir := t.TempDir()
+			docs := writeFrozenDocs(t, docsDir, s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+
+			var m Stage1Manifest
+			if err := ReadJSONFile(docs.stage1, &m); err != nil {
+				t.Fatal(err)
+			}
+			authority, err := NewSigningKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.arrange(t, &m, authority)
+			if err := m.Sign("ewj2-campaign", authority); err != nil {
+				t.Fatal(err)
+			}
+			stage1 := filepath.Join(docsDir, "stage1-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := WriteJSONFile(stage1, m); err != nil {
+				t.Fatal(err)
+			}
+
+			v, err := VerifyDir(VerifyOptions{
+				Dir: dir, Stage1Path: stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, ReplayPath: docs.replay,
+				AuthorityKeys: []string{PublicKeyOf(authority)}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("a replay that was not independent was scored")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+}
+
+// Two buckets of one plan share their Stage-2 receipt, membership digest,
+// scorer and registry, so a per-bucket document built for one recomputes
+// perfectly inside the other's job and applies the wrong forecast to the wrong
+// work. Artifact naming in a workflow is a convention; only the verifier can
+// make it a control.
+func TestPerBucketDocumentsAreBoundToTheMeasuredBucket(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		doc  func(docs frozenDocs) string
+		edit func(m map[string]any)
+		want string
+	}{
+		{
+			name: "an invocation manifest for a different bucket",
+			doc:  func(d frozenDocs) string { return d.invocations },
+			edit: func(m map[string]any) { m["bucket_name"] = "bucket-7"; m["bucket"] = float64(7) },
+			want: `the invocation manifest is for bucket "bucket-7"`,
+		},
+		{
+			name: "an invocation manifest that names no bucket",
+			doc:  func(d frozenDocs) string { return d.invocations },
+			edit: func(m map[string]any) { m["bucket_name"] = "" },
+			want: "the invocation manifest names no bucket",
+		},
+		{
+			name: "a Pcheck projection for a different bucket",
+			doc:  func(d frozenDocs) string { return d.pcheck },
+			edit: func(m map[string]any) { m["bucket_name"] = "bucket-7" },
+			want: `the Pcheck projection is for bucket "bucket-7"`,
+		},
+		{
+			name: "a forecast for a different bucket",
+			doc:  func(d frozenDocs) string { return d.aeta },
+			edit: func(m map[string]any) { m["bucket_id"] = "bucket-7" },
+			want: `the pre-action forecast is for bucket "bucket-7"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "records")
+			s := newSynthRun(dir)
+			docs := writeFrozenDocs(t, t.TempDir(), s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+			editJSON(t, tc.doc(docs), tc.edit)
+
+			v, err := VerifyDir(VerifyOptions{
+				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("a document for another bucket was scored against this one")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+}
+
+// A wall-time envelope measures duration. A script that skipped half its
+// targets produces a shorter, perfectly well-formed, fully attested envelope,
+// and every gate in this package would pass it. Exact-run coverage is the only
+// thing that says what ran, so a scorable row has to carry its answer.
+func TestCoverageAuditIsAnEligibilityCondition(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		audit    AuditFunc
+		terminal bool
+		want     string
+	}{
+		{
+			name:  "no audit at all",
+			audit: nil,
+			want:  "no coverage audit was supplied",
+		},
+		{
+			name: "an audit that could not run",
+			audit: func(string) (*AuditEvidence, error) {
+				return nil, fmt.Errorf("no events were uploaded for this bucket")
+			},
+			want: "no events were uploaded for this bucket",
+		},
+		{
+			name: "a bucket that never reported",
+			audit: func(bucket string) (*AuditEvidence, error) {
+				return &AuditEvidence{Bucket: bucket, Problems: []string{
+					"tests/alpha.spec.ts: planned 1 invocation(s), reported 0",
+				}}, nil
+			},
+			terminal: true,
+			want:     "planned 1 invocation(s), reported 0",
+		},
+		{
+			name: "a name slice that reached past its own filter",
+			audit: func(bucket string) (*AuditEvidence, error) {
+				return &AuditEvidence{Bucket: bucket, Problems: []string{
+					"tests/alpha.spec.ts: renders fast reported but was in no -run slice",
+				}}, nil
+			},
+			terminal: true,
+			want:     "was in no -run slice",
+		},
+		{
+			name: "another bucket's audit",
+			audit: func(string) (*AuditEvidence, error) {
+				return &AuditEvidence{Bucket: "bucket-7"}, nil
+			},
+			want: `covers bucket "bucket-7"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "records")
+			s := newSynthRun(dir)
+			docs := writeFrozenDocs(t, t.TempDir(), s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+
+			v, err := VerifyDir(VerifyOptions{
+				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta,
+				PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: tc.audit,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("a row nobody proved ran its plan was scored")
+			}
+			// A failed audit ends the row: the frozen scope makes it terminal,
+			// so it is not a threshold anything can be traded against.
+			if tc.terminal && v.Complete {
+				t.Errorf("a run that did not execute its plan was reported complete")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+}
+
+// A is defined as the COMPLETE Run-bucket action elapsed, starting at the
+// first action-owned operation. Reporting a prefix through a whole-second
+// diagnostic made it visible; it did not bound it, and an unbounded prefix
+// means A measures a different product than the campaign compares.
+func TestActionOwnedWorkBeforeTheEnvelopeIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		start time.Duration
+		want  string
+	}{
+		{
+			name:  "a wrapper installed inside the action",
+			start: -12 * time.Second,
+			want:  "ran before AT_start",
+		},
+		{
+			// The fixture's step already starts a fraction of a second before
+			// AT_start; whole-second reporting cannot distinguish that from
+			// zero, so it is not attributed to anything and the row stands.
+			name:  "a prefix inside A_GH's own resolution",
+			start: 0,
+			want:  "",
+		},
+		{
+			// Refused, though by the step-attempt identity check rather than
+			// the gap bound: an envelope that claims to have opened before the
+			// step that ran it is not describing that step. The assertion is
+			// on the outcome for that reason.
+			name:  "an envelope that opened before the step did",
+			start: 5 * time.Second,
+			want:  "outside the step attempt's precision-widened interval",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "records")
+			s := newSynthRun(dir)
+			docs := writeFrozenDocs(t, t.TempDir(), s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+			editJSON(t, docs.stepAttempt, func(m map[string]any) {
+				attempt := m["attempt"].(map[string]any)
+				started, err := time.Parse(time.RFC3339, attempt["started_at"].(string))
+				if err != nil {
+					t.Fatal(err)
+				}
+				attempt["started_at"] = started.Add(tc.start).Format(time.RFC3339)
+			})
+
+			v, err := VerifyDir(VerifyOptions{
+				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta,
+				PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			joined := strings.Join(details, "\n")
+			if tc.want == "" {
+				if !v.Eligible {
+					t.Errorf("a prefix within the diagnostic's own resolution made the row ineligible:\n%s", joined)
+				}
+				return
+			}
+			if v.Eligible {
+				t.Errorf("an action that did work before its envelope opened was scored")
+			}
+			if !strings.Contains(joined, tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, joined)
+			}
+		})
+	}
+}
+
+// A per-bucket document that merely NAMES a Stage-2 digest proves only that
+// its author knew the digest, which is public. The receipt is the one document
+// that is signed and independently replayed, so the derived documents have to
+// be bound into it — otherwise the atom, slice and forecast the bucket actually
+// runs against are unbound files travelling beside the frozen plan.
+func TestDerivedDocumentsMustBeBoundToStageTwo(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		doc  func(docs frozenDocs) string
+		edit func(m map[string]any)
+		want string
+	}{
+		{
+			name: "a substituted invocation manifest",
+			doc:  func(d frozenDocs) string { return d.invocations },
+			edit: func(m map[string]any) {
+				// Every field the old checks looked at is untouched: the kind,
+				// the Stage-2 string and the bucket all still agree. Only the
+				// content differs, which is the whole substitution.
+				inv := m["invocations"].([]any)
+				m["invocations"] = inv[:1]
+			},
+			want: "the Stage-2 receipt binds invocations",
+		},
+		{
+			name: "a substituted Pcheck projection",
+			doc:  func(d frozenDocs) string { return d.pcheck },
+			edit: func(m map[string]any) { m["scorer_id"] = "some-other-run" },
+			want: "the Stage-2 receipt binds pcheck",
+		},
+		{
+			name: "a substituted forecast",
+			doc:  func(d frozenDocs) string { return d.aeta },
+			edit: func(m map[string]any) { m["registry_digest"] = "sha256:elsewhere" },
+			want: "the Stage-2 receipt binds aeta",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "records")
+			s := newSynthRun(dir)
+			docs := writeFrozenDocs(t, t.TempDir(), s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+			editJSON(t, tc.doc(docs), tc.edit)
+
+			v, err := VerifyDir(VerifyOptions{
+				Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta,
+				PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("a derived document the frozen plan never bound was scored")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+
+	// And a receipt that binds nothing at all: the state every plan produced
+	// before this existed, which must not silently pass.
+	t.Run("a receipt that binds no derived documents", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "records")
+		s := newSynthRun(dir)
+		docs := writeFrozenDocs(t, t.TempDir(), s)
+		s.stage2 = docs.digest
+		s.write(t, nil)
+		editJSON(t, docs.stage2, func(m map[string]any) { delete(m, "derived_document_digests") })
+
+		v, err := VerifyDir(VerifyOptions{
+			Dir: dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+			RegistryPath: docs.registry, AetaPath: docs.aeta,
+			PcheckPath: docs.pcheck, ScorerPath: docs.scorer, Audit: docs.audit,
+			ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+			StepAttemptPath: docs.stepAttempt,
+			AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Eligible {
+			t.Errorf("a plan that bound none of its derived documents was scored")
+		}
+		var details []string
+		for _, f := range v.Findings {
+			details = append(details, f.Detail)
+		}
+		if !strings.Contains(strings.Join(details, "\n"), "binds no") {
+			t.Errorf("no finding names the missing binding:\n%s", strings.Join(details, "\n"))
+		}
+	})
 }

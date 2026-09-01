@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"crypto/ed25519"
 	"fmt"
 	"math"
 	"sort"
@@ -191,16 +192,45 @@ func (s TrainingReceiptSet) DigestOf() (Digest, error) {
 // Validate refuses the whole set if any single label is inadmissible. A
 // training set is a lineage claim; one unqualified label makes the claim
 // false, so there is no "skip the bad rows" path.
-func (s TrainingReceiptSet) Validate() error {
+// Seal signs the receipt set as the training authority. It is the only way a
+// set becomes admissible, and it is deliberately separate from the campaign
+// authority: the offline surface is sealed once, long before any campaign.
+func (s *TrainingReceiptSet) Seal(authority string, key ed25519.PrivateKey) error {
+	d, err := s.DigestOf()
+	if err != nil {
+		return err
+	}
+	s.Signature = &Signature{Authority: authority, KeyID: PublicKeyOf(key), Digest: d, Value: SignDigest(key, d)}
+	return nil
+}
+
+// Validate takes the PREDECLARED keys allowed to seal a training set. An
+// empty set is not "accept any key": a lineage claim nobody can attribute is
+// the claim that somebody, somewhere, ran the right procedure — which is the
+// thing a sealed offline surface exists to replace.
+func (s TrainingReceiptSet) Validate(sealKeys []string) error {
 	if s.Kind != TrainingSetKind {
 		return fmt.Errorf("training receipt set kind %q, want %q", s.Kind, TrainingSetKind)
+	}
+	if s.Signature == nil {
+		return fmt.Errorf("training receipt set is unsigned: an unattributable lineage cannot seal the offline surface")
+	}
+	if len(sealKeys) == 0 {
+		return fmt.Errorf("no training-authority key was predeclared, so the set's own signature would authenticate it")
+	}
+	d, err := s.DigestOf()
+	if err != nil {
+		return err
+	}
+	if err := VerifySigned(s.Signature, d, sealKeys); err != nil {
+		return fmt.Errorf("training receipt set signature: %w", err)
 	}
 	if s.Cutoff == "" {
 		return fmt.Errorf("training receipt set has no observation cutoff")
 	}
-	cutoff, err := parseInstant(s.Cutoff)
-	if err != nil {
-		return err
+	cutoff, err2 := parseInstant(s.Cutoff)
+	if err2 != nil {
+		return err2
 	}
 	if len(s.Labels) == 0 {
 		return fmt.Errorf("training receipt set is empty: no wrapper-qualified historical V label exists yet, so no scorer can be trained")
@@ -302,8 +332,8 @@ func (s Scorer) Score(v FeatureVector) (float64, error) {
 //
 // It refuses an unvalidated set. Training is where labels are allowed to
 // exist; it is not where the rules about them stop applying.
-func TrainScorer(set TrainingReceiptSet, id string, lambda float64) (*Scorer, error) {
-	if err := set.Validate(); err != nil {
+func TrainScorer(set TrainingReceiptSet, id string, lambda float64, sealKeys []string) (*Scorer, error) {
+	if err := set.Validate(sealKeys); err != nil {
 		return nil, err
 	}
 	if lambda < 0 {
@@ -430,6 +460,12 @@ type PcheckInvocation struct {
 type PcheckDocument struct {
 	Kind   string `json:"kind"`
 	Stage2 Digest `json:"stage2_digest"`
+	// BucketIndex and BucketName say WHICH bucket this projection is for. Two
+	// buckets of one plan share a Stage-2 digest, a membership digest and a
+	// scorer, so without these a projection for bucket 3 substituted into
+	// bucket 1's job recomputes perfectly and predicts the wrong work.
+	BucketIndex int    `json:"bucket"`
+	BucketName  string `json:"bucket_name"`
 	// MembershipDigest must equal the Stage-2 receipt's rendered-membership
 	// digest: a projection over some other membership is a projection of some
 	// other plan.
@@ -441,7 +477,13 @@ type PcheckDocument struct {
 	// Palloc is the frozen per-unit allocation score. PallocDigest covers it.
 	Palloc       map[string]float64 `json:"palloc"`
 	PallocDigest Digest             `json:"palloc_digest"`
-	Invocations  []PcheckInvocation `json:"invocations"`
+	// Features are the RUNTIME feature vectors each Palloc value was scored
+	// from. Without them the projection recomputes only against itself: an
+	// internally consistent Palloc map the frozen scorer never produced passes
+	// every arithmetic check, and the runtime surface is then a number
+	// asserting its own provenance.
+	Features    []FeatureVector    `json:"features"`
+	Invocations []PcheckInvocation `json:"invocations"`
 }
 
 // PallocNs converts a frozen score in seconds to the integer nanoseconds the
@@ -467,6 +509,58 @@ func PallocSubset(palloc map[string]float64, units []string) (map[string]float64
 // Recompute re-derives every projection from the document's own frozen values
 // and reports what disagrees. It is the verifier's half of the audit: a
 // projection nobody can recompute is a number, not a prediction.
+// RecomputeFrom re-derives every Palloc value by running the FROZEN SCORER
+// over the document's own feature vectors, and reports what disagrees.
+//
+// Recompute checks the projection against itself, which catches an edited
+// number but not a substituted model: a Palloc map no scorer ever produced is
+// perfectly self-consistent. This is the other half — the runtime surface is
+// frozen_scorer(frozen_preplan_unit_feature_vector), so verifying it means
+// running exactly that.
+func (d PcheckDocument) RecomputeFrom(scorer Scorer) []string {
+	problems := d.Recompute()
+	got, err := scorer.DigestOf()
+	if err != nil {
+		return append(problems, "the supplied scorer cannot be digested: "+err.Error())
+	}
+	if got != d.ScorerDigest {
+		return append(problems, fmt.Sprintf("the projection claims scorer %s but the supplied frozen scorer is %s", d.ScorerDigest, got))
+	}
+	if len(d.Features) == 0 {
+		return append(problems, "the projection carries no runtime feature vectors, so its values cannot be re-derived from the frozen scorer and are unattributable to it")
+	}
+	seen := map[string]bool{}
+	for _, fv := range d.Features {
+		if seen[fv.UnitID] {
+			problems = append(problems, fmt.Sprintf("unit %q has two feature vectors, so which one produced its score is undecided", fv.UnitID))
+			continue
+		}
+		seen[fv.UnitID] = true
+		want, ok := d.Palloc[fv.UnitID]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("unit %q has a feature vector but no frozen Palloc value", fv.UnitID))
+			continue
+		}
+		score, err := scorer.Score(fv)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("unit %q: %v", fv.UnitID, err))
+			continue
+		}
+		// Compared at the resolution the values are CARRIED at: a float
+		// equality here would fail on a value that round-tripped through JSON,
+		// which is a serialisation artefact rather than a different score.
+		if PallocNs(score) != PallocNs(want) {
+			problems = append(problems, fmt.Sprintf("unit %q is frozen at %v but the frozen scorer scores its feature vector at %v", fv.UnitID, want, score))
+		}
+	}
+	for unit := range d.Palloc {
+		if !seen[unit] {
+			problems = append(problems, fmt.Sprintf("unit %q carries a frozen Palloc value with no feature vector, so nothing says the frozen scorer produced it", unit))
+		}
+	}
+	return problems
+}
+
 func (d PcheckDocument) Recompute() []string {
 	var problems []string
 	if d.Kind != PcheckKind {
@@ -512,7 +606,7 @@ const PcheckKind = "tb.walltime.pcheck/v1"
 // BuildPcheck projects frozen Palloc values onto the renderer's deterministic
 // membership. It takes the values as data — it cannot call the scorer — so
 // there is no path by which a projection could re-score a unit.
-func BuildPcheck(stage2, membership Digest, scorer Scorer, palloc map[string]float64, invocations []PcheckInvocation) (*PcheckDocument, error) {
+func BuildPcheck(stage2, membership Digest, scorer Scorer, palloc map[string]float64, features []FeatureVector, invocations []PcheckInvocation, bucketIndex int, bucketName string) (*PcheckDocument, error) {
 	scorerDigest, err := scorer.DigestOf()
 	if err != nil {
 		return nil, err
@@ -523,8 +617,10 @@ func BuildPcheck(stage2, membership Digest, scorer Scorer, palloc map[string]flo
 	}
 	doc := &PcheckDocument{
 		Kind: PcheckKind, Stage2: stage2, MembershipDigest: membership,
+		BucketIndex: bucketIndex, BucketName: bucketName,
 		ScorerID: scorer.ID, ScorerDigest: scorerDigest,
 		Palloc: palloc, PallocDigest: pallocDigest,
+		Features: features,
 	}
 	for _, inv := range invocations {
 		subset, err := PallocSubset(palloc, inv.Units)
@@ -543,9 +639,10 @@ func BuildPcheck(stage2, membership Digest, scorer Scorer, palloc map[string]flo
 		inv.PallocDigest = d
 		doc.Invocations = append(doc.Invocations, inv)
 	}
-	if problems := doc.Recompute(); len(problems) > 0 {
-		// A document this function just built must recompute; if it does not,
-		// the bug is here and shipping it would hide it in a later verdict.
+	if problems := doc.RecomputeFrom(scorer); len(problems) > 0 {
+		// A document this function just built must recompute — including
+		// against the frozen scorer it names. If it does not, the bug is here
+		// and shipping it would hide it in a later verdict.
 		return nil, fmt.Errorf("pcheck: the projection does not recompute: %s", strings.Join(problems, "; "))
 	}
 	return doc, nil

@@ -85,6 +85,31 @@ inputs:
       still written and every campaign will refuse it — loudly, which beats a
       silently uncountable row. Pass a secret, never a literal.
     default: ""
+  scorer-file:
+    description: >-
+      The frozen scorer the Pcheck projection claims. The verifier re-derives
+      every Palloc value by RUNNING it over the projection's own feature
+      vectors; without it the projection is checked only against its own
+      arithmetic, which an allocation map no model produced satisfies
+      perfectly.
+    default: ""
+  shard-plan-file:
+    description: >-
+      The authorised plan artifact, for the exact-run coverage audit. With
+      `events-dir` it is what proves this bucket ran the targets, count-shards
+      and name slices the plan gave it. A wall-time envelope records how long
+      something took; it can never record what was skipped, so without these
+      two a row can be eligible having measured a script that did half its
+      work.
+    default: ""
+  events-dir:
+    description: >-
+      This bucket's runner events directory, for the coverage audit above.
+    default: ""
+  runner:
+    description: >-
+      Which adapter's event parser reads `events-dir`: go or vitest.
+    default: go
   records-artifact:
     description: >-
       Name the caller uploads the records under, echoed into the log so a
@@ -116,6 +141,10 @@ runs:
         TB_PCHECK_FILE: ${{ inputs.pcheck-file }}
         TB_INVOCATIONS_FILE: ${{ inputs.invocations-file }}
         TB_STEP_ATTEMPT_FILE: ${{ inputs.step-attempt-file }}
+        TB_SCORER_FILE: ${{ inputs.scorer-file }}
+        TB_SHARD_PLAN_FILE: ${{ inputs.shard-plan-file }}
+        TB_EVENTS_DIR: ${{ inputs.events-dir }}
+        TB_RUNNER: ${{ inputs.runner }}
         TB_AUTHORITY: ${{ inputs.authority }}
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
         TB_VERDICT_FILE: ${{ inputs.verdict-file }}
@@ -135,6 +164,9 @@ runs:
         if [ -n "$TB_PCHECK_FILE" ]; then args+=(--pcheck "$TB_PCHECK_FILE"); fi
         if [ -n "$TB_INVOCATIONS_FILE" ]; then args+=(--invocations "$TB_INVOCATIONS_FILE"); fi
         if [ -n "$TB_STEP_ATTEMPT_FILE" ]; then args+=(--step-attempt "$TB_STEP_ATTEMPT_FILE"); fi
+        if [ -n "$TB_SCORER_FILE" ]; then args+=(--scorer "$TB_SCORER_FILE"); fi
+        if [ -n "$TB_SHARD_PLAN_FILE" ]; then args+=(--shard-plan "$TB_SHARD_PLAN_FILE"); fi
+        if [ -n "$TB_EVENTS_DIR" ]; then args+=(--events "$TB_EVENTS_DIR" --runner "$TB_RUNNER"); fi
         if [ -n "$TB_AUTHORITY" ]; then args+=(--authority "$TB_AUTHORITY"); fi
         if [ -n "$TB_AUTHORITY_KEY" ]; then args+=(--authority-key "$TB_AUTHORITY_KEY"); fi
         if [ -n "$TB_RECORDS_ARTIFACT" ]; then

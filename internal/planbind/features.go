@@ -110,23 +110,47 @@ type Allocator struct {
 	// taken over the SAME frozen numbers the partition used rather than
 	// recomputed later from a scorer that might have moved.
 	values map[string]float64
+	// vectors records the feature vector each score came FROM, so the
+	// projection can be re-derived by running the frozen scorer again rather
+	// than only checked against its own arithmetic.
+	vectors map[string]walltime.FeatureVector
 }
 
 // NewAllocator binds a frozen scorer to a feature builder.
 func NewAllocator(scorer walltime.Scorer, builder *FeatureBuilder) *Allocator {
-	return &Allocator{scorer: scorer, builder: builder, values: map[string]float64{}}
+	return &Allocator{
+		scorer: scorer, builder: builder,
+		values:  map[string]float64{},
+		vectors: map[string]walltime.FeatureVector{},
+	}
 }
 
 // Score is the core's AllocationScore callback. It fails rather than falls
 // back: a unit the frozen scorer cannot score must fail the plan, because
 // packing it by some other rule is the leak the two surfaces exist to prevent.
 func (a *Allocator) Score(u runner.Unit) (float64, error) {
-	v, err := a.scorer.Score(a.builder.Vector(u))
+	fv := a.builder.Vector(u)
+	v, err := a.scorer.Score(fv)
 	if err != nil {
 		return 0, err
 	}
-	a.values[u.ID] = v
+	a.values[u.ID], a.vectors[u.ID] = v, fv
 	return v, nil
+}
+
+// Vectors is the frozen feature vector behind every score, in unit order, so
+// the audit projection can carry what it was derived from.
+func (a *Allocator) Vectors() []walltime.FeatureVector {
+	ids := make([]string, 0, len(a.vectors))
+	for id := range a.vectors {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]walltime.FeatureVector, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, a.vectors[id])
+	}
+	return out
 }
 
 // Values is the frozen Palloc map, for the audit projection.
@@ -150,10 +174,15 @@ func PcheckFor(doc *core.PlanDocument, bucket int, stage2, membership walltime.D
 		return nil, fmt.Errorf("planbind: no frozen allocation score, so there is nothing to project")
 	}
 	var invocations []walltime.PcheckInvocation
+	// The projection names the bucket it is FOR, so a document built for one
+	// bucket cannot be verified against another's measurement. Every other
+	// field two buckets of one plan carry is identical.
+	name := ""
 	for _, b := range doc.Buckets {
 		if bucket >= 0 && b.Index != bucket {
 			continue
 		}
+		name = b.Name
 		for i, inv := range b.Invocations {
 			ids := append([]string(nil), inv.Units...)
 			sort.Strings(ids)
@@ -162,7 +191,7 @@ func PcheckFor(doc *core.PlanDocument, bucket int, stage2, membership walltime.D
 			})
 		}
 	}
-	return walltime.BuildPcheck(stage2, membership, a.scorer, a.Values(), invocations)
+	return walltime.BuildPcheck(stage2, membership, a.scorer, a.Values(), a.Vectors(), invocations, bucket, name)
 }
 
 // PallocTotal is one bucket's frozen pre-KK Palloc total, which is what the

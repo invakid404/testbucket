@@ -413,7 +413,9 @@ func ReadDir(dir string) ([]Record, error) {
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+		// The key log shares the .jsonl suffix but is not a record stream:
+		// reading it as one would report every line as a malformed record.
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") || e.Name() == keyLogFile {
 			continue
 		}
 		names = append(names, e.Name())

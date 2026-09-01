@@ -161,6 +161,30 @@ on:
           unsigned and every campaign refuses them.
         type: string
         default: ""
+      frozen-inputs-artifact:
+        description: >-
+          Name of an artifact holding the frozen PLANNING INPUTS: the
+          planning-input bundle (`bundle.json`), the signed Stage-1 manifest
+          authorising it (`stage1.json`), the Aeta component registry
+          (`registry.json`) and, when the arm allocates by a frozen model, the
+          scorer named by `frozen-scorer-file`.
+
+          When set, the plan job derives the matrix from those EXACT bytes
+          rather than from the live tree and the restored store, writes the
+          Stage-2 receipt and every per-bucket document, and uploads them as
+          `testbucket-derived-<cache-scope>`. That is what the exactly-once
+          frozen handoff means: without it the matrix a scored pair compares is
+          two derivations of different inputs, however carefully the rest is
+          measured. Empty leaves planning byte-identical to before.
+        type: string
+        default: ""
+      frozen-scorer-file:
+        description: >-
+          File name of the frozen scorer inside `frozen-inputs-artifact`. The
+          partition then packs by Palloc; without it the split uses the store's
+          measured weights, which is a good split and is not campaign eligible.
+        type: string
+        default: ""
       frozen-documents-artifact:
         description: >-
           Name of an artifact holding the frozen documents a scored row needs:
@@ -224,6 +248,18 @@ jobs:
           restore-keys: |
             testbucket-timings-${{ inputs.cache-scope }}-v1-
 
+      # BEFORE the plan, not after it. A scored row's matrix has to come from
+      # the frozen planning-input bundle, and the ordinary plan path reads the
+      # live tree and the restored store at the moment it runs — so a pair
+      # planned that way would be comparing two derivations of different
+      # inputs, however carefully the rest is measured.
+      - name: Download the frozen planning inputs
+        if: inputs.frozen-inputs-artifact != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.frozen-inputs-artifact }}
+          path: ${{ runner.temp }}/testbucket-frozen-inputs
+
       - name: Plan the buckets
         id: plan
         uses: $/.github/actions/plan
@@ -242,6 +278,29 @@ jobs:
           exclude-module: ${{ inputs.exclude-module }}
           setup-command: ${{ inputs.setup-command }}
           wall-time-dir: ${{ inputs.wall-time-dir }}
+          # With a bundle the matrix is derived by the frozen planner over
+          # those exact bytes, and every per-bucket document is derived and
+          # bound into the Stage-2 receipt in the same step. Empty leaves the
+          # ordinary path byte-identical.
+          bundle: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-frozen-inputs/bundle.json', runner.temp) || '' }}
+          stage1: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-frozen-inputs/stage1.json', runner.temp) || '' }}
+          stage2-out: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/stage2.json', runner.temp) || '' }}
+          scorer: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
+          registry: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-frozen-inputs/registry.json', runner.temp) || '' }}
+          derived-out: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived', runner.temp) || '' }}
+
+      # The Stage-2 receipt and the per-bucket documents the frozen planner
+      # just derived. A bucket downloads them and is verified against them;
+      # without this they would have to be produced somewhere else, which is
+      # exactly the unbound handoff the binding exists to close.
+      - name: Upload the derived plan documents
+        if: always() && inputs.frozen-inputs-artifact != ''
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: testbucket-derived-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/testbucket-derived
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload the shard plan
         if: always()
@@ -315,6 +374,35 @@ jobs:
         with:
           name: ${{ inputs.frozen-documents-artifact }}
           path: ${{ runner.temp }}/testbucket-frozen
+
+      # The Stage-2 receipt and per-bucket documents the frozen planner
+      # derived, and the plan itself. The plan is what the coverage audit
+      # compares this bucket's events against: a wall-time envelope records how
+      # long something took and can never record what it skipped.
+      - name: Download the derived plan documents
+        if: inputs.frozen-inputs-artifact != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: testbucket-derived-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/testbucket-derived
+
+      # The frozen scorer travels with the inputs, not the outputs: the
+      # verifier re-derives every Palloc value by running it, and a projection
+      # checked only against its own arithmetic is satisfied by an allocation
+      # map no model produced.
+      - name: Download the frozen planning inputs
+        if: inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.frozen-inputs-artifact }}
+          path: ${{ runner.temp }}/testbucket-frozen-inputs
+
+      - name: Download the shard plan
+        if: inputs.wall-time-dir != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: testbucket-shard-plan-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/testbucket-plan
 
       # The wrapper is installed BEFORE the measured action, by the caller.
       # The physical action envelope opens on run-bucket's first owned
@@ -417,13 +505,25 @@ jobs:
           verdict-file: ${{ inputs.wall-time-dir }}/verdict.json
           verifier-key: ${{ inputs.verifier-key-secret != '' && secrets[inputs.verifier-key-secret] || '' }}
           stage1-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage1.json', runner.temp) || '' }}
-          stage2-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage2.json', runner.temp) || '' }}
+          # The derived documents come from the PLANNER when the arm was
+          # planned from a frozen bundle: they are the one authorised plan's
+          # own output, bound into its Stage-2 receipt by digest. The
+          # frozen-documents artifact remains the path for an arm whose plan
+          # was derived elsewhere.
+          stage2-file: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/stage2.json', runner.temp) || (inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage2.json', runner.temp) || '') }}
           replay-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/replay.json', runner.temp) || '' }}
           registry-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/registry.json', runner.temp) || '' }}
-          aeta-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/aeta-{1}.json', runner.temp, matrix.bucket) || '' }}
-          pcheck-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/pcheck-{1}.json', runner.temp, matrix.bucket) || '' }}
-          invocations-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/invocations-{1}.json', runner.temp, matrix.bucket) || '' }}
+          aeta-file: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/aeta-{1}.json', runner.temp, matrix.bucket) || (inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/aeta-{1}.json', runner.temp, matrix.bucket) || '') }}
+          pcheck-file: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/pcheck-{1}.json', runner.temp, matrix.bucket) || (inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/pcheck-{1}.json', runner.temp, matrix.bucket) || '') }}
+          invocations-file: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/invocations-{1}.json', runner.temp, matrix.bucket) || (inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/invocations-{1}.json', runner.temp, matrix.bucket) || '') }}
           step-attempt-file: ${{ inputs.wall-time-dir != '' && format('{0}/step-attempt.json', inputs.wall-time-dir) || '' }}
+          # Exact-run coverage. Without these the verifier can say the
+          # measurement was well formed and nothing more: a script that skipped
+          # half its targets produces a shorter, perfectly attested envelope.
+          runner: ${{ inputs.runner }}
+          shard-plan-file: ${{ inputs.wall-time-dir != '' && format('{0}/testbucket-plan/shard-plan.json', runner.temp) || '' }}
+          events-dir: /tmp/testbucket-events
+          scorer-file: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
 
       # The raw records and the verdict ARE the evidence: a campaign assembles
       # its population from them, and a row whose records were discarded with

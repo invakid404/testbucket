@@ -1,8 +1,10 @@
 package walltime
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -97,6 +99,17 @@ func Exec(opt ExecOptions) (int, error) {
 		return 1, err
 	}
 	defer w.Close()
+	// A script- or invocation-level wrapper is started BY the measured step,
+	// so its key cannot be in a roster sealed before that step ran. What can
+	// be fixed is that the set is CLOSED at AT_end: every key registers here,
+	// `wall end` seals the log, and a key that was never registered — or one
+	// appended afterwards — is not a signer this measurement admitted.
+	if err := RegisterKey(opt.Dir, KeyLogEntry{
+		Producer: ProducerPhysical, Level: opt.Level, Seq: opt.Seq,
+		PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
+	}); err != nil {
+		return 1, err
+	}
 
 	spec := &SpecIdentity{
 		ArgvDigest:     mustDigest(opt.Argv),
@@ -408,6 +421,10 @@ type observerProc struct {
 	cmd      *exec.Cmd
 	ctl      control
 	stream   string
+	// pub is the observer's signing identity, kept so the wrapper can declare
+	// it in the roster or register it in the key log. The PRIVATE half never
+	// comes back here — it goes down a pipe into the child and nowhere else.
+	pub string
 }
 
 // startObserver spawns a peer or trace collector as a SEPARATE PROCESS with
@@ -435,13 +452,24 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 		"--control", base,
 		"--containment", string(identJSON),
 		"--run", string(runJSON),
-		"--key", EncodeKey(key),
+		// The key travels down an inherited pipe, NOT in argv. Argv is
+		// world-readable in the process table, so a key passed that way is
+		// readable by every process on the runner — not merely by the measured
+		// script, but by anything sharing the machine. A signer set nobody
+		// else can read is the point of having one.
+		"--key-fd", fmt.Sprint(observerKeyFD),
 		"--timeout", time.Until(deadline).String(),
 	}
 	cmd, err := ObserverLauncher(args)
 	if err != nil {
 		return nil, err
 	}
+	keyR, keyW, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer keyR.Close()
+	cmd.ExtraFiles = append(cmd.ExtraFiles, keyR)
 	if detached {
 		// The action-level observers outlive the step that started them:
 		// `wall begin` and `wall end` are two different Actions steps, so the
@@ -456,10 +484,52 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 	cmd.Stdout, cmd.Stderr = logf, logf
 	if err := cmd.Start(); err != nil {
 		logf.Close()
+		keyW.Close()
 		return nil, err
 	}
 	logf.Close()
-	return &observerProc{producer: p, cmd: cmd, ctl: control{base: base}, stream: filepath.Join(opt.Dir, streamName(p, opt.Level, opt.Seq))}, nil
+	// Write and close AFTER Start: the child holds the read end, so the write
+	// end must be closed here or the child's read never sees EOF.
+	_, writeErr := io.WriteString(keyW, EncodeKey(key))
+	closeErr := keyW.Close()
+	if writeErr != nil {
+		return nil, fmt.Errorf("walltime: hand the %s its key: %w", p, writeErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("walltime: hand the %s its key: %w", p, closeErr)
+	}
+	if opt.Level != LevelAction {
+		// Action-level observers are declared in the roster instead; anything
+		// below it registers, for the same reason the physical wrapper does.
+		if err := RegisterKey(opt.Dir, KeyLogEntry{
+			Producer: p, Level: opt.Level, Seq: opt.Seq,
+			PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return &observerProc{
+		producer: p, cmd: cmd, ctl: control{base: base}, pub: PublicKeyOf(key),
+		stream: filepath.Join(opt.Dir, streamName(p, opt.Level, opt.Seq)),
+	}, nil
+}
+
+// observerKeyFD is the descriptor an observer reads its signing key from. It
+// is 3 because Go places ExtraFiles immediately after stdin/stdout/stderr.
+const observerKeyFD = 3
+
+// ReadKeyFD reads a signing key handed down an inherited descriptor.
+func ReadKeyFD(fd int) (ed25519.PrivateKey, error) {
+	f := os.NewFile(uintptr(fd), "walltime-key")
+	if f == nil {
+		return nil, fmt.Errorf("walltime: no key on fd %d", fd)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("walltime: read key from fd %d: %w", fd, err)
+	}
+	return DecodeKey(strings.TrimSpace(string(b)))
 }
 
 // admit releases the observer's admission read and waits for the RECORD it

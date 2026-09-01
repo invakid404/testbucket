@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
+	"github.com/invakid404/testbucket/internal/core"
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
@@ -15,6 +18,12 @@ import (
 // the same reason the authority key is: a key on a command line is a key in
 // the process table.
 const verifierKeyEnv = "TB_WALL_VERIFIER_KEY"
+
+// replayKeyEnv is the INDEPENDENT replay party's own signing key. It is a
+// separate variable from the authority key because the whole value of a replay
+// is that a different party produced it; sharing one key would make the
+// distinction editorial.
+const replayKeyEnv = "TB_WALL_REPLAY_KEY"
 
 const wallUsage = `testbucket wall — complete-action wall-time measurement
 
@@ -295,7 +304,10 @@ func runWallObserve(args []string) error {
 	control := fs.String("control", "", "control file base path")
 	containment := fs.String("containment", "", "containment identity as JSON")
 	runJSON := fs.String("run", "", "run identity as JSON")
-	key := fs.String("key", "", "this observer's own signing key")
+	// The key arrives on an inherited descriptor, never in argv: argv is
+	// readable by every process on the machine, and a signing key visible in
+	// the process table is not a signing key.
+	keyFD := fs.Int("key-fd", 0, "descriptor to read this observer's own signing key from")
 	timeout := fs.Duration("timeout", walltime.DefaultTimeout, "bound on the wait for verified-empty containment")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -310,7 +322,10 @@ func runWallObserve(args []string) error {
 			return fmt.Errorf("run identity: %w", err)
 		}
 	}
-	priv, err := walltime.DecodeKey(*key)
+	if *keyFD <= 0 {
+		return fmt.Errorf("--key-fd is required: an observer is handed its key on an inherited descriptor")
+	}
+	priv, err := walltime.ReadKeyFD(*keyFD)
 	if err != nil {
 		return err
 	}
@@ -395,17 +410,21 @@ func runWallTrain(args []string) error {
 	id := fs.String("id", "", "identity to give the frozen scorer (required)")
 	lambda := fs.Float64("lambda", 0.01, "ridge regularisation; 0 is plain least squares")
 	out := fs.String("out", "", "write the frozen scorer here (required)")
+	sealKeys := fs.String("training-authority-key", "", "comma-separated PREDECLARED public keys allowed to seal a training receipt set (required): a lineage nobody can attribute is the claim that somebody ran the right procedure")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *labels == "" || *id == "" || *out == "" {
 		return fmt.Errorf("--labels, --id and --out are all required")
 	}
+	if strings.TrimSpace(*sealKeys) == "" {
+		return fmt.Errorf("--training-authority-key is required: without a predeclared sealing key the receipt set's own signature would authenticate it, and a self-sealed lineage is not a sealed offline surface")
+	}
 	var set walltime.TrainingReceiptSet
 	if err := walltime.ReadJSONFile(*labels, &set); err != nil {
 		return err
 	}
-	scorer, err := walltime.TrainScorer(set, *id, *lambda)
+	scorer, err := walltime.TrainScorer(set, *id, *lambda, splitList(*sealKeys))
 	if err != nil {
 		return err
 	}
@@ -502,6 +521,10 @@ func runWallVerify(args []string) error {
 	replay := fs.String("replay", "", "independent Stage-2 replay attestation (`wall replay --attest`). Required to score: comparing the planner's account of its own output to itself proves nothing")
 	require := fs.String("require", "complete", "verdict this command exits non-zero below: complete (well-formed records) or eligible (scorable under every frozen ROW gate; the campaign-scope gates are decided by `wall campaign`)")
 	authority := fs.String("authority", "", "the protected environment the Stage-1 manifest must name")
+	scorer := fs.String("scorer", "", "the frozen scorer the Pcheck projection claims. Without it the projection is only checked against its own arithmetic, which a substituted allocation map satisfies")
+	shardPlan := fs.String("shard-plan", "", "the authorised plan artifact, for the exact-run coverage audit")
+	eventsDir := fs.String("events", "", "this bucket's runner events directory, for the exact-run coverage audit. Without --events and --shard-plan nothing checks that the measured script ran the work the plan gave it")
+	runnerKind := fs.String("runner", "go", "which adapter's event parser reads --events: go or vitest")
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable. Without one the verifier will not treat any signature as authority approval, because a self-generated key would otherwise pass")
 	if err := fs.Parse(args); err != nil {
@@ -512,8 +535,9 @@ func runWallVerify(args []string) error {
 	}
 	v, err := walltime.VerifyDir(walltime.VerifyOptions{
 		Dir: *dir, Stage1Path: *stage1, Stage2Path: *stage2,
-		AetaPath: *aeta, PcheckPath: *pcheck, RegistryPath: *registry,
+		AetaPath: *aeta, PcheckPath: *pcheck, RegistryPath: *registry, ScorerPath: *scorer,
 		ReplayPath: *replay, InvocationsPath: *invocations, StepAttemptPath: *stepAttempt,
+		Audit:         coverageAudit(*shardPlan, *eventsDir, *runnerKind),
 		AuthorityKeys: authorityKeys, Authority: *authority,
 	})
 	if err != nil {
@@ -560,4 +584,72 @@ func runWallVerify(args []string) error {
 		return fmt.Errorf("--require must be complete or eligible, got %q", *require)
 	}
 	return nil
+}
+
+// coverageAudit builds the verifier's exact-run coverage check.
+//
+// It lives here rather than in internal/walltime because the audit belongs to
+// the planner/adapter layer, and the measurement package deliberately imports
+// neither — the code that measures must not be able to reach the code it
+// measures. Returning nil when the inputs are absent is not a way to skip the
+// check: the verifier turns a nil audit into a finding.
+func coverageAudit(shardPlan, eventsDir, runnerKind string) walltime.AuditFunc {
+	if shardPlan == "" || eventsDir == "" {
+		return nil
+	}
+	return func(bucketID string) (*walltime.AuditEvidence, error) {
+		index, err := core.BucketIndexOf(shardPlan, bucketID)
+		if err != nil {
+			return nil, err
+		}
+		planned, err := core.LoadPlannedCoverageForBucket(shardPlan, index)
+		if err != nil {
+			return nil, err
+		}
+		entries, err := os.ReadDir(eventsDir)
+		if err != nil {
+			return nil, fmt.Errorf("read events %s: %w", eventsDir, err)
+		}
+		var readers []io.Reader
+		var closers []io.Closer
+		defer func() {
+			for _, c := range closers {
+				c.Close()
+			}
+		}()
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			f, err := os.Open(filepath.Join(eventsDir, e.Name()))
+			if err != nil {
+				return nil, fmt.Errorf("open events %s: %w", e.Name(), err)
+			}
+			closers = append(closers, f)
+			readers = append(readers, f)
+		}
+		if len(readers) == 0 {
+			// An empty events directory is the exact failure the audit exists
+			// to catch — a bucket that produced nothing — so it is reported as
+			// a coverage problem rather than as a missing input.
+			return &walltime.AuditEvidence{Bucket: bucketID, Planned: planned.Units, Problems: []string{
+				fmt.Sprintf("bucket %s produced no runner events at all, so none of its %d planned unit(s) can be shown to have run", bucketID, planned.Units),
+			}}, nil
+		}
+		rnr, _, err := newRunner(runnerConfig{kind: runnerKind})
+		if err != nil {
+			return nil, err
+		}
+		sum, err := rnr.ParseTimings(readers...)
+		if err != nil {
+			return nil, err
+		}
+		var report strings.Builder
+		ev := &walltime.AuditEvidence{Bucket: bucketID, Planned: planned.Units, Reported: len(sum.PackageRuns)}
+		if err := core.AuditCoverage(&report, planned, sum); err != nil {
+			ev.Problems = append(ev.Problems, err.Error())
+		}
+		ev.Report = report.String()
+		return ev, nil
+	}
 }

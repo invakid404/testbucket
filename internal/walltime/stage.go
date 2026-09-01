@@ -430,17 +430,68 @@ func hasPrefix(s, p string) bool { return len(s) >= len(p) && s[:len(p)] == p }
 // Absent bytes are a cold start: schema 0 and an empty token, which a receipt
 // must then also declare.
 func parsedStoreIdentity(b []byte) (int, string) {
-	if len(b) == 0 {
+	d, err := DeriveStoreFacts(b)
+	if err != nil {
 		return 0, ""
+	}
+	return d.Schema, d.Token
+}
+
+// StoreFacts is what the ADMITTED STORE BYTES themselves say. Every field here
+// is derived by parsing, never read from a receipt: the point of a receipt is
+// to be checked, and a receipt that is only checked against its own claims is
+// a signed assertion.
+type StoreFacts struct {
+	Schema int
+	Token  string
+	Rows   int
+	// Coverage is the live target set the store recorded, sorted.
+	Coverage []string
+	// Measured counts rows carrying at least one ingest sample; Unmeasured
+	// counts rows that exist with none. A row with samples but zero weight is
+	// counted in Measured and is NOT a gap — that distinction is the whole
+	// reason observed_zero is a class of its own.
+	Measured   int
+	Unmeasured int
+	// Zero counts measured rows whose weight is zero. The bytes cannot tell a
+	// target that ran in no time from one with no tests, so the receipt is
+	// checked against the SUM of those two classes rather than against a split
+	// the store does not record.
+	Zero int
+}
+
+// DeriveStoreFacts parses the frozen store bytes and reports what they say.
+func DeriveStoreFacts(b []byte) (StoreFacts, error) {
+	var f StoreFacts
+	if len(b) == 0 {
+		return f, fmt.Errorf("the frozen store bytes are empty")
 	}
 	var probe struct {
-		Schema int    `json:"schema"`
-		Flags  string `json:"flags"`
+		Schema   int      `json:"schema"`
+		Flags    string   `json:"flags"`
+		Coverage []string `json:"coverage"`
+		Units    map[string]struct {
+			Seconds float64 `json:"seconds"`
+			Samples int     `json:"samples"`
+		} `json:"units"`
 	}
 	if err := json.Unmarshal(b, &probe); err != nil {
-		return 0, ""
+		return f, fmt.Errorf("parse the frozen store bytes: %w", err)
 	}
-	return probe.Schema, probe.Flags
+	f.Schema, f.Token, f.Rows = probe.Schema, probe.Flags, len(probe.Units)
+	f.Coverage = append([]string(nil), probe.Coverage...)
+	sort.Strings(f.Coverage)
+	for _, u := range probe.Units {
+		if u.Samples > 0 {
+			f.Measured++
+			if u.Seconds == 0 {
+				f.Zero++
+			}
+			continue
+		}
+		f.Unmeasured++
+	}
+	return f, nil
 }
 
 // fullSHALen is the length of a full Git commit SHA. The contract is explicit
@@ -563,7 +614,68 @@ func (r StoreReceipt) Validate(bytes []byte, parsedSchema int, parsedToken strin
 	if r.Token != parsedToken {
 		return fmt.Errorf("store receipt: it claims token %q but the frozen bytes were measured under %q", r.Token, parsedToken)
 	}
+	if err := r.checkAgainstBytes(bytes); err != nil {
+		return err
+	}
 	return r.validateFields(now)
+}
+
+// checkAgainstBytes DERIVES the row count, the coverage set and the row
+// classification from the admitted store and refuses a receipt that disagrees.
+//
+// Before this, those three were signed assertions: a receipt could claim any
+// coverage and any classification over bytes it merely cited by digest, and
+// the only thing checked was that its own numbers added up. A receipt that is
+// checked against its own arithmetic is not evidence about the store.
+func (r StoreReceipt) checkAgainstBytes(b []byte) error {
+	f, err := DeriveStoreFacts(b)
+	if err != nil {
+		return fmt.Errorf("store receipt: %w", err)
+	}
+	// The RESIDENT classes are the ones the store can speak to. The rest —
+	// failed, cancelled, malformed, excluded — describe rows the ingest
+	// declined to admit, which are by definition not in the store, so the
+	// bytes constrain the resident total rather than Rows itself.
+	resident := r.Classifications[RowObservedPositive] + r.Classifications[RowObservedZero] +
+		r.Classifications[RowNoTests] + r.Classifications[RowMissing]
+	if resident != f.Rows {
+		return fmt.Errorf("store receipt: it classifies %d row(s) as present in the store but the frozen bytes hold %d", resident, f.Rows)
+	}
+	got := append([]string(nil), r.Coverage...)
+	sort.Strings(got)
+	if !equalStrings(got, f.Coverage) {
+		return fmt.Errorf("store receipt: it claims coverage of %d target(s) but the frozen bytes recorded %d, and the two sets are not the same",
+			len(got), len(f.Coverage))
+	}
+	// The bytes distinguish measured from unmeasured rows, and among measured
+	// rows those with zero weight. They cannot tell a target that ran in no
+	// time from one with no tests at all, so observed_zero and no_tests are
+	// checked as one class rather than against a split the store never
+	// recorded.
+	if got, want := r.Classifications[RowMissing], f.Unmeasured; got != want {
+		return fmt.Errorf("store receipt: it classifies %d row(s) as %s but %d row(s) in the frozen bytes carry no sample", got, RowMissing, want)
+	}
+	if got, want := r.Classifications[RowObservedZero]+r.Classifications[RowNoTests], f.Zero; got != want {
+		return fmt.Errorf("store receipt: it classifies %d row(s) as %s or %s but %d measured row(s) in the frozen bytes weigh zero",
+			got, RowObservedZero, RowNoTests, want)
+	}
+	if got, want := r.Classifications[RowObservedPositive], f.Measured-f.Zero; got != want {
+		return fmt.Errorf("store receipt: it classifies %d row(s) as %s but %d measured row(s) in the frozen bytes carry a positive weight", got, RowObservedPositive, want)
+	}
+	return nil
+}
+
+// equalStrings compares two sorted lists.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // validateFields checks the receipt's internal consistency, independent of the
@@ -632,9 +744,19 @@ type InstrumentationIdentity struct {
 	EndpointOrder      string   `json:"endpoint_order_policy"`
 	CancellationPolicy string   `json:"cancellation_policy"`
 	RawSourceTaxonomy  []string `json:"raw_source_taxonomy"`
-	// Signers lists the public keys that may sign records. A record signed by
-	// anything else is not evidence this campaign bound.
+	// Signers lists the PUBLIC halves of the run keys that may sign a
+	// measurement's roster and closing seal. Per-producer record keys are
+	// minted at run time and cannot be predeclared — they do not exist when
+	// this manifest is signed — so what is bound here is the key that attests
+	// to them, delivered only to the steps the measured script is not in.
+	// Empty means nothing was declared, and a run whose signer set nobody
+	// declared authenticates only itself.
 	Signers []string `json:"signers"`
+	// ReplaySigners are the keys allowed to sign an independent Stage-2 replay
+	// attestation. They are kept separate from the authority key on purpose:
+	// an attestation signed by the party that authorised the plan is the
+	// planner re-checking its own work, which is what "independent" excludes.
+	ReplaySigners []string `json:"replay_signers,omitempty"`
 }
 
 // policy is the part of the instrumentation identity that must be EQUAL
@@ -643,6 +765,9 @@ type InstrumentationIdentity struct {
 // with it. Everything describing HOW the measurement was taken stays.
 func (i InstrumentationIdentity) policy() InstrumentationIdentity {
 	i.PhysicalBinary, i.PeerBinary, i.TraceBinary, i.VerifierBinary = "", "", "", ""
+	// Signer sets are per-arm delivery facts, not measurement policy: the two
+	// arms of a pair run in different jobs and hold different run keys.
+	i.Signers, i.ReplaySigners = nil, nil
 	return i
 }
 
@@ -991,6 +1116,18 @@ type Stage2Receipt struct {
 	ScriptDigest     Digest `json:"generated_script_digest"`
 	MatrixDigest     Digest `json:"matrix_digest"`
 
+	// Sidecars binds every per-bucket document this plan derived, by name and
+	// digest.
+	//
+	// The receipt already digests the plan, the membership and the
+	// invocations in aggregate. What it could not say is which per-bucket
+	// Pcheck, forecast and invocation manifest were the authorised output —
+	// those were written beside the receipt carrying nothing but a Stage-2
+	// string, which any substituted document can also carry. Naming them here
+	// puts them inside the one document that is signed and independently
+	// replayed.
+	Sidecars map[string]Digest `json:"derived_document_digests,omitempty"`
+
 	Algorithms struct {
 		FullPlan     AlgorithmIdentity `json:"full_plan"`
 		SemanticPlan AlgorithmIdentity `json:"semantic_plan"`
@@ -998,6 +1135,56 @@ type Stage2Receipt struct {
 	PlannerResult  string     `json:"planner_result"`
 	RendererResult string     `json:"renderer_result"`
 	Signature      *Signature `json:"signature,omitempty"`
+}
+
+// PlanDigestOf is the receipt's PLAN identity: everything it says about the
+// plan, excluding both its signature and the binding over the documents that
+// plan derived.
+//
+// The two identities exist because the reference is circular: the receipt
+// binds each derived document by digest, and each derived document names the
+// receipt. Something has to be named that does not include the binding, and
+// the plan itself is the honest choice — a sidecar is derived FROM the plan,
+// so the plan is what it should be citing. Records and attestations continue
+// to name DigestOf, which does cover the binding.
+func (r Stage2Receipt) PlanDigestOf() (Digest, error) {
+	c := r
+	c.Signature, c.Sidecars = nil, nil
+	return DigestJSON(c)
+}
+
+// SidecarName is the stable key a derived per-bucket document is bound under.
+// It is a function so the writer and the verifier cannot spell it differently.
+func SidecarName(kind string, bucket int) string {
+	return fmt.Sprintf("%s-%d", kind, bucket)
+}
+
+// Sidecar kinds, as they appear in a Stage-2 receipt's binding.
+const (
+	SidecarPcheck      = "pcheck"
+	SidecarAeta        = "aeta"
+	SidecarInvocations = "invocations"
+)
+
+// checkSidecar reports whether a derived document is the one Stage 2 bound.
+//
+// An unbound sidecar is refused rather than accepted-with-a-warning: the whole
+// point of the two-stage freeze is that exactly one plan was authorised, and a
+// per-bucket document nobody bound is a document anybody could have written.
+func (r Stage2Receipt) checkSidecar(kind string, bucket int, doc any) error {
+	name := SidecarName(kind, bucket)
+	want, ok := r.Sidecars[name]
+	if !ok {
+		return fmt.Errorf("the Stage-2 receipt binds no %s document for bucket %d, so the supplied one is not provably the authorised plan's output", kind, bucket)
+	}
+	got, err := DigestJSON(doc)
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("the Stage-2 receipt binds %s %s for bucket %d but the supplied document digests to %s", kind, want, bucket, got)
+	}
+	return nil
 }
 
 // DigestOf is the receipt's canonical identity.
@@ -1071,6 +1258,21 @@ func (r Stage2Receipt) Matches(other Stage2Receipt) error {
 	for _, p := range pairs {
 		if p.a != p.b {
 			return fmt.Errorf("%s digest mismatch: %s vs %s", p.name, p.a, p.b)
+		}
+	}
+	// The per-bucket bindings are compared too. Aggregate digests say the two
+	// parties derived the same plan; only these say they derived the same
+	// documents the buckets will be verified against.
+	if len(r.Sidecars) != len(other.Sidecars) {
+		return fmt.Errorf("derived-document binding mismatch: the receipt binds %d document(s), the replay derived %d", len(r.Sidecars), len(other.Sidecars))
+	}
+	for name, want := range r.Sidecars {
+		got, ok := other.Sidecars[name]
+		if !ok {
+			return fmt.Errorf("the receipt binds derived document %q, which the replay did not derive", name)
+		}
+		if got != want {
+			return fmt.Errorf("derived document %q: %s vs %s", name, want, got)
 		}
 	}
 	return nil

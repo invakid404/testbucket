@@ -44,10 +44,14 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	// AT_start before ANYTHING else this process owns — before the records
 	// directory, the signing key and the writer. Those are action-owned work,
 	// and an envelope opened after them would report an action shorter than
-	// the one that ran. The action step's binary install necessarily precedes
-	// this, because there is no wrapper to read the clock until it exists; it
-	// is the one action-step operation outside A, and the realtime bracket on
-	// this record is what makes the gap visible against the GitHub step.
+	// the one that ran.
+	//
+	// The wrapper cannot read a clock before it exists, so under measurement
+	// it is installed by the CALLER, before the measured action starts, and
+	// `wall begin` is the action's first owned step. What remains before this
+	// reading is the runner's own step startup, which the verifier bounds
+	// against A_GH's one-second resolution rather than merely reporting: an
+	// unbounded prefix would mean A measured a different product.
 	clock := NewSystemClock()
 	start := clock.Now()
 	probe(atStartReading, dir)
@@ -64,6 +68,10 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		return nil, err
 	}
 	defer w.Close()
+	runKey, err := RunKeyFromEnv()
+	if err != nil {
+		return nil, err
+	}
 
 	// From here on every failure is RETAINED. A bootstrap that dies without a
 	// record is indistinguishable from an action that never started, and the
@@ -107,6 +115,25 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	if err := trace.admit(deadline); err != nil {
 		peer.abandon()
 		return fail("admit the trace collector", err)
+	}
+
+	// The roster is sealed HERE, inside the envelope and before the measured
+	// script exists, and it is signed with a key delivered only to this step.
+	// That ordering is the control: after this point the set of keys that may
+	// sign action-level evidence is fixed, and the step that runs the measured
+	// work cannot extend it.
+	roster := Roster{Kind: RosterKind, Run: run, Entries: []RosterEntry{
+		{Producer: ProducerPhysical, Level: LevelAction, PublicKey: PublicKeyOf(key), Binary: SelfDigest()},
+		{Producer: ProducerPeer, Level: LevelAction, PublicKey: peer.pub, Binary: SelfDigest()},
+		{Producer: ProducerTrace, Level: LevelAction, PublicKey: trace.pub, Binary: SelfDigest()},
+	}}
+	if runKey != nil {
+		if err := roster.Sign(run.CampaignID, runKey); err != nil {
+			return fail("sign the signer roster", err)
+		}
+	}
+	if err := WriteRoster(dir, roster); err != nil {
+		return fail("write the signer roster", err)
 	}
 
 	st := &ActionState{
@@ -180,6 +207,10 @@ func retainActionTerminal(dir string, run RunIdentity, state, reason string) {
 		return
 	}
 	defer w.Close()
+	_ = RegisterKey(dir, KeyLogEntry{
+		Producer: ProducerPhysical, Level: LevelAction,
+		PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
+	})
 	_, _ = w.Append(Record{
 		Kind: "terminal", Role: RolePhysicalAction, Level: LevelAction,
 		Source: SourceWrapper, Run: run, Instant: NewSystemClock().Now(),
@@ -230,6 +261,12 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 		return st, err
 	}
 	defer w.Close()
+	if err := RegisterKey(dir, KeyLogEntry{
+		Producer: ProducerPhysical, Level: LevelAction,
+		PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
+	}); err != nil {
+		return st, err
+	}
 
 	cont, err := AttachContainment(st.Containment)
 	if err != nil {
@@ -263,9 +300,51 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 		Kind: "boundary", Role: RolePhysicalAction, Level: LevelAction, Boundary: "end",
 		Source: SourceWrapper, Run: st.Run, Containment: st.Containment,
 		Instant: clock.Now(), Terminal: terminal, Reason: reason,
-		Note: "observers reaped, containment destroyed and the action-state handoff removed before this reading; only this record's own write follows it",
+		Note: "observers reaped, containment destroyed and the action-state handoff removed before this reading; only this record's own write and the ledger seal follow it",
 	}); err != nil {
 		return st, err
 	}
+	// The seal comes AFTER the closing record so it covers that record too.
+	// Both are the ledger closing itself rather than action work: no measured
+	// process exists at this point, and a seal that omitted AT_end would leave
+	// the one record that defines the end of A unfixed.
+	if err := w.Close(); err != nil {
+		return st, err
+	}
+	if err := sealDirectory(dir, st.Run); err != nil {
+		return st, err
+	}
 	return st, nil
+}
+
+// sealDirectory writes the closing attestation over every stream and the key
+// log. An unsigned seal is still written: it fixes the bytes for a reader, and
+// the verifier reports the missing signature rather than silently accepting
+// it.
+func sealDirectory(dir string, run RunIdentity) error {
+	runKey, err := RunKeyFromEnv()
+	if err != nil {
+		return err
+	}
+	streams, err := SealStreams(dir)
+	if err != nil {
+		return err
+	}
+	_, keyLog, err := ReadKeyLog(dir)
+	if err != nil {
+		return err
+	}
+	rosterDigest := Digest("")
+	if r, err := ReadRoster(dir); err == nil {
+		if d, err := r.DigestOf(); err == nil {
+			rosterDigest = d
+		}
+	}
+	seal := Seal{Kind: SealKind, Run: run, RosterDigest: rosterDigest, KeyLogDigest: keyLog, Streams: streams}
+	if runKey != nil {
+		if err := seal.Sign(run.CampaignID, runKey); err != nil {
+			return err
+		}
+	}
+	return WriteSeal(dir, seal)
 }

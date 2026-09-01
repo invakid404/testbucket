@@ -136,6 +136,11 @@ func (r AetaRegistry) Validate() error {
 // candidate result: instantiation is arithmetic on frozen inputs.
 type AetaInputs struct {
 	BucketID string `json:"bucket_id"`
+	// BucketIndex is the same bucket by its position in the plan. Both are
+	// carried because the measured row names the bucket by NAME and the
+	// Stage-2 receipt binds derived documents by INDEX, and a forecast that
+	// answered to only one of them could be checked against only one of them.
+	BucketIndex int `json:"bucket"`
 	// PallocSeconds is the bucket's frozen pre-KK Palloc total.
 	PallocSeconds float64 `json:"palloc_seconds"`
 	// Invocations is the rendered invocation count from the verified Stage-2

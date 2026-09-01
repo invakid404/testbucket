@@ -113,6 +113,10 @@ type Verdict struct {
 	// acceptable rows can still miss it.
 	AetaSample      *AetaSample       `json:"aeta_sample,omitempty"`
 	PredictorSample []PredictorSample `json:"predictor_samples,omitempty"`
+	// Audit is the exact-run coverage evidence for this bucket. A verdict
+	// without it says only that the measurement was well formed, never that
+	// the measured work was the work the plan scheduled.
+	Audit *AuditEvidence `json:"audit,omitempty"`
 	// Signature is the approved verifier's statement over this verdict.
 	Signature *Signature `json:"signature,omitempty"`
 	// Run is the campaign/delivery identity the records carried. A campaign
@@ -137,10 +141,14 @@ type Verdict struct {
 	// recorded so a reader can see the action envelope against the step
 	// GitHub thinks ran.
 	ActionGHNs int64 `json:"action_gh_ns,omitempty"`
-	// BootstrapGapNs is the action-step time before AT_start — installing the
-	// wrapper, because there is no wrapper to read a clock until it exists.
-	// Derived from the step attempt at its resolution, explicitly not part of
-	// A, and reported rather than left invisible.
+	// BootstrapGapNs is the action-step time before AT_start.
+	//
+	// Under measurement the wrapper is installed by the CALLER, before the
+	// measured action starts, so `wall begin` is the action's first owned
+	// operation and this gap should be nothing but the runner's own step
+	// startup. It is GATED for that reason: a gap larger than A_GH's own
+	// resolution means action-owned work ran before the envelope opened, and
+	// A is then not the complete action elapsed the contract defines.
 	BootstrapGapNs int64   `json:"bootstrap_gap_ns,omitempty"`
 	ScriptNs       int64   `json:"script_ns"`
 	InvocationNs   []int64 `json:"invocation_ns,omitempty"`
@@ -178,9 +186,22 @@ type VerifyOptions struct {
 	// environment. An empty set is not "accept any key": it means no authority
 	// was declared, and the run is ineligible.
 	AuthorityKeys []string
+	// ScorerPath is the frozen scorer the Pcheck projection claims. Without it
+	// the projection is only checked against its own arithmetic, which a
+	// substituted allocation map satisfies.
+	ScorerPath string
+	// Audit runs the exact-run coverage audit for the measured bucket. A nil
+	// Audit is not "no audit needed": it makes the row ineligible, because a
+	// row nobody audited cannot be shown to have run its plan.
+	Audit AuditFunc
 	// Authority, when set, is the protected environment name the manifest must
 	// name.
 	Authority string
+	// SignerKeys are the PREDECLARED public keys allowed to sign the roster
+	// and the closing seal — the run keys. They come from the Stage-1
+	// manifest, so a run whose signer set nobody declared is ineligible
+	// rather than trusted.
+	SignerKeys []string
 }
 
 // VerifyDir loads a records directory and verifies it.
@@ -231,9 +252,11 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 				fmt.Sprintf("Stage 1 binds component registry %s but the supplied registry digests to %s", bound.registry, d))
 		}
 	}
+	verifySignerSet(v, opt, bound.signers, recs)
+	verifyAudit(v, opt)
 	verifyStepAttempt(v, opt, envelopes)
-	verifyInvocationIdentity(v, opt, envelopes, bound.stage2)
-	aeta := loadAeta(v, opt, registry, bound.stage2)
+	verifyInvocationIdentity(v, opt, envelopes, bound.planStage2)
+	aeta := loadAeta(v, opt, registry, bound.planStage2)
 	if registry != nil {
 		v.Findings = append(v.Findings, registry.CheckCompleteness(v.Phases, aeta)...)
 	}
@@ -870,6 +893,9 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 		if d, err := stage2.DigestOf(); err == nil {
 			bound.stage2 = d
 		}
+		if d, err := stage2.PlanDigestOf(); err == nil {
+			bound.planStage2 = d
+		}
 	}
 	if stage1 != nil && stage2 != nil {
 		d1, err := stage1.DigestOf()
@@ -907,6 +933,16 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 	}
 	if stage1 != nil {
 		verifyProducerBinaries(v, stage1.Instrumentation, recs)
+		// Stage 1 is where the run-key signer set is DECLARED. Taking it from
+		// the manifest rather than from a verifier flag is the point: the same
+		// signed document that approves the instrumentation says which keys
+		// may attest to what that instrumentation produced.
+		if len(stage1.Instrumentation.Signers) == 0 {
+			v.add("WT-023", SeverityIneligible,
+				"the Stage-1 manifest declares no record signers, so no roster or seal can be attributed and the record chain authenticates only itself")
+		}
+		bound.signers = stage1.Instrumentation.Signers
+		bound.replaySigners = stage1.Instrumentation.ReplaySigners
 	}
 	verifyReplay(v, opt, stage1, stage2, bound)
 	return bound
@@ -952,12 +988,26 @@ func verifyReplay(v *Verdict, opt VerifyOptions, stage1 *Stage1Manifest, stage2 
 		v.add("WT-018", SeverityIneligible, fmt.Sprintf("replay attestation: %v", err))
 		return
 	}
-	if len(opt.AuthorityKeys) == 0 {
+	// The replay signer set is DISTINCT from the authority's. An attestation
+	// accepted from the key that authorised the plan is the planner checking
+	// its own work — the exact thing an independent replay exists to rule out
+	// — so a manifest that declares no separate replay signer leaves the
+	// independence claim unenforced, and the honest answer is unscorable.
+	replayKeys := bound.replaySigners
+	if len(replayKeys) == 0 {
 		v.add("WT-018", SeverityIneligible,
-			"the replay attestation is signed but no authority key was predeclared, so any self-generated key would pass")
+			"the Stage-1 manifest declares no independent replay signer, so the attestation would be accepted from the same party that authorised the plan and its independence is an assertion rather than a control")
 		return
 	}
-	if err := VerifySigned(a.Signature, d, opt.AuthorityKeys); err != nil {
+	for _, rk := range replayKeys {
+		for _, ak := range opt.AuthorityKeys {
+			if rk == ak {
+				v.add("WT-018", SeverityIneligible,
+					fmt.Sprintf("replay signer %s is also the campaign authority key; a replay by the issuer of the plan is not an independent re-derivation", rk))
+			}
+		}
+	}
+	if err := VerifySigned(a.Signature, d, replayKeys); err != nil {
 		v.add("WT-018", SeverityIneligible, fmt.Sprintf("replay attestation signature: %v", err))
 	}
 }
@@ -1096,6 +1146,7 @@ func verifyStepAttempt(v *Verdict, opt VerifyOptions, envs []Envelope) {
 	}
 	if gap, err := doc.Attempt.BootstrapGapNs(action.Physical.start); err == nil {
 		v.BootstrapGapNs = gap
+		checkBootstrapGap(v, gap)
 	}
 }
 
@@ -1135,6 +1186,8 @@ func verifyInvocationIdentity(v *Verdict, opt VerifyOptions, envs []Envelope, st
 		v.add("WT-021", SeverityIneligible,
 			fmt.Sprintf("the invocation manifest names Stage-2 %s, not the verified %s", m.Stage2, stage2))
 	}
+	checkBucket(v, "invocation manifest", m.BucketName)
+	checkSidecarBinding(v, opt, SidecarInvocations, m.BucketIndex, m)
 	if len(m.Invocations) != len(measured) {
 		v.add("WT-021", SeverityIneligible,
 			fmt.Sprintf("the plan rendered %d invocation(s) but %d were measured", len(m.Invocations), len(measured)))
@@ -1182,6 +1235,8 @@ func loadAeta(v *Verdict, opt VerifyOptions, registry *AetaRegistry, stage2 Dige
 		v.add("WT-017", SeverityIneligible,
 			fmt.Sprintf("the pre-action forecast names Stage-2 %s, not the verified %s", a.Stage2, stage2))
 	}
+	checkBucket(v, "pre-action forecast", a.BucketID)
+	checkSidecarBinding(v, opt, SidecarAeta, a.Inputs.BucketIndex, a)
 	if v.has(SeverityIneligible) {
 		// Still return it: the gates should report the numbers the run
 		// actually claimed, alongside the finding that says they are unbound.
@@ -1197,6 +1252,16 @@ func loadAeta(v *Verdict, opt VerifyOptions, registry *AetaRegistry, stage2 Dige
 // name. They come from the Stage-1/Stage-2 documents, not from the documents
 // being checked.
 type boundIdentities struct {
+	// signers are the run-key public keys Stage 1 declared: the only keys
+	// whose roster and seal this verifier will accept.
+	signers []string
+	// replaySigners are the keys allowed to attest an independent replay.
+	replaySigners []string
+	// planStage2 is the receipt's PLAN identity — its Stage-2 digest without
+	// the binding over the documents it derived. Derived documents cite it
+	// rather than the full receipt digest, because the full digest covers a
+	// binding taken over the documents themselves.
+	planStage2 Digest
 	stage1     Digest
 	stage2     Digest
 	membership Digest
@@ -1225,7 +1290,7 @@ func evaluateGates(v *Verdict, opt VerifyOptions, aeta *AetaInstance, bound boun
 		}
 	}
 	if opt.PcheckPath != "" {
-		v.Gates = append(v.Gates, predictorGates(v, opt, bound.stage2, bound.membership, bound.scorer)...)
+		v.Gates = append(v.Gates, predictorGates(v, opt, bound.planStage2, bound.membership, bound.scorer)...)
 	} else {
 		v.Gates = append(v.Gates, GateResult{
 			Name: "predictor:invocation-max", Scope: ScopeRow, Required: "<= " + dur(PcheckInvocationMaxLimit),
@@ -1268,8 +1333,36 @@ func predictorGates(v *Verdict, opt VerifyOptions, stage2, membership, scorer Di
 		v.add("WT-019", SeverityIneligible, fmt.Sprintf("pcheck projection: %v", err))
 		return nil
 	}
-	for _, p := range doc.Recompute() {
-		v.add("WT-019", SeverityIneligible, "the Pcheck projection does not recompute: "+p)
+	// Recomputed against the FROZEN SCORER, not only against itself. Checking
+	// a projection's own arithmetic catches an edited number; it cannot catch
+	// a Palloc map that no scorer ever produced, because such a map is
+	// perfectly self-consistent. The runtime surface is defined as
+	// frozen_scorer(frozen_preplan_unit_feature_vector), so the verifier runs
+	// exactly that and compares.
+	if opt.ScorerPath == "" {
+		v.add("WT-019", SeverityIneligible,
+			"no frozen scorer was supplied, so the Pcheck projection can only be checked against its own arithmetic and its values are unattributable to any model")
+		for _, p := range doc.Recompute() {
+			v.add("WT-019", SeverityIneligible, "the Pcheck projection does not recompute: "+p)
+		}
+	} else {
+		var sc Scorer
+		if err := ReadJSONFile(opt.ScorerPath, &sc); err != nil {
+			v.add("WT-019", SeverityIneligible, fmt.Sprintf("frozen scorer: %v", err))
+		} else {
+			if sc.Kind != ScorerKind {
+				v.add("WT-019", SeverityIneligible, fmt.Sprintf("frozen scorer kind %q, want %q", sc.Kind, ScorerKind))
+			}
+			// The scorer's own lineage must name a sealed receipt set, or the
+			// model is attributable to nothing on the offline side either.
+			if sc.Lineage.ReceiptSetDigest == "" {
+				v.add("WT-019", SeverityIneligible,
+					"the frozen scorer names no sealed training receipt set, so its coefficients have no admissible lineage")
+			}
+			for _, p := range doc.RecomputeFrom(sc) {
+				v.add("WT-019", SeverityIneligible, "the Pcheck projection does not recompute: "+p)
+			}
+		}
 	}
 	if stage2 != "" && doc.Stage2 != stage2 {
 		v.add("WT-019", SeverityIneligible,
@@ -1282,6 +1375,16 @@ func predictorGates(v *Verdict, opt VerifyOptions, stage2, membership, scorer Di
 	if scorer != "" && doc.ScorerDigest != scorer {
 		v.add("WT-019", SeverityIneligible,
 			fmt.Sprintf("the Pcheck projection came from scorer %s but Stage 1 binds %s", doc.ScorerDigest, scorer))
+	}
+	checkBucket(v, "Pcheck projection", doc.BucketName)
+	checkSidecarBinding(v, opt, SidecarPcheck, doc.BucketIndex, doc)
+	for _, inv := range doc.Invocations {
+		if inv.BucketIndex != doc.BucketIndex {
+			v.add("WT-025", SeverityIneligible,
+				fmt.Sprintf("the Pcheck projection is for bucket %d but its invocation %d is for bucket %d",
+					doc.BucketIndex, inv.Seq, inv.BucketIndex))
+			break
+		}
 	}
 	observed := map[int]int64{}
 	for _, e := range v.Envelopes {
@@ -1390,4 +1493,78 @@ func firstNonEmptyStr(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// checkBucket ties a per-bucket document to the bucket that was measured.
+//
+// Every other identity two buckets of one plan carry is the same: one Stage-2
+// receipt, one membership digest, one scorer, one registry. A forecast or a
+// projection built for bucket 3 therefore recomputes perfectly against its own
+// frozen values inside bucket 1's job, and applies the wrong prediction to the
+// wrong work. Artifact naming in a workflow is a convention; this is the
+// control.
+func checkBucket(v *Verdict, what, named string) {
+	if v.Run.BucketID == "" {
+		v.add("WT-025", SeverityIneligible,
+			fmt.Sprintf("the records name no bucket, so the %s cannot be tied to the bucket that was measured", what))
+		return
+	}
+	if named == "" {
+		v.add("WT-025", SeverityIneligible,
+			fmt.Sprintf("the %s names no bucket, so it would verify identically against any bucket of this plan", what))
+		return
+	}
+	if named != v.Run.BucketID {
+		v.add("WT-025", SeverityIneligible,
+			fmt.Sprintf("the %s is for bucket %q but bucket %q was measured", what, named, v.Run.BucketID))
+	}
+}
+
+// BootstrapGapResolution is the bound on action-step time before AT_start.
+//
+// It is not an invented threshold: A_GH is reported by GitHub in whole
+// SECONDS, so a gap of up to one tick is indistinguishable from zero and
+// cannot be attributed to anything. Anything beyond one tick is time the
+// action spent before its envelope opened — which, now that the wrapper is
+// installed by the caller, can only be work that belongs inside A.
+const BootstrapGapResolution = int64(second)
+
+// checkBootstrapGap refuses a scored row whose action did work before AT_start.
+//
+// The frozen scope requires A to begin at the first action-owned operation.
+// Reporting the omission through a whole-second diagnostic made it visible; it
+// did not make it bounded, and an unbounded prefix means A measures a
+// different product than the one the campaign compares.
+func checkBootstrapGap(v *Verdict, gap int64) {
+	if gap < 0 {
+		v.add("WT-026", SeverityIneligible,
+			fmt.Sprintf("AT_start precedes the step GitHub says ran it by %s, so the two cannot describe the same attempt", dur(-gap)))
+		return
+	}
+	if gap > BootstrapGapResolution {
+		v.add("WT-026", SeverityIneligible,
+			fmt.Sprintf("%s of action-step time ran before AT_start, which is more than A_GH's own %s resolution: the action did work before its envelope opened, so A is not the complete action elapsed. Under measurement the wrapper is installed by the caller and `wall begin` is the action's first step",
+				dur(gap), dur(BootstrapGapResolution)))
+	}
+}
+
+// checkSidecarBinding requires a derived per-bucket document to be the one the
+// Stage-2 receipt bound.
+//
+// A document that merely names a Stage-2 digest proves only that its author
+// knew the digest, which is public. The receipt is signed and independently
+// replayed, so binding the document's digest INTO it is what makes the
+// per-bucket handoff part of the frozen plan rather than a file travelling
+// beside it.
+func checkSidecarBinding(v *Verdict, opt VerifyOptions, kind string, bucket int, doc any) {
+	if opt.Stage2Path == "" {
+		return // already reported: without a receipt there is nothing to bind to
+	}
+	var r Stage2Receipt
+	if err := ReadJSONFile(opt.Stage2Path, &r); err != nil {
+		return // already reported by verifyStageBinding
+	}
+	if err := r.checkSidecar(kind, bucket, doc); err != nil {
+		v.add("WT-021", SeverityIneligible, err.Error())
+	}
 }

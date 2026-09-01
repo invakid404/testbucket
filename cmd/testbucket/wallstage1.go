@@ -48,6 +48,8 @@ func runWallStage1(args []string) error {
 	workflowSHA := fs.String("caller-workflow-sha", "", "caller workflow commit SHA")
 	downstreamRef := fs.String("downstream-ref", "", "downstream ref the caller resolves")
 	authority := fs.String("authority", "ewj2-campaign", "protected environment that authorises these inputs")
+	signers := fs.String("record-signers", "", "comma-separated PUBLIC halves of the run keys allowed to sign a measurement's roster and closing seal (required for a scored row): the wrapper mints its per-producer keys at run time, so what a manifest can bind is the key that attests to them — and without it the records authenticate only themselves")
+	replaySigners := fs.String("replay-signers", "", "comma-separated PUBLIC keys allowed to sign an independent Stage-2 replay attestation. They must not include the authority key: a replay signed by the party that authorised the plan is the planner checking its own work")
 	var allowed stringList
 	fs.Var(&allowed, "allow-difference", "an enumerated permitted difference between the two arms of a pair; repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -175,6 +177,8 @@ func runWallStage1(args []string) error {
 			walltime.SourceContainment, walltime.SourceProcessLifecycle,
 			walltime.SourceReporter, walltime.SourceWrapper,
 		},
+		Signers:       splitList(*signers),
+		ReplaySigners: splitList(*replaySigners),
 	}
 	m.AllowedDifferences = allowed
 	if len(allowed) == 0 {
@@ -199,4 +203,15 @@ func runWallStage1(args []string) error {
 		*role, m.Signature.Digest, m.Signature.KeyID)
 	fmt.Println(m.Signature.Digest)
 	return nil
+}
+
+// splitList parses a comma-separated flag into a trimmed, empty-free list.
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

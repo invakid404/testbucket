@@ -54,7 +54,9 @@ func observerFromArgs(args []string) error {
 			return err
 		}
 	}
-	key, err := DecodeKey(flags["--key"])
+	fd := 0
+	fmt.Sscanf(flags["--key-fd"], "%d", &fd)
+	key, err := ReadKeyFD(fd)
 	if err != nil {
 		return err
 	}

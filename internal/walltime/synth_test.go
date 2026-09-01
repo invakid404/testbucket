@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"crypto/ed25519"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -66,7 +67,19 @@ type synthRun struct {
 	// context with one key — the shape a single-process implementation
 	// produces, and the one the independence check exists to catch.
 	sharedObserverContext bool
+	// runKey stands in for the key an Actions step holds and the measured
+	// script does not: it signs the roster and the closing seal, exactly as
+	// `wall begin` and `wall end` do.
+	runKey ed25519.PrivateKey
+	// rosterKeys collects the ACTION-level signing keys, which production
+	// declares in the roster; everything below action level registers in the
+	// key log instead, because it is minted after the roster is sealed.
+	rosterKeys []RosterEntry
 }
+
+// RunSigner is the public half a Stage-1 manifest must declare for this run's
+// roster and seal to be attributable.
+func (s *synthRun) RunSigner() string { return PublicKeyOf(s.runKey) }
 
 func newSynthRun(dir string) *synthRun {
 	return &synthRun{
@@ -79,6 +92,33 @@ func newSynthRun(dir string) *synthRun {
 		containmentPrimitive: PrimitiveCgroup2,
 		clockID:              ClockMonotonic,
 		producerBinary:       synthBinary,
+		runKey:               mustSigningKey(),
+	}
+}
+
+// mustSigningKey mints the fixture's run key. A failure here is a broken test
+// environment, not a case under test.
+func mustSigningKey() ed25519.PrivateKey {
+	k, err := NewSigningKey()
+	if err != nil {
+		panic(err)
+	}
+	return k
+}
+
+// run is the identity every record, the roster and the seal share. One source
+// so the fixture cannot drift the way production must not.
+func (s *synthRun) run() RunIdentity {
+	return RunIdentity{
+		// bucket-1 rather than a fixture-only label: production passes the
+		// plan's own bucket NAME as the run's bucket id, and every per-bucket
+		// document is now checked against it, so a fixture that used a
+		// different spelling would exercise the check against a shape no run
+		// produces.
+		CampaignID: "ewj2", BucketID: "bucket-1", RunID: "r1",
+		Repository: "example/mandel", WorkflowRun: "run-1", Job: "test",
+		Step: "run-bucket", StepAttempt: "1",
+		Stage2: s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
 	}
 }
 
@@ -113,6 +153,41 @@ func (s *synthRun) write(t *testing.T, mutate mutation) {
 		spec := s.spec(i)
 		s.writeLevel(t, LevelInvocation, i, inv[0], inv[1], &spec, mutate)
 	}
+	s.attest(t)
+}
+
+// attest writes the two run-key documents that bracket a real measurement: the
+// roster `wall begin` seals before the measured script exists, and the seal
+// `wall end` writes over the finished streams.
+func (s *synthRun) attest(t *testing.T) {
+	t.Helper()
+	run := s.run()
+	roster := Roster{Kind: RosterKind, Run: run, Entries: s.rosterKeys}
+	if err := roster.Sign(run.CampaignID, s.runKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRoster(s.dir, roster); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := roster.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams, err := SealStreams(s.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, keyLog, err := ReadKeyLog(s.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := Seal{Kind: SealKind, Run: run, RosterDigest: rd, KeyLogDigest: keyLog, Streams: streams}
+	if err := seal.Sign(run.CampaignID, s.runKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSeal(s.dir, seal); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // writeLevel emits the three ledgers of one envelope with the contract's
@@ -129,12 +204,7 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 	}
 	peerStart, peerEnd := start+s.bootstrapNs, end-s.suffixNs
 	traceStart, traceEnd := peerStart+s.peerLeadNs, peerEnd-s.peerLeadNs
-	run := RunIdentity{
-		CampaignID: "ewj2", BucketID: "b1", RunID: "r1",
-		Repository: "example/mandel", WorkflowRun: "run-1", Job: "test",
-		Step: "run-bucket", StepAttempt: "1",
-		Stage2: s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-	}
+	run := s.run()
 
 	type point struct {
 		producer Producer
@@ -170,6 +240,20 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 		}
 		w, err := NewWriter(filepath.Join(s.dir, streamName(producer, level, seq)), producer, context, key)
 		if err != nil {
+			t.Fatal(err)
+		}
+		// Production declares the action-level keys in the roster and
+		// registers everything later in the key log; the fixture does the
+		// same, or the verifier's signer check would be exercised against a
+		// shape no real run produces.
+		if level == LevelAction {
+			s.rosterKeys = append(s.rosterKeys, RosterEntry{
+				Producer: producer, Level: level, PublicKey: PublicKeyOf(key), Binary: s.producerBinary,
+			})
+		} else if err := RegisterKey(s.dir, KeyLogEntry{
+			Producer: producer, Level: level, Seq: seq,
+			PublicKey: PublicKeyOf(key), Binary: s.producerBinary,
+		}); err != nil {
 			t.Fatal(err)
 		}
 		for _, p := range byProducer[producer] {

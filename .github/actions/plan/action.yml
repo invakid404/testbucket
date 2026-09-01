@@ -83,6 +83,43 @@ inputs:
       measurement ⇒ byte-identical script to before.
     default: ""
 
+  bundle:
+    description: >-
+      Frozen planning-input bundle. When set, the matrix is derived by
+      `testbucket wall plan` from these EXACT bytes rather than by an ordinary
+      `testbucket plan` over the live tree — which is what the exactly-once
+      frozen handoff means. The ordinary path reads the working tree and the
+      restored store at the moment it runs; two arms of a pair would then be
+      comparing plans derived from different inputs. Empty = the ordinary
+      unmeasured path, byte-identical to before.
+    default: ""
+  stage1:
+    description: >-
+      Signed Stage-1 input manifest authorising that bundle. Required with
+      `bundle`: a frozen plan derived from inputs nobody authorised is frozen
+      and unaccountable.
+    default: ""
+  stage2-out:
+    description: >-
+      Where to write the Stage-2 derived-plan receipt. It is written O_EXCL, so
+      the exactly-once rule is mechanical rather than procedural.
+    default: ""
+  scorer:
+    description: >-
+      Frozen scorer whose sealed lineage the plan allocates by. Without it the
+      partition uses the store's measured weights, which is a perfectly good
+      split and is not campaign eligible.
+    default: ""
+  registry:
+    description: 'Frozen Aeta component-registry template.'
+    default: ""
+  derived-out:
+    description: >-
+      Directory for the per-bucket derived documents (Palloc, Pcheck, forecast,
+      invocation manifest). Every one is bound into the Stage-2 receipt by
+      digest as it is written.
+    default: ""
+
 outputs:
   matrix:
     description: 'The fromJSON matrix to feed the test job''s strategy.'
@@ -132,8 +169,36 @@ runs:
         TB_NODE_PREFIXES: ${{ inputs.node-prefixes }}
         TB_EXCLUDE_MODULE: ${{ inputs.exclude-module }}
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_BUNDLE: ${{ inputs.bundle }}
+        TB_STAGE1: ${{ inputs.stage1 }}
+        TB_STAGE2_OUT: ${{ inputs.stage2-out }}
+        TB_SCORER: ${{ inputs.scorer }}
+        TB_REGISTRY: ${{ inputs.registry }}
+        TB_DERIVED_OUT: ${{ inputs.derived-out }}
       run: |
         set -euo pipefail
+
+        # THE FROZEN PATH. With a bundle, the matrix comes from `wall plan`
+        # over those exact bytes — the one authorised plan, with its Stage-2
+        # receipt and every per-bucket document derived and bound in the same
+        # step. The ordinary path below re-reads the live tree and the restored
+        # store at the moment it runs, so a scored pair planned that way would
+        # be comparing two derivations of different inputs.
+        if [ -n "$TB_BUNDLE" ]; then
+          if [ -z "$TB_STAGE1" ]; then
+            echo "a frozen bundle needs --stage1: a plan derived from inputs nobody authorised is frozen and unaccountable." >&2
+            exit 1
+          fi
+          frozen=(--wall-bundle "$TB_BUNDLE" --wall-stage1 "$TB_STAGE1" --shard-plan "$TB_SHARD_PLAN")
+          if [ -n "$TB_STAGE2_OUT" ]; then frozen+=(--wall-stage2 "$TB_STAGE2_OUT"); fi
+          if [ -n "$TB_SCORER" ]; then frozen+=(--palloc-scorer "$TB_SCORER"); fi
+          if [ -n "$TB_REGISTRY" ]; then frozen+=(--wall-registry "$TB_REGISTRY"); fi
+          if [ -n "$TB_DERIVED_OUT" ]; then frozen+=(--wall-out-dir "$TB_DERIVED_OUT"); fi
+          matrix=$(testbucket plan "${frozen[@]}" --json)
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         if [ -f "$TB_STORE" ]; then
           echo "planning from the restored store at $TB_STORE"
         else
