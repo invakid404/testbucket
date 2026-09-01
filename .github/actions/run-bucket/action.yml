@@ -101,43 +101,29 @@ runs:
     # explicit that a moving tag is descriptive metadata, not an identity. The
     # opt-in measured run may still use the alias, because it only ever claims
     # `complete`.
-    # A scored row must be measured and immutably delivered. Both are checked
-    # HERE, before anything runs, because the alternative is a job that finishes
-    # green having proven neither.
-    - name: Refuse an unmeasurable or mutably-delivered scored row
-      if: inputs.scored == 'true'
+    # A scored row that cannot be measured is a contradiction, and this is the
+    # only configuration in which refusing it costs nothing: there is no
+    # envelope to be inside, because none will ever open. Every other scored
+    # precondition is checked INSIDE the envelope, where a failure is retained
+    # as a terminal record rather than vanishing.
+    - name: Refuse an unmeasurable scored row
+      if: inputs.scored == 'true' && inputs.wall-time-dir == ''
       shell: bash
-      env:
-        TB_VERSION: ${{ inputs.version }}
-        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
       run: |
-        set -euo pipefail
-        # Without a records directory nothing is measured, so `scored` would be
-        # a claim about a row that produced no evidence at all.
-        if [ -z "$TB_WALL_DIR" ]; then
-          echo "scored=true needs a wall-time-dir: a scored row is a MEASURED row, and with no records directory this bucket produces no evidence to verify." >&2
-          exit 1
-        fi
-        # The installer resolves `local`, a moving `vX`/`vX.Y` alias, or an
-        # exact `vX.Y.Z` — and nothing else. A commit SHA is not deliverable
-        # here (there is no release asset at an arbitrary SHA), so accepting
-        # one would advertise a delivery path that does not exist. An exact
-        # published tag is the only immutable identity this installer can
-        # actually fetch and checksum-verify.
-        case "$TB_VERSION" in
-          v[0-9]*.[0-9]*.[0-9]*) ;;
-          *)
-            echo "scored=true needs an exact published release tag (vX.Y.Z), got '$TB_VERSION'." >&2
-            echo "A moving alias is descriptive metadata rather than a delivery identity; a commit SHA has no release asset to download and checksum-verify." >&2
-            exit 1
-            ;;
-        esac
+        echo "scored=true needs a wall-time-dir: a scored row is a MEASURED row, and with no records directory this bucket produces no evidence to verify." >&2
+        exit 1
 
     # The Go runner needs the binary for `testbucket render`; a Vitest bucket's
-    # script prints its own default-reporter log, so it needs no binary — UNLESS
-    # it is being measured, which is the wrapper's own binary.
+    # script prints its own default-reporter log, so it needs no binary.
+    #
+    # A MEASURED bucket needs it too — and must NOT install it here. The
+    # physical action envelope opens on the first action-owned operation, and
+    # the wrapper cannot read a clock before it exists, so installing inside
+    # this action would put action-owned work before AT_start permanently. A
+    # measured caller runs the `install` action first; the envelope step below
+    # is then this action's first operation.
     - name: Install testbucket
-      if: inputs.runner == 'go' || inputs.wall-time-dir != ''
+      if: inputs.runner == 'go' && inputs.wall-time-dir == ''
       shell: bash
       env:
         TB_VERSION: ${{ inputs.version }}
@@ -146,10 +132,15 @@ runs:
         GH_TOKEN: ${{ github.token }}
       run: bash "${{ github.action_path }}/../install-testbucket.sh"
 
-    # AT_start. This is deliberately the FIRST action-owned operation: the
-    # containment, the two observer processes and their admission handshakes are
-    # all real action time, and starting the envelope after them would make A
-    # smaller than the action actually was.
+    # AT_start. This is the FIRST action-owned operation, and it is first in
+    # the step list for that reason: the containment, the two observer
+    # processes and their admission handshakes are all real action time, and
+    # anything this action did before them would be action-owned work outside
+    # the interval that claims to contain it.
+    #
+    # The wrapper must therefore already be on PATH — a measured caller runs
+    # the `install` action first. A missing wrapper fails here, before the
+    # envelope opens, which is a precondition rather than unmeasured work.
     - name: Open the wall-time action envelope
       if: inputs.wall-time-dir != ''
       shell: bash
@@ -224,6 +215,8 @@ runs:
         TB_EVENTS_DIR: ${{ inputs.events-dir }}
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_SCORED: ${{ inputs.scored }}
+        TB_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
         # Under measurement, EVERYTHING this step owns runs inside one
@@ -243,6 +236,22 @@ runs:
         if [ -n "$TB_WALL_DIR" ]; then
           set +e
           testbucket wall run --dir "$TB_WALL_DIR" -- bash -euo pipefail -c '
+            # Delivery identity, checked INSIDE the envelope so a refusal is
+            # retained as a terminal record. The installer resolves `local`, a
+            # moving alias or an exact tag and nothing else; there is no
+            # release asset at an arbitrary commit SHA to download and
+            # checksum-verify, so a SHA is refused rather than promised.
+            if [ "$TB_SCORED" = "true" ]; then
+              case "$TB_VERSION" in
+                v[0-9]*.[0-9]*.[0-9]*) ;;
+                *)
+                  echo "scored=true needs an exact published release tag (vX.Y.Z), got '"'"'$TB_VERSION'"'"'." >&2
+                  echo "A moving alias is descriptive metadata rather than a delivery identity; a commit SHA has no release asset to download and checksum-verify." >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+
             # The generated script tees its events into this directory; create
             # it first so `tee` has somewhere to write (the script itself does
             # not mkdir, and each bucket runs on a fresh runner).

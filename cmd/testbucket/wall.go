@@ -11,6 +11,11 @@ import (
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
+// verifierKeyEnv is where the verifier's own signing key is read from, for
+// the same reason the authority key is: a key on a command line is a key in
+// the process table.
+const verifierKeyEnv = "TB_WALL_VERIFIER_KEY"
+
 const wallUsage = `testbucket wall — complete-action wall-time measurement
 
 usage:
@@ -515,6 +520,22 @@ func runWallVerify(args []string) error {
 		return err
 	}
 	if *asJSON {
+		// A campaign counts a row only if its verdict is attributable, so the
+		// machine-readable form is signed by the verifier. Without a key the
+		// verdict is still emitted — and the campaign will refuse it, loudly,
+		// which is better than a silently uncountable row.
+		if key := strings.TrimSpace(os.Getenv(verifierKeyEnv)); key != "" {
+			priv, err := walltime.DecodeKey(key)
+			if err != nil {
+				return fmt.Errorf("%s: %w", verifierKeyEnv, err)
+			}
+			if err := v.Sign(*authority, priv); err != nil {
+				return err
+			}
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"testbucket wall: %s is unset, so this verdict is UNSIGNED and no campaign will count it\n", verifierKeyEnv)
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(v); err != nil {

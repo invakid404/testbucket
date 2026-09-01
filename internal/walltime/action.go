@@ -65,9 +65,22 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	}
 	defer w.Close()
 
+	// From here on every failure is RETAINED. A bootstrap that dies without a
+	// record is indistinguishable from an action that never started, and the
+	// contract is explicit that a failed setup stays in the ledger with its
+	// reason rather than disappearing.
+	fail := func(reason string, cause error) (*ActionState, error) {
+		_, _ = w.Append(Record{
+			Kind: "terminal", Role: RolePhysicalAction, Level: LevelAction,
+			Source: SourceWrapper, Run: run, Instant: clock.Now(),
+			Terminal: TerminalWrapperError, Reason: reason + ": " + cause.Error(),
+		})
+		return nil, fmt.Errorf("walltime: %s: %w", reason, cause)
+	}
+
 	cont, err := NewContainment(containmentName(ExecOptions{Level: LevelAction, Run: run}), nil)
 	if err != nil {
-		return nil, err
+		return fail("create the action containment", err)
 	}
 	if _, err := w.Append(Record{
 		Kind: "boundary", Role: RolePhysicalAction, Level: LevelAction, Boundary: "start",
@@ -80,20 +93,20 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	opt := ExecOptions{Level: LevelAction, Dir: dir, Run: run}
 	peer, err := startObserver(ProducerPeer, opt, cont.Identity(), deadline, true)
 	if err != nil {
-		return nil, err
+		return fail("start the containment peer", err)
 	}
 	trace, err := startObserver(ProducerTrace, opt, cont.Identity(), deadline, true)
 	if err != nil {
 		peer.abandon()
-		return nil, err
+		return fail("start the trace collector", err)
 	}
 	if err := peer.admit(deadline); err != nil {
 		trace.abandon()
-		return nil, err
+		return fail("admit the containment peer", err)
 	}
 	if err := trace.admit(deadline); err != nil {
 		peer.abandon()
-		return nil, err
+		return fail("admit the trace collector", err)
 	}
 
 	st := &ActionState{
@@ -103,10 +116,10 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	}
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
-		return nil, err
+		return fail("serialise the action state", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, actionStateFile), b, 0o644); err != nil {
-		return nil, err
+		return fail("write the action state handoff", err)
 	}
 	return st, nil
 }
@@ -152,6 +165,26 @@ func RunInAction(dir string, argv []string, cwd string, stdout, stderr *os.File)
 		return 1, err
 	}
 	return 0, nil
+}
+
+// retainActionTerminal appends a terminal record to the action stream on a
+// best-effort basis. It is best-effort because the alternative — refusing to
+// report a failure because reporting it also failed — retains nothing at all.
+func retainActionTerminal(dir string, run RunIdentity, state, reason string) {
+	key, err := NewSigningKey()
+	if err != nil {
+		return
+	}
+	w, err := NewWriter(filepath.Join(dir, streamName(ProducerPhysical, LevelAction, 0)), ProducerPhysical, ProducerID(ProducerPhysical), key)
+	if err != nil {
+		return
+	}
+	defer w.Close()
+	_, _ = w.Append(Record{
+		Kind: "terminal", Role: RolePhysicalAction, Level: LevelAction,
+		Source: SourceWrapper, Run: run, Instant: NewSystemClock().Now(),
+		Terminal: state, Reason: reason,
+	})
 }
 
 // LoadActionState reads the handoff `wall begin` left behind.

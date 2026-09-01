@@ -153,6 +153,14 @@ on:
           Stage-1 signature as authority approval without one.
         type: string
         default: ""
+      verifier-key-secret:
+        description: >-
+          Name of a secret holding the verifier''s ed25519 signing key, used to
+          sign each bucket''s verdict. A campaign counts a row only if its
+          verdict is attributable; without this the verdicts are written
+          unsigned and every campaign refuses them.
+        type: string
+        default: ""
       frozen-documents-artifact:
         description: >-
           Name of an artifact holding the frozen documents a scored row needs:
@@ -278,8 +286,8 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go
-        # Also for a MEASURED Vitest bucket built from source: run-bucket
-        # installs the wrapper here, and `local` means `go build`.
+        # Also for a MEASURED bucket built from source: the wrapper is
+        # installed below, and `local` means `go build`.
         if: inputs.runner == 'go' || (inputs.wall-time-dir != '' && inputs.testbucket-version == 'local')
         uses: actions/setup-go@v7.0.0
         with:
@@ -307,6 +315,17 @@ jobs:
         with:
           name: ${{ inputs.frozen-documents-artifact }}
           path: ${{ runner.temp }}/testbucket-frozen
+
+      # The wrapper is installed BEFORE the measured action, by the caller.
+      # The physical action envelope opens on run-bucket's first owned
+      # operation and the wrapper cannot read a clock before it exists, so
+      # installing inside that action would put action-owned work outside A
+      # permanently.
+      - name: Install testbucket for the measured action
+        if: inputs.wall-time-dir != ''
+        uses: $/.github/actions/install
+        with:
+          version: ${{ inputs.testbucket-version }}
 
       - name: Run bucket ${{ matrix.bucket }}
         id: run-bucket
@@ -396,6 +415,7 @@ jobs:
           authority-key: ${{ inputs.authority-key }}
           records-artifact: testbucket-wall-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
           verdict-file: ${{ inputs.wall-time-dir }}/verdict.json
+          verifier-key: ${{ inputs.verifier-key-secret != '' && secrets[inputs.verifier-key-secret] || '' }}
           stage1-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage1.json', runner.temp) || '' }}
           stage2-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage2.json', runner.temp) || '' }}
           replay-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/replay.json', runner.temp) || '' }}

@@ -1,0 +1,32 @@
+name: testbucket install
+description: >-
+  Put a `testbucket` binary on PATH. It is the same shared installer the plan,
+  run-bucket, record and verify-wall actions use, exposed as its own action so
+  a MEASURED caller can install the wrapper before the run-bucket action starts.
+
+  That ordering is the point. The physical action envelope must open on the
+  first action-owned operation, and the wrapper cannot read a clock before it
+  exists — so for a measured bucket the install belongs to the caller, and
+  `wall begin` becomes run-bucket's first step.
+
+inputs:
+  version:
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. NOTE: the
+      default `v1` resolves only once a 1.x release is published; while this
+      project is on 0.x, pin an exact tag (or `v0`). A scored row requires an
+      exact `vX.Y.Z`.
+    default: v1
+
+runs:
+  using: composite
+  steps:
+    - name: Install testbucket
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"

@@ -27,10 +27,12 @@ const (
 // verifier ties every record's execution context back to it.
 var synthBinary = DigestBytes([]byte("synthetic testbucket binary"))
 
-// synthContext builds a producer execution context in the production format,
-// so the verifier's binary binding is exercised rather than side-stepped.
+// synthContext builds a producer execution context in the production format.
+// The binary identity is a separate record field, not a fragment of this
+// string, so a test cannot accidentally satisfy the binary check by shaping a
+// display name.
 func synthContext(p Producer, n int) string {
-	return fmt.Sprintf("%s@%s#%d.1", p, shortDigest(synthBinary), n)
+	return fmt.Sprintf("%s#%d.1", p, n)
 }
 
 // synthRun describes one bucket's timeline in nanoseconds from an arbitrary
@@ -53,6 +55,13 @@ type synthRun struct {
 	// containmentPrimitive lets a test make the run unscorable.
 	containmentPrimitive string
 	clockID              string
+	// producerBinary is the executable identity every record claims. A test
+	// can move it to prove the verifier compares the FULL digest.
+	producerBinary Digest
+	// producerContextPrefix decorates the display name, so a test can prove
+	// that smuggling an approved digest into it changes nothing. It keeps the
+	// per-producer suffix, so independence is not disturbed.
+	producerContextPrefix string
 	// sharedObserverContext writes the peer and the trace from ONE execution
 	// context with one key — the shape a single-process implementation
 	// produces, and the one the independence check exists to catch.
@@ -69,6 +78,7 @@ func newSynthRun(dir string) *synthRun {
 		stage2:               synthStage2,
 		containmentPrimitive: PrimitiveCgroup2,
 		clockID:              ClockMonotonic,
+		producerBinary:       synthBinary,
 	}
 }
 
@@ -153,7 +163,7 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 		if err != nil {
 			t.Fatal(err)
 		}
-		context := synthContext(producer, levelRank(level)*100+seq)
+		context := s.producerContextPrefix + synthContext(producer, levelRank(level)*100+seq)
 		if s.sharedObserverContext && producer != ProducerPhysical {
 			key = sharedKey
 			context = synthContext("observer", levelRank(level)*100+seq)
@@ -168,7 +178,8 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 				t.Fatal(err)
 			}
 			rec := Record{
-				Kind: "boundary", Role: role, Level: level, Boundary: p.boundary,
+				ProducerBinary: s.producerBinary,
+				Kind:           "boundary", Role: role, Level: level, Boundary: p.boundary,
 				Source: p.source, Seqno: seq, Run: run, Containment: ident,
 				Instant: Instant{ClockID: s.clockID, Mono: Nanos(p.ns), BootID: synthBoot,
 					Realtime: time.Unix(0, p.ns).UTC().Format(time.RFC3339Nano) + "/" + time.Unix(0, p.ns+1000).UTC().Format(time.RFC3339Nano)},

@@ -162,7 +162,7 @@ func testBundle() PlanningInputBundle {
 		StaleThreshold: "336h0m0s",
 	}
 	b.Discovery = []RawSnapshot{NewRawSnapshot("vitest-list", []string{"vitest", "list", "--filesOnly", "--json"}, "/repo", []byte(`[{"file":"/repo/t0.spec.ts"}]`))}
-	b.Store = NewRawSnapshot("test-timings.json", nil, "/repo", []byte(`{"flags":"vitest","units":{}}`))
+	b.Store = NewRawSnapshot("test-timings.json", nil, "/repo", []byte(`{"schema":1,"flags":"vitest","units":{}}`))
 	b.Source.Repository = "example/mandel"
 	b.Source.Commit = testConsumerCommit
 	b.Source.Tree = "sha256:tree"
@@ -219,7 +219,9 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	}
 	m.Source.ReviewTip = testTip
 	m.Source.ReleaseRefSHA = testTip
-	m.Source.BinaryDigest = "sha256:binary"
+	// The delivered binary IS the binary the producers run; the manifest now
+	// requires them to agree.
+	m.Source.BinaryDigest = synthBinary
 	m.Source.BuildAttestation = "attestation"
 	m.Consumer.Repository = "example/mandel"
 	m.Consumer.Commit = testConsumerCommit
@@ -743,7 +745,7 @@ func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
 	}
 	found := false
 	for _, f := range v.Findings {
-		if strings.Contains(f.Detail, "not the binary Stage 1 approved") {
+		if strings.Contains(f.Detail, "Stage 1 approved") {
 			found = true
 		}
 	}
@@ -894,8 +896,14 @@ func TestCompareArmsFindsEveryUnequalInvariant(t *testing.T) {
 	baseline.Role = "baseline"
 	candidate := testManifest(testBundle(), regDigest)
 	// The permitted difference: a different testbucket source, action content
-	// and binary. It must NOT be reported.
-	candidate.Source.BinaryDigest = "sha256:candidate-binary"
+	// and binary, together with the wrappers that ship with it. None of it may
+	// be reported.
+	candidateBinary := DigestBytes([]byte("candidate testbucket binary"))
+	candidate.Source.BinaryDigest = candidateBinary
+	candidate.Instrumentation.PhysicalBinary = candidateBinary
+	candidate.Instrumentation.PeerBinary = candidateBinary
+	candidate.Instrumentation.TraceBinary = candidateBinary
+	candidate.Instrumentation.VerifierBinary = candidateBinary
 	candidate.Actions["run-bucket"] = ActionIdentity{Commit: testTip, ContentDigest: "sha256:candidate-run"}
 	if diffs := CompareArms(baseline, candidate); len(diffs) != 0 {
 		t.Errorf("the permitted candidate tuple was reported as a difference: %v", diffs)
@@ -1043,9 +1051,14 @@ func TestRawEvidenceIsRetained(t *testing.T) {
 // observed_zero stays distinct from missing, failed, cancelled and malformed —
 // and that a stale store or a restore-key fallback is not warm evidence at all.
 func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
+	// The receipt is checked against the EXACT bytes it describes, at the
+	// canonical planning instant — not against fields that merely look filled
+	// in.
+	storeBytes := []byte(`{"schema":1,"flags":"vitest","units":{}}`)
+	instant := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	base := func() StoreReceipt {
 		return StoreReceipt{
-			Digest: "sha256:store", Schema: 1, MigrationID: "store/v1", Token: "vitest",
+			Digest: DigestBytes(storeBytes), Schema: 1, MigrationID: "store/v1", Token: "vitest",
 			CacheKey: "k", RestoreMethod: "exact-key", StaleAt: "2099-01-01T00:00:00Z",
 			Classifications: map[string]int{
 				RowObservedPositive: 3, RowObservedZero: 1, RowMissing: 1, RowFailed: 1,
@@ -1053,7 +1066,10 @@ func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
 			Rows: 6,
 		}
 	}
-	if err := base().Validate(time.Time{}); err != nil {
+	check := func(r StoreReceipt, now time.Time) error {
+		return r.Validate(storeBytes, 1, "vitest", now)
+	}
+	if err := check(base(), instant); err != nil {
 		t.Fatalf("a complete store receipt was rejected: %v", err)
 	}
 	// Every state the contract names is admissible and separately counted.
@@ -1066,7 +1082,7 @@ func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
 	for _, n := range all.Classifications {
 		all.Rows += n
 	}
-	if err := all.Validate(time.Time{}); err != nil {
+	if err := check(all, instant); err != nil {
 		t.Errorf("the full set of row states was rejected: %v", err)
 	}
 
@@ -1076,18 +1092,22 @@ func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
 		now  time.Time
 		want string
 	}{
-		{"no migration epoch", func(r *StoreReceipt) { r.MigrationID = "" }, time.Time{}, "migration id"},
-		{"a restore-key fallback", func(r *StoreReceipt) { r.RestoreMethod = "restore-key-fallback" }, time.Time{}, "restore-key fallback"},
-		{"a stale store at the moment of use", func(r *StoreReceipt) { r.StaleAt = "2020-01-01T00:00:00Z" },
-			time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), "not warm evidence"},
+		{"no migration epoch", func(r *StoreReceipt) { r.MigrationID = "" }, instant, "migration id"},
+		{"a restore-key fallback", func(r *StoreReceipt) { r.RestoreMethod = "restore-key-fallback" }, instant, "restore-key fallback"},
+		{"a stale store at the canonical instant", func(r *StoreReceipt) { r.StaleAt = "2020-01-01T00:00:00Z" },
+			instant, "not warm evidence"},
+		{"staleness judged against no instant at all", func(r *StoreReceipt) {}, time.Time{}, "canonical planning instant"},
 		{"a classification nobody defined", func(r *StoreReceipt) { r.Classifications["probably_fine"] = 1; r.Rows++ },
-			time.Time{}, "unknown row classification"},
-		{"counts that do not add up", func(r *StoreReceipt) { r.Rows = 99 }, time.Time{}, "count 6 rows but the store has 99"},
+			instant, "unknown row classification"},
+		{"counts that do not add up", func(r *StoreReceipt) { r.Rows = 99 }, instant, "count 6 rows but the store has 99"},
+		{"a digest for some other store", func(r *StoreReceipt) { r.Digest = "sha256:elsewhere" }, instant, "the bundle froze"},
+		{"the wrong schema", func(r *StoreReceipt) { r.Schema = 99 }, instant, "frozen bytes are schema"},
+		{"the wrong comparability token", func(r *StoreReceipt) { r.Token = "-race -count=100" }, instant, "measured under"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := base()
 			tc.edit(&r)
-			err := r.Validate(tc.now)
+			err := check(r, tc.now)
 			if err == nil {
 				t.Fatalf("the receipt validated")
 			}
@@ -1134,8 +1154,8 @@ func TestCompareArmsCatchesEveryBundleAndInstrumentationDifference(t *testing.T)
 		{"a different absent-input claim", func(m *Stage1Manifest) {
 			m.Bundle.AbsentInputs = append(m.Bundle.AbsentInputs, "something else")
 		}},
-		{"a different peer binary", func(m *Stage1Manifest) {
-			m.Instrumentation.PeerBinary = Digest("sha256:" + strings.Repeat("99", 32))
+		{"a different containment primitive", func(m *Stage1Manifest) {
+			m.Instrumentation.ContainmentPolicy = "some other primitive"
 		}},
 		{"a different raw-source taxonomy", func(m *Stage1Manifest) {
 			m.Instrumentation.RawSourceTaxonomy = []string{SourceContainment}
@@ -1272,5 +1292,147 @@ func TestStepAttemptIsIdentityNotAGate(t *testing.T) {
 	}
 	if !got.Eligible {
 		t.Errorf("a sub-second shift inside the declared precision failed the check: %+v", got.Findings)
+	}
+}
+
+// TestVerifierRefusesARecordThatNamesNoBinary covers the defensive branch
+// directly. A Writer always fills the field, so a stream missing it did not
+// come from this implementation — and a record that names no build cannot be
+// tied to the one Stage 1 approved.
+func TestVerifierRefusesARecordThatNamesNoBinary(t *testing.T) {
+	v := &Verdict{}
+	verifyProducerBinaries(v, InstrumentationIdentity{
+		PhysicalBinary: synthBinary, PeerBinary: synthBinary, TraceBinary: synthBinary,
+	}, []Record{{Producer: ProducerPhysical, Kind: "boundary"}})
+	var details []string
+	for _, f := range v.Findings {
+		details = append(details, f.Detail)
+	}
+	if !strings.Contains(strings.Join(details, "\n"), "names no binary") {
+		t.Errorf("a record naming no binary was accepted: %v", details)
+	}
+}
+
+// TestProducerBinaryIsExactNotAPrefix is the identity rule.
+//
+// The binary digest used to live as a twelve-character fragment inside a
+// display string, matched with a substring test. A twelve-hex prefix is
+// findable, and a substring test is satisfiable by embedding the fragment
+// anywhere at all — so an identity that a collision or an injected label could
+// satisfy was not an identity. It is now its own field, compared for exact
+// equality.
+func TestProducerBinaryIsExactNotAPrefix(t *testing.T) {
+	approved := synthBinary
+	// A digest sharing the first twelve hex characters: what a prefix
+	// collision buys an attacker.
+	prefixTwin := Digest(string(approved)[:19] + strings.Repeat("0", len(string(approved))-19))
+	if prefixTwin == approved {
+		t.Fatalf("the twin is not distinct from the approved digest")
+	}
+	if string(prefixTwin)[:19] != string(approved)[:19] {
+		t.Fatalf("the twin does not share the old short-digest window")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		binary   Digest
+		idPrefix string
+		want     string
+	}{
+		{
+			name:   "a digest sharing the old twelve-character window",
+			binary: prefixTwin,
+			want:   "not the",
+		},
+		{
+			name: "the approved digest smuggled into the display name",
+			// The old check searched the context string, so putting the
+			// digest there was enough. The binary FIELD is what counts now,
+			// and the contexts stay distinct so only the smuggling is on
+			// trial.
+			binary:   prefixTwin,
+			idPrefix: "smuggled-" + string(approved) + "-",
+			want:     "not the",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := newSynthRun(filepath.Join(dir, "records"))
+			s.producerBinary = tc.binary
+			s.producerContextPrefix = tc.idPrefix
+			docs := writeFrozenDocs(t, dir, s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+			v, err := VerifyDir(VerifyOptions{
+				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("records from an unapproved build were scored")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+}
+
+// A verdict from a host whose scorable clock reads a real epoch must still
+// sign. Its instants are then above 2^53, which RFC 8785 canonicalisation
+// refuses to render as a number — so an int64 endpoint would make the verdict
+// unsignable, and every row from such a host silently uncountable. The
+// endpoints are carried as strings for exactly this reason.
+func TestVerdictSignsWithEpochScaleInstants(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Well past 2^53 nanoseconds, i.e. any wall-clock epoch after 1970-04-15.
+	const epoch = Nanos(1788243122402847000)
+	v := Verdict{
+		Schema:        SchemaVersion,
+		RecordsDigest: "sha256:abc",
+		Envelopes: []Envelope{{
+			Level:    LevelAction,
+			Physical: Interval{StartNs: epoch, EndNs: epoch + Nanos(90*second), OK: true},
+			Peer:     Interval{StartNs: epoch + 1, EndNs: epoch + Nanos(90*second) - 1, OK: true},
+			Trace:    Interval{StartNs: epoch + 2, EndNs: epoch + Nanos(90*second) - 2, OK: true},
+		}},
+		Phases: []Phase{{ComponentID: "action_containment_bootstrap", Parent: "action",
+			StartNs: epoch, EndNs: epoch + Nanos(20*millisecond)}},
+	}
+	if err := v.Sign("ewj2-campaign", key); err != nil {
+		t.Fatalf("a verdict measured on a real-epoch clock did not sign: %v", err)
+	}
+
+	// The exact value must survive the round trip, or the signature the
+	// campaign checks would cover different numbers than the ones it reads.
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Verdict
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Envelopes[0].Physical.StartNs != epoch {
+		t.Errorf("the action start came back as %d, not %d", got.Envelopes[0].Physical.StartNs, epoch)
+	}
+	d, err := got.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifySigned(got.Signature, d, []string{PublicKeyOf(key)}); err != nil {
+		t.Errorf("the round-tripped verdict no longer verifies: %v", err)
 	}
 }

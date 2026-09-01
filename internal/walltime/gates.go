@@ -312,6 +312,14 @@ type CampaignRun struct {
 	// ActionNs is one complete physical A per bucket. It must hold exactly
 	// BucketsPerRun entries.
 	ActionNs []int64 `json:"action_ns"`
+	// AetaSamples and PredictorSamples are the rows' own gate observations,
+	// carried up from their verdicts so the campaign can compute the
+	// population-wide means the contract requires over all eighty rows. A
+	// campaign that kept only durations could not: eighty individually
+	// acceptable forecasts can still miss a 10-second aggregate MAE, and
+	// nothing would notice.
+	AetaSamples      []AetaSample      `json:"aeta_samples,omitempty"`
+	PredictorSamples []PredictorSample `json:"predictor_samples,omitempty"`
 	// VerdictDigests names the per-row verdict each observation came from —
 	// one per bucket, in the same order — so every number in a campaign can be
 	// traced back to the records and the verifier verdict that produced it. A
@@ -397,6 +405,18 @@ func EvaluateCampaign(pairs []CampaignPair) []GateResult {
 			maxC = v
 		}
 	}
+	// The population-wide gates the contract defines over all eighty rows.
+	// They live here and nowhere else: a single verified row cannot decide a
+	// mean, and if the campaign did not compute one nothing would.
+	var aeta []AetaSample
+	var predictor []PredictorSample
+	for _, p := range pairs {
+		for _, r := range []CampaignRun{p.Baseline, p.Candidate} {
+			aeta = append(aeta, r.AetaSamples...)
+			predictor = append(predictor, r.PredictorSamples...)
+		}
+	}
+
 	medRA := medianFloat(ra)
 	out := []GateResult{
 		population,
@@ -418,6 +438,12 @@ func EvaluateCampaign(pairs []CampaignPair) []GateResult {
 			Population: len(pairs), Expected: CampaignPairs,
 			Pass: full && float64(medianNs(taC)) <= 1.05*float64(medianNs(taB))},
 	}
+	// Aggregate forecast and predictor accuracy over the whole population.
+	// EvaluateAeta is given the frozen expected row count, so a short
+	// population cannot pass it either.
+	out = append(out, campaignScoped(EvaluateAeta(aeta, ScoredActionRows))...)
+	out = append(out, campaignScoped(EvaluatePredictor(predictor))...)
+
 	if !full {
 		for i := range out {
 			if out[i].Name == population.Name {
@@ -425,6 +451,21 @@ func EvaluateCampaign(pairs []CampaignPair) []GateResult {
 			}
 			out[i].Detail = "the population is incomplete, so this statistic answers a different question than the frozen gate"
 		}
+	}
+	return out
+}
+
+// campaignScoped keeps only the gates the full population decides, and marks
+// them as such. The row-scope members of those sets were already decided by
+// each row's own verifier verdict; re-deciding them here would double-count a
+// judgement that has already been made.
+func campaignScoped(gates []GateResult) []GateResult {
+	var out []GateResult
+	for _, g := range gates {
+		if g.Scope != ScopeCampaign {
+			continue
+		}
+		out = append(out, g)
 	}
 	return out
 }

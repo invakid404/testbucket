@@ -539,3 +539,64 @@ func TestRunInActionJoinsBeforeItSpawns(t *testing.T) {
 		t.Errorf("exit code = %d, want 7", code)
 	}
 }
+
+// TestBootstrapFailureIsRetained is the retention rule for setup that never
+// got off the ground.
+//
+// A bootstrap that dies without a record is indistinguishable from an action
+// that never started — and "never started" is exactly what a campaign would
+// have to assume about a row that simply is not there. The contract says a
+// failed setup stays in the ledger with its reason, so it does.
+func TestBootstrapFailureIsRetained(t *testing.T) {
+	dir := t.TempDir()
+	run := RunIdentity{BucketID: "b1", Stage2: "sha256:test"}
+
+	// Make observer startup fail: the launcher is the seam production uses to
+	// spawn them, so this is the real failure path, not a simulated one.
+	original := ObserverLauncher
+	ObserverLauncher = func([]string) (*exec.Cmd, error) {
+		return nil, fmt.Errorf("no observer binary on this host")
+	}
+	t.Cleanup(func() { ObserverLauncher = original })
+
+	if _, err := BeginAction(dir, run, 10*time.Second); err == nil {
+		t.Fatalf("BeginAction succeeded with no observer")
+	}
+
+	recs, err := ReadRecords(filepath.Join(dir, streamName(ProducerPhysical, LevelAction, 0)))
+	if err != nil {
+		t.Fatalf("the failed bootstrap left no records at all: %v", err)
+	}
+	var start, terminal *Record
+	for i := range recs {
+		switch recs[i].Kind {
+		case "boundary":
+			if recs[i].Boundary == "start" {
+				start = &recs[i]
+			}
+		case "terminal":
+			terminal = &recs[i]
+		}
+	}
+	if start == nil {
+		t.Errorf("the envelope's opening reading was not retained")
+	}
+	if terminal == nil {
+		t.Fatalf("the bootstrap failure was not retained as a terminal record: %+v", recs)
+	}
+	if terminal.Terminal != TerminalWrapperError {
+		t.Errorf("terminal state = %q, want %q", terminal.Terminal, TerminalWrapperError)
+	}
+	if !strings.Contains(terminal.Reason, "no observer binary") {
+		t.Errorf("the terminal record does not say what failed: %q", terminal.Reason)
+	}
+
+	// And the verifier refuses to score it while retaining it.
+	v, err := VerifyDir(VerifyOptions{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Eligible {
+		t.Errorf("a failed bootstrap was scorable")
+	}
+}

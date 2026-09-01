@@ -37,20 +37,17 @@ func SelfDigest() Digest {
 	return selfOnce.digest
 }
 
-// ProducerID names one producer's execution context: its role, its binary, and
-// its process identity. Two producers that share it are the SAME execution
-// context and therefore not independent observers, which the verifier checks.
+// ProducerID names one producer's execution context: its role and its process
+// identity. Two producers that share it are the SAME execution context and
+// therefore not independent observers, which the verifier checks.
+//
+// The binary identity is deliberately NOT encoded here. It lives in its own
+// Record field as a full digest, because the verifier compares it for exact
+// equality and a digest embedded in a display string invites a substring
+// match — which a prefix collision satisfies.
 func ProducerID(p Producer) string {
 	pid := os.Getpid()
-	return fmt.Sprintf("%s@%s#%d.%s", p, shortDigest(SelfDigest()), pid, processStartID(pid))
-}
-
-func shortDigest(d Digest) string {
-	s := string(d)
-	if len(s) > 14 {
-		return s[7:19]
-	}
-	return s
+	return fmt.Sprintf("%s#%d.%s", p, pid, processStartID(pid))
 }
 
 // NewSigningKey mints a per-producer ed25519 key. Each producer signs with its

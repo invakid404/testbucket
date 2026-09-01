@@ -423,6 +423,26 @@ func (r SourceProfileReceipt) Validate() error {
 
 func hasPrefix(s, p string) bool { return len(s) >= len(p) && s[:len(p)] == p }
 
+// parsedStoreIdentity reads the schema and comparability token out of the
+// exact frozen store bytes, so a receipt is checked against what the store
+// SAYS rather than against what the receipt claims about it.
+//
+// Absent bytes are a cold start: schema 0 and an empty token, which a receipt
+// must then also declare.
+func parsedStoreIdentity(b []byte) (int, string) {
+	if len(b) == 0 {
+		return 0, ""
+	}
+	var probe struct {
+		Schema int    `json:"schema"`
+		Flags  string `json:"flags"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return 0, ""
+	}
+	return probe.Schema, probe.Flags
+}
+
 // fullSHALen is the length of a full Git commit SHA. The contract is explicit
 // that a full commit SHA is the immutable release reference; an abbreviation
 // is a prefix that another object can grow into, and a tag is metadata.
@@ -524,7 +544,31 @@ var StoreRowStates = []string{
 }
 
 // Validate refuses a receipt that cannot support a warm claim.
-func (r StoreReceipt) Validate(now time.Time) error {
+//
+// bytes are the EXACT admitted store bytes the bundle froze, parsedSchema and
+// parsedToken what those bytes actually say, and now the canonical planning
+// instant. All four are required: a receipt that merely cites a digest can
+// still claim the wrong schema, the wrong comparability token, or a staleness
+// nobody checked, and every one of those is a different store than the one the
+// weights came from.
+func (r StoreReceipt) Validate(bytes []byte, parsedSchema int, parsedToken string, now time.Time) error {
+	if got := DigestBytes(bytes); got != r.Digest {
+		return fmt.Errorf("store receipt: it describes %s but the bundle froze %s", r.Digest, got)
+	}
+	if r.Schema != parsedSchema {
+		return fmt.Errorf("store receipt: it claims schema %d but the frozen bytes are schema %d", r.Schema, parsedSchema)
+	}
+	// An empty token in the bytes is a cold store; the receipt must say the
+	// same thing rather than assert a comparability the bytes do not carry.
+	if r.Token != parsedToken {
+		return fmt.Errorf("store receipt: it claims token %q but the frozen bytes were measured under %q", r.Token, parsedToken)
+	}
+	return r.validateFields(now)
+}
+
+// validateFields checks the receipt's internal consistency, independent of the
+// bytes it describes.
+func (r StoreReceipt) validateFields(now time.Time) error {
 	if err := requireSet(map[string]string{
 		"the store digest":        string(r.Digest),
 		"the migration id":        r.MigrationID,
@@ -543,8 +587,15 @@ func (r StoreReceipt) Validate(now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("store receipt: %w", err)
 	}
-	if !now.IsZero() && !now.Before(staleAt) {
-		return fmt.Errorf("store receipt: the store is stale as of %s, and a stale store is not warm evidence", r.StaleAt)
+	// The staleness question is asked at the CANONICAL planning instant, not
+	// at whatever time the check happens to run. A zero instant would silently
+	// skip it, so it is refused.
+	if now.IsZero() {
+		return fmt.Errorf("store receipt: staleness must be judged against the canonical planning instant, and none was supplied")
+	}
+	if !now.Before(staleAt) {
+		return fmt.Errorf("store receipt: the store is stale as of %s at the canonical instant %s, and a stale store is not warm evidence",
+			r.StaleAt, now.UTC().Format(time.RFC3339))
 	}
 	total := 0
 	for state, n := range r.Classifications {
@@ -584,6 +635,15 @@ type InstrumentationIdentity struct {
 	// Signers lists the public keys that may sign records. A record signed by
 	// anything else is not evidence this campaign bound.
 	Signers []string `json:"signers"`
+}
+
+// policy is the part of the instrumentation identity that must be EQUAL
+// between the two arms of a pair. The four binary digests are excluded: a
+// candidate ships a different testbucket by definition, and its wrappers come
+// with it. Everything describing HOW the measurement was taken stays.
+func (i InstrumentationIdentity) policy() InstrumentationIdentity {
+	i.PhysicalBinary, i.PeerBinary, i.TraceBinary, i.VerifierBinary = "", "", "", ""
+	return i
 }
 
 // DigestOf is the manifest's canonical identity, taken over everything except
@@ -716,15 +776,51 @@ func (m Stage1Manifest) Validate() error {
 	if err := m.SourceProfile.Validate(); err != nil {
 		return err
 	}
-	// The store the weights came from: exact bytes, migration epoch, how the
-	// copy was obtained, and the classification of every row. The instant is
-	// zero here because staleness is a question for the moment of use, not of
-	// signing; the frozen planner asks it again with the canonical instant.
-	if err := m.Store.Validate(time.Time{}); err != nil {
+	// The store the weights came from, bound to the EXACT bytes the bundle
+	// froze and judged at the bundle's own canonical instant — not at signing
+	// time, and not against fields that merely look filled in.
+	instant, err := m.Bundle.Clock.Time()
+	if err != nil {
+		return fmt.Errorf("stage-1 manifest: %w", err)
+	}
+	schema, token := parsedStoreIdentity(m.Bundle.Store.Bytes)
+	if err := m.Store.Validate(m.Bundle.Store.Bytes, schema, token, instant); err != nil {
 		return err
 	}
-	if m.Store.Digest != m.Bundle.Store.Digest {
-		return fmt.Errorf("stage-1 manifest: the store receipt describes %s but the bundle froze %s", m.Store.Digest, m.Bundle.Store.Digest)
+	if m.Store.Token != m.Bundle.Selection.Token {
+		return fmt.Errorf("stage-1 manifest: the store was measured under token %q but this plan runs %q; weights are comparable only within one token",
+			m.Store.Token, m.Bundle.Selection.Token)
+	}
+
+	// The source profile must describe the SOURCE THIS BUNDLE FROZE. A valid
+	// receipt for some other tree proves that tree, not this one.
+	if m.SourceProfile.Repository != m.Bundle.Source.Repository {
+		return fmt.Errorf("stage-1 manifest: the source profile describes repository %q but the bundle froze %q",
+			m.SourceProfile.Repository, m.Bundle.Source.Repository)
+	}
+	if m.SourceProfile.Commit != m.Bundle.Source.Commit {
+		return fmt.Errorf("stage-1 manifest: the source profile describes commit %s but the bundle froze %s",
+			m.SourceProfile.Commit, m.Bundle.Source.Commit)
+	}
+	// And the consumer identity must be the same façade, config and lockfile
+	// the profile proved the Vitest closure for.
+	for _, f := range []struct {
+		name              string
+		profile, consumer Digest
+	}{
+		{"façade", m.SourceProfile.Facade, m.Consumer.Facade},
+		{"config", m.SourceProfile.Config, m.Consumer.Config},
+		{"lockfile", m.SourceProfile.Lockfile, m.Consumer.Lockfile},
+	} {
+		if f.profile != f.consumer {
+			return fmt.Errorf("stage-1 manifest: the source profile's %s digest is %s but the consumer identity binds %s",
+				f.name, f.profile, f.consumer)
+		}
+	}
+	// The delivered binary must be the one the producers actually run.
+	if m.Source.BinaryDigest != m.Instrumentation.PhysicalBinary {
+		return fmt.Errorf("stage-1 manifest: the delivered binary is %s but the physical wrapper is approved as %s",
+			m.Source.BinaryDigest, m.Instrumentation.PhysicalBinary)
 	}
 
 	// The sealed training lineage and the frozen component registry.
@@ -798,33 +894,37 @@ func (m Stage1Manifest) InvariantTuple() map[string]string {
 		// render configuration. Two arms that planned from different inputs
 		// did not run the same experiment.
 		"planning_input_bundle": string(mustDigestOf(bundle)),
-		// The entire instrumentation identity: producer and verifier binaries,
-		// every policy, and the raw-source taxonomy.
-		"instrumentation": string(mustDigestOf(m.Instrumentation)),
+		// The instrumentation POLICY, not its binaries. The candidate arm is
+		// allowed to ship a different testbucket — that is the enumerated
+		// difference the whole campaign is testing — and its wrappers are
+		// "directly necessary schema-versioned" parts of that tuple. What may
+		// NOT differ is how the two arms were instrumented: the containment
+		// primitive, the admission and endpoint rules, the cancellation
+		// behaviour, the raw-source taxonomy and the schema.
+		"instrumentation_policy": string(mustDigestOf(m.Instrumentation.policy())),
 	}
 	// Readable sub-keys for the fields a reader most often wants named in a
 	// diff. They are redundant with the bundle digest above and that is the
 	// point: the digest catches everything, these say what changed.
 	for k, v := range map[string]string{
-		"selection.k":              fmt.Sprint(bundle.Selection.K),
-		"selection.count":          fmt.Sprint(bundle.Selection.Count),
-		"selection.token":          bundle.Selection.Token,
-		"selection.runner":         bundle.Selection.Runner,
-		"selection.renderer":       bundle.Selection.Renderer,
-		"selection.tie_break":      bundle.Selection.TieBreak,
-		"render.events_dir":        bundle.Render.EventsDir,
-		"render.file_parallelism":  fmt.Sprint(bundle.Render.FileParallelism),
-		"render.wall_dir":          bundle.Render.WallDir,
-		"store":                    string(bundle.Store.Digest),
-		"clock.stale_threshold":    bundle.Clock.StaleThreshold,
-		"clock.policy":             bundle.Clock.Policy,
-		"instrumentation.schema":   m.Instrumentation.Schema,
-		"containment_policy":       m.Instrumentation.ContainmentPolicy,
-		"child_admission_policy":   m.Instrumentation.ChildAdmission,
-		"endpoint_order_policy":    m.Instrumentation.EndpointOrder,
-		"cancellation_policy":      m.Instrumentation.CancellationPolicy,
-		"instrumentation.verifier": string(m.Instrumentation.VerifierBinary),
-		"raw_source_taxonomy":      strings.Join(m.Instrumentation.RawSourceTaxonomy, ","),
+		"selection.k":             fmt.Sprint(bundle.Selection.K),
+		"selection.count":         fmt.Sprint(bundle.Selection.Count),
+		"selection.token":         bundle.Selection.Token,
+		"selection.runner":        bundle.Selection.Runner,
+		"selection.renderer":      bundle.Selection.Renderer,
+		"selection.tie_break":     bundle.Selection.TieBreak,
+		"render.events_dir":       bundle.Render.EventsDir,
+		"render.file_parallelism": fmt.Sprint(bundle.Render.FileParallelism),
+		"render.wall_dir":         bundle.Render.WallDir,
+		"store":                   string(bundle.Store.Digest),
+		"clock.stale_threshold":   bundle.Clock.StaleThreshold,
+		"clock.policy":            bundle.Clock.Policy,
+		"instrumentation.schema":  m.Instrumentation.Schema,
+		"containment_policy":      m.Instrumentation.ContainmentPolicy,
+		"child_admission_policy":  m.Instrumentation.ChildAdmission,
+		"endpoint_order_policy":   m.Instrumentation.EndpointOrder,
+		"cancellation_policy":     m.Instrumentation.CancellationPolicy,
+		"raw_source_taxonomy":     strings.Join(m.Instrumentation.RawSourceTaxonomy, ","),
 	} {
 		out[k] = v
 	}

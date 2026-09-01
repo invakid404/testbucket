@@ -198,9 +198,16 @@ type Record struct {
 	Level    Level    `json:"level,omitempty"`
 	Boundary string   `json:"boundary,omitempty"`
 	Producer Producer `json:"producer"`
-	// ProducerID is the execution context of the writer: which binary, which
-	// process. Peer and trace records that share it are not independent.
+	// ProducerID is the execution context of the writer: which process, on
+	// which host. Peer and trace records that share it are not independent.
 	ProducerID string `json:"producer_id"`
+	// ProducerBinary is the FULL SHA-256 of the executable that wrote this
+	// record. It is its own field rather than a fragment inside ProducerID
+	// because the verifier must compare it for exact equality against the
+	// binary Stage 1 approved: a substring match over a truncated digest is
+	// satisfiable by a prefix collision, and an identity that a collision can
+	// satisfy is not an identity.
+	ProducerBinary Digest `json:"producer_binary,omitempty"`
 	// Source is the taxonomy class of the underlying event.
 	Source string `json:"source"`
 	// RawEventID and RawEventDigest identify the raw event this endpoint was
@@ -282,8 +289,12 @@ type Writer struct {
 	prev     Digest
 	producer Producer
 	id       string
-	key      ed25519.PrivateKey
-	signer   string
+	// binary is the full digest of the executable writing this stream. Every
+	// record carries it so the verifier can tie the stream to the build Stage 1
+	// approved without parsing it out of a display string.
+	binary Digest
+	key    ed25519.PrivateKey
+	signer string
 }
 
 // NewWriter opens (creating) the append-only stream for one producer.
@@ -298,7 +309,7 @@ func NewWriter(path string, p Producer, producerID string, key ed25519.PrivateKe
 	if err != nil {
 		return nil, fmt.Errorf("walltime: open records %s: %w", path, err)
 	}
-	w := &Writer{f: f, producer: p, id: producerID, key: key}
+	w := &Writer{f: f, producer: p, id: producerID, binary: SelfDigest(), key: key}
 	if key != nil {
 		w.signer = hex.EncodeToString(key.Public().(ed25519.PublicKey))
 	}
@@ -317,6 +328,9 @@ func (w *Writer) Append(r Record) (Record, error) {
 	r.Schema = SchemaVersion
 	r.Producer = w.producer
 	r.ProducerID = w.id
+	if r.ProducerBinary == "" {
+		r.ProducerBinary = w.binary
+	}
 	r.Seq = w.seq
 	r.PrevHash = w.prev
 	r.SignerID = w.signer

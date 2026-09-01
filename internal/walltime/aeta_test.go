@@ -168,8 +168,8 @@ func TestCompletenessFindsUnforecastMaterialTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	phases := []Phase{
-		{ComponentID: "action_containment_bootstrap", Parent: "action", StartNs: 0, EndNs: 20 * millisecond},
-		{ComponentID: "mystery_wait", Parent: "action", StartNs: 20 * millisecond, EndNs: 20*millisecond + 3*second},
+		{ComponentID: "action_containment_bootstrap", Parent: "action", StartNs: 0, EndNs: Nanos(20 * millisecond)},
+		{ComponentID: "mystery_wait", Parent: "action", StartNs: Nanos(20 * millisecond), EndNs: Nanos(20*millisecond + 3*second)},
 	}
 	findings := reg.CheckCompleteness(phases, aeta)
 	if len(findings) == 0 {
@@ -181,8 +181,8 @@ func TestCompletenessFindsUnforecastMaterialTime(t *testing.T) {
 
 	// A sub-materiality phase is absorbed by the residual allowance instead.
 	small := []Phase{
-		{ComponentID: "action_containment_bootstrap", Parent: "action", StartNs: 0, EndNs: 20 * millisecond},
-		{ComponentID: "tiny_gap", Parent: "action", StartNs: 20 * millisecond, EndNs: 21 * millisecond},
+		{ComponentID: "action_containment_bootstrap", Parent: "action", StartNs: 0, EndNs: Nanos(20 * millisecond)},
+		{ComponentID: "tiny_gap", Parent: "action", StartNs: Nanos(20 * millisecond), EndNs: Nanos(21 * millisecond)},
 	}
 	if got := reg.CheckCompleteness(small, aeta); len(got) != 0 {
 		t.Errorf("a 1 ms unnamed gap produced findings: %+v", got)

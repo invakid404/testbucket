@@ -77,6 +77,14 @@ inputs:
       population from these, so a row whose verdict was never written cannot be
       counted — which is the correct outcome, not a gap to paper over.
     default: ""
+  verifier-key:
+    description: >-
+      The verifier''s own ed25519 signing key. A campaign counts a row only if
+      its verdict is attributable to the approved verifier, so the
+      machine-readable verdict is signed with this. Without it the verdict is
+      still written and every campaign will refuse it — loudly, which beats a
+      silently uncountable row. Pass a secret, never a literal.
+    default: ""
   records-artifact:
     description: >-
       Name the caller uploads the records under, echoed into the log so a
@@ -111,6 +119,7 @@ runs:
         TB_AUTHORITY: ${{ inputs.authority }}
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
         TB_VERDICT_FILE: ${{ inputs.verdict-file }}
+        TB_WALL_VERIFIER_KEY: ${{ inputs.verifier-key }}
         TB_RECORDS_ARTIFACT: ${{ inputs.records-artifact }}
       run: |
         set -euo pipefail

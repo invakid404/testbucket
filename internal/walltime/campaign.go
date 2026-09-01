@@ -148,6 +148,32 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 			problems = append(problems, fmt.Sprintf("%s: %v", row, err))
 			continue
 		}
+		// A verdict is a CLAIM. Before any field of it is believed it must be
+		// attributable to the approved verifier and to the exact records it
+		// describes — otherwise a hand-written JSON file satisfies the
+		// campaign, which is precisely the hole this closes.
+		if v.Signature == nil {
+			problems = append(problems, row+" is unsigned, so it attributes its verdict to nobody")
+			continue
+		}
+		vd, err := v.DigestOf()
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", row, err))
+			continue
+		}
+		if err := VerifySigned(v.Signature, vd, authorityKeys); err != nil {
+			problems = append(problems, fmt.Sprintf("%s verdict signature: %v", row, err))
+			continue
+		}
+		if v.RecordsDigest == "" {
+			problems = append(problems, row+" names no records digest, so it cannot be tied to the evidence it was derived from")
+			continue
+		}
+		if manifest != nil && v.VerifierBinary != manifest.Instrumentation.VerifierBinary {
+			problems = append(problems, fmt.Sprintf("%s was produced by verifier %s, not the %s Stage 1 approved",
+				row, v.VerifierBinary, manifest.Instrumentation.VerifierBinary))
+			continue
+		}
 		switch {
 		case !v.Complete:
 			problems = append(problems, row+" is not a complete measurement")
@@ -170,13 +196,14 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 		if manifestDigest != "" && v.Run.Stage1 != manifestDigest {
 			problems = append(problems, fmt.Sprintf("%s names Stage-1 %s, not this arm's %s", row, v.Run.Stage1, manifestDigest))
 		}
-		d, err := v.DigestOf()
-		if err != nil {
-			problems = append(problems, fmt.Sprintf("%s: %v", row, err))
-			continue
-		}
 		run.ActionNs = append(run.ActionNs, v.ActionNs)
-		run.VerdictDigests = append(run.VerdictDigests, d)
+		run.VerdictDigests = append(run.VerdictDigests, vd)
+		if v.AetaSample != nil {
+			run.AetaSamples = append(run.AetaSamples, *v.AetaSample)
+		} else {
+			problems = append(problems, row+" retains no Aeta sample, so the population-wide forecast mean cannot be computed over it")
+		}
+		run.PredictorSamples = append(run.PredictorSamples, v.PredictorSample...)
 	}
 	return run, manifest, problems
 }

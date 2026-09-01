@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"crypto/ed25519"
 	"fmt"
 	"io"
 	"sort"
@@ -41,12 +42,13 @@ type Phase struct {
 	ComponentID string `json:"component_id"`
 	Index       int    `json:"index,omitempty"`
 	Parent      string `json:"parent"`
-	StartNs     int64  `json:"start_ns"`
-	EndNs       int64  `json:"end_ns"`
+	// Instants, for the same reason as Interval's.
+	StartNs Nanos `json:"start_ns"`
+	EndNs   Nanos `json:"end_ns"`
 }
 
 // Duration is the phase's exclusive half-open length.
-func (p Phase) Duration() int64 { return p.EndNs - p.StartNs }
+func (p Phase) Duration() int64 { return int64(p.EndNs - p.StartNs) }
 
 // Name renders the phase for a report.
 func (p Phase) Name() string {
@@ -58,8 +60,12 @@ func (p Phase) Name() string {
 
 // Interval is one producer's bracketed span at one level.
 type Interval struct {
-	StartNs int64 `json:"start_ns"`
-	EndNs   int64 `json:"end_ns"`
+	// Instants are Nanos, not int64: an epoch-nanosecond count is above 2^53,
+	// and a verdict is CANONICALISED before it is signed. Carried as a number
+	// it would either round or refuse to canonicalise at all — and it refused,
+	// on the first host whose scorable clock reads a real epoch.
+	StartNs Nanos `json:"start_ns"`
+	EndNs   Nanos `json:"end_ns"`
 	OK      bool  `json:"complete"`
 	// Start and End keep the records themselves so the verifier can compare
 	// raw event ids, signers and sources without a second lookup.
@@ -72,7 +78,7 @@ func (i Interval) Duration() int64 {
 	if !i.OK {
 		return 0
 	}
-	return i.EndNs - i.StartNs
+	return int64(i.EndNs - i.StartNs)
 }
 
 // Envelope is one measured thing: the physical ledger plus its independent
@@ -95,6 +101,20 @@ type Envelope struct {
 type Verdict struct {
 	Schema string `json:"schema"`
 	Dir    string `json:"dir"`
+	// RecordsDigest binds this verdict to the EXACT records it was derived
+	// from, and VerifierBinary to the build that derived it. Without both, a
+	// campaign row is a JSON file asserting its own eligibility — and a forged
+	// one is indistinguishable from a real one.
+	RecordsDigest  Digest `json:"records_digest"`
+	VerifierBinary Digest `json:"verifier_binary"`
+	// Samples are the row's own gate observations, retained so the campaign
+	// can compute the population-wide means the contract requires. A row that
+	// discards them leaves an 80-row MAE uncomputable, and 80 individually
+	// acceptable rows can still miss it.
+	AetaSample      *AetaSample       `json:"aeta_sample,omitempty"`
+	PredictorSample []PredictorSample `json:"predictor_samples,omitempty"`
+	// Signature is the approved verifier's statement over this verdict.
+	Signature *Signature `json:"signature,omitempty"`
 	// Run is the campaign/delivery identity the records carried. A campaign
 	// assembles its population from verdicts, and a verdict that did not say
 	// which campaign, run and plan it belongs to could be counted into any of
@@ -173,7 +193,12 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 			return nil, fmt.Errorf("walltime: read records: %w", err)
 		}
 	}
-	v := &Verdict{Schema: SchemaVersion, Dir: opt.Dir}
+	v := &Verdict{Schema: SchemaVersion, Dir: opt.Dir, VerifierBinary: SelfDigest()}
+	// The exact records this verdict describes. A campaign row that cannot
+	// name the evidence behind it is a number in a file.
+	if d, err := DigestJSON(recs); err == nil {
+		v.RecordsDigest = d
+	}
 	if len(recs) == 0 {
 		v.add("WT-004", SeverityTerminal, "no records: an absent measurement is not a zero-length one")
 		return v, nil
@@ -493,10 +518,10 @@ func boundaryInterval(recs []Record) Interval {
 		switch r.Boundary {
 		case "start":
 			if !haveStart {
-				iv.StartNs, iv.start, haveStart = int64(r.Instant.Mono), r, true
+				iv.StartNs, iv.start, haveStart = Nanos(r.Instant.Mono), r, true
 			}
 		case "end":
-			iv.EndNs, iv.end, haveEnd = int64(r.Instant.Mono), r, true
+			iv.EndNs, iv.end, haveEnd = Nanos(r.Instant.Mono), r, true
 		}
 	}
 	iv.OK = haveStart && haveEnd
@@ -523,7 +548,7 @@ func verifyEndpoints(v *Verdict, envs []Envelope) {
 		}
 		order := []struct {
 			name string
-			ns   int64
+			ns   Nanos
 		}{
 			{"physical start", e.Physical.StartNs},
 			{"peer start", e.Peer.StartNs},
@@ -817,7 +842,7 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 		if err := ReadJSONFile(opt.Stage1Path, &m); err != nil {
 			v.add("WT-018", SeverityIneligible, fmt.Sprintf("stage-1 manifest: %v", err))
 		} else if err := m.Validate(); err != nil {
-			v.add("WT-018", SeverityIneligible, fmt.Sprintf("stage-1 manifest: %v", err))
+			v.add("WT-018", SeverityIneligible, err.Error())
 		} else {
 			stage1 = &m
 		}
@@ -980,15 +1005,16 @@ func verifyProducerBinaries(v *Verdict, id InstrumentationIdentity, recs []Recor
 		ProducerPeer:     id.PeerBinary,
 		ProducerTrace:    id.TraceBinary,
 	}
-	reported := map[Producer]map[string]bool{}
+	// Collect the FULL digest each producer's records claim, and compare for
+	// exact equality. A substring match over a truncated digest is satisfiable
+	// by a prefix collision, and an identity a collision can satisfy is not an
+	// identity.
+	reported := map[Producer]map[Digest]bool{}
 	for _, r := range recs {
-		if r.ProducerID == "" {
-			continue
-		}
 		if reported[r.Producer] == nil {
-			reported[r.Producer] = map[string]bool{}
+			reported[r.Producer] = map[Digest]bool{}
 		}
-		reported[r.Producer][r.ProducerID] = true
+		reported[r.Producer][r.ProducerBinary] = true
 	}
 	for producer, digest := range want {
 		if digest == "" {
@@ -996,11 +1022,15 @@ func verifyProducerBinaries(v *Verdict, id InstrumentationIdentity, recs []Recor
 				fmt.Sprintf("Stage 1 binds no binary identity for the %s, so its records cannot be tied to an approved build", producer))
 			continue
 		}
-		for context := range reported[producer] {
-			if !strings.Contains(context, shortDigest(digest)) {
+		for got := range reported[producer] {
+			if got == "" {
 				v.add("WT-018", SeverityIneligible,
-					fmt.Sprintf("a %s record was written by execution context %q, which is not the binary Stage 1 approved (%s)",
-						producer, context, digest))
+					fmt.Sprintf("a %s record names no binary, so it cannot be tied to the build Stage 1 approved", producer))
+				break
+			}
+			if got != digest {
+				v.add("WT-018", SeverityIneligible,
+					fmt.Sprintf("a %s record was written by binary %s, not the %s Stage 1 approved", producer, got, digest))
 				break
 			}
 		}
@@ -1205,8 +1235,13 @@ func evaluateGates(v *Verdict, opt VerifyOptions, aeta *AetaInstance, bound boun
 	if aeta != nil {
 		// expected is 1 because this is a ROW: the individual-error, interval
 		// and width rules are decided here, and the population mean is
-		// reported campaign-scope, where it belongs.
-		v.Gates = append(v.Gates, EvaluateAeta([]AetaSample{aeta.Sample(v.ActionNs)}, 1)...)
+		// reported campaign-scope, where it belongs. The sample is RETAINED so
+		// the campaign can compute that mean over all eighty rows — without it
+		// eighty individually acceptable rows could still miss the aggregate
+		// and nothing would notice.
+		sample := aeta.Sample(v.ActionNs)
+		v.AetaSample = &sample
+		v.Gates = append(v.Gates, EvaluateAeta([]AetaSample{sample}, 1)...)
 	} else {
 		v.Gates = append(v.Gates, GateResult{
 			Name: "aeta:point-max", Scope: ScopeRow, Required: "<= " + dur(AetaMaxLimit),
@@ -1264,6 +1299,7 @@ func predictorGates(v *Verdict, opt VerifyOptions, stage2, membership, scorer Di
 		}
 		samples = append(samples, PredictorSample{InvocationSeq: inv.Seq, BucketIndex: inv.BucketIndex, PredictedNs: inv.PredictedNs, ObservedNs: got})
 	}
+	v.PredictorSample = samples
 	if len(samples) != len(observed) {
 		v.add("WT-019", SeverityIneligible,
 			fmt.Sprintf("pcheck covers %d of the %d observed invocations; a skipped interval does not qualify", len(samples), len(observed)))
@@ -1325,9 +1361,27 @@ func (v *Verdict) Write(out io.Writer) error {
 	return w.Flush()
 }
 
-// DigestOf is the verdict's canonical identity. A campaign names its rows by
-// this digest, so an index cannot cite one verdict file and score another.
-func (v Verdict) DigestOf() (Digest, error) { return DigestJSON(v) }
+// DigestOf is the verdict's canonical identity, taken over everything except
+// the signature that covers it. A campaign names its rows by this digest, so
+// an index cannot cite one verdict file and score another.
+func (v Verdict) DigestOf() (Digest, error) {
+	c := v
+	c.Signature = nil
+	return DigestJSON(c)
+}
+
+// Sign attaches the verifier's statement. A campaign will not count a row
+// without one: a verdict is a claim, and an unsigned claim names nobody.
+func (v *Verdict) Sign(authority string, key ed25519.PrivateKey) error {
+	d, err := v.DigestOf()
+	if err != nil {
+		return err
+	}
+	v.Signature = &Signature{
+		Authority: authority, KeyID: PublicKeyOf(key), Digest: d, Value: SignDigest(key, d),
+	}
+	return nil
+}
 
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
