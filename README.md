@@ -501,8 +501,19 @@ before any bucket runs rather than finishing green having proven nothing.
 
 A_GH is not in that artifact and cannot be: `step-attempt.json` describes the
 bucket step, which has not finished when the artifact is built. The workflow
-reads it back from the Actions API after the run — which is why the test job
-needs `actions: read` — and hands it to the verifier.
+reads it back from the Actions API after the run and hands it to the verifier —
+so a scored caller must grant `actions: read` alongside `contents: read`:
+
+```yaml
+permissions:
+  contents: read
+  actions: read      # only needed for a scored arm, to collect A_GH
+```
+
+The workflow cannot request that for you: a called reusable workflow may only
+narrow its caller's permissions, so declaring it here would break every caller
+that grants less. Without it the collector says so and exits 0, and the
+verifier reports the row ineligible.
 
 **On `version`:** every action defaults to `v1`, which resolves only once a 1.x
 release exists. While this project is on 0.x, pin an exact tag (or `v0`). A

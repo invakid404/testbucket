@@ -99,6 +99,11 @@ on:
           action runs inside a physical envelope with its own containment peer
           and independent trace, and each invocation gets one of its own. Empty
           = no measurement ⇒ unchanged behavior.
+          NOTE: a SCORED arm also needs the caller to grant `actions: read`, so
+          the A_GH step diagnostic can be read back from the Actions API. This
+          workflow cannot request it for you — a called workflow may only
+          narrow the caller's permissions — and without it the row is reported
+          ineligible rather than failing the job.
         type: string
         default: ""
       cgroup-root:
@@ -243,12 +248,17 @@ jobs:
   test:
     needs: plan
     runs-on: ${{ inputs.runs-on }}
-    permissions:
-      contents: read
-      # The A_GH diagnostic reads this job's own step timestamps back from the
-      # Actions API. Without it a measured row cannot say which step it
-      # measured, and the verifier reports the row ineligible.
-      actions: read
+    # No `permissions:` block here on purpose. A called reusable workflow can
+    # only NARROW what its caller granted, never request more, so declaring
+    # `actions: read` would make every existing caller that grants only
+    # `contents: read` fail at startup — a break for consumers who do not use
+    # wall-time at all.
+    #
+    # The A_GH collector needs `actions: read` to read this job's own step
+    # timestamps back. A caller that wants a scored row grants it; a caller
+    # that does not simply gets no A_GH, the collector says so and exits 0, and
+    # the verifier reports the row ineligible. That is the fail-closed path
+    # already, and it costs an unmeasured consumer nothing.
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
