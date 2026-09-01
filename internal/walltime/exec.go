@@ -343,6 +343,10 @@ func runChild(opt ExecOptions, cont Containment) (int, ProcIdentity, string, str
 var (
 	atStartReading func(dir string)
 	atEndReading   func(dir string)
+	// atContainmentJoin fires after this process has joined the enclosing
+	// containment and before it spawns anything, so a test can prove the
+	// ordering the inheritance depends on.
+	atContainmentJoin func(dir string)
 )
 
 func probe(hook func(string), dir string) {

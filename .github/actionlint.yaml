@@ -1,0 +1,24 @@
+# actionlint configuration.
+#
+# The reusable workflow references its own composite actions with GitHub's
+# `$/` SELF-REPOSITORY syntax, so they resolve to this repository at the ref
+# the workflow was called with rather than to the caller's checkout. That is
+# the whole point: `./` resolves against the workspace, which for a called
+# reusable workflow belongs to the CALLER, and an external consumer would look
+# for `.github/actions/plan` in its own repository and not find it.
+#
+# actionlint does not yet recognise the spelling — it was announced on
+# 2026-07-30 — and reports it as "invalid format because ref is missing". The
+# diagnostic is suppressed here rather than the syntax changed, because the
+# syntax is correct and the linter is behind. Revisit when actionlint learns
+# it: the ignore should be deleted, not widened.
+#
+# actionlint finds this file by detecting the project root from a `.git`
+# directory. This workspace is jj-only and has none, so run it with the path
+# given explicitly:
+#
+#   actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
+paths:
+  .github/workflows/bucketed-reusable.yml:
+    ignore:
+      - 'specifying action "\$/[^"]*" in invalid format because ref is missing'

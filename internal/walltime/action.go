@@ -127,9 +127,15 @@ func RunInAction(dir string, argv []string, cwd string, stdout, stderr *os.File)
 	if err != nil {
 		return 1, err
 	}
+	// Join BEFORE spawning. The child then inherits the containment, and so
+	// does everything the child starts — which is the whole mechanism: a
+	// process can move itself, and a child cannot retroactively admit the
+	// parent that spawned it. Anything an already-running sibling did is
+	// outside the lifecycle the peer and the trace observe, permanently.
 	if err := joinContainment(st.Containment, os.Getpid()); err != nil {
 		return 1, fmt.Errorf("walltime: join action containment: %w", err)
 	}
+	probe(atContainmentJoin, dir)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = cwd
 	if stdout == nil {

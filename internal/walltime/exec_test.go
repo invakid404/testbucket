@@ -481,3 +481,61 @@ func TestEnvelopeBracketsTheWholeCall(t *testing.T) {
 		t.Errorf("the envelope [%d,%d] is not inside the call [%d,%d]", start, end, before.Mono, after.Mono)
 	}
 }
+
+// TestRunInActionJoinsBeforeItSpawns is the property the composite action's
+// bucket step depends on.
+//
+// A process can move ITSELF into a containment; it cannot move a sibling that
+// is already running. So everything that must be inside the action containment
+// has to be a descendant of a process that joined first — which is why the
+// bucket step's preparation runs inside `wall run` rather than beside it. If
+// the join moved after the spawn, the child would inherit the wrong cgroup and
+// the peer and the trace would never see that work.
+func TestRunInActionJoinsBeforeItSpawns(t *testing.T) {
+	dir := t.TempDir()
+	run := RunIdentity{BucketID: "b1", Stage2: "sha256:test"}
+	if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
+		t.Fatalf("BeginAction: %v", err)
+	}
+	t.Cleanup(func() {
+		atContainmentJoin = nil
+		_, _ = EndAction(dir, TerminalPassed, "")
+	})
+
+	joined := false
+	marker := filepath.Join(dir, "child-ran")
+	atContainmentJoin = func(string) {
+		joined = true
+		// The child has not run yet: the join must come first.
+		if _, err := os.Stat(marker); err == nil {
+			t.Errorf("the child had already run when this process joined the containment")
+		}
+	}
+
+	code, err := RunInAction(dir, []string{"sh", "-c", "touch " + marker}, dir, nil, nil)
+	if err != nil {
+		t.Fatalf("RunInAction: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if !joined {
+		t.Errorf("RunInAction never joined the action containment")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the admitted command did not run: %v", err)
+	}
+
+	// And it propagates a failure: the bucket step takes its status from here,
+	// so a swallowed non-zero would make a red bucket look green. The probe is
+	// cleared first — the marker from the run above exists now, and the
+	// ordering it checks has already been established.
+	atContainmentJoin = nil
+	code, err = RunInAction(dir, []string{"sh", "-c", "exit 7"}, dir, nil, nil)
+	if err != nil {
+		t.Fatalf("RunInAction: %v", err)
+	}
+	if code != 7 {
+		t.Errorf("exit code = %d, want 7", code)
+	}
+}

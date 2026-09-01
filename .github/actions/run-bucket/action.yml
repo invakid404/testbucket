@@ -204,40 +204,68 @@ runs:
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
       run: |
         set -euo pipefail
-        # The generated script tees its events into this directory; create it
-        # first so `tee` has somewhere to write (the script itself does not mkdir,
-        # and each bucket runs on a fresh runner).
-        mkdir -p "$TB_EVENTS_DIR"
-        echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
-        printf '%s\n' "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
-        echo "--- invocations ---"
-        cat "$RUNNER_TEMP/testbucket-bucket.sh"
-        echo "--- output ---"
-
-        # The generated script already tees each stream to the events directory
-        # for the record job. The status taken is the SCRIPT's (PIPESTATUS[0]),
-        # never the renderer's.
-        set +e
+        # Under measurement, EVERYTHING this step owns runs inside one
+        # `wall run`, which admits itself to the action containment before
+        # spawning its child — so the child, and everything the child starts,
+        # inherits that cgroup.
+        #
+        # Preparing here and wrapping only the script would not work: this
+        # Actions shell is already running, `wall run` moves only its own
+        # process, and a child cannot retroactively admit its parent. The
+        # preparation would sit inside A's clock interval while the peer and
+        # the trace never saw it.
+        #
+        # The measured body is single-quoted, so the generated script is never
+        # spliced into a command line; the inner shell reads it from the
+        # environment, exactly as the unmeasured path does.
         if [ -n "$TB_WALL_DIR" ]; then
-          # VB: the complete generated script under its own physical envelope,
-          # containment peer and independent trace. The wrapper exits with the
-          # script's status, so a red bucket stays red.
-          # The run identity is inherited from the action state `wall begin`
-          # wrote, so the script and its invocations bind the same Stage-1 and
-          # Stage-2 receipts the action does.
-          testbucket wall exec --dir "$TB_WALL_DIR" --level script \
-            --desc "$BUCKET_NAME" -- bash "$RUNNER_TEMP/testbucket-bucket.sh"
+          set +e
+          testbucket wall run --dir "$TB_WALL_DIR" -- bash -euo pipefail -c '
+            # The generated script tees its events into this directory; create
+            # it first so `tee` has somewhere to write (the script itself does
+            # not mkdir, and each bucket runs on a fresh runner).
+            mkdir -p "$TB_EVENTS_DIR"
+            echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
+            printf "%s\n" "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
+            echo "--- invocations ---"
+            cat "$RUNNER_TEMP/testbucket-bucket.sh"
+            echo "--- output ---"
+
+            # VB: the complete generated script under its own physical
+            # envelope, containment peer and independent trace. The run
+            # identity is inherited from the action state `wall begin` wrote,
+            # so the script and its invocations bind the same Stage-1 and
+            # Stage-2 receipts the action does. The wrapper exits with the
+            # script status and `wall run` passes it on, so a red bucket stays
+            # red.
+            testbucket wall exec --dir "$TB_WALL_DIR" --level script \
+              --desc "$BUCKET_NAME" -- bash "$RUNNER_TEMP/testbucket-bucket.sh"
+          '
           status=$?
-        elif [ "$TB_RUNNER" = "go" ]; then
-          # Go's script emits `go test -json` on stdout; pipe it through
-          # `testbucket render` to reproduce the plain test log for humans.
-          bash "$RUNNER_TEMP/testbucket-bucket.sh" | testbucket render
-          status=${PIPESTATUS[0]}
         else
-          # Vitest's script prints a default-reporter log itself (the JSON report
-          # goes to a side file), so run it directly.
-          bash "$RUNNER_TEMP/testbucket-bucket.sh"
-          status=$?
+          # Unmeasured: exactly what this step always did.
+          mkdir -p "$TB_EVENTS_DIR"
+          echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
+          printf '%s\n' "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
+          echo "--- invocations ---"
+          cat "$RUNNER_TEMP/testbucket-bucket.sh"
+          echo "--- output ---"
+
+          # The generated script already tees each stream to the events
+          # directory for the record job. The status taken is the SCRIPT's
+          # (PIPESTATUS[0]), never the renderer's.
+          set +e
+          if [ "$TB_RUNNER" = "go" ]; then
+            # Go's script emits `go test -json` on stdout; pipe it through
+            # `testbucket render` to reproduce the plain test log for humans.
+            bash "$RUNNER_TEMP/testbucket-bucket.sh" | testbucket render
+            status=${PIPESTATUS[0]}
+          else
+            # Vitest's script prints a default-reporter log itself (the JSON
+            # report goes to a side file), so run it directly.
+            bash "$RUNNER_TEMP/testbucket-bucket.sh"
+            status=$?
+          fi
         fi
         set -e
         exit "$status"

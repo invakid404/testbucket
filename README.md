@@ -459,6 +459,12 @@ Each bucket's records are uploaded as their own artifact, because the records
 are the evidence: a row whose records went away with the runner cannot be
 re-verified by anyone.
 
+The reusable workflow references its own composite actions with GitHub's `$/`
+self-repository syntax, so they resolve to **this** repository at the ref you
+called — not to your checkout. Plain `./` would resolve against the workspace,
+which for a called reusable workflow is *yours*. That needs a GitHub-hosted
+runner or a self-hosted runner ≥ 2.336.0.
+
 For a **scored** arm, add the campaign identities and hand the workflow the
 frozen documents — the signed manifest, the one authorised Stage-2 receipt, the
 independent replay attestation, the registry, and each bucket's forecast and

@@ -17,13 +17,20 @@ name: testbucket bucketed (reusable)
 # gate inside `plan` is what makes the fan-out safe: it refuses to emit a matrix
 # unless every live target lands in exactly one bucket.
 #
-# The composite actions are referenced with `./`, GitHub's local-action syntax.
-# Inside a CALLED reusable workflow a local reference resolves against the
-# repository that contains the workflow file, so an external `@v1` consumer gets
-# this repo's actions at the ref it called, and testbucket's own dogfood gets the
-# local checkout. The earlier `$/` spelling was not a reference GitHub or
-# actionlint accepts ("ref is missing"), so a consumer could not resolve the
-# plan/run/record actions at all.
+# The composite actions are referenced with the `$/` SELF-REPOSITORY syntax, so
+# they resolve to THIS repo at the SAME ref the reusable workflow was called
+# with — the pinned actions for an external `@v1` consumer, and the local
+# checkout for testbucket's own pre-release dogfood.
+#
+# Plain `./` would resolve against the WORKSPACE, which for a called reusable
+# workflow is the CALLER's checkout: an external consumer would look for
+# `.github/actions/plan` in its own repository and not find it. The internal
+# dogfood would still pass, which is exactly what makes that mistake expensive.
+#
+# `$/` requires a GitHub-hosted runner or a self-hosted runner >= 2.336.0 (see
+# the 2026-07-30 self-repository-syntax changelog). actionlint does not yet know
+# the spelling and reports "ref is missing"; that diagnostic is suppressed for
+# this file in .github/actionlint.yaml, with the same reasoning written there.
 
 on:
   workflow_call:
@@ -202,7 +209,7 @@ jobs:
 
       - name: Plan the buckets
         id: plan
-        uses: ./.github/actions/plan
+        uses: $/.github/actions/plan
         with:
           runner: ${{ inputs.runner }}
           k: ${{ inputs.k }}
@@ -270,7 +277,7 @@ jobs:
           path: ${{ runner.temp }}/testbucket-frozen
 
       - name: Run bucket ${{ matrix.bucket }}
-        uses: ./.github/actions/run-bucket
+        uses: $/.github/actions/run-bucket
         with:
           runner: ${{ inputs.runner }}
           script: ${{ matrix.script }}
@@ -295,7 +302,7 @@ jobs:
       # work after the interval that claims to contain it.
       - name: Verify bucket ${{ matrix.bucket }}
         if: always() && inputs.wall-time-dir != ''
-        uses: ./.github/actions/verify-wall
+        uses: $/.github/actions/verify-wall
         with:
           wall-time-dir: ${{ inputs.wall-time-dir }}
           require: ${{ inputs.verify-require }}
@@ -393,7 +400,7 @@ jobs:
             testbucket-timings-${{ inputs.cache-scope }}-v1-
 
       - name: Audit and record the run
-        uses: ./.github/actions/record
+        uses: $/.github/actions/record
         with:
           runner: ${{ inputs.runner }}
           k: ${{ inputs.k }}
