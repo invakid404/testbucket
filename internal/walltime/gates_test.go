@@ -116,6 +116,10 @@ func TestAetaGates(t *testing.T) {
 
 // TestCampaignDecisionRule exercises the frozen five-pair rule, including the
 // two ways a candidate that looks better on average still fails.
+// campaignFixtureInvocations is how many invocations each fixture bucket
+// measures, so the invocation-peer population is 80 rows times this.
+const campaignFixtureInvocations = 2
+
 func TestCampaignDecisionRule(t *testing.T) {
 	// The baseline is imbalanced (one long bucket, the rest shorter); the
 	// candidate is even. That is the shape the campaign is meant to reward: a
@@ -141,16 +145,40 @@ func TestCampaignDecisionRule(t *testing.T) {
 		}
 		return out
 	}
+	// A run carries the evidence a campaign is required to aggregate, not only
+	// its durations: how many invocations each bucket measured, one
+	// Pcheck/observed-V sample per invocation, and the like-for-like peer
+	// deltas. A fixture that carried only durations could assert PASS on a
+	// campaign that proved nothing about prediction or reconciliation, which
+	// is exactly the hole these gates close.
+	run := func(prefix string, action []int64, start string) CampaignRun {
+		r := CampaignRun{RunID: prefix, StartedAt: start, Terminal: TerminalPassed,
+			ActionNs: action, VerdictDigests: verdicts(prefix)}
+		for b, ns := range action {
+			r.Invocations = append(r.Invocations, campaignFixtureInvocations)
+			for i := 0; i < campaignFixtureInvocations; i++ {
+				each := ns / (campaignFixtureInvocations + 2)
+				r.PredictorSamples = append(r.PredictorSamples, PredictorSample{
+					InvocationSeq: i, BucketIndex: b,
+					PredictedNs: each + 100*millisecond, ObservedNs: each,
+				})
+			}
+			r.Recon = append(r.Recon,
+				Reconciliation{Level: LevelAction, Deltas: []int64{3 * millisecond}},
+				Reconciliation{Level: LevelScript, Deltas: []int64{-2 * millisecond}},
+				Reconciliation{Level: LevelInvocation, Deltas: []int64{1 * millisecond, 2 * millisecond}},
+			)
+		}
+		return r
+	}
 	day := 0
 	pair := func(bmax, cmax int64) CampaignPair {
 		// Three distinct UTC dates inside the fourteen-day window.
 		start := fmt.Sprintf("2026-09-%02dT0%d:00:00Z", 1+day%3, day%9)
 		day++
 		return CampaignPair{
-			Baseline: CampaignRun{RunID: "b", StartedAt: start, Terminal: TerminalPassed,
-				ActionNs: buckets(bmax, 5*second), VerdictDigests: verdicts("b")},
-			Candidate: CampaignRun{RunID: "c", StartedAt: start, Terminal: TerminalPassed,
-				ActionNs: buckets(cmax, 0), VerdictDigests: verdicts("c")},
+			Baseline:  run("b", buckets(bmax, 5*second), start),
+			Candidate: run("c", buckets(cmax, 0), start),
 		}
 	}
 	// The candidate is flat and slightly cheaper in total: a real improvement

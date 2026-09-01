@@ -320,6 +320,18 @@ type CampaignRun struct {
 	// nothing would notice.
 	AetaSamples      []AetaSample      `json:"aeta_samples,omitempty"`
 	PredictorSamples []PredictorSample `json:"predictor_samples,omitempty"`
+	// Invocations is, per bucket in order, how many scored invocations that
+	// bucket measured. It is what makes an EMPTY predictor sample set
+	// checkable: without it, "this row measured no invocations" and "this row
+	// discarded its predictor evidence" are the same absence, and a campaign
+	// could pass having proved nothing about Pcheck against observed V.
+	Invocations []int `json:"invocations"`
+	// Recon is the like-for-like peer/trace population, carried up per level.
+	// The contract requires the 50 ms / 100 ms gates over ALL 80 action peers,
+	// ALL 80 script peers and EVERY actual invocation peer; a campaign that
+	// kept only the per-row verdicts could not compute any of the three, and
+	// would report nothing rather than a failure.
+	Recon []Reconciliation `json:"reconciliation,omitempty"`
 	// VerdictDigests names the per-row verdict each observation came from —
 	// one per bucket, in the same order — so every number in a campaign can be
 	// traced back to the records and the verifier verdict that produced it. A
@@ -410,10 +422,23 @@ func EvaluateCampaign(pairs []CampaignPair) []GateResult {
 	// mean, and if the campaign did not compute one nothing would.
 	var aeta []AetaSample
 	var predictor []PredictorSample
+	var recon []Reconciliation
+	invocations, rowsWithCoverage, rows := 0, 0, 0
 	for _, p := range pairs {
 		for _, r := range []CampaignRun{p.Baseline, p.Candidate} {
 			aeta = append(aeta, r.AetaSamples...)
 			predictor = append(predictor, r.PredictorSamples...)
+			recon = append(recon, r.Recon...)
+			// Coverage is counted PER ROW against that row's own measured
+			// invocation count, so a population cannot be padded by one
+			// heavily-instrumented bucket standing in for the rest.
+			for i, n := range r.Invocations {
+				rows++
+				invocations += n
+				if i < len(r.perBucketSamples()) && r.perBucketSamples()[i] == n {
+					rowsWithCoverage++
+				}
+			}
 		}
 	}
 
@@ -442,13 +467,20 @@ func EvaluateCampaign(pairs []CampaignPair) []GateResult {
 	// EvaluateAeta is given the frozen expected row count, so a short
 	// population cannot pass it either.
 	out = append(out, campaignScoped(EvaluateAeta(aeta, ScoredActionRows))...)
-	out = append(out, campaignScoped(EvaluatePredictor(predictor))...)
+	out = append(out, EvaluateCampaignPredictor(predictor, invocations, rows, rowsWithCoverage)...)
+	out = append(out, EvaluateCampaignRecon(recon, invocations)...)
 
 	if !full {
 		for i := range out {
 			if out[i].Name == population.Name {
 				continue
 			}
+			// Pass is cleared, not merely annotated. Every statistic here is
+			// defined over the frozen population; computed over a shorter one
+			// it answers a different question, and a gate that answered a
+			// different question and reported "pass" would be the campaign
+			// deciding itself.
+			out[i].Pass = false
 			out[i].Detail = "the population is incomplete, so this statistic answers a different question than the frozen gate"
 		}
 	}
@@ -611,4 +643,113 @@ func dur(ns int64) string {
 	default:
 		return fmt.Sprintf("%.3f s", float64(ns)/float64(second))
 	}
+}
+
+// perBucketSamples counts this run's retained predictor samples per bucket, in
+// bucket order. It is derived rather than stored so it cannot disagree with the
+// samples themselves.
+func (r CampaignRun) perBucketSamples() []int {
+	out := make([]int, len(r.Invocations))
+	for _, s := range r.PredictorSamples {
+		if s.BucketIndex >= 0 && s.BucketIndex < len(out) {
+			out[s.BucketIndex]++
+		}
+	}
+	return out
+}
+
+// EvaluateCampaignPredictor runs the frozen Pcheck-versus-observed-V gates
+// over the WHOLE population, and first checks that the population is there.
+//
+// The coverage gate is the load-bearing one. `EvaluatePredictor` on an empty
+// sample set returns a row-scope finding, and campaign scope discards row-scope
+// gates — so a campaign whose eighty verdicts all omitted their predictor
+// samples used to report no predictor gate at all and pass. Absence has to be
+// a failure, and it has to be distinguishable from a row that legitimately
+// measured no invocations, which is why each row carries its own invocation
+// count.
+func EvaluateCampaignPredictor(samples []PredictorSample, invocations, rows, covered int) []GateResult {
+	coverage := GateResult{
+		Name: "predictor:coverage", Scope: ScopeCampaign,
+		Required:   "one Pcheck/observed-V sample per scored invocation, in every row",
+		Observed:   fmt.Sprintf("%d sample(s) for %d invocation(s) across %d row(s)", len(samples), invocations, rows),
+		Population: covered, Expected: rows,
+	}
+	switch {
+	case rows == 0:
+		coverage.Detail = "the population retains no rows, so predictor coverage cannot be established"
+	case covered < rows:
+		coverage.Detail = fmt.Sprintf("%d of %d row(s) retain a sample for every invocation they measured; the rest prove nothing about Pcheck against observed V", covered, rows)
+	case len(samples) != invocations:
+		coverage.Detail = fmt.Sprintf("the population holds %d sample(s) for %d scored invocation(s)", len(samples), invocations)
+	case invocations == 0:
+		// Every row measured zero invocations and every row says so. That is
+		// consistent and it is not predictor evidence, so it does not pass.
+		coverage.Detail = "no row measured any invocation, so the Pcheck-versus-observed-V gates have no population"
+	default:
+		coverage.Pass = true
+	}
+
+	out := []GateResult{coverage}
+	for _, g := range EvaluatePredictor(samples) {
+		// Every predictor gate is decided at CAMPAIGN scope here: the contract
+		// states invocation MAE, individual invocation error and bucket MAE
+		// over the campaign population, and a row-scope copy of them would be
+		// filtered out of a campaign verdict.
+		g.Scope, g.Expected = ScopeCampaign, invocations
+		if !coverage.Pass {
+			g.Pass = false
+			g.Detail = firstNonEmptyStr(g.Detail, "predictor coverage is incomplete, so this statistic answers a different question than the frozen gate")
+		}
+		out = append(out, g)
+	}
+	return out
+}
+
+// EvaluateCampaignRecon runs the frozen like-for-like reconciliation over the
+// three complete populations the contract names: all 80 scored action
+// containment peers, all 80 scored complete-script peers, and every actual
+// nested-invocation peer.
+//
+// Coverage is EXACT, not a minimum. "All 80" is a population, and a campaign
+// that reconciled sixty of them perfectly has not reconciled the eighty it
+// claims. An absent population fails rather than disappearing.
+func EvaluateCampaignRecon(recon []Reconciliation, invocations int) []GateResult {
+	merged := map[Level]*Reconciliation{}
+	for _, r := range recon {
+		m, ok := merged[r.Level]
+		if !ok {
+			m = &Reconciliation{Level: r.Level}
+			merged[r.Level] = m
+		}
+		m.Deltas = append(m.Deltas, r.Deltas...)
+	}
+	expected := map[Level]int{
+		LevelAction:     ScoredActionRows,
+		LevelScript:     ScoredActionRows,
+		LevelInvocation: invocations,
+	}
+	var out []GateResult
+	for _, l := range []Level{LevelAction, LevelScript, LevelInvocation} {
+		r := merged[l]
+		if r == nil {
+			r = &Reconciliation{Level: l}
+		}
+		g := r.Gate(expected[l])
+		g.Name, g.Scope = "campaign:"+g.Name, ScopeCampaign
+		// Gate() passes a population that merely REACHES the expected count.
+		// At campaign scope the count is the population itself, so more peers
+		// than the frozen population is as wrong as fewer: it means peers from
+		// outside the campaign were counted in.
+		if g.Pass && expected[l] > 0 && len(r.Deltas) != expected[l] {
+			g.Pass = false
+			g.Detail = fmt.Sprintf("population is %d, not the frozen %d", len(r.Deltas), expected[l])
+		}
+		if expected[l] == 0 {
+			g.Pass = false
+			g.Detail = "the population has no invocation peers to reconcile"
+		}
+		out = append(out, g)
+	}
+	return out
 }

@@ -1520,30 +1520,39 @@ func checkBucket(v *Verdict, what, named string) {
 	}
 }
 
-// BootstrapGapResolution is the bound on action-step time before AT_start.
-//
-// It is not an invented threshold: A_GH is reported by GitHub in whole
-// SECONDS, so a gap of up to one tick is indistinguishable from zero and
-// cannot be attributed to anything. Anything beyond one tick is time the
-// action spent before its envelope opened — which, now that the wrapper is
-// installed by the caller, can only be work that belongs inside A.
+// BootstrapGapResolution is A_GH's own reporting resolution: GitHub reports
+// step timestamps in whole SECONDS, so a gap up to one tick is
+// indistinguishable from zero and cannot be attributed to anything.
 const BootstrapGapResolution = int64(second)
 
-// checkBootstrapGap refuses a scored row whose action did work before AT_start.
+// checkBootstrapGap REPORTS action-step time before AT_start. It never changes
+// the verdict.
 //
-// The frozen scope requires A to begin at the first action-owned operation.
-// Reporting the omission through a whole-second diagnostic made it visible; it
-// did not make it bounded, and an unbounded prefix means A measures a
-// different product than the one the campaign compares.
+// The acceptance contract is explicit: A_GH is "an integer-second
+// identity/sanity diagnostic only and never enters balance, non-regression,
+// prediction, or success calculation". Eligibility is success calculation —
+// a campaign's population is assembled from eligible rows — so a finding that
+// makes a row ineligible on the strength of a whole-second GitHub timestamp
+// is A_GH entering the result, whatever the finding is called.
+//
+// An earlier revision gated this. That was wrong, and it is stated here rather
+// than quietly reverted: the underlying concern is real — the contract also
+// requires A to begin at the first action-owned operation, and nothing in the
+// physical ledger can see before AT_start — but bounding the prefix by A_GH is
+// not an available remedy, and making it one is an acceptance-contract
+// decision rather than an implementation choice. The structural control
+// remains: under measurement the wrapper is installed by the caller and
+// `wall begin` is the action's first step, so there is no action-owned work
+// left to precede the envelope.
 func checkBootstrapGap(v *Verdict, gap int64) {
 	if gap < 0 {
-		v.add("WT-026", SeverityIneligible,
-			fmt.Sprintf("AT_start precedes the step GitHub says ran it by %s, so the two cannot describe the same attempt", dur(-gap)))
+		v.add("WT-026", SeverityNote,
+			fmt.Sprintf("diagnostic: AT_start precedes the start GitHub reports for the step by %s. A_GH is whole-second, so this is reported and not scored", dur(-gap)))
 		return
 	}
 	if gap > BootstrapGapResolution {
-		v.add("WT-026", SeverityIneligible,
-			fmt.Sprintf("%s of action-step time ran before AT_start, which is more than A_GH's own %s resolution: the action did work before its envelope opened, so A is not the complete action elapsed. Under measurement the wrapper is installed by the caller and `wall begin` is the action's first step",
+		v.add("WT-026", SeverityNote,
+			fmt.Sprintf("diagnostic: %s of action-step time precedes AT_start, beyond A_GH's own %s resolution. Under measurement the wrapper is installed by the caller and `wall begin` is the action's first step, so this should be runner startup; A_GH never enters a gate, so it is reported and not scored",
 				dur(gap), dur(BootstrapGapResolution)))
 	}
 }

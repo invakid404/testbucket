@@ -48,6 +48,7 @@ func runWallStage1(args []string) error {
 	workflowSHA := fs.String("caller-workflow-sha", "", "caller workflow commit SHA")
 	downstreamRef := fs.String("downstream-ref", "", "downstream ref the caller resolves")
 	authority := fs.String("authority", "ewj2-campaign", "protected environment that authorises these inputs")
+	schedulePath := fs.String("campaign-schedule", "", "the authority-frozen campaign schedule JSON (required for a scored arm): the five predeclared pairs, which run is each arm, the randomisation seed and the UTC date each pair runs on. The contract freezes pair order before the first candidate run, and an order chosen afterwards from whatever ran is a selection nobody predeclared")
 	signers := fs.String("record-signers", "", "comma-separated PUBLIC halves of the run keys allowed to sign a measurement's roster and closing seal (required for a scored row): the wrapper mints its per-producer keys at run time, so what a manifest can bind is the key that attests to them — and without it the records authenticate only themselves")
 	replaySigners := fs.String("replay-signers", "", "comma-separated PUBLIC keys allowed to sign an independent Stage-2 replay attestation. They must not include the authority key: a replay signed by the party that authorised the plan is the planner checking its own work")
 	var allowed stringList
@@ -179,6 +180,25 @@ func runWallStage1(args []string) error {
 		},
 		Signers:       splitList(*signers),
 		ReplaySigners: splitList(*replaySigners),
+	}
+	if *schedulePath != "" {
+		var schedule walltime.CampaignSchedule
+		if err := walltime.ReadJSONFile(*schedulePath, &schedule); err != nil {
+			return err
+		}
+		// Validated HERE, before it is signed. A manifest that carried an
+		// unvalidatable order would bind the campaign to a document the
+		// verifier will refuse, which is a failure discovered eighty rows too
+		// late.
+		if err := schedule.Validate(); err != nil {
+			return err
+		}
+		order, err := schedule.OrderDigest()
+		if err != nil {
+			return err
+		}
+		m.Schedule = schedule
+		fmt.Fprintf(os.Stderr, "testbucket wall: frozen pair order %s over %v\n", order, schedule.SortedDates())
 	}
 	m.AllowedDifferences = allowed
 	if len(allowed) == 0 {

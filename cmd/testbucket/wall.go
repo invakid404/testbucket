@@ -394,6 +394,17 @@ func runWallDigest(args []string) error {
 		if err = walltime.ReadJSONFile(*file, &v); err == nil {
 			d, err = v.DigestOf()
 		}
+	case walltime.ScheduleKind:
+		// A schedule digests to its ORDER, not to the whole document: the
+		// order is what a campaign index cites, and it is what a reordering
+		// changes. The schedule is validated first, because a digest of an
+		// unusable order is a number nobody can act on.
+		var v walltime.CampaignSchedule
+		if err = walltime.ReadJSONFile(*file, &v); err == nil {
+			if err = v.Validate(); err == nil {
+				d, err = v.OrderDigest()
+			}
+		}
 	default:
 		return fmt.Errorf("%s has kind %q, which is not a document this verifier digests", *file, probe.Kind)
 	}

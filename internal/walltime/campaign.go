@@ -35,9 +35,14 @@ type CampaignPairRef struct {
 
 // CampaignIndex is the campaign's population, by reference.
 type CampaignIndex struct {
-	Kind       string            `json:"kind"`
-	CampaignID string            `json:"campaign_id"`
-	Pairs      []CampaignPairRef `json:"pairs"`
+	Kind       string `json:"kind"`
+	CampaignID string `json:"campaign_id"`
+	// OrderDigest is the frozen pair order this campaign claims to be
+	// executing. It is checked against the authority-signed schedule Stage 1
+	// binds; without it the five pairs are whichever five the index happens to
+	// list, which is a selection nobody predeclared.
+	OrderDigest Digest            `json:"order_digest"`
+	Pairs       []CampaignPairRef `json:"pairs"`
 }
 
 // CampaignLoader reads the artifacts an index names. It is an interface so a
@@ -92,6 +97,11 @@ func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []st
 	}
 
 	var pairs []CampaignPair
+	// The frozen ORDER, bound before anything else is believed. Every other
+	// check in this file asks whether a row is genuine; this one asks whether
+	// this is the experiment the authority predeclared, and five genuine pairs
+	// chosen after the fact from ten attempts pass all the others.
+	var schedule *CampaignSchedule
 	for i, ref := range index.Pairs {
 		baseline, bm, bp := loadArm(index, ref.Baseline, "baseline", i, loader, authorityKeys, authority)
 		candidate, cm, cp := loadArm(index, ref.Candidate, "candidate", i, loader, authorityKeys, authority)
@@ -103,6 +113,36 @@ func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []st
 			}
 		}
 		pairs = append(pairs, CampaignPair{Baseline: baseline, Candidate: candidate})
+		// The schedule comes from the arms' own Stage-1 manifests, which are
+		// authority-signed and already verified above. Taking it from the
+		// index instead would let the thing being checked supply its own rule.
+		for _, m := range []*Stage1Manifest{bm, cm} {
+			if m == nil {
+				continue
+			}
+			if err := m.Schedule.Validate(); err != nil {
+				problems = append(problems, fmt.Sprintf("pair %d: %v", i, err))
+				continue
+			}
+			if schedule == nil {
+				sc := m.Schedule
+				schedule = &sc
+				continue
+			}
+			// Every arm must be authorised by the SAME order. Two manifests
+			// carrying different schedules is two campaigns wearing one id.
+			a, errA := schedule.OrderDigest()
+			b, errB := m.Schedule.OrderDigest()
+			if errA == nil && errB == nil && a != b {
+				problems = append(problems, fmt.Sprintf(
+					"pair %d is authorised by a different frozen pair order (%s) than an earlier arm (%s)", i, b, a))
+			}
+		}
+	}
+	if schedule == nil {
+		problems = append(problems, "no arm's Stage-1 manifest binds a frozen campaign schedule, so the pair order, the roles and the dates were all decided outside the authority artifact")
+	} else {
+		problems = append(problems, bindOrder(index, *schedule)...)
 	}
 	return pairs, problems
 }
@@ -203,7 +243,45 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 		} else {
 			problems = append(problems, row+" retains no Aeta sample, so the population-wide forecast mean cannot be computed over it")
 		}
-		run.PredictorSamples = append(run.PredictorSamples, v.PredictorSample...)
+
+		// PREDICTOR COVERAGE, checked per row against that row's own measured
+		// invocation count. Appending whatever samples happen to be present
+		// makes an omission indistinguishable from a row with no invocations,
+		// and eighty such omissions used to reach a passing campaign with the
+		// Pcheck-versus-observed-V gates never evaluated at all.
+		measured := len(v.InvocationNs)
+		run.Invocations = append(run.Invocations, measured)
+		if len(v.PredictorSample) != measured {
+			problems = append(problems, fmt.Sprintf(
+				"%s measured %d invocation(s) but retains %d Pcheck/observed-V sample(s), so it is not evidence for the predictor gates",
+				row, measured, len(v.PredictorSample)))
+		}
+		// The samples are re-keyed to this arm's bucket ORDINAL. A verdict
+		// carries the bucket index its own plan gave it; the campaign counts
+		// coverage per row, and two rows that shared an index would collide.
+		for _, sample := range v.PredictorSample {
+			sample.BucketIndex = j
+			run.PredictorSamples = append(run.PredictorSamples, sample)
+		}
+
+		// RECONCILIATION, retained so the campaign can compute the frozen
+		// aggregate. The verifier decides each row's own 50/100 ms gate; only
+		// the campaign can decide it over all 80 action peers, all 80 script
+		// peers and every actual invocation peer, and it can only do that from
+		// the deltas.
+		if len(v.Recon) == 0 {
+			problems = append(problems, row+" retains no like-for-like reconciliation, so the campaign-wide peer/trace population cannot be computed over it")
+		}
+		// COPIED, not aliased. A Reconciliation carries a slice, so appending
+		// the struct would leave the campaign's aggregate sharing memory with
+		// the signed verdict it came from — and anything that later touched
+		// the aggregate would silently edit the document whose signature is
+		// the only reason the numbers are believed.
+		for _, r := range v.Recon {
+			run.Recon = append(run.Recon, Reconciliation{
+				Level: r.Level, Deltas: append([]int64(nil), r.Deltas...),
+			})
+		}
 	}
 	return run, manifest, problems
 }

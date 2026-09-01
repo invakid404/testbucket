@@ -1974,37 +1974,29 @@ func TestCoverageAuditIsAnEligibilityCondition(t *testing.T) {
 	}
 }
 
-// A is defined as the COMPLETE Run-bucket action elapsed, starting at the
-// first action-owned operation. Reporting a prefix through a whole-second
-// diagnostic made it visible; it did not bound it, and an unbounded prefix
-// means A measures a different product than the campaign compares.
-func TestActionOwnedWorkBeforeTheEnvelopeIsRefused(t *testing.T) {
+// A_GH is frozen as an identity/sanity diagnostic that "never enters balance,
+// non-regression, prediction, or success calculation". Eligibility IS success
+// calculation — a campaign's population is assembled from eligible rows — so a
+// whole-second GitHub timestamp must never decide one.
+//
+// An earlier revision gated the pre-envelope gap on exactly that timestamp.
+// This test pins the contract's rule instead: the gap is REPORTED, in full,
+// and the row still stands on its physical records.
+func TestTheStepDiagnosticNeverDecidesEligibility(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		start time.Duration
 		want  string
 	}{
 		{
-			name:  "a wrapper installed inside the action",
+			name:  "a large prefix before the envelope opened",
 			start: -12 * time.Second,
-			want:  "ran before AT_start",
+			want:  "precedes AT_start",
 		},
 		{
-			// The fixture's step already starts a fraction of a second before
-			// AT_start; whole-second reporting cannot distinguish that from
-			// zero, so it is not attributed to anything and the row stands.
 			name:  "a prefix inside A_GH's own resolution",
 			start: 0,
 			want:  "",
-		},
-		{
-			// Refused, though by the step-attempt identity check rather than
-			// the gap bound: an envelope that claims to have opened before the
-			// step that ran it is not describing that step. The assertion is
-			// on the outcome for that reason.
-			name:  "an envelope that opened before the step did",
-			start: 5 * time.Second,
-			want:  "outside the step attempt's precision-widened interval",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2033,22 +2025,28 @@ func TestActionOwnedWorkBeforeTheEnvelopeIsRefused(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var details []string
-			for _, f := range v.Findings {
-				details = append(details, f.Detail)
-			}
-			joined := strings.Join(details, "\n")
-			if tc.want == "" {
-				if !v.Eligible {
-					t.Errorf("a prefix within the diagnostic's own resolution made the row ineligible:\n%s", joined)
+			// The row stands either way: what GitHub reports about the step
+			// cannot decide whether the physical envelope is scorable.
+			if !v.Eligible {
+				var details []string
+				for _, f := range v.Findings {
+					details = append(details, f.Severity+" "+f.Detail)
 				}
+				t.Errorf("a whole-second step timestamp made the row ineligible:\n%s", strings.Join(details, "\n"))
+			}
+			var notes []string
+			for _, f := range v.Findings {
+				if f.Severity == SeverityNote {
+					notes = append(notes, f.Detail)
+				}
+			}
+			joined := strings.Join(notes, "\n")
+			if tc.want == "" {
 				return
 			}
-			if v.Eligible {
-				t.Errorf("an action that did work before its envelope opened was scored")
-			}
+			// Reported in full, as a diagnostic — visible, and not scored.
 			if !strings.Contains(joined, tc.want) {
-				t.Errorf("no finding mentions %q:\n%s", tc.want, joined)
+				t.Errorf("the gap was not reported as a diagnostic:\n%s", joined)
 			}
 		})
 	}

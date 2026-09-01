@@ -46,9 +46,14 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 		t.Fatal(err)
 	}
 
+	// The authority freezes WHICH five pairs, which arm is which, and the
+	// order and dates they run in — before any of them runs. Both manifests
+	// carry the same schedule, and the index below must execute exactly it.
+	schedule := testSchedule()
 	sign := func(role string, candidateTuple bool) (*Stage1Manifest, Digest) {
 		m := testManifest(testBundle(), regDigest)
 		m.Role = role
+		m.Schedule = schedule
 		if candidateTuple {
 			// The enumerated permitted difference: a different testbucket
 			// source/action/binary, and the wrappers that come with it.
@@ -75,12 +80,16 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 		verdicts:  map[string]*Verdict{},
 		manifests: map[string]*Stage1Manifest{"baseline.json": baseline, "candidate.json": candidate},
 	}
-	idx := CampaignIndex{Kind: CampaignIndexKind, CampaignID: "ewj2"}
+	order, err := schedule.OrderDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := CampaignIndex{Kind: CampaignIndexKind, CampaignID: "ewj2", OrderDigest: order}
 	for pair := 0; pair < CampaignPairs; pair++ {
 		arm := func(role, runID string, stage1, verifier Digest, top, step int64) CampaignArm {
 			a := CampaignArm{
 				RunID: runID, Terminal: TerminalPassed,
-				StartedAt:  fmt.Sprintf("2026-09-%02dT0%d:00:00Z", 1+pair%3, pair),
+				StartedAt:  scheduledInstant(pair),
 				Stage1Path: role + ".json",
 			}
 			for b := 0; b < BucketsPerRun; b++ {
@@ -100,6 +109,14 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 						LowerNs: observed - 5*second, UpperNs: observed + 5*second,
 						ObservedNs: observed,
 					},
+					// A row that measured invocations and RETAINS the evidence
+					// about them. The fixture used to carry an Aeta sample and
+					// nothing else, which is why the Pcheck-versus-observed-V
+					// and like-for-like gates could be absent from a campaign
+					// this same fixture called fully authenticated.
+					InvocationNs:    invocationNs(observed),
+					PredictorSample: predictorSamples(b, observed),
+					Recon:           reconFor(len(invocationNs(observed))),
 					Run: RunIdentity{
 						CampaignID: "ewj2", RunID: runID, BucketID: fmt.Sprint(b), Stage1: stage1,
 					},
@@ -399,4 +416,351 @@ func gateNames(gates []GateResult) []string {
 		out = append(out, g.Name)
 	}
 	return out
+}
+
+// invocationsPerBucket is how many invocations each fixture bucket measures.
+// It is small and fixed so the campaign-wide invocation-peer population is a
+// number a reader can check by hand: 80 rows times this.
+const invocationsPerBucket = 2
+
+// invocationNs splits a bucket's action into its measured invocations. The
+// values only have to be positive and consistent with the samples below; what
+// is under test is that they are RETAINED and COUNTED, not their magnitude.
+func invocationNs(action int64) []int64 {
+	out := make([]int64, invocationsPerBucket)
+	for i := range out {
+		out[i] = action / int64(invocationsPerBucket+2)
+	}
+	return out
+}
+
+// predictorSamples pairs each invocation's frozen projection with what it
+// observed, one per invocation — the coverage the campaign now requires.
+func predictorSamples(bucket int, action int64) []PredictorSample {
+	var out []PredictorSample
+	for i, ns := range invocationNs(action) {
+		out = append(out, PredictorSample{
+			InvocationSeq: i, BucketIndex: bucket,
+			// Within the frozen 5 s MAE and 10 s individual limits.
+			PredictedNs: ns + int64(i)*100*millisecond, ObservedNs: ns,
+		})
+	}
+	return out
+}
+
+// reconFor is one row's like-for-like population: its action peer, its script
+// peer and one peer per invocation, each inside the frozen 50 ms / 100 ms
+// bounds.
+func reconFor(invocations int) []Reconciliation {
+	out := []Reconciliation{
+		{Level: LevelAction, Deltas: []int64{3 * millisecond}},
+		{Level: LevelScript, Deltas: []int64{-2 * millisecond}},
+	}
+	inv := Reconciliation{Level: LevelInvocation}
+	for i := 0; i < invocations; i++ {
+		inv.Deltas = append(inv.Deltas, int64(i+1)*millisecond)
+	}
+	if len(inv.Deltas) > 0 {
+		out = append(out, inv)
+	}
+	return out
+}
+
+// The frozen contract puts the Pcheck-versus-observed-V gates and the
+// like-for-like 50 ms / 100 ms reconciliation over the WHOLE population. Both
+// used to be satisfiable by absence: a verdict that retained neither was
+// accepted, `EvaluatePredictor` on an empty set returned a row-scope finding
+// that campaign scope discarded, and no reconciliation gate was computed at
+// all. Eighty such rows reached a passing campaign.
+//
+// Each case starts from the positive fixture and removes exactly one kind of
+// evidence.
+func TestCampaignRefusesAPopulationMissingItsEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// strip edits one row of the otherwise complete population.
+		strip func(v *Verdict)
+		want  string
+	}{
+		{
+			name:  "a row that retains no predictor samples",
+			strip: func(v *Verdict) { v.PredictorSample = nil },
+			want:  "retains 0 Pcheck/observed-V sample(s)",
+		},
+		{
+			name:  "a row that retains fewer samples than it measured invocations",
+			strip: func(v *Verdict) { v.PredictorSample = v.PredictorSample[:1] },
+			want:  "retains 1 Pcheck/observed-V sample(s)",
+		},
+		{
+			name: "a row that claims samples for invocations it never measured",
+			strip: func(v *Verdict) {
+				v.InvocationNs = nil
+			},
+			want: "measured 0 invocation(s)",
+		},
+		{
+			name:  "a row that retains no reconciliation",
+			strip: func(v *Verdict) { v.Recon = nil },
+			want:  "retains no like-for-like reconciliation",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, loader, keys, key := campaignFixture(t)
+			resign(loader.verdicts["baseline-2-3.json"], key, tc.strip)
+
+			_, problems := LoadCampaign(idx, loader, keys, "ewj2-campaign")
+			if len(problems) == 0 {
+				t.Fatalf("a population missing its evidence was accepted")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tc.want) {
+				t.Errorf("no problem mentions %q:\n%s", tc.want, strings.Join(problems, "\n"))
+			}
+		})
+	}
+}
+
+// And the gates themselves: even a population that loads must be REFUSED when
+// the evidence it carries does not cover what the contract measures. A
+// campaign that reconciled sixty of its eighty action peers perfectly has not
+// reconciled the eighty it claims.
+func TestCampaignGatesRefuseIncompleteEvidence(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	pairs, problems := LoadCampaign(idx, loader, keys, "ewj2-campaign")
+	if len(problems) != 0 {
+		t.Fatalf("the positive fixture no longer loads: %v", problems)
+	}
+	if failed := failedGates(EvaluateCampaign(pairs)); len(failed) != 0 {
+		t.Fatalf("the complete population failed: %v", failed)
+	}
+
+	for _, tc := range []struct {
+		name string
+		edit func(p []CampaignPair)
+		want string
+	}{
+		{
+			name: "the predictor samples are dropped after loading",
+			edit: func(p []CampaignPair) {
+				for i := range p {
+					p[i].Baseline.PredictorSamples = nil
+					p[i].Candidate.PredictorSamples = nil
+				}
+			},
+			want: "predictor:coverage",
+		},
+		{
+			name: "the reconciliation population is dropped after loading",
+			edit: func(p []CampaignPair) {
+				for i := range p {
+					p[i].Baseline.Recon = nil
+					p[i].Candidate.Recon = nil
+				}
+			},
+			want: "campaign:reconciliation:action",
+		},
+		{
+			name: "one action peer is missing from the eighty",
+			edit: func(p []CampaignPair) {
+				for i := range p[0].Baseline.Recon {
+					if p[0].Baseline.Recon[i].Level == LevelAction {
+						p[0].Baseline.Recon[i].Deltas = nil
+						break
+					}
+				}
+			},
+			want: "campaign:reconciliation:action",
+		},
+		{
+			name: "one peer delta exceeds the frozen maximum",
+			edit: func(p []CampaignPair) {
+				for i := range p[0].Candidate.Recon {
+					if p[0].Candidate.Recon[i].Level == LevelScript {
+						p[0].Candidate.Recon[i].Deltas[0] = 250 * millisecond
+						break
+					}
+				}
+			},
+			want: "campaign:reconciliation:script",
+		},
+		{
+			name: "one invocation's prediction misses by more than the frozen limit",
+			edit: func(p []CampaignPair) {
+				p[0].Candidate.PredictorSamples[0].PredictedNs += 30 * second
+			},
+			want: "predictor:invocation-max",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fresh, problems := LoadCampaign(idx, loader, keys, "ewj2-campaign")
+			if len(problems) != 0 {
+				t.Fatalf("fixture: %v", problems)
+			}
+			tc.edit(fresh)
+			failed := failedGates(EvaluateCampaign(fresh))
+			if len(failed) == 0 {
+				t.Fatalf("a campaign missing %s still passed every gate", tc.want)
+			}
+			found := false
+			for _, name := range failed {
+				if name == tc.want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("gate %q did not fail; failures were %v", tc.want, failed)
+			}
+		})
+	}
+}
+
+// failedGates names the gates that did not pass.
+func failedGates(gates []GateResult) []string {
+	var out []string
+	for _, g := range gates {
+		if !g.Pass {
+			out = append(out, g.Name)
+		}
+	}
+	return out
+}
+
+// testSchedule is the authority-frozen pair order the fixture executes: five
+// predeclared pairs, named arms, across three UTC dates.
+func testSchedule() CampaignSchedule {
+	s := CampaignSchedule{Kind: ScheduleKind, CampaignID: "ewj2", Seed: 20260901}
+	for pair := 0; pair < CampaignPairs; pair++ {
+		s.Pairs = append(s.Pairs, ScheduledPair{
+			Index:        pair,
+			BaselineRun:  fmt.Sprintf("b%d", pair),
+			CandidateRun: fmt.Sprintf("c%d", pair),
+			Date:         scheduledDate(pair),
+		})
+	}
+	return s
+}
+
+// scheduledDate and scheduledInstant keep the schedule and the runs that
+// execute it derived from one source, so the fixture cannot drift the way the
+// verifier now refuses to let a campaign drift.
+func scheduledDate(pair int) string { return fmt.Sprintf("2026-09-%02d", 1+pair%3) }
+func scheduledInstant(pair int) string {
+	return fmt.Sprintf("%sT0%d:00:00Z", scheduledDate(pair), pair)
+}
+
+// The contract requires the authority-signed Stage-1 artifact to bind campaign
+// and pair order BEFORE planning and role assignment, and to freeze that order
+// before the first candidate run. Without it, which five pairs count, which arm
+// is baseline, and the sequence they are attempted in are all decided after the
+// authority has signed — and five genuine pairs chosen after the fact from ten
+// attempts pass every other check in this package.
+func TestCampaignMustExecuteTheFrozenPairOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// edit changes the index, the schedule, or both.
+		edit func(t *testing.T, idx *CampaignIndex, m map[string]*Stage1Manifest, key ed25519.PrivateKey)
+		want string
+	}{
+		{
+			name: "no frozen schedule at all",
+			edit: func(t *testing.T, idx *CampaignIndex, m map[string]*Stage1Manifest, key ed25519.PrivateKey) {
+				for _, mf := range m {
+					resignManifest(t, mf, key, func(mf *Stage1Manifest) { mf.Schedule = CampaignSchedule{} })
+				}
+			},
+			want: "binds a frozen campaign schedule",
+		},
+		{
+			name: "the index names no order",
+			edit: func(t *testing.T, idx *CampaignIndex, _ map[string]*Stage1Manifest, _ ed25519.PrivateKey) {
+				idx.OrderDigest = ""
+			},
+			want: "names no frozen pair order",
+		},
+		{
+			name: "the index claims an order the authority did not freeze",
+			edit: func(t *testing.T, idx *CampaignIndex, _ map[string]*Stage1Manifest, _ ed25519.PrivateKey) {
+				idx.OrderDigest = "sha256:some-other-order"
+			},
+			want: "but the authority froze",
+		},
+		{
+			name: "the pairs are run in a different sequence",
+			edit: func(t *testing.T, idx *CampaignIndex, _ map[string]*Stage1Manifest, _ ed25519.PrivateKey) {
+				idx.Pairs[0], idx.Pairs[4] = idx.Pairs[4], idx.Pairs[0]
+			},
+			want: "the frozen order predeclared",
+		},
+		{
+			name: "a run nobody predeclared is substituted into a pair",
+			edit: func(t *testing.T, idx *CampaignIndex, _ map[string]*Stage1Manifest, _ ed25519.PrivateKey) {
+				idx.Pairs[2].Candidate.RunID = "c-rerun"
+			},
+			want: `pair 2's candidate is run "c-rerun"`,
+		},
+		{
+			name: "a pair ran on a date it was not scheduled for",
+			edit: func(t *testing.T, idx *CampaignIndex, _ map[string]*Stage1Manifest, _ ed25519.PrivateKey) {
+				idx.Pairs[1].Baseline.StartedAt = "2026-09-09T01:00:00Z"
+			},
+			want: "but the frozen order scheduled",
+		},
+		{
+			name: "the two arms are authorised by different orders",
+			edit: func(t *testing.T, idx *CampaignIndex, m map[string]*Stage1Manifest, key ed25519.PrivateKey) {
+				resignManifest(t, m["candidate.json"], key, func(mf *Stage1Manifest) {
+					mf.Schedule.Seed = 999
+				})
+			},
+			want: "authorised by a different frozen pair order",
+		},
+		{
+			name: "the schedule reuses one run across two pairs",
+			edit: func(t *testing.T, idx *CampaignIndex, m map[string]*Stage1Manifest, key ed25519.PrivateKey) {
+				for _, mf := range m {
+					resignManifest(t, mf, key, func(mf *Stage1Manifest) {
+						mf.Schedule.Pairs[3].BaselineRun = mf.Schedule.Pairs[0].BaselineRun
+					})
+				}
+			},
+			want: "pairs would not be independent",
+		},
+		{
+			name: "the schedule spans fewer than the frozen minimum of UTC dates",
+			edit: func(t *testing.T, idx *CampaignIndex, m map[string]*Stage1Manifest, key ed25519.PrivateKey) {
+				for _, mf := range m {
+					resignManifest(t, mf, key, func(mf *Stage1Manifest) {
+						for i := range mf.Schedule.Pairs {
+							mf.Schedule.Pairs[i].Date = "2026-09-01"
+						}
+					})
+				}
+			},
+			want: "UTC date(s), and the frozen campaign needs at least",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, loader, keys, key := campaignFixture(t)
+			tc.edit(t, &idx, loader.manifests, key)
+
+			_, problems := LoadCampaign(idx, loader, keys, "ewj2-campaign")
+			if len(problems) == 0 {
+				t.Fatalf("a campaign that did not execute the frozen order was accepted")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tc.want) {
+				t.Errorf("no problem mentions %q:\n%s", tc.want, strings.Join(problems, "\n"))
+			}
+		})
+	}
+}
+
+// resignManifest applies an edit and re-signs, so a refusal case tests the
+// field it names rather than the broken signature the edit would leave.
+func resignManifest(t *testing.T, m *Stage1Manifest, key ed25519.PrivateKey, edit func(*Stage1Manifest)) {
+	t.Helper()
+	edit(m)
+	m.Signature = nil
+	if err := m.Sign("ewj2-campaign", key); err != nil {
+		t.Fatal(err)
+	}
 }

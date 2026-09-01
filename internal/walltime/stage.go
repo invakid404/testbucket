@@ -336,6 +336,13 @@ type Stage1Manifest struct {
 	// AllowedDifferences enumerates what may differ between the two arms of a
 	// pair. Anything else differing fails the pair.
 	AllowedDifferences []string `json:"allowed_differences"`
+	// Schedule is the authority-frozen campaign identity and pair order. The
+	// contract requires Stage 1 to bind campaign/pair order before planning
+	// and role assignment, and to freeze that order before the first candidate
+	// run: without it, which five pairs count, which arm is baseline, and the
+	// sequence they are attempted in are all decided after this document is
+	// signed.
+	Schedule CampaignSchedule `json:"campaign_schedule"`
 	// Registry is the frozen Aeta component-registry template digest.
 	Registry Digest `json:"component_registry_digest"`
 	// Bundle is the planning-input bundle this manifest authorises.
@@ -1013,6 +1020,10 @@ func (m Stage1Manifest) InvariantTuple() map[string]string {
 		"component_registry":      string(m.Registry),
 		"store_receipt":           string(mustDigestOf(m.Store)),
 		"allowed_differences":     string(mustDigestOf(m.AllowedDifferences)),
+		// The frozen pair ORDER. Both arms of a pair must be authorised by the
+		// same schedule; two manifests carrying different orders are two
+		// campaigns sharing an id, and comparing their arms compares nothing.
+		"campaign_schedule": string(mustDigestOf(m.Schedule)),
 		// The entire planning-input bundle: discovery and runnable bytes, the
 		// acquisition closure, every parser and policy, both algorithm
 		// implementations, the absent-input claims, the selection AND the
