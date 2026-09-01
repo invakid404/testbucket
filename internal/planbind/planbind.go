@@ -24,7 +24,6 @@ package planbind
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -58,9 +57,17 @@ type AcquireOptions struct {
 	K          int
 	Count      int
 	Token      string
-	// StorePath is the timing store; its exact bytes are frozen into the
-	// bundle. A missing store is an explicit absent input, not an error.
+	// StorePath names the timing store, and StoreBytes are its EXACT bytes as
+	// the caller read them. The bytes are passed in rather than re-read here:
+	// the caller has already used them to decide which targets need a runnable
+	// listing, and a second read could freeze a different store than the one
+	// that decision was made from.
 	StorePath string
+	// StoreBytes is nil when the store is absent, which is a bound cold start.
+	StoreBytes []byte
+	// StoreAbsent distinguishes "no store" from "an empty store": both are
+	// legitimate, and only one of them is a cold start.
+	StoreAbsent bool
 	// Discovery is the raw discovery output and the argv that produced it.
 	DiscoveryArgv []string
 	Discovery     []byte
@@ -117,9 +124,22 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 	}
 	for _, id := range sortedKeys(opt.Runnables) {
 		raw := opt.Runnables[id]
+		// The names are parsed HERE, through the bound parser, and frozen
+		// alongside the bytes. Freezing only the bytes would leave the runtime
+		// feature vector to re-derive them, and the one thing worse than a
+		// missing feature is a feature that reports zero while the evidence in
+		// the same bundle says otherwise.
+		names, err := vitestrunner.ParseRunnableNames(opt.Root, id, raw)
+		if err != nil {
+			return nil, fmt.Errorf("planbind: freeze the runnable listing for %s: %w", id, err)
+		}
+		if len(raw) > 0 && len(names) == 0 {
+			return nil, fmt.Errorf("planbind: the runnable listing for %s parsed to no names; a target flagged for slicing with no runnable universe cannot be sliced", id)
+		}
 		b.Runnables = append(b.Runnables, walltime.RunnableSnapshot{
 			TargetID: id,
 			Argv:     []string{"vitest", "list", id, "--json"},
+			Names:    names,
 			Empty:    len(raw) == 0,
 			Bytes:    raw,
 			Digest:   walltime.DigestBytes(raw),
@@ -129,18 +149,13 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 		b.AbsentInputs = append(b.AbsentInputs, "runnable_listings: no name-sliced target in this plan")
 	}
 
-	storeBytes, err := os.ReadFile(opt.StorePath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("planbind: read store %s: %w", opt.StorePath, err)
-		}
+	if opt.StoreAbsent {
 		// A cold start is normal and must be BOUND as a cold start, so a
 		// replay cold-starts too instead of finding a store that appeared
 		// later.
-		storeBytes = nil
 		b.AbsentInputs = append(b.AbsentInputs, "store: cold start, no store at "+opt.StorePath)
 	}
-	b.Store = walltime.NewRawSnapshot(opt.StorePath, nil, opt.Root, storeBytes)
+	b.Store = walltime.NewRawSnapshot(opt.StorePath, nil, opt.Root, opt.StoreBytes)
 
 	b.Source.Repository, b.Source.Commit, b.Source.Tree = opt.Repository, opt.Commit, opt.Tree
 	b.Acquisition.Argv = append([]string{"testbucket", "wall", "bundle"}, opt.DiscoveryArgv...)

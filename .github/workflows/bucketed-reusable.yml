@@ -139,6 +139,19 @@ on:
           Stage-1 signature as authority approval without one.
         type: string
         default: ""
+      frozen-documents-artifact:
+        description: >-
+          Name of an artifact holding the frozen documents a scored row needs:
+          the signed Stage-1 manifest (`stage1.json`), the Stage-2 derived-plan
+          receipt (`stage2.json`), the independent replay attestation
+          (`replay.json`), the Aeta component registry (`registry.json`), and
+          per-bucket `aeta-<n>.json` / `pcheck-<n>.json`. The campaign harness
+          produces and uploads it; this workflow downloads it and hands each
+          bucket its own files. Without it `verify-require: eligible` fails
+          closed, because the verifier is being asked to prove something it has
+          not been given.
+        type: string
+        default: ""
       runs-on:
         description: 'Runner label for every job.'
         type: string
@@ -242,6 +255,18 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         run: npm ci
 
+      # A scored row is verified against documents this workflow does not
+      # produce: the signed manifest, the one authorised Stage-2 receipt, the
+      # independent replay attestation, and this bucket's own forecast and
+      # projection. They are downloaded here so the verifier has them, rather
+      # than the bucket claiming eligibility it cannot demonstrate.
+      - name: Download the frozen documents
+        if: inputs.frozen-documents-artifact != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.frozen-documents-artifact }}
+          path: ${{ runner.temp }}/testbucket-frozen
+
       - name: Run bucket ${{ matrix.bucket }}
         uses: $/.github/actions/run-bucket
         with:
@@ -263,6 +288,25 @@ jobs:
           verify-require: ${{ inputs.verify-require }}
           authority: ${{ inputs.authority }}
           authority-key: ${{ inputs.authority-key }}
+          wall-records-artifact: ${{ inputs.wall-time-dir != '' && format('testbucket-wall-{0}-bucket-{1}', inputs.cache-scope, matrix.bucket) || '' }}
+          stage1-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage1.json', runner.temp) || '' }}
+          stage2-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage2.json', runner.temp) || '' }}
+          replay-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/replay.json', runner.temp) || '' }}
+          registry-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/registry.json', runner.temp) || '' }}
+          aeta-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/aeta-{1}.json', runner.temp, matrix.bucket) || '' }}
+          pcheck-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/pcheck-{1}.json', runner.temp, matrix.bucket) || '' }}
+
+      # The raw records and the verdict ARE the evidence: a campaign assembles
+      # its population from them, and a row whose records were discarded with
+      # the runner cannot be re-verified by anyone.
+      - name: Upload the wall-time records
+        if: always() && inputs.wall-time-dir != ''
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: testbucket-wall-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
+          path: ${{ inputs.wall-time-dir }}
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Upload timing events
         # if: always() so a red bucket still contributes what it measured;

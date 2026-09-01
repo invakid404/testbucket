@@ -2,6 +2,7 @@ package planbind
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 
@@ -146,5 +147,86 @@ func unitFixture() runner.Unit {
 		ID: "tests/alpha.spec.ts[alpha one]", Kind: runner.KindRunSlice, Count: 1,
 		Run:      []string{"alpha one"},
 		Packages: []runner.LivePackage{{ID: "tests/alpha.spec.ts", HasTests: true}},
+	}
+}
+
+// TestRunnableCountComesFromTheFrozenListing is the numeric half of the
+// provenance check. Provenance says WHERE a feature came from; this says the
+// value is actually the one the frozen evidence carries.
+//
+// The failure it guards against is quiet: a bundle that freezes raw listing
+// bytes but no parsed names presents a satisfied scorer schema while reporting
+// a count of zero, which changes allocation, Pcheck and Aeta together while
+// looking entirely well-formed.
+func TestRunnableCountComesFromTheFrozenListing(t *testing.T) {
+	root := t.TempDir()
+	b := acquire(t, root, nil)
+
+	if len(b.Runnables) != 1 {
+		t.Fatalf("the bundle froze %d runnable listing(s), want 1", len(b.Runnables))
+	}
+	snap := b.Runnables[0]
+	if got, want := len(snap.Names), 2; got != want {
+		t.Errorf("the frozen listing parsed to %d names (%v), want %d", got, snap.Names, want)
+	}
+	// Vitest's -t matches the space-joined form, so the parser sorts; the
+	// frozen order is the parser's, not the capture's.
+	if len(snap.Names) == 2 && !sort.StringsAreSorted(snap.Names) {
+		t.Errorf("the frozen names are not in the parser's order: %v", snap.Names)
+	}
+
+	fb := NewFeatureBuilder(b, nil, "sha256:stage1")
+	v := fb.Vector(runner.Unit{
+		ID: "tests/alpha.spec.ts", Kind: runner.KindPackage, Count: 1,
+		Packages: []runner.LivePackage{{ID: "tests/alpha.spec.ts", HasTests: true}},
+	})
+	got, ok := v.Value("runnable_count")
+	if !ok {
+		t.Fatalf("the vector has no runnable_count")
+	}
+	if got != 2 {
+		t.Errorf("runnable_count = %v, want 2 — the frozen listing names two tests", got)
+	}
+
+	// A slice of one of those two names is half the file.
+	slice := fb.Vector(runner.Unit{
+		ID: "tests/alpha.spec.ts[alpha one]", Kind: runner.KindRunSlice, Count: 1,
+		Run:      []string{"alpha one"},
+		Packages: []runner.LivePackage{{ID: "tests/alpha.spec.ts", HasTests: true}},
+	})
+	if share, _ := slice.Value("slice_share"); share != 0.5 {
+		t.Errorf("slice_share = %v, want 0.5", share)
+	}
+}
+
+// TestFrozenListingRefusesTruncatedEvidence: a listing whose bytes are present
+// but parse to nothing is refused at acquisition, not silently frozen as a
+// zero count. The empty-title case must survive, because `test("")` is a real
+// runnable and dropping it would slice a whale over an incomplete universe.
+func TestFrozenListingRefusesTruncatedEvidence(t *testing.T) {
+	root := t.TempDir()
+	if _, err := Acquire(baseAcquire(t, root, func(o *AcquireOptions) {
+		o.Runnables = map[string][]byte{"tests/alpha.spec.ts": []byte(`[]`)}
+	})); err == nil {
+		t.Errorf("a listing that parses to no names was frozen for a sliced target")
+	}
+	// A row with no name field at all is a truncated capture, and the bound
+	// parser refuses it rather than dropping a test.
+	if _, err := Acquire(baseAcquire(t, root, func(o *AcquireOptions) {
+		o.Runnables = map[string][]byte{"tests/alpha.spec.ts": []byte(`[{"file":"tests/alpha.spec.ts"}]`)}
+	})); err == nil {
+		t.Errorf("a truncated listing row was frozen")
+	}
+	// A legal empty title is kept.
+	b, err := Acquire(baseAcquire(t, root, func(o *AcquireOptions) {
+		o.Runnables = map[string][]byte{
+			"tests/alpha.spec.ts": []byte(`[{"name":"","file":"tests/alpha.spec.ts"},{"name":"named","file":"tests/alpha.spec.ts"}]`),
+		}
+	}))
+	if err != nil {
+		t.Fatalf("a legal empty-title runnable was refused: %v", err)
+	}
+	if got := len(b.Runnables[0].Names); got != 2 {
+		t.Errorf("froze %d names, want 2 — the empty title is a real runnable", got)
 	}
 }

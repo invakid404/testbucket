@@ -108,6 +108,11 @@ func (v FeatureVector) Validate(schema []string) error {
 	return nil
 }
 
+// Value looks a feature up by name. It is exported because the value a
+// feature carries is as much a part of the contract as its provenance: a test
+// that only checks where a number came from cannot notice that it is wrong.
+func (v FeatureVector) Value(name string) (float64, bool) { return v.value(name) }
+
 // value looks a feature up by name.
 func (v FeatureVector) value(name string) (float64, bool) {
 	for _, f := range v.Features {

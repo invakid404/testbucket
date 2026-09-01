@@ -112,6 +112,17 @@ func parseList(root string, data []byte) ([]runner.LivePackage, error) {
 // name added since the last record — the steady-state case is already demoted at
 // ingest, so refusing here is rare, and refusing beats emitting a slice that
 // would double-run a test.
+// ParseRunnableNames is the exported entry point to the bound runnable parser.
+//
+// It exists so a planning-input bundle can freeze the raw listing bytes AND
+// the names those bytes parse to, through the same parser the planner uses. A
+// bundle that carried only the bytes would leave every consumer to re-derive
+// the names, and a consumer that guessed — or defaulted to none — would report
+// a pre-plan feature that disagrees with the evidence it was taken from.
+func ParseRunnableNames(root, file string, data []byte) ([]string, error) {
+	return runnableNames(root, file, data)
+}
+
 func runnableNames(root, file string, data []byte) ([]string, error) {
 	var rows []listEntry
 	if err := json.Unmarshal(data, &rows); err != nil {

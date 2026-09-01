@@ -79,6 +79,13 @@ func DecodeKey(s string) (ed25519.PrivateKey, error) {
 	return ed25519.PrivateKey(b), nil
 }
 
+// SignDigest produces the detached signature value a Signature carries. It is
+// one function so every document in this package is signed the same way and a
+// second implementation cannot drift.
+func SignDigest(k ed25519.PrivateKey, d Digest) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(k, []byte(d)))
+}
+
 // PublicKeyOf renders a signer id (the hex public key) from a private key.
 func PublicKeyOf(k ed25519.PrivateKey) string {
 	return hex.EncodeToString(k.Public().(ed25519.PublicKey))

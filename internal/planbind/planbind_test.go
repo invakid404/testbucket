@@ -29,17 +29,33 @@ const storeJSON = `{
   }
 }`
 
+// testCommit is a FULL commit SHA: the bundle refuses an abbreviation, because
+// a prefix is something another object can grow into.
+const testCommit = "d9ae1d433bb45012c04d567879b66fc4bf6112c6"
+
 // runnableJSON is what `vitest list <file> --json` prints for the sliced file.
 const runnableJSON = `[{"name":"alpha one","file":"tests/alpha.spec.ts"},{"name":"alpha two","file":"tests/alpha.spec.ts"}]`
 
 func acquire(t *testing.T, root string, mutate func(*AcquireOptions)) *walltime.PlanningInputBundle {
+	t.Helper()
+	b, err := Acquire(baseAcquire(t, root, mutate))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	return b
+}
+
+// baseAcquire is the fixture's acquisition options, so a test can vary one
+// input and call Acquire itself when it expects a refusal.
+func baseAcquire(t *testing.T, root string, mutate func(*AcquireOptions)) AcquireOptions {
 	t.Helper()
 	storePath := filepath.Join(root, "test-timings.json")
 	if err := os.WriteFile(storePath, []byte(storeJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	opt := AcquireOptions{
-		Root: root, Runner: "vitest",
+		StoreBytes: []byte(storeJSON),
+		Root:       root, Runner: "vitest",
 		Instant:       time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC),
 		StaleAfter:    14 * 24 * time.Hour,
 		K:             2,
@@ -52,16 +68,12 @@ func acquire(t *testing.T, root string, mutate func(*AcquireOptions)) *walltime.
 		Env:           map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": ""},
 		Executables:   map[string]string{"npx": "/usr/local/bin/npx"},
 		Tools:         map[string]string{"node": "24.19.0"},
-		Repository:    "example/mandel", Commit: "d9ae1d43", Tree: "sha256:tree",
+		Repository:    "example/mandel", Commit: testCommit, Tree: "sha256:tree",
 	}
 	if mutate != nil {
 		mutate(&opt)
 	}
-	b, err := Acquire(opt)
-	if err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	return b
+	return opt
 }
 
 func plan(t *testing.T, b *walltime.PlanningInputBundle) *Result {
@@ -182,8 +194,11 @@ func TestColdStartIsBoundAsAColdStart(t *testing.T) {
 	b, err := Acquire(AcquireOptions{
 		Root: root, Runner: "vitest", Instant: time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC),
 		StaleAfter: 14 * 24 * time.Hour, K: 2, Count: 1, Token: "vitest",
-		StorePath: filepath.Join(root, "absent.json"),
-		Discovery: []byte(discoveryJSON),
+		StorePath: filepath.Join(root, "absent.json"), StoreAbsent: true,
+		Discovery:   []byte(discoveryJSON),
+		Executables: map[string]string{"npx": "/usr/local/bin/npx"},
+		Env:         map[string]string{},
+		Repository:  "example/mandel", Commit: testCommit, Tree: "sha256:tree",
 	})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)

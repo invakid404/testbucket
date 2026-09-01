@@ -50,12 +50,6 @@ func NewFeatureBuilder(b *walltime.PlanningInputBundle, live []runner.LivePackag
 	}
 	for _, r := range b.Runnables {
 		fb.runnableCount[r.TargetID] = len(r.Names)
-		if len(r.Names) == 0 && len(r.Bytes) > 0 {
-			// The bundle carries raw bytes; the parsed names are the
-			// authority when present, and a raw-only snapshot contributes no
-			// count rather than a guessed one.
-			fb.runnableCount[r.TargetID] = 0
-		}
 	}
 	for _, p := range live {
 		if k := p.AtomKey(); k != "" {

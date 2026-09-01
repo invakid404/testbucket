@@ -96,12 +96,25 @@ func runWallBundle(args []string) error {
 		return fmt.Errorf("parse the captured discovery snapshot: %w", err)
 	}
 
+	// ONE read of the store, too. The same bytes decide which targets need a
+	// runnable listing AND are frozen into the bundle: reading it twice would
+	// let a store that changed between the two reads make the capture decision
+	// and the frozen evidence disagree.
+	storeBytes, err := os.ReadFile(*store)
+	storeAbsent := false
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("read store %s: %w", *store, err)
+		}
+		storeBytes, storeAbsent = nil, true
+	}
+
 	// Capture a runnable listing for exactly the targets the store has flagged
 	// for name slicing. Listing every file would import the whole project —
 	// the cost `vitest list --filesOnly` discovery exists to avoid — and
 	// listing none would leave the slice's names unbound.
 	runnables := map[string][]byte{}
-	st, _, err := core.LoadStore(*store)
+	st, _, err := core.ParseStore(storeBytes, *store)
 	if err != nil {
 		return err
 	}
@@ -125,7 +138,8 @@ func runWallBundle(args []string) error {
 
 	bundle, err := planbind.Acquire(planbind.AcquireOptions{
 		Root: *root, Runner: "vitest", Instant: now, StaleAfter: *staleAfter,
-		K: *k, Count: 1, Token: rnr.CanonicalToken(), StorePath: *store,
+		K: *k, Count: 1, Token: rnr.CanonicalToken(),
+		StorePath: *store, StoreBytes: storeBytes, StoreAbsent: storeAbsent,
 		DiscoveryArgv: discoveryArgv(*vitestCommand, *vitestDiscovery, *vitestDiscoveryCommand),
 		Discovery:     discovery, Runnables: runnables,
 		Env: planningEnv(), Executables: resolvedExecutables(*vitestCommand),
@@ -204,8 +218,12 @@ func runWallReplay(args []string) error {
 	bundlePath := fs.String("bundle", "", "planning-input bundle to replay (required)")
 	receiptPath := fs.String("stage2", "", "Stage-2 derived-plan receipt to check against (required)")
 	stage1Path := fs.String("stage1", "", "Stage-1 manifest whose digest the receipt must name")
+	var authorityKeys stringList
+	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex) the Stage-1 signature must come from; repeatable and required with --stage1")
 	scorerPath := fs.String("scorer", "", "the frozen scorer the plan allocated with; its digest must match the training lineage Stage 1 bound")
 	shardPlan := fs.String("shard-plan", "", "also write the replayed plan here")
+	attest := fs.String("attest", "", "write a SIGNED replay attestation here (signing key from TB_WALL_AUTHORITY_KEY). `wall verify` requires one: comparing the planner's account of its own output to itself proves nothing")
+	verifierID := fs.String("verifier-id", "", "identity of the party running this replay (required with --attest)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -242,7 +260,13 @@ func runWallReplay(args []string) error {
 		if d != issued.Stage1Digest {
 			return fmt.Errorf("the receipt names Stage-1 %s but the supplied manifest digests to %s", issued.Stage1Digest, d)
 		}
-		if err := walltime.VerifySigned(m.Signature, d, nil); err != nil {
+		// The same rule the verifier applies: a signature checked against
+		// whatever signed it is not an authority check. A replay that vouched
+		// for a manifest signed by an undeclared key would launder it.
+		if len(authorityKeys) == 0 {
+			return fmt.Errorf("--stage1 needs at least one --authority-key: verifying a signature against whatever signed the document accepts any self-generated key")
+		}
+		if err := walltime.VerifySigned(m.Signature, d, authorityKeys); err != nil {
 			return fmt.Errorf("stage-1 authority signature: %w", err)
 		}
 		stage1 = d
@@ -278,6 +302,11 @@ func runWallReplay(args []string) error {
 	if err := issued.Matches(res.Receipt); err != nil {
 		return fmt.Errorf("the replayed plan does not match the issued receipt: %w", err)
 	}
+	if *attest != "" {
+		if err := writeReplayAttestation(*attest, *verifierID, issued, bundle, res.Receipt); err != nil {
+			return err
+		}
+	}
 	if *shardPlan != "" {
 		if err := writeJSONFile(*shardPlan, res.Doc); err != nil {
 			return err
@@ -285,6 +314,61 @@ func runWallReplay(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "testbucket wall: replay reproduced the plan exactly\n  full document: %s\n  semantic:      %s\n",
 		res.Receipt.PlanDigest, res.Receipt.SemanticDigest)
+	return nil
+}
+
+// writeReplayAttestation records that THIS party independently re-derived the
+// plan and got the issued receipt.
+//
+// It is signed, because an attestation nobody can attribute is an assertion.
+// The signing key is the authority's, read from the environment for the same
+// reason `wall stage1` reads it there: a key on a command line is a key in the
+// process table.
+func writeReplayAttestation(path, verifierID string, issued walltime.Stage2Receipt, bundle walltime.PlanningInputBundle, recomputed walltime.Stage2Receipt) error {
+	if strings.TrimSpace(verifierID) == "" {
+		return fmt.Errorf("--attest needs --verifier-id: an attestation nobody can attribute is an assertion")
+	}
+	key, err := walltime.DecodeKey(strings.TrimSpace(os.Getenv(authorityKeyEnv)))
+	if err != nil {
+		return fmt.Errorf("%s: %w (an attestation must be signed)", authorityKeyEnv, err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	selfDigest, err := walltime.FileDigest(self)
+	if err != nil {
+		return err
+	}
+	issuedDigest, err := issued.DigestOf()
+	if err != nil {
+		return err
+	}
+	bundleDigest, err := bundle.DigestOf()
+	if err != nil {
+		return err
+	}
+	a := walltime.ReplayAttestation{
+		Kind:           walltime.ReplayKind,
+		Stage1Digest:   issued.Stage1Digest,
+		Stage2Digest:   issuedDigest,
+		BundleDigest:   bundleDigest,
+		Recomputed:     recomputed,
+		VerifierID:     verifierID,
+		VerifierBinary: selfDigest,
+	}
+	d, err := a.DigestOf()
+	if err != nil {
+		return err
+	}
+	a.Signature = &walltime.Signature{
+		Authority: "ewj2-campaign", KeyID: walltime.PublicKeyOf(key), Digest: d,
+		Value: walltime.SignDigest(key, d),
+	}
+	if err := walltime.WriteJSONFile(path, a); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "testbucket wall: attested the replay as %s\n  attestation digest: %s\n", verifierID, d)
 	return nil
 }
 

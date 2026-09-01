@@ -46,7 +46,9 @@ usage:
                                    receipt set of historical wrapper-qualified
                                    physical V labels
   testbucket wall campaign [flags] apply the frozen five-pair decision rule to a
-                                   campaign's observed action times
+                                   campaign of AUTHENTICATED rows: each arm's
+                                   signed Stage-1 manifest and one eligible
+                                   verifier verdict per bucket
 
 Every endpoint is a fresh CLOCK_MONOTONIC read taken by the producer that
 records it. A host with no delegated cgroup-v2 subtree (TB_WALL_CGROUP_ROOT)
@@ -415,19 +417,39 @@ func runWallTrain(args []string) error {
 // qualifies, and this says whether five pairs of them decide anything.
 func runWallCampaign(args []string) error {
 	fs := flag.NewFlagSet("wall campaign", flag.ExitOnError)
-	in := fs.String("in", "", "JSON array of baseline/candidate pairs (required)")
+	index := fs.String("index", "", "campaign index naming each arm's Stage-1 manifest and its per-bucket verifier verdicts. This is the only input that can produce a campaign result")
+	in := fs.String("in", "", "CALCULATOR ONLY: a JSON array of baseline/candidate pairs with durations already filled in. It exercises the arithmetic and can never pass, because nothing about those numbers is authenticated")
 	asJSON := fs.Bool("json", false, "write the gate results as JSON")
+	authority := fs.String("authority", "", "protected environment each arm's manifest must name")
+	var authorityKeys stringList
+	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable and required with --index")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *in == "" {
-		return fmt.Errorf("--in is required")
+	if (*index == "") == (*in == "") {
+		return fmt.Errorf("pass exactly one of --index (a campaign) or --in (the calculator)")
 	}
-	var pairs []walltime.CampaignPair
-	if err := walltime.ReadJSONFile(*in, &pairs); err != nil {
-		return err
+	_ = authority
+
+	var gates []walltime.GateResult
+	calculatorOnly := false
+	if *index != "" {
+		var idx walltime.CampaignIndex
+		if err := walltime.ReadJSONFile(*index, &idx); err != nil {
+			return err
+		}
+		gates, _ = walltime.EvaluateCampaignIndex(idx, walltime.FileCampaignLoader{}, authorityKeys)
+	} else {
+		// The calculator path. It prints the arithmetic and ALWAYS fails: a
+		// number in a JSON file is not an observation, and the one thing this
+		// command must never do is let a hand-written file look like a result.
+		calculatorOnly = true
+		var pairs []walltime.CampaignPair
+		if err := walltime.ReadJSONFile(*in, &pairs); err != nil {
+			return err
+		}
+		gates = walltime.EvaluateCampaign(pairs)
 	}
-	gates := walltime.EvaluateCampaign(pairs)
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -456,6 +478,10 @@ func runWallCampaign(args []string) error {
 			return fmt.Errorf("wall campaign: the decision rule is not satisfied (%s)", g.Name)
 		}
 	}
+	if calculatorOnly {
+		return fmt.Errorf("wall campaign: --in is the calculator; every gate above is arithmetic over unauthenticated numbers. " +
+			"Pass --index with per-bucket verifier verdicts and each arm's signed Stage-1 manifest for a campaign result")
+	}
 	return nil
 }
 
@@ -468,6 +494,7 @@ func runWallVerify(args []string) error {
 	aeta := fs.String("aeta", "", "instantiated pre-action Aeta document for the ETA-completeness gate")
 	pcheck := fs.String("pcheck", "", "post-render Pcheck projection for the predictor gate")
 	registry := fs.String("registry", "", "frozen Aeta component-registry template; without it ETA completeness cannot be proven")
+	replay := fs.String("replay", "", "independent Stage-2 replay attestation (`wall replay --attest`). Required to score: comparing the planner's account of its own output to itself proves nothing")
 	require := fs.String("require", "complete", "verdict this command exits non-zero below: complete (well-formed records) or eligible (scorable under every frozen ROW gate; the campaign-scope gates are decided by `wall campaign`)")
 	authority := fs.String("authority", "", "the protected environment the Stage-1 manifest must name")
 	var authorityKeys stringList
@@ -481,6 +508,7 @@ func runWallVerify(args []string) error {
 	v, err := walltime.VerifyDir(walltime.VerifyOptions{
 		Dir: *dir, Stage1Path: *stage1, Stage2Path: *stage2,
 		AetaPath: *aeta, PcheckPath: *pcheck, RegistryPath: *registry,
+		ReplayPath:    *replay,
 		AuthorityKeys: authorityKeys, Authority: *authority,
 	})
 	if err != nil {

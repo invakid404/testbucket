@@ -92,6 +92,18 @@ inputs:
   stage2-file:
     description: 'Path to the Stage-2 derived-plan receipt, for `wall verify`.'
     default: ""
+  replay-file:
+    description: >-
+      Path to the independent Stage-2 replay attestation (`wall replay
+      --attest`), for `wall verify`. A scored row needs one: comparing the
+      planner''s account of its own output to itself proves nothing.
+    default: ""
+  wall-records-artifact:
+    description: >-
+      Name the caller will upload this bucket''s records under. It is recorded
+      in the verification log so a reader can find the evidence a verdict was
+      derived from; this action does not upload it.
+    default: ""
   registry-file:
     description: 'Path to the frozen Aeta component registry, for `wall verify`.'
     default: ""
@@ -300,6 +312,8 @@ runs:
         TB_REQUIRE: ${{ inputs.verify-require }}
         TB_STAGE1_FILE: ${{ inputs.stage1-file }}
         TB_STAGE2_FILE: ${{ inputs.stage2-file }}
+        TB_REPLAY_FILE: ${{ inputs.replay-file }}
+        TB_RECORDS_ARTIFACT: ${{ inputs.wall-records-artifact }}
         TB_REGISTRY_FILE: ${{ inputs.registry-file }}
         TB_AETA_FILE: ${{ inputs.aeta-file }}
         TB_PCHECK_FILE: ${{ inputs.pcheck-file }}
@@ -317,6 +331,10 @@ runs:
         args=(--dir "$TB_WALL_DIR" --require "$TB_REQUIRE")
         if [ -n "$TB_STAGE1_FILE" ]; then args+=(--stage1 "$TB_STAGE1_FILE"); fi
         if [ -n "$TB_STAGE2_FILE" ]; then args+=(--stage2 "$TB_STAGE2_FILE"); fi
+        if [ -n "$TB_REPLAY_FILE" ]; then args+=(--replay "$TB_REPLAY_FILE"); fi
+        if [ -n "$TB_RECORDS_ARTIFACT" ]; then
+          echo "the records this verdict is derived from are uploaded as: $TB_RECORDS_ARTIFACT"
+        fi
         if [ -n "$TB_REGISTRY_FILE" ]; then args+=(--registry "$TB_REGISTRY_FILE"); fi
         if [ -n "$TB_AETA_FILE" ]; then args+=(--aeta "$TB_AETA_FILE"); fi
         if [ -n "$TB_PCHECK_FILE" ]; then args+=(--pcheck "$TB_PCHECK_FILE"); fi

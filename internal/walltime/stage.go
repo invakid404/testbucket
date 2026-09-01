@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -177,8 +178,18 @@ func (b PlanningInputBundle) Validate() error {
 		}
 	}
 	for _, s := range b.Runnables {
-		if len(s.Bytes) > 0 && s.Digest != DigestBytes(s.Bytes) {
+		if s.Digest != DigestBytes(s.Bytes) {
 			return fmt.Errorf("planning-input bundle: runnable snapshot %q does not match its digest", s.TargetID)
+		}
+		if s.Empty != (len(s.Bytes) == 0) {
+			return fmt.Errorf("planning-input bundle: runnable snapshot %q disagrees with its own empty flag", s.TargetID)
+		}
+		// Names are frozen alongside the bytes so the runtime feature vector
+		// reads the evidence rather than re-deriving it. A listing with bytes
+		// and no names would present a satisfied schema while reporting a
+		// count of zero, which is worse than a missing feature.
+		if len(s.Bytes) > 0 && len(s.Names) == 0 {
+			return fmt.Errorf("planning-input bundle: runnable snapshot %q carries bytes but no parsed names", s.TargetID)
 		}
 	}
 	if b.Store.Digest != DigestBytes(b.Store.Bytes) {
@@ -189,6 +200,48 @@ func (b PlanningInputBundle) Validate() error {
 	}
 	if len(b.Parsers) == 0 {
 		return fmt.Errorf("planning-input bundle: no parser or policy identity is bound")
+	}
+	for _, p := range b.Parsers {
+		if p.Name == "" || p.Version == "" || p.Digest == "" {
+			return fmt.Errorf("planning-input bundle: parser %q has no version or digest", p.Name)
+		}
+	}
+	// The source and acquisition closure: what tree the inputs came from, and
+	// what it would take to reproduce taking them.
+	if err := requireSet(map[string]string{
+		"the source repository": b.Source.Repository,
+		"the source commit":     b.Source.Commit,
+		"the source tree":       b.Source.Tree,
+		"the acquisition cwd":   b.Acquisition.Cwd,
+	}); err != nil {
+		return fmt.Errorf("planning-input bundle %w", err)
+	}
+	if err := requireFullSHA("the source commit", b.Source.Commit); err != nil {
+		return fmt.Errorf("planning-input bundle: %w", err)
+	}
+	if len(b.Acquisition.Argv) == 0 {
+		return fmt.Errorf("planning-input bundle: the acquisition argv is empty")
+	}
+	if len(b.Acquisition.Executables) == 0 {
+		return fmt.Errorf("planning-input bundle: no resolved executable path is bound, so \"npx\" could name two different binaries on two runners")
+	}
+	if b.Acquisition.Env == nil {
+		return fmt.Errorf("planning-input bundle: the planning-relevant environment is unbound (an empty map is a bound fact; a missing one is not)")
+	}
+	// The selection closure the plan is a function of.
+	if b.Selection.K < 1 {
+		return fmt.Errorf("planning-input bundle: K is %d", b.Selection.K)
+	}
+	if b.Selection.Count < 1 {
+		return fmt.Errorf("planning-input bundle: the sweep count is %d", b.Selection.Count)
+	}
+	if err := requireSet(map[string]string{
+		"the comparability token": b.Selection.Token,
+		"the runner":              b.Selection.Runner,
+		"the renderer identity":   b.Selection.Renderer,
+		"the tie-break order":     b.Selection.TieBreak,
+	}); err != nil {
+		return fmt.Errorf("planning-input bundle %w", err)
 	}
 	return nil
 }
@@ -278,6 +331,22 @@ const RequiredVitest = "4.1.10"
 // the recorded version. A missing @vitest/runner is the interesting case: the
 // façade loads it, so a closure without it has not proven what actually ran.
 func (r SourceProfileReceipt) Validate() error {
+	if err := requireSet(map[string]string{
+		"the repository":      r.Repository,
+		"the commit":          r.Commit,
+		"the façade digest":   string(r.Facade),
+		"the config digest":   string(r.Config),
+		"the lockfile digest": string(r.Lockfile),
+		"the lock parser":     r.ParserID.Name,
+	}); err != nil {
+		return fmt.Errorf("source profile %w", err)
+	}
+	if err := requireFullSHA("the source-profile commit", r.Commit); err != nil {
+		return fmt.Errorf("source profile: %w", err)
+	}
+	if r.ParserID.Digest == "" || r.ParserID.Version == "" {
+		return fmt.Errorf("source profile: the lock parser has no version or digest")
+	}
 	if len(r.Packages) == 0 {
 		return fmt.Errorf("source profile: the resolved package closure is empty")
 	}
@@ -311,6 +380,53 @@ func (r SourceProfileReceipt) Validate() error {
 }
 
 func hasPrefix(s, p string) bool { return len(s) >= len(p) && s[:len(p)] == p }
+
+// fullSHALen is the length of a full Git commit SHA. The contract is explicit
+// that a full commit SHA is the immutable release reference; an abbreviation
+// is a prefix that another object can grow into, and a tag is metadata.
+const fullSHALen = 40
+
+// requireFullSHA rejects anything that is not a full 40-hex-character commit
+// identity.
+func requireFullSHA(field, v string) error {
+	if len(v) != fullSHALen {
+		return fmt.Errorf("%s must be a full %d-character commit SHA, got %q", field, fullSHALen, v)
+	}
+	for _, c := range v {
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return fmt.Errorf("%s must be lowercase hexadecimal, got %q", field, v)
+		}
+	}
+	return nil
+}
+
+// requireSet refuses an empty identity. It exists so the manifest's required
+// fields are enumerated in one readable list rather than as a wall of ifs.
+func requireSet(fields map[string]string) error {
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var missing []string
+	for _, name := range names {
+		if strings.TrimSpace(fields[name]) == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("does not bind %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// isImmutableImage rejects a runner-image alias. `ubuntu-latest` names
+// whatever GitHub rebuilt this morning; two arms of a pair resolved through it
+// are not proven to have run on the same image, which is the entire point of
+// binding it.
+func isImmutableImage(v string) bool {
+	return strings.Contains(v, "@sha256:") || strings.Contains(v, "@sha512:")
+}
 
 // InstrumentationIdentity binds every producer and the verifier. A peer built
 // from different bytes than these is not the peer the campaign authorised.
@@ -348,7 +464,7 @@ func (m *Stage1Manifest) Sign(authority string, key ed25519.PrivateKey) error {
 		Authority: authority,
 		KeyID:     PublicKeyOf(key),
 		Digest:    d,
-		Value:     base64.StdEncoding.EncodeToString(ed25519.Sign(key, []byte(d))),
+		Value:     SignDigest(key, d),
 	}
 	return nil
 }
@@ -387,8 +503,13 @@ func VerifySigned(sig *Signature, digest Digest, allowedKeys []string) error {
 	return nil
 }
 
-// Validate checks the manifest's internal consistency, including that it
-// contains no derived output.
+// Validate checks that the manifest binds EVERY identity the contract requires
+// before either arm plans, and that it contains no derived output.
+//
+// It is deliberately exhaustive rather than representative. A manifest that
+// binds most of the delivery identity proves most of the delivery, and "most"
+// is indistinguishable from "none" when the question is whether two arms ran
+// the same thing. Each field below is one the contract names.
 func (m Stage1Manifest) Validate() error {
 	if m.Kind != Stage1Kind {
 		return fmt.Errorf("stage-1 manifest kind %q, want %q", m.Kind, Stage1Kind)
@@ -396,28 +517,172 @@ func (m Stage1Manifest) Validate() error {
 	if m.Role != "baseline" && m.Role != "candidate" {
 		return fmt.Errorf("stage-1 role %q must be baseline or candidate", m.Role)
 	}
+
+	// The three action directories, each by FULL commit SHA and content digest.
 	for _, name := range []string{"plan", "run-bucket", "record"} {
 		a, ok := m.Actions[name]
-		if !ok || a.Commit == "" || a.ContentDigest == "" {
+		if !ok || a.ContentDigest == "" {
 			return fmt.Errorf("stage-1 manifest does not bind the %s action's commit and content digest", name)
 		}
+		if err := requireFullSHA("the "+name+" action commit", a.Commit); err != nil {
+			return fmt.Errorf("stage-1 manifest: %w", err)
+		}
 	}
-	if m.Source.ReviewTip == "" || m.Source.BinaryDigest == "" {
-		return fmt.Errorf("stage-1 manifest does not bind the reviewed tip and binary digest")
+
+	// Delivery: reviewed tip, the release ref it must equal, the exact binary
+	// and its build attestation. A local binary cannot deliver a scored row.
+	if err := requireSet(map[string]string{
+		"the reviewed tip":      m.Source.ReviewTip,
+		"the binary digest":     string(m.Source.BinaryDigest),
+		"the build attestation": m.Source.BuildAttestation,
+		"the release ref SHA":   m.Source.ReleaseRefSHA,
+	}); err != nil {
+		return fmt.Errorf("stage-1 manifest %w", err)
 	}
-	if m.Source.ReleaseRefSHA != "" && m.Source.ReleaseRefSHA != m.Source.ReviewTip {
+	if err := requireFullSHA("the reviewed tip", m.Source.ReviewTip); err != nil {
+		return fmt.Errorf("stage-1 manifest: %w", err)
+	}
+	if err := requireFullSHA("the release ref SHA", m.Source.ReleaseRefSHA); err != nil {
+		return fmt.Errorf("stage-1 manifest: %w", err)
+	}
+	if m.Source.ReleaseRefSHA != m.Source.ReviewTip {
 		return fmt.Errorf("stage-1 manifest: the release ref resolves to %s but the reviewed tip is %s", m.Source.ReleaseRefSHA, m.Source.ReviewTip)
 	}
+
+	// Consumer closure: the repository, the commit, the caller workflow, the
+	// downstream ref it resolves, and an IMMUTABLE runner image.
+	if err := requireSet(map[string]string{
+		"the consumer repository": m.Consumer.Repository,
+		"the consumer commit":     m.Consumer.Commit,
+		"the caller workflow SHA": m.Consumer.WorkflowSHA,
+		"the downstream ref":      m.Consumer.DownstreamRef,
+		"the runner image":        m.Consumer.RunnerImage,
+		"the façade digest":       string(m.Consumer.Facade),
+		"the config digest":       string(m.Consumer.Config),
+		"the lockfile digest":     string(m.Consumer.Lockfile),
+	}); err != nil {
+		return fmt.Errorf("stage-1 manifest %w", err)
+	}
+	if err := requireFullSHA("the consumer commit", m.Consumer.Commit); err != nil {
+		return fmt.Errorf("stage-1 manifest: %w", err)
+	}
+	if err := requireFullSHA("the caller workflow SHA", m.Consumer.WorkflowSHA); err != nil {
+		return fmt.Errorf("stage-1 manifest: %w", err)
+	}
+	if !isImmutableImage(m.Consumer.RunnerImage) {
+		return fmt.Errorf("stage-1 manifest: runner image %q is an alias, not an immutable identity; two arms resolved through an alias are not proven to have run on the same image", m.Consumer.RunnerImage)
+	}
+
 	if err := m.SourceProfile.Validate(); err != nil {
 		return err
 	}
+
+	// The sealed training lineage and the frozen component registry.
+	if err := requireSet(map[string]string{
+		"the training receipt-set digest": string(m.TrainingLineage.ReceiptSetDigest),
+		"the training cutoff instant":     m.TrainingLineage.Cutoff,
+		"the training epoch":              m.TrainingLineage.Epoch,
+		"the frozen scorer digest":        string(m.TrainingLineage.ScorerDigest),
+		"the component registry digest":   string(m.Registry),
+	}); err != nil {
+		return fmt.Errorf("stage-1 manifest %w", err)
+	}
+	if _, err := parseInstant(m.TrainingLineage.Cutoff); err != nil {
+		return fmt.Errorf("stage-1 manifest: training %w", err)
+	}
+
+	// The instrumentation identities and the allowed-difference matrix.
 	if m.Instrumentation.Schema != SchemaVersion {
 		return fmt.Errorf("stage-1 manifest binds instrumentation schema %q, want %q", m.Instrumentation.Schema, SchemaVersion)
 	}
-	if err := m.Bundle.Validate(); err != nil {
-		return err
+	if err := requireSet(map[string]string{
+		"the physical wrapper binary": string(m.Instrumentation.PhysicalBinary),
+		"the containment peer binary": string(m.Instrumentation.PeerBinary),
+		"the trace collector binary":  string(m.Instrumentation.TraceBinary),
+		"the verifier binary":         string(m.Instrumentation.VerifierBinary),
+		"the containment policy":      m.Instrumentation.ContainmentPolicy,
+		"the child-admission policy":  m.Instrumentation.ChildAdmission,
+		"the endpoint-order policy":   m.Instrumentation.EndpointOrder,
+		"the cancellation policy":     m.Instrumentation.CancellationPolicy,
+	}); err != nil {
+		return fmt.Errorf("stage-1 manifest %w", err)
 	}
-	return nil
+	if len(m.Instrumentation.RawSourceTaxonomy) == 0 {
+		return fmt.Errorf("stage-1 manifest does not bind the raw-source taxonomy")
+	}
+	if len(m.AllowedDifferences) == 0 {
+		return fmt.Errorf("stage-1 manifest does not enumerate the allowed differences between the two arms of a pair")
+	}
+
+	return m.Bundle.Validate()
+}
+
+// InvariantTuple is what must be BYTE-IDENTICAL between the two arms of a
+// pair. Everything a run could differ in, other than the enumerated candidate
+// testbucket tuple, lives here: if two arms disagree on any of it, the pair
+// compared two different experiments.
+func (m Stage1Manifest) InvariantTuple() map[string]string {
+	out := map[string]string{
+		"consumer.repository":     m.Consumer.Repository,
+		"consumer.commit":         m.Consumer.Commit,
+		"consumer.workflow_sha":   m.Consumer.WorkflowSHA,
+		"consumer.downstream_ref": m.Consumer.DownstreamRef,
+		"consumer.runner_image":   m.Consumer.RunnerImage,
+		"consumer.facade":         string(m.Consumer.Facade),
+		"consumer.config":         string(m.Consumer.Config),
+		"consumer.lockfile":       string(m.Consumer.Lockfile),
+		"source_profile":          string(mustDigestOf(m.SourceProfile)),
+		"training_lineage":        string(mustDigestOf(m.TrainingLineage)),
+		"component_registry":      string(m.Registry),
+		"selection.k":             fmt.Sprint(m.Bundle.Selection.K),
+		"selection.count":         fmt.Sprint(m.Bundle.Selection.Count),
+		"selection.token":         m.Bundle.Selection.Token,
+		"selection.runner":        m.Bundle.Selection.Runner,
+		"selection.renderer":      m.Bundle.Selection.Renderer,
+		"selection.tie_break":     m.Bundle.Selection.TieBreak,
+		"store":                   string(m.Bundle.Store.Digest),
+		"clock.stale_threshold":   m.Bundle.Clock.StaleThreshold,
+		"instrumentation.schema":  m.Instrumentation.Schema,
+		"containment_policy":      m.Instrumentation.ContainmentPolicy,
+		"child_admission_policy":  m.Instrumentation.ChildAdmission,
+		"endpoint_order_policy":   m.Instrumentation.EndpointOrder,
+		"cancellation_policy":     m.Instrumentation.CancellationPolicy,
+	}
+	return out
+}
+
+// CompareArms reports every invariant the two arms of a pair disagree on. An
+// empty result is the only admissible one: the ONLY permitted difference is
+// the enumerated candidate testbucket source/action/binary tuple, which lives
+// outside this map by construction.
+func CompareArms(baseline, candidate Stage1Manifest) []string {
+	b, c := baseline.InvariantTuple(), candidate.InvariantTuple()
+	keys := make([]string, 0, len(b))
+	for k := range b {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var diffs []string
+	for _, k := range keys {
+		if b[k] != c[k] {
+			diffs = append(diffs, fmt.Sprintf("%s: baseline %q, candidate %q", k, b[k], c[k]))
+		}
+	}
+	if baseline.Role != "baseline" || candidate.Role != "candidate" {
+		diffs = append(diffs, fmt.Sprintf("roles are %q and %q, want baseline and candidate", baseline.Role, candidate.Role))
+	}
+	return diffs
+}
+
+// mustDigestOf digests a sub-document for the invariant comparison. A value
+// that cannot be canonicalised compares unequal to everything, which fails the
+// pair rather than silently matching.
+func mustDigestOf(v any) Digest {
+	d, err := DigestJSON(v)
+	if err != nil {
+		return Digest("uncanonicalisable:" + err.Error())
+	}
+	return d
 }
 
 // InputAccess is one field of the bundle the planner actually read. The
@@ -477,8 +742,19 @@ func (r Stage2Receipt) Validate() error {
 	if r.Algorithms.FullPlan.Name != FullPlanDigestAlgorithm || r.Algorithms.SemanticPlan.Name != SemanticPlanDigestAlgorithm {
 		return fmt.Errorf("stage-2 receipt names unknown plan-digest algorithms")
 	}
-	if r.ScriptDigest == "" || r.InvocationDigest == "" || r.MembershipDigest == "" {
-		return fmt.Errorf("stage-2 receipt does not bind the rendered script, invocations and membership")
+	// Every derived identity, not a representative sample. A receipt missing
+	// the atom digest cannot detect an atom split; missing the topology
+	// digest, a re-shaped schedule; missing the matrix digest, a different
+	// fan-out. Each of those is separately terminal in the contract.
+	if err := requireSet(map[string]string{
+		"the rendered script digest":     string(r.ScriptDigest),
+		"the invocation digest":          string(r.InvocationDigest),
+		"the rendered membership digest": string(r.MembershipDigest),
+		"the atom digest":                string(r.AtomDigest),
+		"the topology digest":            string(r.TopologyDigest),
+		"the matrix digest":              string(r.MatrixDigest),
+	}); err != nil {
+		return fmt.Errorf("stage-2 receipt %w", err)
 	}
 	if len(r.InputAccess) == 0 {
 		return fmt.Errorf("stage-2 receipt carries no input-access record")
@@ -511,6 +787,70 @@ func (r Stage2Receipt) Matches(other Stage2Receipt) error {
 		}
 	}
 	return nil
+}
+
+// ReplayKind identifies an independent Stage-2 replay attestation.
+const ReplayKind = "tb.walltime.stage2-replay/v1"
+
+// ReplayAttestation is an INDEPENDENT verifier's statement that it re-derived
+// the plan from the frozen bundle and got the same thing.
+//
+// It exists because a Stage-2 receipt is the planner's own account of what it
+// produced. Comparing that account to itself proves nothing; the contract
+// requires a separate party to rerun the frozen parsers and policies over the
+// frozen bytes and reject a changed plan, atom, topology, membership,
+// invocation, script or matrix BEFORE the action starts. This document is that
+// rerun's result, and `wall verify` refuses to score a run without one.
+type ReplayAttestation struct {
+	Kind         string `json:"kind"`
+	Stage1Digest Digest `json:"stage1_digest"`
+	// Stage2Digest is the ISSUED receipt this replay was checked against.
+	Stage2Digest Digest `json:"stage2_digest"`
+	BundleDigest Digest `json:"planning_input_bundle_digest"`
+	// Recomputed is what the replay independently derived. It is kept whole
+	// rather than reduced to a boolean so a reader can see WHICH digest
+	// disagreed, if one did.
+	Recomputed Stage2Receipt `json:"recomputed"`
+	// VerifierID and VerifierBinary identify who ran the replay and with what
+	// bytes; Stage 1 binds the approved verifier binary.
+	VerifierID     string     `json:"verifier_id"`
+	VerifierBinary Digest     `json:"verifier_binary"`
+	Signature      *Signature `json:"signature,omitempty"`
+}
+
+// DigestOf is the attestation's canonical identity.
+func (a ReplayAttestation) DigestOf() (Digest, error) {
+	c := a
+	c.Signature = nil
+	return DigestJSON(c)
+}
+
+// Verify checks the attestation against the issued receipt and the Stage-1
+// identities, and reports everything that disagrees.
+func (a ReplayAttestation) Verify(issued Stage2Receipt, issuedDigest, stage1 Digest, instr InstrumentationIdentity) []string {
+	var problems []string
+	if a.Kind != ReplayKind {
+		problems = append(problems, fmt.Sprintf("kind is %q, want %q", a.Kind, ReplayKind))
+	}
+	if issuedDigest != "" && a.Stage2Digest != issuedDigest {
+		problems = append(problems, fmt.Sprintf("it attests to Stage-2 receipt %s, not the supplied %s", a.Stage2Digest, issuedDigest))
+	}
+	if stage1 != "" && a.Stage1Digest != stage1 {
+		problems = append(problems, fmt.Sprintf("it names Stage-1 %s, not the verified %s", a.Stage1Digest, stage1))
+	}
+	if err := a.Recomputed.Validate(); err != nil {
+		problems = append(problems, "the recomputed receipt is not well formed: "+err.Error())
+	}
+	if err := issued.Matches(a.Recomputed); err != nil {
+		problems = append(problems, "the independent replay derived a different plan: "+err.Error())
+	}
+	if instr.VerifierBinary != "" && a.VerifierBinary != instr.VerifierBinary {
+		problems = append(problems, fmt.Sprintf("the replay ran verifier binary %s, not the %s Stage 1 approved", a.VerifierBinary, instr.VerifierBinary))
+	}
+	if strings.TrimSpace(a.VerifierID) == "" {
+		problems = append(problems, "the replay names no verifier")
+	}
+	return problems
 }
 
 // WriteJSONFile writes a receipt, manifest or bundle, refusing to overwrite.

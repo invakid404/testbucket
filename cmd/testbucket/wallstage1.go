@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/invakid404/testbucket/internal/walltime"
@@ -34,13 +35,13 @@ func runWallStage1(args []string) error {
 	actionsDir := fs.String("actions-dir", ".github/actions", "directory holding the plan, run-bucket and record action directories")
 	actionCommit := fs.String("action-commit", "", "the full commit SHA the action directories were reviewed at (required)")
 	reviewTip := fs.String("review-tip", "", "the reviewed testbucket source tip (required)")
-	releaseSHA := fs.String("release-sha", "", "the SHA the release ref resolves to; it must equal the reviewed tip")
+	releaseSHA := fs.String("release-sha", "", "the SHA the release ref resolves to; it must equal the reviewed tip. A local binary cannot deliver a scored row")
 	binary := fs.String("binary", "", "path to the exact binary asset being delivered")
 	attestation := fs.String("build-attestation", "", "build-attestation identity for that binary")
 	sourceProfile := fs.String("source-profile", "", "source-profile receipt JSON (required): the resolved Vitest closure")
 	scorerPath := fs.String("scorer", "", "frozen scorer whose sealed training lineage this manifest binds")
 	registryPath := fs.String("registry", "", "frozen Aeta component-registry template")
-	runnerImage := fs.String("runner-image", "", "immutable runner image identity (never an alias such as ubuntu-latest)")
+	runnerImage := fs.String("runner-image", "", "immutable runner image identity, e.g. ubuntu-24.04@sha256:… — never an alias such as ubuntu-latest, which two arms could resolve differently")
 	consumerRepo := fs.String("consumer-repository", "", "consumer repository")
 	consumerCommit := fs.String("consumer-commit", "", "consumer commit")
 	workflowSHA := fs.String("caller-workflow-sha", "", "caller workflow commit SHA")
@@ -51,14 +52,34 @@ func runWallStage1(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	for name, v := range map[string]string{
+	// Every one of these is an identity the contract requires bound BEFORE
+	// either arm plans. Making them optional here would move the check to
+	// `Validate`, where a campaign discovers at verification time that the
+	// manifest it already signed cannot be used.
+	required := map[string]string{
 		"--bundle": *bundlePath, "--out": *out, "--role": *role,
 		"--action-commit": *actionCommit, "--review-tip": *reviewTip,
-		"--source-profile": *sourceProfile,
-	} {
-		if strings.TrimSpace(v) == "" {
-			return fmt.Errorf("%s is required", name)
+		"--release-sha": *releaseSHA, "--binary": *binary,
+		"--build-attestation": *attestation, "--source-profile": *sourceProfile,
+		"--scorer": *scorerPath, "--registry": *registryPath,
+		"--runner-image": *runnerImage, "--consumer-repository": *consumerRepo,
+		"--consumer-commit": *consumerCommit, "--caller-workflow-sha": *workflowSHA,
+		"--downstream-ref": *downstreamRef,
+	}
+	names := make([]string, 0, len(required))
+	for name := range required {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var missing []string
+	for _, name := range names {
+		if strings.TrimSpace(required[name]) == "" {
+			missing = append(missing, name)
 		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("these are required and each binds an identity the contract needs before either arm plans: %s",
+			strings.Join(missing, ", "))
 	}
 
 	var bundle walltime.PlanningInputBundle
@@ -87,13 +108,11 @@ func runWallStage1(args []string) error {
 	m.Source.ReviewTip = *reviewTip
 	m.Source.ReleaseRefSHA = *releaseSHA
 	m.Source.BuildAttestation = *attestation
-	if *binary != "" {
-		d, err := walltime.FileDigest(*binary)
-		if err != nil {
-			return fmt.Errorf("digest the binary asset: %w", err)
-		}
-		m.Source.BinaryDigest = d
+	binaryDigest, err := walltime.FileDigest(*binary)
+	if err != nil {
+		return fmt.Errorf("digest the binary asset: %w", err)
 	}
+	m.Source.BinaryDigest = binaryDigest
 	m.Consumer.Repository = *consumerRepo
 	m.Consumer.Commit = *consumerCommit
 	m.Consumer.WorkflowSHA = *workflowSHA
@@ -103,27 +122,29 @@ func runWallStage1(args []string) error {
 	m.Consumer.Config = profile.Config
 	m.Consumer.Lockfile = profile.Lockfile
 
-	if *scorerPath != "" {
-		var sc walltime.Scorer
-		if err := walltime.ReadJSONFile(*scorerPath, &sc); err != nil {
-			return err
-		}
-		m.TrainingLineage = sc.Lineage
+	var sc walltime.Scorer
+	if err := walltime.ReadJSONFile(*scorerPath, &sc); err != nil {
+		return err
 	}
-	if *registryPath != "" {
-		var reg walltime.AetaRegistry
-		if err := walltime.ReadJSONFile(*registryPath, &reg); err != nil {
-			return err
-		}
-		if err := reg.Validate(); err != nil {
-			return err
-		}
-		d, err := reg.DigestOf()
-		if err != nil {
-			return err
-		}
-		m.Registry = d
+	m.TrainingLineage = sc.Lineage
+	if d, err := sc.DigestOf(); err == nil {
+		// Bind the scorer by its own digest rather than by whatever the
+		// lineage claims, so a scorer whose lineage was edited cannot be
+		// bound under the identity it names.
+		m.TrainingLineage.ScorerDigest = d
 	}
+	var reg walltime.AetaRegistry
+	if err := walltime.ReadJSONFile(*registryPath, &reg); err != nil {
+		return err
+	}
+	if err := reg.Validate(); err != nil {
+		return err
+	}
+	registryDigest, err := reg.DigestOf()
+	if err != nil {
+		return err
+	}
+	m.Registry = registryDigest
 
 	self, err := os.Executable()
 	if err != nil {
@@ -150,7 +171,7 @@ func runWallStage1(args []string) error {
 		},
 	}
 	m.AllowedDifferences = allowed
-	if len(m.AllowedDifferences) == 0 {
+	if len(allowed) == 0 {
 		m.AllowedDifferences = []string{"the enumerated candidate testbucket source/action/binary tuple and its schema-versioned wrappers"}
 	}
 

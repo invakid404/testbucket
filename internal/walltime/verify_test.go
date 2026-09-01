@@ -1,6 +1,8 @@
 package walltime
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,6 +21,7 @@ type frozenDocs struct {
 	registry string
 	aeta     string
 	pcheck   string
+	replay   string
 	digest   Digest
 	// authority is the PREDECLARED public key of the protected environment.
 	// The verifier refuses to treat a signature as authority approval without
@@ -75,17 +78,36 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 		t.Fatal(err)
 	}
 
+	// The independent replay attestation: a separate party re-derived the plan
+	// from the frozen bundle and got the same receipt. Signed by the same
+	// authority in the fixture; in a campaign it is the verifier's own key,
+	// predeclared alongside it.
+	replay := ReplayAttestation{
+		Kind: ReplayKind, Stage1Digest: m1, Stage2Digest: r2, BundleDigest: bd,
+		Recomputed: receipt, VerifierID: "synthetic-verifier", VerifierBinary: synthBinary,
+	}
+	rd, err := replay.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay.Signature = &Signature{
+		Authority: "ewj2-campaign", KeyID: PublicKeyOf(key), Digest: rd,
+		Value: signValue(key, rd),
+	}
+
 	docs := frozenDocs{
 		stage1:    filepath.Join(dir, "stage1.json"),
 		stage2:    filepath.Join(dir, "stage2.json"),
 		registry:  filepath.Join(dir, "registry.json"),
 		aeta:      filepath.Join(dir, "aeta.json"),
 		pcheck:    filepath.Join(dir, "pcheck.json"),
+		replay:    filepath.Join(dir, "replay.json"),
 		digest:    r2,
 		authority: m.Signature.KeyID,
 	}
 	for path, v := range map[string]any{
-		docs.stage1: m, docs.stage2: receipt, docs.registry: reg, docs.aeta: aeta, docs.pcheck: pcheck,
+		docs.stage1: m, docs.stage2: receipt, docs.registry: reg,
+		docs.aeta: aeta, docs.pcheck: pcheck, docs.replay: replay,
 	} {
 		if err := WriteJSONFile(path, v); err != nil {
 			t.Fatal(err)
@@ -105,7 +127,7 @@ func testBundle() PlanningInputBundle {
 	b.Discovery = []RawSnapshot{NewRawSnapshot("vitest-list", []string{"vitest", "list", "--filesOnly", "--json"}, "/repo", []byte(`[{"file":"/repo/t0.spec.ts"}]`))}
 	b.Store = NewRawSnapshot("test-timings.json", nil, "/repo", []byte(`{"flags":"vitest","units":{}}`))
 	b.Source.Repository = "example/mandel"
-	b.Source.Commit = "d9ae1d433bb45012c04d567879b66fc4bf6112c6"
+	b.Source.Commit = testConsumerCommit
 	b.Source.Tree = "sha256:tree"
 	b.Acquisition.Argv = []string{"testbucket", "wall", "bundle"}
 	b.Acquisition.Cwd = "/repo"
@@ -141,18 +163,37 @@ func testScorer() Scorer {
 	}
 }
 
+// testTip and testConsumerCommit are FULL commit SHAs, because that is what
+// the manifest requires: an abbreviation is a prefix another object can grow
+// into, and the fixture must not be able to pass on something the contract
+// would refuse.
+const (
+	testTip            = "693a19981fb6e0061d3fab62e59d75dc1c01ff3f"
+	testConsumerCommit = "d9ae1d433bb45012c04d567879b66fc4bf6112c6"
+	testWorkflowSHA    = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c"
+)
+
 func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	m := Stage1Manifest{Kind: Stage1Kind, Role: "candidate", Bundle: b}
 	m.Actions = map[string]ActionIdentity{
-		"plan":       {Commit: "693a1998", ContentDigest: "sha256:plan"},
-		"run-bucket": {Commit: "693a1998", ContentDigest: "sha256:run"},
-		"record":     {Commit: "693a1998", ContentDigest: "sha256:record"},
+		"plan":       {Commit: testTip, ContentDigest: "sha256:plan"},
+		"run-bucket": {Commit: testTip, ContentDigest: "sha256:run"},
+		"record":     {Commit: testTip, ContentDigest: "sha256:record"},
 	}
-	m.Source.ReviewTip = "693a19981fb6e0061d3fab62e59d75dc1c01ff3f"
+	m.Source.ReviewTip = testTip
+	m.Source.ReleaseRefSHA = testTip
 	m.Source.BinaryDigest = "sha256:binary"
 	m.Source.BuildAttestation = "attestation"
+	m.Consumer.Repository = "example/mandel"
+	m.Consumer.Commit = testConsumerCommit
+	m.Consumer.WorkflowSHA = testWorkflowSHA
+	m.Consumer.DownstreamRef = "refs/heads/main@" + testConsumerCommit
+	m.Consumer.RunnerImage = "ubuntu-24.04@sha256:" + strings.Repeat("cd", 32)
+	m.Consumer.Facade = "sha256:facade"
+	m.Consumer.Config = "sha256:config"
+	m.Consumer.Lockfile = "sha256:lock"
 	m.SourceProfile = SourceProfileReceipt{
-		Repository: "example/mandel", Commit: "d9ae1d43", Facade: "sha256:facade",
+		Repository: "example/mandel", Commit: testConsumerCommit, Facade: "sha256:facade",
 		Config: "sha256:config", Lockfile: "sha256:lock",
 		ParserID:    ParserIdentity{Name: "pnpm-lock", Version: "9", Digest: "sha256:lockparser"},
 		Packages:    map[string]string{"vitest": RequiredVitest, "@vitest/runner": RequiredVitest},
@@ -241,6 +282,7 @@ func verifySynth(t *testing.T, mutate mutation, tweak func(*synthRun)) *Verdict 
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		ReplayPath:    docs.replay,
 		AuthorityKeys: []string{docs.authority}, Authority: "ewj2-campaign",
 	})
 	if err != nil {
@@ -501,6 +543,43 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			want: "does not re-derive",
 		},
 		{
+			name: "no independent replay attestation",
+			opts: func(o *VerifyOptions) { o.ReplayPath = "" },
+			want: "nobody re-derived",
+		},
+		{
+			name: "a replay that derived a different plan",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.replay, func(m map[string]any) {
+					m["recomputed"].(map[string]any)["atom_digest"] = "sha256:different-atoms"
+				})
+			},
+			want: "derived a different plan",
+		},
+		{
+			name: "a replay attesting to another receipt",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.replay, func(m map[string]any) { m["stage2_digest"] = "sha256:elsewhere" })
+			},
+			want: "attests to Stage-2 receipt",
+		},
+		{
+			name: "a replay run by an unapproved verifier binary",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.replay, func(m map[string]any) {
+					m["verifier_binary"] = "sha256:" + strings.Repeat("ab", 32)
+				})
+			},
+			want: "not the",
+		},
+		{
+			name: "an unsigned replay attestation",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.replay, func(m map[string]any) { delete(m, "signature") })
+			},
+			want: "unsigned",
+		},
+		{
 			name: "a forecast for another plan",
 			edit: func(t *testing.T, docs frozenDocs) {
 				editJSON(t, docs.aeta, func(m map[string]any) { m["stage2_digest"] = "sha256:elsewhere" })
@@ -521,6 +600,7 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			opts := VerifyOptions{
 				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+				ReplayPath:    docs.replay,
 				AuthorityKeys: []string{docs.authority}, Authority: "ewj2-campaign",
 			}
 			if tc.opts != nil {
@@ -559,6 +639,7 @@ func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		ReplayPath:    docs.replay,
 		AuthorityKeys: []string{docs.authority},
 	})
 	if err != nil {
@@ -576,6 +657,12 @@ func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
 	if !found {
 		t.Errorf("no binary-identity finding: %+v", v.Findings)
 	}
+}
+
+// signValue signs a digest the way Sign does, for a document the fixture
+// assembles by hand.
+func signValue(key ed25519.PrivateKey, d Digest) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(key, []byte(d)))
 }
 
 // editJSON rewrites one field of a frozen document on disk, which is how a
@@ -597,5 +684,161 @@ func editJSON(t *testing.T, path string, edit func(map[string]any)) {
 	}
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestStage1BindsEveryRequiredIdentity walks the manifest field by field. A
+// manifest that binds MOST of the delivery identity proves most of the
+// delivery, and "most" is indistinguishable from "none" when the question is
+// whether two arms ran the same thing.
+func TestStage1BindsEveryRequiredIdentity(t *testing.T) {
+	reg := testRegistry()
+	regDigest, err := reg.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := func() Stage1Manifest { return testManifest(testBundle(), regDigest) }
+	if err := base().Validate(); err != nil {
+		t.Fatalf("a fully bound manifest was rejected: %v", err)
+	}
+	cases := []struct {
+		name string
+		edit func(*Stage1Manifest)
+		want string
+	}{
+		{"an abbreviated action commit", func(m *Stage1Manifest) {
+			m.Actions["plan"] = ActionIdentity{Commit: "693a1998", ContentDigest: "sha256:plan"}
+		}, "full 40-character commit SHA"},
+		{"no release ref to prove the delivery", func(m *Stage1Manifest) { m.Source.ReleaseRefSHA = "" }, "release ref SHA"},
+		{"a release ref that is not the reviewed tip", func(m *Stage1Manifest) {
+			m.Source.ReleaseRefSHA = strings.Repeat("a", 40)
+		}, "the reviewed tip is"},
+		{"no build attestation", func(m *Stage1Manifest) { m.Source.BuildAttestation = "" }, "build attestation"},
+		{"no binary digest", func(m *Stage1Manifest) { m.Source.BinaryDigest = "" }, "binary digest"},
+		{"no consumer repository", func(m *Stage1Manifest) { m.Consumer.Repository = "" }, "consumer repository"},
+		{"an abbreviated consumer commit", func(m *Stage1Manifest) { m.Consumer.Commit = "d9ae1d43" }, "consumer commit"},
+		{"no caller workflow", func(m *Stage1Manifest) { m.Consumer.WorkflowSHA = "" }, "caller workflow"},
+		{"no downstream ref", func(m *Stage1Manifest) { m.Consumer.DownstreamRef = "" }, "downstream ref"},
+		{"a runner-image alias", func(m *Stage1Manifest) { m.Consumer.RunnerImage = "ubuntu-latest" }, "is an alias"},
+		{"no component registry", func(m *Stage1Manifest) { m.Registry = "" }, "component registry"},
+		{"no training lineage", func(m *Stage1Manifest) { m.TrainingLineage = TrainingLineageID{} }, "training"},
+		{"no allowed-difference matrix", func(m *Stage1Manifest) { m.AllowedDifferences = nil }, "allowed differences"},
+		{"no containment policy", func(m *Stage1Manifest) { m.Instrumentation.ContainmentPolicy = "" }, "containment policy"},
+		{"no raw-source taxonomy", func(m *Stage1Manifest) { m.Instrumentation.RawSourceTaxonomy = nil }, "raw-source taxonomy"},
+		{"an unbound source-profile commit", func(m *Stage1Manifest) { m.SourceProfile.Commit = "" }, "source profile"},
+		{"an unbound lock parser", func(m *Stage1Manifest) { m.SourceProfile.ParserID = ParserIdentity{} }, "lock parser"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base()
+			m.Actions = map[string]ActionIdentity{
+				"plan":       {Commit: testTip, ContentDigest: "sha256:plan"},
+				"run-bucket": {Commit: testTip, ContentDigest: "sha256:run"},
+				"record":     {Commit: testTip, ContentDigest: "sha256:record"},
+			}
+			tc.edit(&m)
+			err := m.Validate()
+			if err == nil {
+				t.Fatalf("the manifest validated")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestBundleBindsItsAcquisitionClosure: a bundle that names no tree, no argv
+// and no resolved executables cannot say what reproducing its inputs would
+// take, which is the whole reason it exists.
+func TestBundleBindsItsAcquisitionClosure(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*PlanningInputBundle)
+		want string
+	}{
+		{"no source tree", func(b *PlanningInputBundle) { b.Source.Tree = "" }, "source tree"},
+		{"an abbreviated source commit", func(b *PlanningInputBundle) { b.Source.Commit = "d9ae1d43" }, "source commit"},
+		{"no acquisition argv", func(b *PlanningInputBundle) { b.Acquisition.Argv = nil }, "acquisition argv"},
+		{"no resolved executable", func(b *PlanningInputBundle) { b.Acquisition.Executables = nil }, "resolved executable"},
+		{"an unbound environment", func(b *PlanningInputBundle) { b.Acquisition.Env = nil }, "environment is unbound"},
+		{"no comparability token", func(b *PlanningInputBundle) { b.Selection.Token = "" }, "comparability token"},
+		{"no tie-break order", func(b *PlanningInputBundle) { b.Selection.TieBreak = "" }, "tie-break"},
+		{"K of zero", func(b *PlanningInputBundle) { b.Selection.K = 0 }, "K is 0"},
+		{"a parser with no digest", func(b *PlanningInputBundle) {
+			b.Parsers = []ParserIdentity{{Name: "x", Version: "1"}}
+		}, "no version or digest"},
+		{"a runnable listing with bytes but no names", func(b *PlanningInputBundle) {
+			raw := []byte(`[{"name":"a","file":"x.spec.ts"}]`)
+			b.Runnables = []RunnableSnapshot{{TargetID: "x.spec.ts", Bytes: raw, Digest: DigestBytes(raw)}}
+		}, "no parsed names"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testBundle()
+			tc.edit(&b)
+			err := b.Validate()
+			if err == nil {
+				t.Fatalf("the bundle validated")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestCompareArmsFindsEveryUnequalInvariant is the pair-equality rule: the two
+// arms may differ ONLY in the enumerated candidate testbucket tuple. Anything
+// else differing means the pair compared two different experiments.
+func TestCompareArmsFindsEveryUnequalInvariant(t *testing.T) {
+	reg := testRegistry()
+	regDigest, err := reg.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := testManifest(testBundle(), regDigest)
+	baseline.Role = "baseline"
+	candidate := testManifest(testBundle(), regDigest)
+	// The permitted difference: a different testbucket source, action content
+	// and binary. It must NOT be reported.
+	candidate.Source.BinaryDigest = "sha256:candidate-binary"
+	candidate.Actions["run-bucket"] = ActionIdentity{Commit: testTip, ContentDigest: "sha256:candidate-run"}
+	if diffs := CompareArms(baseline, candidate); len(diffs) != 0 {
+		t.Errorf("the permitted candidate tuple was reported as a difference: %v", diffs)
+	}
+
+	for _, tc := range []struct {
+		name string
+		edit func(*Stage1Manifest)
+		want string
+	}{
+		{"a different runner image", func(m *Stage1Manifest) { m.Consumer.RunnerImage = "ubuntu-22.04@sha256:" + strings.Repeat("ef", 32) }, "runner_image"},
+		{"a different K", func(m *Stage1Manifest) { m.Bundle.Selection.K = 4 }, "selection.k"},
+		{"a different sweep count", func(m *Stage1Manifest) { m.Bundle.Selection.Count = 2 }, "selection.count"},
+		{"a different store", func(m *Stage1Manifest) { m.Bundle.Store = NewRawSnapshot("s", nil, "/repo", []byte("other")) }, "store"},
+		{"a different lockfile", func(m *Stage1Manifest) { m.Consumer.Lockfile = "sha256:other" }, "consumer.lockfile"},
+		{"a different training lineage", func(m *Stage1Manifest) { m.TrainingLineage.ScorerDigest = "sha256:other" }, "training_lineage"},
+		{"a different component registry", func(m *Stage1Manifest) { m.Registry = "sha256:other" }, "component_registry"},
+		{"a different consumer commit", func(m *Stage1Manifest) { m.Consumer.Commit = strings.Repeat("b", 40) }, "consumer.commit"},
+		{"a different source profile", func(m *Stage1Manifest) { m.SourceProfile.Integrities["vitest"] = "sha512-different" }, "source_profile"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testManifest(testBundle(), regDigest)
+			tc.edit(&c)
+			diffs := CompareArms(baseline, c)
+			if len(diffs) == 0 {
+				t.Fatalf("the difference was not reported")
+			}
+			if !strings.Contains(strings.Join(diffs, "; "), tc.want) {
+				t.Errorf("diffs %v do not mention %q", diffs, tc.want)
+			}
+		})
+	}
+
+	// And two arms with the same role are not a pair.
+	same := testManifest(testBundle(), regDigest)
+	if diffs := CompareArms(same, same); len(diffs) == 0 {
+		t.Errorf("two candidate manifests were accepted as a baseline/candidate pair")
 	}
 }

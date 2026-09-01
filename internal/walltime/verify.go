@@ -95,6 +95,11 @@ type Envelope struct {
 type Verdict struct {
 	Schema string `json:"schema"`
 	Dir    string `json:"dir"`
+	// Run is the campaign/delivery identity the records carried. A campaign
+	// assembles its population from verdicts, and a verdict that did not say
+	// which campaign, run and plan it belongs to could be counted into any of
+	// them.
+	Run RunIdentity `json:"run"`
 	// Complete means the records describe a well-formed measurement.
 	Complete bool `json:"complete"`
 	// Eligible means the measurement may be SCORED: complete, plus a scorable
@@ -125,6 +130,11 @@ type VerifyOptions struct {
 	// ETA-completeness gate cannot pass — which is the correct answer, not a
 	// reason to skip the gate.
 	RegistryPath string
+	// ReplayPath is the independent Stage-2 replay attestation. Without it the
+	// records are bound to a receipt nobody re-derived, so the run cannot be
+	// scored: comparing the planner's account of its own output to itself
+	// proves nothing.
+	ReplayPath string
 	// AuthorityKeys are the PREDECLARED public keys of the protected campaign
 	// environment. An empty set is not "accept any key": it means no authority
 	// was declared, and the run is ineligible.
@@ -159,6 +169,15 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	v.Phases = derivePartition(v, envelopes)
 	v.Recon = reconcile(envelopes)
 	summarise(v, envelopes)
+	for _, r := range recs {
+		// The action record's identity is the row's identity; a script or
+		// invocation record inherits it, so the first one that names a
+		// campaign is enough.
+		if r.Level == LevelAction && r.Kind == "boundary" {
+			v.Run = r.Run
+			break
+		}
+	}
 
 	bound := verifyStageBinding(v, opt, recs)
 	registry := loadRegistry(v, opt)
@@ -769,7 +788,58 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 	if stage1 != nil {
 		verifyProducerBinaries(v, stage1.Instrumentation, recs)
 	}
+	verifyReplay(v, opt, stage1, stage2, bound)
 	return bound
+}
+
+// verifyReplay requires an INDEPENDENT re-derivation of the plan.
+//
+// The Stage-2 receipt is the planner's own account of what it produced.
+// Checking it against itself is not verification, and the contract is explicit
+// that an independent verifier must rerun the frozen parsers over the frozen
+// bytes and reject a changed plan before AT_start. A run with no such
+// attestation is complete and unscorable, which is the honest answer.
+func verifyReplay(v *Verdict, opt VerifyOptions, stage1 *Stage1Manifest, stage2 *Stage2Receipt, bound boundIdentities) {
+	if opt.ReplayPath == "" {
+		v.add("WT-018", SeverityIneligible,
+			"no independent Stage-2 replay attestation was supplied; the records are bound to a plan receipt nobody re-derived")
+		return
+	}
+	var a ReplayAttestation
+	if err := ReadJSONFile(opt.ReplayPath, &a); err != nil {
+		v.add("WT-018", SeverityIneligible, fmt.Sprintf("replay attestation: %v", err))
+		return
+	}
+	if stage2 == nil {
+		v.add("WT-018", SeverityIneligible, "a replay attestation was supplied with no Stage-2 receipt to check it against")
+		return
+	}
+	var instr InstrumentationIdentity
+	if stage1 != nil {
+		instr = stage1.Instrumentation
+	}
+	for _, p := range a.Verify(*stage2, bound.stage2, bound.stage1, instr) {
+		v.add("WT-018", SeverityIneligible, "the independent replay does not attest this plan: "+p)
+	}
+	// The attestation is a claim by a party; it has to be signed by one the
+	// campaign declared, for the same reason the manifest does.
+	if a.Signature == nil {
+		v.add("WT-018", SeverityIneligible, "the replay attestation is unsigned")
+		return
+	}
+	d, err := a.DigestOf()
+	if err != nil {
+		v.add("WT-018", SeverityIneligible, fmt.Sprintf("replay attestation: %v", err))
+		return
+	}
+	if len(opt.AuthorityKeys) == 0 {
+		v.add("WT-018", SeverityIneligible,
+			"the replay attestation is signed but no authority key was predeclared, so any self-generated key would pass")
+		return
+	}
+	if err := VerifySigned(a.Signature, d, opt.AuthorityKeys); err != nil {
+		v.add("WT-018", SeverityIneligible, fmt.Sprintf("replay attestation signature: %v", err))
+	}
 }
 
 // verifyAuthority checks the Stage-1 signature against a PREDECLARED authority
@@ -1049,6 +1119,10 @@ func (v *Verdict) Write(out io.Writer) error {
 	}
 	return w.Flush()
 }
+
+// DigestOf is the verdict's canonical identity. A campaign names its rows by
+// this digest, so an index cannot cite one verdict file and score another.
+func (v Verdict) DigestOf() (Digest, error) { return DigestJSON(v) }
 
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {

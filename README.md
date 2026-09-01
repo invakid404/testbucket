@@ -369,24 +369,47 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   (`wall verify --authority-key`). Verifying a signature against whatever
   signed the document accepts any self-generated key, so a run with no
   predeclared authority is reported ineligible rather than trusted.
+- Scoring needs an **independent replay**. The Stage-2 receipt is the planner's
+  own account of what it produced, and checking it against itself proves
+  nothing, so `wall verify --replay` requires a signed attestation from a
+  separate party that re-derived the same plan from the same frozen bytes
+  (`wall replay --attest`).
+- `wall campaign --index` assembles its population from **verifier verdicts**,
+  not from durations in a file: every row must be an `eligible: true` verdict
+  that names the same campaign, run and Stage-1 manifest, and each pair's two
+  signed manifests are compared field by field and may differ only in the
+  enumerated candidate tuple. `--in` still runs the arithmetic on a
+  hand-written file and always exits non-zero, because a number in a JSON file
+  is not an observation.
 
 ### A reproducible plan
 
 ```sh
 # Freeze every planning input — the canonical instant, the raw discovery and
-# runnable bytes, the store bytes, the acquisition closure. The ONLY live read.
+# runnable bytes (and the names they parse to), the store bytes, the
+# acquisition closure. This is the ONLY live read in the whole path.
 testbucket wall bundle --out bundle.json --root . --k 8 --wall-dir /tmp/tb-wall
 
-# Authorise it (the key comes from TB_WALL_AUTHORITY_KEY, never a flag).
+# Authorise it. Every identity the contract needs bound before either arm
+# plans is required here, not discovered at verification time. The signing key
+# comes from TB_WALL_AUTHORITY_KEY, never a flag.
 testbucket wall stage1 --bundle bundle.json --out stage1.json --role candidate \
-  --action-commit "$SHA" --review-tip "$SHA" --source-profile profile.json
+  --action-commit "$SHA" --review-tip "$SHA" --release-sha "$SHA" \
+  --binary ./testbucket --build-attestation "$ATTESTATION" \
+  --source-profile profile.json --scorer scorer.json --registry registry.json \
+  --runner-image "ubuntu-24.04@sha256:…" --consumer-repository owner/repo \
+  --consumer-commit "$CONSUMER_SHA" --caller-workflow-sha "$WORKFLOW_SHA" \
+  --downstream-ref "$REF"
 
 # Plan from the bundle and nothing else: no clock, no discovery, no listing.
 testbucket plan --wall-bundle bundle.json --wall-stage1 stage1.json \
   --wall-stage2 stage2.json --shard-plan plan.json --json > matrix.json
 
-# Replay it independently: this refuses to agree unless EVERY digest matches.
-testbucket wall replay --bundle bundle.json --stage2 stage2.json --stage1 stage1.json
+# Replay it independently and ATTEST the result. `wall verify` requires this:
+# the receipt above is the planner's own account of its own output.
+testbucket wall replay --bundle bundle.json --stage2 stage2.json \
+  --stage1 stage1.json --authority-key "$KEY" \
+  --attest replay.json --verifier-id independent-verifier
 ```
 
 Two plan digests are recorded because they answer different questions. Moving
@@ -424,6 +447,35 @@ with:
   wall-time-dir: /tmp/testbucket-wall
   cgroup-root: /sys/fs/cgroup/testbucket   # create it in a prior step
 ```
+
+Each bucket's records are uploaded as their own artifact, because the records
+are the evidence: a row whose records went away with the runner cannot be
+re-verified by anyone.
+
+For a **scored** arm, add the campaign identities and hand the workflow the
+frozen documents — the signed manifest, the one authorised Stage-2 receipt, the
+independent replay attestation, the registry, and each bucket's forecast and
+projection — as an artifact:
+
+```yaml
+with:
+  runner: vitest
+  wall-time-dir: /tmp/testbucket-wall
+  cgroup-root: /sys/fs/cgroup/testbucket
+  verify-require: eligible          # also refuses a moving version alias
+  testbucket-version: v0.3.0        # an exact tag or a full SHA, never v1
+  campaign-id: ewj2
+  stage1-digest: sha256:…
+  stage2-digest: sha256:…
+  registry-digest: sha256:…
+  authority: ewj2-campaign
+  authority-key: <hex public key>
+  frozen-documents-artifact: testbucket-frozen-candidate
+```
+
+Without that artifact, `verify-require: eligible` fails closed — the verifier
+is being asked to prove something it has not been given, and saying so is the
+right answer.
 
 Wall-time measurement is Vitest-only today. `--wall-dir` with `--runner go` is
 **refused**, not ignored: a flag that silently does nothing is how a consumer
