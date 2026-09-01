@@ -192,12 +192,21 @@ func Exec(opt ExecOptions) (int, error) {
 func runChild(opt ExecOptions, cont Containment) (int, ProcIdentity, string, string) {
 	cmd := exec.Command(opt.Argv[0], opt.Argv[1:]...)
 	cmd.Dir = opt.Cwd
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = opt.Stdin, opt.Stdout, opt.Stderr
-	if cmd.Stdout == nil {
-		cmd.Stdout = os.Stdout
+	// Assign the concrete *os.File values, not the struct fields directly: a
+	// nil *os.File stored in an io.Writer is a NON-nil interface holding a nil
+	// pointer, so `cmd.Stdout == nil` would be false and the child's output
+	// would go nowhere. The tests measured this the hard way — a wrapper that
+	// swallows the test log is worse than no wrapper.
+	stdout, stderr := opt.Stdout, opt.Stderr
+	if stdout == nil {
+		stdout = os.Stdout
 	}
-	if cmd.Stderr == nil {
-		cmd.Stderr = os.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if opt.Stdin != nil {
+		cmd.Stdin = opt.Stdin
 	}
 	attr, cleanup, err := containmentSysProc(cont)
 	if err != nil {

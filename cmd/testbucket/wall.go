@@ -24,6 +24,12 @@ usage:
   testbucket wall observe [flags]  INTERNAL: the peer/collector process itself
   testbucket wall verify  [flags]  verify a records directory and report
                                    eligibility, reconciliation and every gate
+  testbucket wall bundle  [flags]  freeze a planning-input bundle: the canonical
+                                   instant, the raw discovery and runnable bytes,
+                                   the store bytes, and the acquisition closure
+  testbucket wall replay  [flags]  independently replay a bundle through the
+                                   planner and refuse to agree unless every
+                                   digest matches the issued Stage-2 receipt
 
 Every endpoint is a fresh CLOCK_MONOTONIC read taken by the producer that
 records it. A host with no delegated cgroup-v2 subtree (TB_WALL_CGROUP_ROOT)
@@ -47,6 +53,10 @@ func runWall(args []string) error {
 		return runWallObserve(args[1:])
 	case "verify":
 		return runWallVerify(args[1:])
+	case "bundle":
+		return runWallBundle(args[1:])
+	case "replay":
+		return runWallReplay(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, wallUsage)
 		return nil
@@ -163,7 +173,7 @@ func runWallExec(args []string) error {
 		Timeout: *timeout,
 	}
 	if *spec != "" {
-		loaded, err := loadInvocationSpec(*spec)
+		loaded, err := walltime.LoadInvocationSpec(*spec)
 		if err != nil {
 			return err
 		}
@@ -201,35 +211,6 @@ func runWallExec(args []string) error {
 		os.Exit(code)
 	}
 	return nil
-}
-
-// invocationSpec is the plan-bound description of one rendered invocation. The
-// generated script passes a FILE, never a command line: a serialized argv
-// cannot be re-parsed by a shell into different work.
-type invocationSpec struct {
-	Seq        int               `json:"seq"`
-	Argv       []string          `json:"argv"`
-	Cwd        string            `json:"cwd"`
-	Selector   []string          `json:"selector,omitempty"`
-	Desc       string            `json:"desc,omitempty"`
-	UnitDigest walltime.Digest   `json:"unit_digest,omitempty"`
-	AtomDigest walltime.Digest   `json:"atom_digest,omitempty"`
-	Env        map[string]string `json:"env,omitempty"`
-}
-
-func loadInvocationSpec(path string) (*invocationSpec, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read invocation spec: %w", err)
-	}
-	var s invocationSpec
-	if err := json.Unmarshal(b, &s); err != nil {
-		return nil, fmt.Errorf("invocation spec %s: %w", path, err)
-	}
-	if len(s.Argv) == 0 {
-		return nil, fmt.Errorf("invocation spec %s has no argv", path)
-	}
-	return &s, nil
 }
 
 func runWallObserve(args []string) error {

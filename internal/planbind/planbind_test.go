@@ -1,0 +1,232 @@
+package planbind
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/invakid404/testbucket/internal/walltime"
+)
+
+// discoveryJSON is what `vitest list --filesOnly --json` prints: the raw bytes
+// a bundle freezes.
+const discoveryJSON = `[{"file":"tests/alpha.spec.ts"},{"file":"tests/beta.spec.ts"},{"file":"tests/gamma.spec.ts"}]`
+
+// storeJSON is a warm store: three measured targets, one of them flagged for
+// name slicing so the runnable-listing input actually matters.
+const storeJSON = `{
+  "schema": 1,
+  "flags": "vitest",
+  "updated_at": "2026-08-20T00:00:00Z",
+  "units": {
+    "tests/alpha.spec.ts": {"seconds": 90, "samples": 4, "split": "run", "split_into": 2,
+      "tests": {"alpha one": 60, "alpha two": 30}},
+    "tests/beta.spec.ts": {"seconds": 40, "samples": 4},
+    "tests/gamma.spec.ts": {"seconds": 20, "samples": 4}
+  }
+}`
+
+// runnableJSON is what `vitest list <file> --json` prints for the sliced file.
+const runnableJSON = `[{"name":"alpha one","file":"tests/alpha.spec.ts"},{"name":"alpha two","file":"tests/alpha.spec.ts"}]`
+
+func acquire(t *testing.T, root string, mutate func(*AcquireOptions)) *walltime.PlanningInputBundle {
+	t.Helper()
+	storePath := filepath.Join(root, "test-timings.json")
+	if err := os.WriteFile(storePath, []byte(storeJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opt := AcquireOptions{
+		Root: root, Runner: "vitest",
+		Instant:       time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC),
+		StaleAfter:    14 * 24 * time.Hour,
+		K:             2,
+		Count:         1,
+		Token:         "vitest",
+		StorePath:     storePath,
+		DiscoveryArgv: []string{"npx", "vitest", "list", "--filesOnly", "--json"},
+		Discovery:     []byte(discoveryJSON),
+		Runnables:     map[string][]byte{"tests/alpha.spec.ts": []byte(runnableJSON)},
+		Env:           map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": ""},
+		Executables:   map[string]string{"npx": "/usr/local/bin/npx"},
+		Tools:         map[string]string{"node": "24.19.0"},
+		Repository:    "example/mandel", Commit: "d9ae1d43", Tree: "sha256:tree",
+	}
+	if mutate != nil {
+		mutate(&opt)
+	}
+	b, err := Acquire(opt)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	return b
+}
+
+func plan(t *testing.T, b *walltime.PlanningInputBundle) *Result {
+	t.Helper()
+	res, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	return res
+}
+
+// TestReplayIsByteIdentical is the replay evidence: the same frozen bundle
+// planned twice produces the same plan, digest for digest. Without this, a
+// Stage-2 receipt is a claim nobody can check.
+func TestReplayIsByteIdentical(t *testing.T) {
+	root := t.TempDir()
+	b := acquire(t, root, nil)
+	first := plan(t, b)
+	second := plan(t, b)
+	if err := first.Receipt.Matches(second.Receipt); err != nil {
+		t.Fatalf("replaying one bundle produced a different plan: %v", err)
+	}
+	// The receipt must actually carry both digests and the derived identities;
+	// a receipt that validates but is empty proves nothing.
+	if first.Receipt.PlanDigest == first.Receipt.SemanticDigest {
+		t.Errorf("the full-document and semantic digests are the same value")
+	}
+	for name, d := range map[string]walltime.Digest{
+		"atom": first.Receipt.AtomDigest, "topology": first.Receipt.TopologyDigest,
+		"membership": first.Receipt.MembershipDigest, "invocation": first.Receipt.InvocationDigest,
+		"script": first.Receipt.ScriptDigest, "matrix": first.Receipt.MatrixDigest,
+	} {
+		if d == "" {
+			t.Errorf("the receipt has no %s digest", name)
+		}
+	}
+	// The sliced target's names came from the frozen listing, so the plan must
+	// contain a name slice rather than the whole file.
+	if !strings.Contains(scriptBytes(first.Doc), "alpha one") {
+		t.Errorf("the frozen runnable listing did not reach the rendered slice:\n%s", scriptBytes(first.Doc))
+	}
+}
+
+// TestChangedInputChangesTheDigest: one byte of discovery is a different plan,
+// and the receipt says so.
+func TestChangedInputChangesTheDigest(t *testing.T) {
+	root := t.TempDir()
+	base := plan(t, acquire(t, root, nil))
+	// The same root, so the only difference between the two runs is the
+	// discovery bytes themselves.
+	changed := plan(t, acquire(t, root, func(o *AcquireOptions) {
+		o.Discovery = []byte(strings.Replace(discoveryJSON, "gamma", "delta", 1))
+	}))
+	if err := base.Receipt.Matches(changed.Receipt); err == nil {
+		t.Fatalf("renaming a discovered file did not change any digest")
+	}
+	if base.Receipt.SemanticDigest == changed.Receipt.SemanticDigest {
+		t.Errorf("the semantic projection did not notice a different file set")
+	}
+}
+
+// TestTheTwoDigestsAnswerDifferentQuestions is why both exist. Moving the
+// canonical instant changes the plan DOCUMENT — the store is older, so the
+// summary says so — while changing nothing about what will run.
+func TestTheTwoDigestsAnswerDifferentQuestions(t *testing.T) {
+	root := t.TempDir()
+	early := plan(t, acquire(t, root, nil))
+	late := plan(t, acquire(t, root, func(o *AcquireOptions) {
+		o.Instant = o.Instant.Add(72 * time.Hour)
+	}))
+	if early.Receipt.PlanDigest == late.Receipt.PlanDigest {
+		t.Errorf("a three-day-older store did not change the full plan document")
+	}
+	if early.Receipt.SemanticDigest != late.Receipt.SemanticDigest {
+		t.Errorf("the clock changed WHAT RUNS, which it must not:\n%s\n%s",
+			early.Receipt.SemanticDigest, late.Receipt.SemanticDigest)
+	}
+}
+
+// TestAmbientInputsAreRefused: the bundle is the only admissible source, so a
+// missing frozen listing is an error rather than a live `vitest list`.
+func TestAmbientInputsAreRefused(t *testing.T) {
+	root := t.TempDir()
+	b := acquire(t, root, func(o *AcquireOptions) { o.Runnables = nil })
+	_, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	if err == nil {
+		t.Fatalf("planning succeeded with no frozen listing for a name-sliced target")
+	}
+	if !strings.Contains(err.Error(), "unbound input") {
+		t.Errorf("error %q does not name the unbound input", err)
+	}
+
+	// And an ambient clock is refused at acquisition, before anything is
+	// frozen at all.
+	if _, err := Acquire(AcquireOptions{Root: root, Runner: "vitest", Discovery: []byte(discoveryJSON)}); err == nil {
+		t.Errorf("a bundle was acquired with no canonical planning instant")
+	}
+}
+
+// TestBundleTamperingIsCaught: a snapshot whose bytes no longer match its
+// digest cannot be planned from.
+func TestBundleTamperingIsCaught(t *testing.T) {
+	root := t.TempDir()
+	b := acquire(t, root, nil)
+	b.Discovery[0].Bytes = []byte(`[{"file":"tests/injected.spec.ts"}]`)
+	if err := b.Validate(); err == nil {
+		t.Fatalf("a rewritten discovery snapshot validated")
+	}
+	if _, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"}); err == nil {
+		t.Fatalf("a rewritten discovery snapshot was planned from")
+	}
+}
+
+// TestColdStartIsBoundAsAColdStart: an absent store is recorded explicitly, so
+// a replay cold-starts too instead of finding a store that appeared later.
+func TestColdStartIsBoundAsAColdStart(t *testing.T) {
+	root := t.TempDir()
+	b, err := Acquire(AcquireOptions{
+		Root: root, Runner: "vitest", Instant: time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC),
+		StaleAfter: 14 * 24 * time.Hour, K: 2, Count: 1, Token: "vitest",
+		StorePath: filepath.Join(root, "absent.json"),
+		Discovery: []byte(discoveryJSON),
+	})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	found := false
+	for _, a := range b.AbsentInputs {
+		if strings.HasPrefix(a, "store:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a missing store was not recorded as an absent input: %v", b.AbsentInputs)
+	}
+	res := plan(t, b)
+	if !res.Doc.Summary.ColdStart {
+		t.Errorf("the replayed plan did not cold-start")
+	}
+}
+
+// TestWallRenderedScriptCarriesItsSpecs: with a records directory, each
+// invocation is written as a serialised spec and run through the wrapper, and
+// the spec is IN the script so the plan digest covers it.
+func TestWallRenderedScriptCarriesItsSpecs(t *testing.T) {
+	root := t.TempDir()
+	b := acquire(t, root, func(o *AcquireOptions) { o.WallDir = "/tmp/wall" })
+	res, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	script := scriptBytes(res.Doc)
+	for _, want := range []string{"testbucket wall exec", "--level invocation", `"argv":`, "/tmp/wall/spec-"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the rendered script does not contain %q:\n%s", want, script)
+		}
+	}
+	// The same plan WITHOUT a records directory must render the v0.2.2 bytes,
+	// so measurement stays strictly opt-in.
+	plainRes := plan(t, acquire(t, root, nil))
+	plain := scriptBytes(plainRes.Doc)
+	if strings.Contains(plain, "testbucket wall") {
+		t.Errorf("the default render mentions the wrapper:\n%s", plain)
+	}
+	if res.Receipt.ScriptDigest == plainRes.Receipt.ScriptDigest {
+		t.Errorf("wrapping every invocation did not change the script digest")
+	}
+}

@@ -134,6 +134,16 @@ type PlanningInputBundle struct {
 		Renderer string `json:"renderer"`
 		TieBreak string `json:"tie_break"`
 	} `json:"selection"`
+	// Render is the render configuration the generated script bytes depend on.
+	// It belongs in the bundle rather than in a replay flag: a replay that had
+	// to be TOLD how to render could produce a different script from the same
+	// bound inputs, which is exactly the unbound input the bundle exists to
+	// close.
+	Render struct {
+		EventsDir       string `json:"events_dir"`
+		FileParallelism int    `json:"file_parallelism"`
+		WallDir         string `json:"wall_dir"`
+	} `json:"render"`
 	// AbsentInputs names every input that legitimately does not exist, so
 	// "not present" is a bound claim rather than an omission.
 	AbsentInputs []string `json:"absent_inputs"`

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/invakid404/testbucket/internal/runner"
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
 // renderConfig is the Vitest adapter's own render configuration.
@@ -25,6 +26,12 @@ type renderConfig struct {
 	// trading that sum-of-weights guarantee — a bucket then finishes nearer its
 	// heaviest file than its sum — for using more of a runner's cores.
 	fileParallelism int
+	// wallDir, when set, runs each invocation under `testbucket wall exec` so
+	// it gets a physical envelope (V), a containment peer (CPV) and an
+	// independent trace (VT). Empty — the default — renders exactly the bytes
+	// v0.2.2 rendered: measurement is opt-in, and a consumer that does not ask
+	// for it sees no change at all.
+	wallDir string
 }
 
 // Render turns one planned bucket into the concrete `vitest run` command(s). It
@@ -127,6 +134,9 @@ func vitestInvocation(cfg renderConfig, files, names []string) runner.Invocation
 }
 
 func shellLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string {
+	if cfg.wallDir != "" {
+		return wallLine(inv, cfg, bucket, seq)
+	}
 	var sb strings.Builder
 	sb.WriteString("( cd ")
 	sb.WriteString(shellQuote(inv.Dir))
@@ -145,6 +155,46 @@ func shellLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string 
 			shellQuote(fmt.Sprintf("%s/bucket-%d-%02d.json", strings.TrimSuffix(cfg.eventsDir, "/"), bucket, seq)))
 	}
 	sb.WriteString(" )")
+	return sb.String()
+}
+
+// wallLine renders one invocation under the physical wrapper. The command is
+// written out as a SPEC FILE and the wrapper is handed its path, so the argv
+// the plan digested is the argv that executes: no shell re-splits it, and a
+// file name with a space or a leading dash cannot become different work
+// between planning and running.
+//
+// The spec is embedded in the script rather than written beside it because the
+// script bytes are what the Stage-2 receipt digests. A spec that lived
+// elsewhere could change without changing the plan.
+func wallLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string {
+	args := append([]string(nil), inv.Args...)
+	if cfg.eventsDir != "" {
+		args = append(args, "--reporter=default", "--reporter=json",
+			fmt.Sprintf("--outputFile.json=%s/bucket-%d-%02d.json", strings.TrimSuffix(cfg.eventsDir, "/"), bucket, seq))
+	}
+	spec, err := walltime.MarshalSpec(walltime.InvocationSpec{
+		Seq: seq, Argv: args, Cwd: inv.Dir, Selector: strings.Fields(inv.Desc), Desc: inv.Desc,
+	})
+	if err != nil {
+		// MarshalSpec fails only on a value encoding/json cannot represent,
+		// which an argv of strings cannot be; a panic here would be a bug in
+		// this function, not a runtime condition.
+		panic(err)
+	}
+	dir := strings.TrimSuffix(cfg.wallDir, "/")
+	specPath := fmt.Sprintf("%s/spec-%d-%02d.json", dir, bucket, seq)
+	var sb strings.Builder
+	sb.WriteString("printf '%s' ")
+	sb.WriteString(shellQuote(spec))
+	sb.WriteString(" > ")
+	sb.WriteString(shellQuote(specPath))
+	sb.WriteString(" && testbucket wall exec --dir ")
+	sb.WriteString(shellQuote(dir))
+	sb.WriteString(" --level invocation --seq ")
+	fmt.Fprintf(&sb, "%d", seq)
+	sb.WriteString(" --spec ")
+	sb.WriteString(shellQuote(specPath))
 	return sb.String()
 }
 

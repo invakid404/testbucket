@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -312,5 +313,34 @@ func TestRecordsAreTamperEvident(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no WT-002 chain finding for a rewritten record: %+v", v.Findings)
+	}
+}
+
+// TestExecPassesTheChildOutputThrough is a regression test with a scar: a
+// wrapper that swallows the test log is worse than no wrapper, and a nil
+// *os.File stored in an io.Writer is a non-nil interface holding a nil
+// pointer, so the obvious nil check does not catch it.
+func TestExecPassesTheChildOutputThrough(t *testing.T) {
+	dir := t.TempDir()
+	out, err := os.CreateTemp(dir, "stdout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	if _, err := Exec(ExecOptions{
+		Level: LevelInvocation, Dir: dir, Cwd: dir, Timeout: 30 * time.Second,
+		Argv:   []string{"sh", "-c", "echo the-test-log; echo the-error-log >&2"},
+		Stdout: out, Stderr: out,
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	b, err := os.ReadFile(out.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"the-test-log", "the-error-log"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("the child's output did not reach the caller: wanted %q in %q", want, b)
+		}
 	}
 }

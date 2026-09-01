@@ -184,6 +184,12 @@ func parseProjects(root string, data []byte) (map[string]string, error) {
 // resolves files without importing them; `list` opts into the importing
 // full-collection path, and a verbatim DiscoveryCommand overrides both.
 func (r *Runner) discover(ctx context.Context) ([]runner.LivePackage, error) {
+	// A frozen bundle supplies the discovery BYTES; the parser below is the
+	// same one the live path uses, so a replay differs from the original run
+	// in where the bytes came from and in nothing else.
+	if r.frozen != nil {
+		return parseList(r.root, r.frozen.Discovery)
+	}
 	out, err := r.runDiscovery(ctx)
 	if err != nil {
 		return nil, err

@@ -136,18 +136,27 @@ func LoadStore(path string) (st *Store, reason string, err error) {
 			return nil, "", fmt.Errorf("read store %s: %w", path, err)
 		}
 	}
+	return ParseStore(data, storeName(path))
+}
+
+// ParseStore turns store BYTES into a store, with the same not-an-error
+// reasons LoadStore reports. It is separate from LoadStore so a caller that
+// already holds the exact bytes — a replay from a frozen input bundle, say —
+// reads the same store the file would have produced, through the same parser,
+// without a detour through the filesystem.
+func ParseStore(data []byte, name string) (st *Store, reason string, err error) {
 	if len(strings.TrimSpace(string(data))) == 0 {
-		return nil, fmt.Sprintf("store %s is empty", storeName(path)), nil
+		return nil, fmt.Sprintf("store %s is empty", name), nil
 	}
 	st = &Store{}
 	if err := json.Unmarshal(data, st); err != nil {
-		return nil, "", fmt.Errorf("parse store %s: %w", storeName(path), err)
+		return nil, "", fmt.Errorf("parse store %s: %w", name, err)
 	}
 	if st.Units == nil {
 		st.Units = map[string]*UnitStat{}
 	}
 	if st.Schema != storeSchema {
-		return nil, fmt.Sprintf("store %s has schema %d, this tool speaks schema %d", storeName(path), st.Schema, storeSchema), nil
+		return nil, fmt.Sprintf("store %s has schema %d, this tool speaks schema %d", name, st.Schema, storeSchema), nil
 	}
 	return st, "", nil
 }

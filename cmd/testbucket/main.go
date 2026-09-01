@@ -148,6 +148,7 @@ type runnerConfig struct {
 	timeout      string
 	nodePrefixes []string
 	// Vitest run envelope.
+	wallDir                string
 	root                   string
 	vitestCommand          string
 	vitestDiscovery        string
@@ -200,6 +201,7 @@ func newRunner(cfg runnerConfig) (runner.Runner, liveLoader, error) {
 			DiscoveryTimeout: cfg.discoveryTimeout,
 			EventsDir:        cfg.eventsDir,
 			FileParallelism:  cfg.fileParallelism,
+			WallDir:          cfg.wallDir,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -303,6 +305,9 @@ func runPlan(args []string) error {
 	countFlag := fs.Int("count", 100, "-count for the flake sweep; count-shards divide it (Go default 100; Vitest requires 1)")
 	timeout := fs.String("timeout", "20m", "-timeout passed to each go test invocation")
 	live := fs.String("live", "", "read the live package set from this JSON file instead of running go list")
+	wallBundle := fs.String("wall-bundle", "", "plan DETERMINISTICALLY from this frozen planning-input bundle (`testbucket wall bundle`) instead of discovering and reading the clock: every input comes from the bundle, so the plan is reproducible")
+	wallStage1 := fs.String("wall-stage1", "", "Stage-1 input manifest that authorises the bundle (--wall-bundle)")
+	wallStage2 := fs.String("wall-stage2", "", "write the Stage-2 derived-plan receipt here (--wall-bundle). It refuses to overwrite: the bound planner runs exactly once")
 	nodePrefixes := fs.String("node-prefixes", "", "comma-separated package-dir prefixes whose buckets need Node set up (empty = none; a consumer opts in)")
 	eventsDir := fs.String("events-dir", "", "if set, emitted invocations add -json and tee events into this directory")
 	fileParallelism := fs.Int("file-parallelism", 1, "intra-bucket file/package concurrency (#22): 1 keeps a bucket serial (the sum-of-weights model the balancer packs to); N>1 renders `-p=N` (Go) / `--maxWorkers=N` (Vitest), trading that estimate for more cores")
@@ -314,10 +319,18 @@ func runPlan(args []string) error {
 	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly` — resolves files by glob WITHOUT importing them, immune to the multi-project `vitest list` collection deadlock) or list (`vitest list --json` — imports the module graph; only its per-test names matter, which file-granularity bucketing does not use today)")
 	vitestDiscoveryCommand := fs.String("vitest-discovery-command", "", "override discovery with a command run VERBATIM (--runner vitest): it OWNS its subcommand and flags (testbucket appends nothing) and must print the [{file}] / [{name,file}] JSON to stdout. Lets a run-wrapper that already owns `run` be paired with a separate discovery command. Empty = derive from --vitest-command + --vitest-discovery")
 	discoveryTimeout := fs.Duration("discovery-timeout", defDiscoveryTimeout, "fail-fast deadline for vitest test discovery (--runner vitest); a stalled `vitest list` errors here instead of hanging the whole job. 0 disables. Default overridable via TB_DISCOVERY_TIMEOUT")
+	wallDir := fs.String("wall-dir", "", "records directory for complete-action wall-time measurement (--runner vitest): every rendered invocation runs under `testbucket wall exec`, which gives it a physical envelope, a containment peer and an independent trace. Empty (the default) renders exactly the bytes v0.2.2 rendered")
 	var excludes stringList
 	fs.Var(&excludes, "exclude-module", "module dir (glob) to leave out of the module set; repeatable, replaces the defaults")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// The frozen path takes over completely: a bundle carries K, the count, the
+	// token, the clock and the render configuration, so honouring a flag here
+	// as well would be a second, unbound source for the same input.
+	if *wallBundle != "" {
+		return planFromBundle(*wallBundle, *wallStage1, *wallStage2, *shardPlan, *asJSON)
 	}
 
 	// The effective sweep count is adapter-aware (Go 100, Vitest 1); resolve it
@@ -360,6 +373,7 @@ func runPlan(args []string) error {
 		discoveryTimeout:       *discoveryTimeout,
 		eventsDir:              *eventsDir,
 		fileParallelism:        *fileParallelism,
+		wallDir:                *wallDir,
 	})
 	if err != nil {
 		return err
