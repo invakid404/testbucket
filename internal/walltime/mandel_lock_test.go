@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -56,12 +57,31 @@ func TestTheParserReadsTheFrozenMandelLockShape(t *testing.T) {
 		}
 	}
 
-	// Every node carries a complete identity: the lock's own key, a name, a
-	// version and an integrity. A closure with holes is not a closure.
+	// Every node carries a complete identity: the lock's own key, a name and a
+	// version. Integrity is the one field a real lock can genuinely lack, and
+	// the excerpt keeps the frozen lock's single such node so the fail-closed
+	// policy is exercised against a real one rather than an invented one.
+	unpinned := map[string]string{}
 	for key, node := range closure {
-		if node.Key != key || node.Name == "" || node.Version == "" || node.Integrity == "" {
+		if node.Key != key || node.Name == "" || node.Version == "" {
 			t.Errorf("node %q is incompletely resolved: %+v", key, node)
 		}
+		if node.Integrity == "" {
+			unpinned[key] = node.Tarball
+		}
+	}
+	const xlsx = "xlsx@https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+	tarball, ok := unpinned[xlsx]
+	if !ok {
+		t.Fatalf("the excerpt no longer carries the frozen lock's one unpinned node; unpinned=%v", unpinned)
+	}
+	if tarball != "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz" {
+		t.Errorf("the unpinned node records tarball %q", tarball)
+	}
+	// And its VERSION comes from the entry's own `version:` field, not from
+	// the URL its key is made of.
+	if got := closure[xlsx].Version; got != "0.20.3" {
+		t.Errorf("the URL-resolved node reports version %q, want the lock-recorded 0.20.3", got)
 	}
 
 	// The frozen Vitest family, at the frozen version, from the real entries.
@@ -73,6 +93,32 @@ func TestTheParserReadsTheFrozenMandelLockShape(t *testing.T) {
 		family[node.Name] = true
 		if node.Version != RequiredVitest {
 			t.Errorf("%s resolves at %s, not the frozen %s", node.Key, node.Version, RequiredVitest)
+		}
+	}
+
+	// PEER CONTEXTS, from the lock's `snapshots:` section. Reading only
+	// `packages:` looked complete and dropped every one of these: the same
+	// package@version resolved under two different peer graphs is two nodes,
+	// and the frozen lock has 474 of them.
+	peers := map[string]int{}
+	for _, node := range closure {
+		if node.PeerContext != "" {
+			peers[node.Name]++
+		}
+	}
+	for _, want := range []string{"vitest", "@vitest/mocker", "@ai-sdk/provider-utils"} {
+		if peers[want] < 2 {
+			t.Errorf("%s has %d peer-context node(s); the excerpt keeps the multi-peer ones and the parser must return all of them", want, peers[want])
+		}
+	}
+	// A peer node inherits its resolution metadata from the package entry,
+	// so it is a fully identified node and not a bare key.
+	for key, node := range closure {
+		if node.PeerContext == "" {
+			continue
+		}
+		if node.Version != strings.TrimPrefix(key[:len(key)-len(node.PeerContext)], node.Name+"@") {
+			t.Errorf("peer node %q reports version %q", key, node.Version)
 		}
 	}
 	for _, want := range []string{"vitest", "@vitest/runner", "@vitest/expect", "@vitest/mocker", "@vitest/snapshot", "@vitest/spy", "@vitest/utils"} {

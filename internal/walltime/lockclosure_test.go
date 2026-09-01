@@ -32,12 +32,13 @@ func TestTheLockClosureIsDerivedFromTheLockfileBytes(t *testing.T) {
 			"node_modules/tinyrainbow":    {Key: "node_modules/tinyrainbow", Name: "tinyrainbow", Version: "2.0.0", Integrity: "sha512-rainbow"},
 		}},
 		{LockParserPNPM, testPnpmLock, map[string]LockedPackage{
-			"vitest@4.1.10":                     {Key: "vitest@4.1.10", Name: "vitest", Version: "4.1.10", Integrity: "sha512-vitest"},
-			"@vitest/runner@4.1.10":             {Key: "@vitest/runner@4.1.10", Name: "@vitest/runner", Version: "4.1.10", Integrity: "sha512-runner"},
-			"@vitest/expect@4.1.10(vite@7.0.0)": {Key: "@vitest/expect@4.1.10(vite@7.0.0)", Name: "@vitest/expect", Version: "4.1.10", Integrity: "sha512-expect"},
-			"tinyrainbow@2.0.0":                 {Key: "tinyrainbow@2.0.0", Name: "tinyrainbow", Version: "2.0.0", Integrity: "sha512-tinyrainbow"},
-			"@ai-sdk/provider-utils@2.2.8":      {Key: "@ai-sdk/provider-utils@2.2.8", Name: "@ai-sdk/provider-utils", Version: "2.2.8", Integrity: "sha512-provider-utils-2"},
-			"@ai-sdk/provider-utils@3.0.30":     {Key: "@ai-sdk/provider-utils@3.0.30", Name: "@ai-sdk/provider-utils", Version: "3.0.30", Integrity: "sha512-provider-utils-3"},
+			"vitest@4.1.10":         {Key: "vitest@4.1.10", Name: "vitest", Version: "4.1.10", Integrity: "sha512-vitest"},
+			"@vitest/runner@4.1.10": {Key: "@vitest/runner@4.1.10", Name: "@vitest/runner", Version: "4.1.10", Integrity: "sha512-runner"},
+			"@vitest/expect@4.1.10(vite@7.0.0)": {Key: "@vitest/expect@4.1.10(vite@7.0.0)", Name: "@vitest/expect", Version: "4.1.10",
+				Integrity: "sha512-expect", PeerContext: "(vite@7.0.0)"},
+			"tinyrainbow@2.0.0":             {Key: "tinyrainbow@2.0.0", Name: "tinyrainbow", Version: "2.0.0", Integrity: "sha512-tinyrainbow"},
+			"@ai-sdk/provider-utils@2.2.8":  {Key: "@ai-sdk/provider-utils@2.2.8", Name: "@ai-sdk/provider-utils", Version: "2.2.8", Integrity: "sha512-provider-utils-2"},
+			"@ai-sdk/provider-utils@3.0.30": {Key: "@ai-sdk/provider-utils@3.0.30", Name: "@ai-sdk/provider-utils", Version: "3.0.30", Integrity: "sha512-provider-utils-3"},
 		}},
 	} {
 		t.Run(tc.parser, func(t *testing.T) {

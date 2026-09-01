@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -34,6 +35,21 @@ type PhysicalVReceipt struct {
 	Kind      string `json:"kind"`
 	ReceiptID string `json:"receipt_id"`
 	UnitID    string `json:"unit_id"`
+	// The EXCLUSION DOMAIN identities, in the signed receipt where they belong.
+	//
+	// The contract excludes candidate, campaign, current-run and holdout
+	// evidence from the training surface. Those are properties of the
+	// OBSERVATION, so a receipt that does not carry them cannot be excluded by
+	// them: exclusions used to be compared against `receipt_id` alone, and a
+	// label from an explicitly excluded campaign was admissible because
+	// nothing in the schema could say which campaign it came from.
+	//
+	// They are part of the signed receipt bytes, so the observing authority
+	// attests them and a later reader cannot add or drop one.
+	CampaignID  string `json:"campaign_id,omitempty"`
+	CandidateID string `json:"candidate_id,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
+	HoldoutID   string `json:"holdout_id,omitempty"`
 	// Level, Producer and Source are the qualification. A reporter annotation
 	// or a peer/trace record is not a physical V, and only an independently
 	// observed OS class may delimit one.
@@ -172,7 +188,24 @@ func (l TrainingLabel) VerifyEvidence(signers []string) []string {
 		problems = append(problems, fmt.Sprintf("%s: it claims %s but its receipt observed %s", where, l.ObservedAt, receipt.ObservedAt))
 	}
 
-	// 4. The causal chain is stated by the RECEIPT, not only by the label.
+	// 4. The exclusion-domain identities the label repeats must be the ones
+	//    its own signed receipt states. A label that could name a different
+	//    campaign than its receipt would be excludable only on its own say-so.
+	for _, f := range []struct {
+		what        string
+		label, from string
+	}{
+		{"campaign", l.CampaignID, receipt.CampaignID},
+		{"candidate", l.CandidateID, receipt.CandidateID},
+		{"run", l.RunID, receipt.RunID},
+		{"holdout", l.HoldoutID, receipt.HoldoutID},
+	} {
+		if l.Evidence != nil && f.label != f.from {
+			problems = append(problems, fmt.Sprintf("%s: it names %s %q, but its own receipt names %q", where, f.what, f.label, f.from))
+		}
+	}
+
+	// 5. The causal chain is stated by the RECEIPT, not only by the label.
 	if receipt.SelectedWorkDigest != l.SelectedWorkDigest {
 		problems = append(problems, fmt.Sprintf("%s: it attributes the duration to selected work %s, but its own receipt attributes it to %s", where, l.SelectedWorkDigest, receipt.SelectedWorkDigest))
 	}
@@ -180,7 +213,7 @@ func (l TrainingLabel) VerifyEvidence(signers []string) []string {
 		problems = append(problems, fmt.Sprintf("%s: it names topology receipt %s, but its own receipt names %s", where, l.TopologyReceipt, receipt.TopologyReceipt))
 	}
 
-	// 5. The selected work is this unit's, and it is not empty: a duration
+	// 6. The selected work is this unit's, and it is not empty: a duration
 	//    attributed to no work is not causally attributed at all.
 	if work.UnitID != l.UnitID {
 		problems = append(problems, fmt.Sprintf("%s: its selected-work document is for unit %s", where, work.UnitID))
@@ -189,7 +222,7 @@ func (l TrainingLabel) VerifyEvidence(signers []string) []string {
 		problems = append(problems, fmt.Sprintf("%s: its selected-work document selects nothing, so the duration is attributed to no work", where))
 	}
 
-	// 6. The topology was VALIDATED, for this unit, over this selected work.
+	// 7. The topology was VALIDATED, for this unit, over this selected work.
 	if !topology.Validated {
 		problems = append(problems, fmt.Sprintf("%s: its topology receipt does not record a validated topology", where))
 	}
@@ -216,7 +249,13 @@ func decodeEvidence[T any](where, what string, raw []byte, want Digest, kind str
 		return nil, []string{fmt.Sprintf("%s: its %s digests to %s, not the %s it names", where, what, got, want)}
 	}
 	var doc T
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	// UNKNOWN FIELDS ARE REFUSED. Ordinary decoding discards them, and a
+	// security-relevant field the schema does not model is one no check can
+	// read: a receipt carrying an exclusion identity nobody decoded verified
+	// its own signature perfectly while the value it named went unexamined.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&doc); err != nil {
 		return nil, []string{fmt.Sprintf("%s: its %s does not parse: %v", where, what, err)}
 	}
 	k, sig, err := evidenceIdentity(&doc)

@@ -210,6 +210,57 @@ func TestAnEditedReleaseManifestIsRefused(t *testing.T) {
 	}
 }
 
+// TestThePublisherRechecksTheMutableTag is the F7 regression.
+//
+// The campaign gate binds `github.sha` — the commit the run was triggered for.
+// Publication addressed the tag by NAME, and a tag is mutable: one moved
+// between the gate and the upload would publish a different commit's work
+// under gated evidence. GitHub also ignores `--target` when the tag already
+// exists, so the create path's target was no defence and the upload path had
+// none at all.
+func TestThePublisherRechecksTheMutableTag(t *testing.T) {
+	publisher := releaseWorkflowStep(t, "- name: Publish the gated assets")
+	// The remote tag is resolved again, immediately before publishing.
+	if !strings.Contains(publisher, "git/ref/tags") {
+		t.Error("the publisher never re-resolves the remote tag; a tag moved after the gate publishes an unauthorised commit")
+	}
+	// An annotated tag object is dereferenced to the commit it points at.
+	if !strings.Contains(publisher, "git/tags") {
+		t.Error("the publisher does not dereference an annotated tag object to its commit")
+	}
+	// And the resolved commit is COMPARED with the gated one, not merely read.
+	if !strings.Contains(publisher, "$TB_RELEASE_SHA") || !strings.Contains(publisher, "REFUSED") {
+		t.Error("the publisher does not compare the re-resolved tag with the gated SHA and refuse a mismatch")
+	}
+	// The recheck must come BEFORE any upload, or it reports on a release that
+	// already happened.
+	recheck := strings.Index(publisher, "git/ref/tags")
+	for _, upload := range []string{"gh release upload", "gh release create"} {
+		if at := strings.Index(publisher, upload); at >= 0 && at < recheck {
+			t.Errorf("%q happens before the tag recheck", upload)
+		}
+	}
+}
+
+// releaseWorkflowStep returns one step of the committed release workflow.
+func releaseWorkflowStep(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	yaml := string(b)
+	start := strings.Index(yaml, name)
+	if start < 0 {
+		t.Fatalf("release.yml has no step %q", name)
+	}
+	end := strings.Index(yaml[start:], "\n  # The major alias")
+	if end < 0 {
+		t.Fatalf("could not isolate %q", name)
+	}
+	return yaml[start : start+end]
+}
+
 // TestTheReleaseWorkflowUsesOneSelector is the workflow-level half of F1.
 //
 // The Go layer above cannot see a workflow that derives the set correctly and

@@ -350,6 +350,40 @@ packages:
 const testFacade = "await import('vitest/node')\n"
 const testViteConfig = "export default { test: { fileParallelism: false } }\n"
 
+// testBuilderAuthority is the party that built and attested the delivered
+// binary — a different party from the campaign authority that approves the
+// inputs, because a builder vouching for its own approval is one signature
+// doing two jobs.
+var testBuilderAuthority = mustSigningKey()
+
+func testBuilderKeys() []string { return []string{PublicKeyOf(testBuilderAuthority)} }
+
+// testBuildAttestation is a complete signed statement about one build: every
+// identity the contract asks to be retained, and a result that admits it.
+func testBuildAttestation(binary Digest, commit string) BuildAttestation {
+	a := BuildAttestation{
+		Kind: BuildAttestationKind, SubjectName: "testbucket", SubjectDigest: binary,
+		SourceRepository: "invakid404/testbucket", SourceCommit: commit,
+		BuilderID: "invakid404/testbucket/.github/workflows/release.yml@refs/tags/v0.3.0",
+		Issuer:    "https://token.actions.githubusercontent.com",
+		BuildRun:  "run-1", BuildAttempt: "1",
+		VerifierID: "ewj2-delivery", VerifierBinary: synthBinary, VerifierVersion: "v0.3.0",
+		VerifiedAt: "2026-08-31T12:00:00Z", Result: AttestationVerified,
+	}
+	if err := a.Sign("ewj2-builder", testBuilderAuthority); err != nil {
+		panic(err)
+	}
+	return a
+}
+
+func mustLockParserIdentity(name string) ParserIdentity {
+	id, err := LockParserIdentity(name)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
 // testSourceProfile is the complete, lock-derivable source profile: the exact
 // façade, config and lockfile bytes, and a closure that is exactly what the
 // lockfile resolves.
@@ -361,7 +395,9 @@ func testSourceProfile() SourceProfileReceipt {
 		Config:      DigestBytes([]byte(testViteConfig)),
 		Lockfile:    DigestBytes(lock),
 		FacadeBytes: []byte(testFacade), ConfigBytes: []byte(testViteConfig), LockfileBytes: lock,
-		ParserID: ParserIdentity{Name: LockParserPNPM, Version: "9", Digest: "sha256:lockparser"},
+		// The identity of the parser that actually runs, not a caller's claim
+		// about one.
+		ParserID: mustLockParserIdentity(LockParserPNPM),
 		// EXACTLY what the lockfile resolves — every NODE, keyed by the lock's
 		// own identity, not just the Vitest family keyed by name. tinyrainbow
 		// is here because the lock resolves it; @ai-sdk/provider-utils appears
@@ -526,7 +562,8 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	// The delivered binary IS the binary the producers run; the manifest now
 	// requires them to agree.
 	m.Source.BinaryDigest = synthBinary
-	m.Source.BuildAttestation = "attestation"
+	m.Source.BuildAttestation = testBuildAttestation(synthBinary, testTip)
+	m.BuilderKeys = testBuilderKeys()
 	m.Consumer.Repository = "example/mandel"
 	m.Consumer.Commit = testConsumerCommit
 	m.Consumer.WorkflowSHA = testWorkflowSHA
@@ -1111,7 +1148,31 @@ func TestStage1BindsEveryRequiredIdentity(t *testing.T) {
 		{"a release ref that is not the reviewed tip", func(m *Stage1Manifest) {
 			m.Source.ReleaseRefSHA = strings.Repeat("a", 40)
 		}, "the reviewed tip is"},
-		{"no build attestation", func(m *Stage1Manifest) { m.Source.BuildAttestation = "" }, "build attestation"},
+		{"no build attestation", func(m *Stage1Manifest) { m.Source.BuildAttestation = BuildAttestation{} }, "build attestation"},
+		{"a build attestation for another binary", func(m *Stage1Manifest) {
+			m.Source.BuildAttestation = testBuildAttestation(DigestBytes([]byte("some other build")), testTip)
+		}, "but the delivered binary is"},
+		{"a build attestation for another source", func(m *Stage1Manifest) {
+			m.Source.BuildAttestation = testBuildAttestation(synthBinary, strings.Repeat("b", 40))
+		}, "but the reviewed tip is"},
+		{"a build attestation signed by an undeclared builder", func(m *Stage1Manifest) {
+			a := testBuildAttestation(synthBinary, testTip)
+			a.Signature = nil
+			if err := a.Sign("other-builder", mustSigningKey()); err != nil {
+				panic(err)
+			}
+			m.Source.BuildAttestation = a
+		}, "signature"},
+		{"a build attestation whose retained result is not a verification", func(m *Stage1Manifest) {
+			a := testBuildAttestation(synthBinary, testTip)
+			a.Result = "probably fine"
+			a.Signature = nil
+			if err := a.Sign("ewj2-builder", testBuilderAuthority); err != nil {
+				panic(err)
+			}
+			m.Source.BuildAttestation = a
+		}, "retained result is"},
+		{"no predeclared builder key", func(m *Stage1Manifest) { m.BuilderKeys = nil }, "no builder key is predeclared"},
 		{"no binary digest", func(m *Stage1Manifest) { m.Source.BinaryDigest = "" }, "binary digest"},
 		{"no consumer repository", func(m *Stage1Manifest) { m.Consumer.Repository = "" }, "consumer repository"},
 		{"an abbreviated consumer commit", func(m *Stage1Manifest) { m.Consumer.Commit = "d9ae1d43" }, "consumer commit"},

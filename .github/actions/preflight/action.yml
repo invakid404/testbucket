@@ -38,6 +38,28 @@ inputs:
     description: >-
       The frozen scorer the plan allocated by, when Stage 1 binds one.
     default: ""
+  stage1-digest:
+    description: >-
+      The Stage-1 digest the measured records will be stamped with. Replaying
+      the frozen documents proves the PLAN; it says nothing about the separate
+      caller strings run-bucket writes onto every record, and a mismatch there
+      used to be found only by verification after the bucket had already run.
+      Supplying it here makes the comparison happen before AT_start.
+    default: ""
+  stage2-digest:
+    description: 'The Stage-2 digest the measured records will be stamped with.'
+    default: ""
+  registry-digest:
+    description: >-
+      The Aeta component-registry digest the measured records will be stamped
+      with.
+    default: ""
+  verifier-id:
+    description: >-
+      The verifier identity the measured records will be stamped with. A record
+      that names no verifier is attributable to nobody, so a scored row needs
+      one and this refuses a blank before any work starts.
+    default: ""
   version:
     description: >-
       testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
@@ -69,6 +91,10 @@ runs:
         TB_REGISTRY: ${{ inputs.registry }}
         TB_SCORER: ${{ inputs.scorer }}
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_STAGE1_DIGEST: ${{ inputs.stage1-digest }}
+        TB_STAGE2_DIGEST: ${{ inputs.stage2-digest }}
+        TB_REGISTRY_DIGEST: ${{ inputs.registry-digest }}
+        TB_VERIFIER_ID: ${{ inputs.verifier-id }}
       run: |
         set -euo pipefail
         if [ -z "$TB_AUTHORITY_KEY" ]; then
@@ -79,6 +105,15 @@ runs:
               --authority-key "$TB_AUTHORITY_KEY")
         if [ -n "$TB_REGISTRY" ]; then args+=(--registry "$TB_REGISTRY"); fi
         if [ -n "$TB_SCORER" ]; then args+=(--scorer "$TB_SCORER"); fi
+
+        # The four identities run-bucket will stamp onto every record. They are
+        # compared with what this replay derives, and an unequal or blank value
+        # fails the bucket here — before `wall begin`, before the envelope, and
+        # before any measured command exists.
+        if [ -n "$TB_STAGE1_DIGEST" ]; then args+=(--expect-stage1 "$TB_STAGE1_DIGEST"); fi
+        if [ -n "$TB_STAGE2_DIGEST" ]; then args+=(--expect-stage2 "$TB_STAGE2_DIGEST"); fi
+        if [ -n "$TB_REGISTRY_DIGEST" ]; then args+=(--expect-registry "$TB_REGISTRY_DIGEST"); fi
+        if [ -n "$TB_VERIFIER_ID" ]; then args+=(--expect-verifier-id "$TB_VERIFIER_ID"); fi
 
         # No `|| true`. This step exists to stop the bucket, and a pre-flight
         # that reported a problem and continued would be a log line.

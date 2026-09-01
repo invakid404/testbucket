@@ -97,6 +97,10 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 			// source/action/binary, and the wrappers that come with it.
 			candidateBinary := candidateBinaryDigest
 			m.Source.BinaryDigest = candidateBinary
+			// The attestation is part of the delivered tuple: it attests THIS
+			// binary, so a candidate arm shipping a different build carries a
+			// different signed statement about it.
+			m.Source.BuildAttestation = testBuildAttestation(candidateBinary, m.Source.ReviewTip)
 			m.Instrumentation.PhysicalBinary = candidateBinary
 			m.Instrumentation.PeerBinary = candidateBinary
 			m.Instrumentation.TraceBinary = candidateBinary

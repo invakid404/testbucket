@@ -419,6 +419,18 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   manifest predeclares and REFITS the scorer from it. A model that cites this
   evidence and a model built from it are otherwise indistinguishable, because
   the receipt-set digest is a string the model states about itself.
+- The delivered binary needs a **signed build attestation**, not a sentence.
+  Stage 1 verifies its subject digest against the binary it delivers, its
+  source commit against the reviewed tip, its signature against a predeclared
+  builder key, and its retained result against the only value that admits a
+  delivery. `wall attest` produces one.
+- The **pre-flight** compares the Stage-1, Stage-2, registry and verifier
+  identities the action will stamp on every record with the ones it derives
+  itself, and fails the bucket before `wall begin`. Refusing after the tests
+  have run can invalidate a row; it cannot un-measure it.
+- The publisher **re-resolves the release tag** immediately before uploading
+  and refuses unless it still points at the campaign-gated commit. A tag is
+  mutable, and GitHub ignores `--target` for a tag that already exists.
 - Every training label carries the **exact bytes** of its physical-V receipt,
   its selected work and its topology validation — not three digests. The
   verifier hashes them, checks each against the reference that names it,
@@ -426,19 +438,27 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   predeclares, and requires the receipt itself to be a passed, invocation-level,
   physical, containment-delimited observation of that unit at that duration.
   Refitting proves the coefficients follow the rows; only the evidence proves
-  the rows are observations.
+  the rows are observations. Exclusions are matched against every identity a
+  label carries — campaign, candidate, run and holdout, all in the signed
+  receipt — and evidence decoding refuses unknown fields, so an identity the
+  schema does not model cannot slip past the checks that read it.
 - Every frozen listing binds the **closure of its own argv**: the exact
   command, cwd, planning-relevant environment, resolved executable path and a
   complete tool/version/integrity closure. An unresolved or empty identity is a
   bound fact about a failure, and `wall bundle` refuses to freeze one rather
-  than planning on it. The source profile carries the exact façade, config and
+  than planning on it. A launcher binds what it LAUNCHES: `pnpm exec tsx …`
+  resolves the package-selected `tsx` shim from the project's own
+  `node_modules/.bin`, because that is the program the façade actually runs. The source profile carries the exact façade, config and
   lockfile bytes, and its package closure is re-derived from the lock instead
   of read back from the receipt — the WHOLE closure, not the Vitest family
   within it, because a substituted transitive dependency changes what ran and a
   receipt that may omit it cannot tell the two trees apart. The closure is a
-  multiset of resolved NODES keyed by the lock's own identity, so a real
-  lockfile that resolves one package at two versions is representable rather
-  than rejected. The real adapter fixture is pinned to that same frozen
+  multiset of resolved NODES keyed by the lock's own identity — both pnpm
+  sections, so every peer context in `snapshots:` is a node of its own — and a
+  version comes from the entry's own field rather than from its key. A node the
+  lock does not pin is refused unless the receipt declares that exception and
+  names the tarball. The parser identity in the receipt must be the identity of
+  the parser that actually ran. The real adapter fixture is pinned to that same frozen
   version, and a test reads the committed manifest and lockfile so the pin
   cannot drift away from it.
 

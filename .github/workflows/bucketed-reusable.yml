@@ -551,6 +551,14 @@ jobs:
           registry: ${{ runner.temp }}/testbucket-frozen-inputs/registry.json
           scorer: ${{ inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
           authority-key: ${{ inputs.authority-key }}
+          # The four identities run-bucket stamps onto every measured record,
+          # compared here with what the replay derives. Without them a
+          # mismatched or empty record identity opened the envelope, ran the
+          # tests, and was refused only by verification afterwards.
+          stage1-digest: ${{ inputs.stage1-digest }}
+          stage2-digest: ${{ inputs.stage2-digest }}
+          registry-digest: ${{ inputs.registry-digest }}
+          verifier-id: ${{ inputs.verifier-id }}
 
       # The wrapper is installed BEFORE the measured action, by the caller.
       # The physical action envelope opens on run-bucket's first owned

@@ -142,6 +142,13 @@ type TrainingLabel struct {
 	SelectedWorkDigest Digest    `json:"selected_work_digest"`
 	TopologyReceipt    Digest    `json:"topology_receipt"`
 	Features           []Feature `json:"features"`
+	// The exclusion-domain identities, repeated from the signed receipt so the
+	// sealed set carries them and validation can compare each against its own
+	// exclusion list. They must equal the receipt's.
+	CampaignID  string `json:"campaign_id,omitempty"`
+	CandidateID string `json:"candidate_id,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
+	HoldoutID   string `json:"holdout_id,omitempty"`
 	// Evidence is the EXACT BYTES the three references above address: the
 	// physical-V receipt this duration came from, the selected work it is
 	// attributed to, and the receipt that says that topology was validated.
@@ -175,10 +182,20 @@ type TrainingReceiptSet struct {
 	Kind   string `json:"kind"`
 	Epoch  string `json:"epoch"`
 	Cutoff string `json:"cutoff_instant"`
-	// Exclusions are the permanent anti-overfit exclusions plus any
-	// campaign/candidate/holdout ids. A label whose id is here is refused even
-	// if it is otherwise admissible.
-	Exclusions    []string        `json:"exclusions"`
+	// Exclusions is the UNIVERSAL exclusion list: a label is refused when this
+	// names its receipt id OR any of its campaign, candidate, run or holdout
+	// identities. It used to be compared against the receipt id alone, which
+	// made the campaign/candidate/holdout half of its own documentation
+	// unenforceable.
+	Exclusions []string `json:"exclusions"`
+	// The per-domain exclusion lists, for the common case where a whole
+	// campaign, candidate, run or holdout is excluded and naming it in the
+	// universal list would be ambiguous about what kind of thing it is.
+	ExcludedCampaigns  []string `json:"excluded_campaigns,omitempty"`
+	ExcludedCandidates []string `json:"excluded_candidates,omitempty"`
+	ExcludedRuns       []string `json:"excluded_runs,omitempty"`
+	ExcludedHoldouts   []string `json:"excluded_holdouts,omitempty"`
+
 	FeatureSchema []string        `json:"feature_schema"`
 	Labels        []TrainingLabel `json:"labels"`
 	Algorithm     string          `json:"algorithm"`
@@ -197,6 +214,14 @@ type TrainingReceiptSet struct {
 	// authority may vouch for the observations it is built from.
 	EvidenceSigners []string   `json:"evidence_signers"`
 	Signature       *Signature `json:"signature,omitempty"`
+}
+
+func setOf(v []string) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range v {
+		out[s] = true
+	}
+	return out
 }
 
 // PermanentExclusions are the anti-overfit examples the contract names. They
@@ -271,9 +296,17 @@ func (s TrainingReceiptSet) Validate(sealKeys []string) error {
 	if len(s.Labels) == 0 {
 		return fmt.Errorf("training receipt set is empty: no wrapper-qualified historical V label exists yet, so no scorer can be trained")
 	}
+	// The UNIVERSAL exclusion set, matched against every identity a label
+	// carries — not against its receipt id alone.
 	excluded := map[string]bool{}
 	for _, e := range append(append([]string(nil), PermanentExclusions...), s.Exclusions...) {
 		excluded[e] = true
+	}
+	byDomain := map[string]map[string]bool{
+		"campaign":  setOf(s.ExcludedCampaigns),
+		"candidate": setOf(s.ExcludedCandidates),
+		"run":       setOf(s.ExcludedRuns),
+		"holdout":   setOf(s.ExcludedHoldouts),
 	}
 	if len(s.EvidenceSigners) == 0 {
 		return fmt.Errorf("training receipt set predeclares no evidence signer, so each label's receipt, selected-work and topology documents would authenticate themselves")
@@ -302,6 +335,24 @@ func (s TrainingReceiptSet) Validate(sealKeys []string) error {
 		}
 		if !at.Before(cutoff) {
 			return fmt.Errorf("label %s was observed at %s, at or after the %s cutoff", l.ReceiptID, l.ObservedAt, s.Cutoff)
+		}
+		// EVERY exclusion domain, each against the universal list and its own.
+		// A whole excluded campaign used to be admissible because nothing
+		// compared anything but the receipt id.
+		for _, d := range []struct {
+			what, id string
+		}{
+			{"campaign", l.CampaignID},
+			{"candidate", l.CandidateID},
+			{"run", l.RunID},
+			{"holdout", l.HoldoutID},
+		} {
+			if d.id == "" {
+				continue
+			}
+			if excluded[d.id] || byDomain[d.what][d.id] {
+				return fmt.Errorf("label %s belongs to excluded %s %q; candidate, campaign, current-run and holdout evidence may never train the allocation surface", l.ReceiptID, d.what, d.id)
+			}
 		}
 		fv := FeatureVector{UnitID: l.UnitID, Features: l.Features}
 		if err := fv.Validate(s.FeatureSchema); err != nil {

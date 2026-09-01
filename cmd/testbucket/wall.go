@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -59,6 +60,10 @@ usage:
   testbucket wall train   [flags]  fit the frozen scorer from a sealed training
                                    receipt set of historical wrapper-qualified
                                    physical V labels
+  testbucket wall attest   [flags]  produce the builder's SIGNED build
+                                   attestation for one exact artifact: its
+                                   subject digest, source, builder, issuer,
+                                   verifier identity and retained result
   testbucket wall release-manifest [flags]
                                    derive the canonical publish set from
                                    goreleaser's own artifact manifest: every
@@ -107,6 +112,8 @@ func runWall(args []string) error {
 		return runWallCampaign(args[1:])
 	case "release-manifest":
 		return runWallReleaseManifest(args[1:])
+	case "attest":
+		return runWallAttest(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, wallUsage)
 		return nil
@@ -453,6 +460,97 @@ func runWallTrain(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "testbucket wall: fitted %s from %d sealed label(s)\n  scorer digest: %s\n  receipt set:   %s\n",
 		scorer.ID, len(set.Labels), scorer.Lineage.ScorerDigest, scorer.Lineage.ReceiptSetDigest)
+	return nil
+}
+
+// builderKeyEnv is where the builder's signing key is read from — an
+// environment variable rather than a flag, for the same reason the authority
+// key is: a key on a command line is a key in the process table.
+const builderKeyEnv = "TB_WALL_BUILDER_KEY"
+
+// runWallAttest produces the builder's signed statement about one artifact.
+//
+// Stage 1 used to accept a caller-authored sentence here. This is the document
+// that replaces it: it names the exact subject bytes, the source they were
+// built from, the workload that built them, the identity vouching for that
+// workload, and who checked it with what result — and it is signed, so a
+// predeclared builder key is what makes the whole statement attributable.
+func runWallAttest(args []string) error {
+	fs := flag.NewFlagSet("wall attest", flag.ExitOnError)
+	subject := fs.String("subject", "", "path to the exact artifact being attested (required); its digest is computed here")
+	subjectName := fs.String("subject-name", "", "the name the artifact is delivered under; defaults to the file's base name")
+	repository := fs.String("source-repository", "", "repository the artifact was built from (required)")
+	commit := fs.String("source-commit", "", "the full 40-hex commit it was built from (required)")
+	builderID := fs.String("builder-id", "", "the workload that produced it, e.g. the workflow ref (required)")
+	issuer := fs.String("issuer", "", "the identity vouching for that workload, e.g. the OIDC issuer (required)")
+	run := fs.String("build-run", "", "the run that produced it")
+	attempt := fs.String("build-attempt", "", "that run's attempt")
+	verifierID := fs.String("verifier-id", "", "who checked the build (required)")
+	at := fs.String("verified-at", "", "RFC3339 instant the check was made (required)")
+	out := fs.String("out", "", "write the signed attestation here (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	required := map[string]string{
+		"--subject": *subject, "--source-repository": *repository, "--source-commit": *commit,
+		"--builder-id": *builderID, "--issuer": *issuer, "--verifier-id": *verifierID,
+		"--verified-at": *at, "--out": *out,
+	}
+	names := make([]string, 0, len(required))
+	for name := range required {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var missing []string
+	for _, name := range names {
+		if strings.TrimSpace(required[name]) == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("these are required, and each is one of the identities the contract asks a build attestation to retain: %s", strings.Join(missing, ", "))
+	}
+	digest, err := walltime.FileDigest(*subject)
+	if err != nil {
+		return fmt.Errorf("digest the attested artifact: %w", err)
+	}
+	name := *subjectName
+	if strings.TrimSpace(name) == "" {
+		name = filepath.Base(*subject)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	selfDigest, err := walltime.FileDigest(self)
+	if err != nil {
+		return err
+	}
+	a := walltime.BuildAttestation{
+		Kind: walltime.BuildAttestationKind, SubjectName: name, SubjectDigest: digest,
+		SourceRepository: *repository, SourceCommit: *commit,
+		BuilderID: *builderID, Issuer: *issuer, BuildRun: *run, BuildAttempt: *attempt,
+		VerifierID: *verifierID, VerifierBinary: selfDigest, VerifierVersion: version,
+		VerifiedAt: *at, Result: walltime.AttestationVerified,
+	}
+	key, err := walltime.DecodeKey(strings.TrimSpace(os.Getenv(builderKeyEnv)))
+	if err != nil {
+		return fmt.Errorf("%s: %w (only the builder may attest what it built)", builderKeyEnv, err)
+	}
+	if err := a.Sign(*builderID, key); err != nil {
+		return err
+	}
+	// Checked before it is written. An attestation that could not verify
+	// against its own subject would be discovered by Stage 1 instead.
+	if problems := a.Verify(digest, *commit, []string{walltime.PublicKeyOf(key)}); len(problems) > 0 {
+		return fmt.Errorf("the attestation this produced does not verify:\n  %s", strings.Join(problems, "\n  "))
+	}
+	if err := walltime.WriteJSONFile(*out, a); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "testbucket wall: attested %s\n  subject: %s\n  source:  %s@%s\n  builder: %s (%s)\n  key:     %s\n",
+		name, digest, *repository, *commit, *builderID, *issuer, a.Signature.KeyID)
+	fmt.Println(a.Signature.KeyID)
 	return nil
 }
 

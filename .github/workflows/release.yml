@@ -167,6 +167,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           TB_RELEASE_SHA: ${{ github.sha }}
           TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+          GITHUB_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -184,6 +185,30 @@ jobs:
           echo "publishing ${#assets[@]} gated asset(s):"
           printf '  %s\n' "${assets[@]}"
 
+          # RE-RESOLVE THE TAG, immediately before publishing.
+          #
+          # The campaign gate binds github.sha — the commit the workflow was
+          # triggered for. Publication addresses the tag by NAME, and a tag is
+          # mutable: one moved between the gate and this step would publish a
+          # different commit's work under gated evidence. GitHub also ignores
+          # --target when the tag already exists, so the create path's target
+          # is no defence and the upload path never had one.
+          #
+          # An annotated tag object is dereferenced to the commit it points at,
+          # because that is what a release actually ships.
+          ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha + " " + .object.type')"
+          tag_sha="${ref%% *}"
+          tag_type="${ref##* }"
+          if [ "$tag_type" = "tag" ]; then
+            tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          if [ "$tag_sha" != "$TB_RELEASE_SHA" ]; then
+            echo "REFUSED: $TAG now resolves to $tag_sha, but the campaign gated $TB_RELEASE_SHA." >&2
+            echo "A tag moved after the gate would publish a commit no campaign authorised." >&2
+            exit 1
+          fi
+          echo "tag recheck: $TAG still resolves to the gated $TB_RELEASE_SHA"
+
           # A pre-release tag (v1.2.3-rc.1) publishes as a prerelease, which is
           # what `prerelease: auto` did.
           prerelease=()
@@ -192,6 +217,16 @@ jobs:
           fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # An existing release is published from the tag, and GitHub will
+            # not retarget it. The only safe answer is to require that the tag
+            # it is built on is still the gated commit — which the recheck
+            # above has just established — and to refuse if the release was
+            # somehow cut from something else.
+            existing="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.target_commitish')"
+            if [ "$existing" != "$TB_RELEASE_SHA" ] && [ "$existing" != "$TAG" ]; then
+              echo "REFUSED: the existing $TAG release targets $existing, not the gated $TB_RELEASE_SHA." >&2
+              exit 1
+            fi
             gh release upload "$TAG" "${assets[@]}" --clobber
           else
             gh release create "$TAG" "${assets[@]}" \

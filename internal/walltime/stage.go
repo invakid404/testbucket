@@ -447,12 +447,20 @@ type Stage1Manifest struct {
 	// reviewed commit and content digest. A tag is metadata; this is identity.
 	Actions map[string]ActionIdentity `json:"actions"`
 	Source  struct {
-		ReviewTip        string `json:"review_tip"`
-		BinaryDigest     Digest `json:"binary_digest"`
-		BuildAttestation string `json:"build_attestation"`
-		ReleaseRefSHA    string `json:"release_ref_sha,omitempty"`
+		ReviewTip    string `json:"review_tip"`
+		BinaryDigest Digest `json:"binary_digest"`
+		// BuildAttestation is the builder's SIGNED statement about the exact
+		// delivered binary, not a sentence about it. It used to be a string
+		// that validation checked only for non-emptiness.
+		BuildAttestation BuildAttestation `json:"build_attestation"`
+		ReleaseRefSHA    string           `json:"release_ref_sha,omitempty"`
 	} `json:"source"`
-	Consumer struct {
+	// BuilderKeys are the PREDECLARED public keys allowed to sign that
+	// attestation. They sit in the authority-signed manifest for the same
+	// reason the record signers and the training authority do: the document
+	// that approves the inputs is the one that says whose word counts.
+	BuilderKeys []string `json:"builder_keys"`
+	Consumer    struct {
 		Repository    string `json:"repository"`
 		Commit        string `json:"commit"`
 		WorkflowSHA   string `json:"workflow_sha"`
@@ -529,12 +537,25 @@ type SourceProfileReceipt struct {
 	FacadeBytes   []byte `json:"facade_bytes,omitempty"`
 	ConfigBytes   []byte `json:"config_bytes,omitempty"`
 	LockfileBytes []byte `json:"lockfile_bytes,omitempty"`
-	// ParserID names the lock parser. It must be one this verifier implements,
-	// because a parser nobody here can run leaves the closure exactly as
-	// unchecked as a bare digest.
+	// ParserID names the lock parser. It must be one this verifier implements
+	// AND must equal that implementation's own identity: a parser nobody here
+	// can run leaves the closure exactly as unchecked as a bare digest, and a
+	// version/digest nobody compares is two strings the caller chose.
 	ParserID    ParserIdentity    `json:"lock_parser"`
 	Packages    map[string]string `json:"packages"`
 	Integrities map[string]string `json:"integrities"`
+	// UnpinnedNodes is the EXPLICIT, signed exception list for resolved nodes
+	// whose lock resolution carries no integrity, mapping the node key to the
+	// tarball URL it is fetched from.
+	//
+	// The default is refusal. A node with no integrity is not pinned — its
+	// bytes can change under the same key — and a closure that quietly
+	// admitted one would be describing a tree that cannot be reproduced. The
+	// frozen Mandel lock has exactly one such node
+	// (`xlsx@https://cdn.sheetjs.com/…`), so the exception has to be
+	// representable; making it a declared field inside the signed receipt is
+	// what keeps it a visible, attributable decision rather than a gap.
+	UnpinnedNodes map[string]string `json:"unpinned_nodes,omitempty"`
 }
 
 // RequiredVitest is the version the exact lifecycle inventory was written
@@ -594,6 +615,18 @@ func (r SourceProfileReceipt) Validate() error {
 	// and no Vitest-family package it left out. A supplied two-entry map used
 	// to satisfy every rule below while saying nothing about the rest of the
 	// tree the façade actually loads.
+	// The parser identity must be the identity of the parser that RAN. A
+	// receipt could previously name arbitrary version and digest values while
+	// production dispatched on the name alone and executed its own code.
+	implemented, err := LockParserIdentity(r.ParserID.Name)
+	if err != nil {
+		return fmt.Errorf("source profile: %w", err)
+	}
+	if r.ParserID != implemented {
+		return fmt.Errorf("source profile: the receipt names lock parser %s/%s (%s), but the implementation that re-derives this closure is %s/%s (%s)",
+			r.ParserID.Name, r.ParserID.Version, r.ParserID.Digest,
+			implemented.Name, implemented.Version, implemented.Digest)
+	}
 	derived, err := DeriveLockClosure(r.ParserID.Name, r.LockfileBytes)
 	if err != nil {
 		return fmt.Errorf("source profile: %w", err)
@@ -634,6 +667,20 @@ func (r SourceProfileReceipt) Validate() error {
 			missing = append(missing, k)
 			continue
 		}
+		// INTEGRITY IS PART OF THE CLOSURE, for every node and not only for
+		// the Vitest family. A node the lock does not pin is refused unless
+		// the receipt declares that exception and names the tarball it is
+		// fetched from, so an unpinned dependency is a signed, visible
+		// decision instead of an empty string nobody looked at.
+		if node.Integrity == "" {
+			declared, ok := r.UnpinnedNodes[k]
+			switch {
+			case !ok:
+				return fmt.Errorf("source profile: the bound lockfile resolves %s with no integrity, and the receipt does not declare it as an accepted unpinned resolution; an unpinned node cannot be reproduced", k)
+			case declared == "" || declared != node.Tarball:
+				return fmt.Errorf("source profile: %s is declared as an unpinned resolution of %q, but the bound lockfile fetches it from %q", k, declared, node.Tarball)
+			}
+		}
 		// The version and integrity rules are about a PACKAGE; the closure is
 		// a multiset of NODES. Every node whose name is in the Vitest family
 		// has to be the frozen version, however many peer contexts or depths
@@ -654,6 +701,16 @@ func (r SourceProfileReceipt) Validate() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("source profile: the bound lockfile resolves %d node(s) the declared closure omits (%s); a partial closure cannot prove what the façade loads",
 			len(missing), strings.Join(missing, ", "))
+	}
+	// An exception nobody needs is an exception nobody reviewed.
+	for _, k := range sortedStringKeys(r.UnpinnedNodes) {
+		node, ok := derived[k]
+		if !ok {
+			return fmt.Errorf("source profile: %s is declared as an unpinned resolution, but the bound lockfile does not resolve it", k)
+		}
+		if node.Integrity != "" {
+			return fmt.Errorf("source profile: %s is declared as an unpinned resolution, but the bound lockfile records integrity %s for it", k, node.Integrity)
+		}
 	}
 	sawVitest := false
 	for _, k := range sortedLockNames(derived) {
@@ -1105,12 +1162,19 @@ func (m Stage1Manifest) Validate() error {
 	// Delivery: reviewed tip, the release ref it must equal, the exact binary
 	// and its build attestation. A local binary cannot deliver a scored row.
 	if err := requireSet(map[string]string{
-		"the reviewed tip":      m.Source.ReviewTip,
-		"the binary digest":     string(m.Source.BinaryDigest),
-		"the build attestation": m.Source.BuildAttestation,
-		"the release ref SHA":   m.Source.ReleaseRefSHA,
+		"the reviewed tip":    m.Source.ReviewTip,
+		"the binary digest":   string(m.Source.BinaryDigest),
+		"the release ref SHA": m.Source.ReleaseRefSHA,
 	}); err != nil {
 		return fmt.Errorf("stage-1 manifest %w", err)
+	}
+	// The build attestation is CHECKED, against this delivery. It was a string
+	// nobody compared with anything.
+	if len(m.BuilderKeys) == 0 {
+		return fmt.Errorf("stage-1 manifest: no builder key is predeclared, so the build attestation would be authenticated by its own signature and any self-generated key could vouch for any build")
+	}
+	if problems := m.Source.BuildAttestation.Verify(m.Source.BinaryDigest, m.Source.ReviewTip, m.BuilderKeys); len(problems) > 0 {
+		return fmt.Errorf("stage-1 manifest: %s", strings.Join(problems, "; "))
 	}
 	if err := requireFullSHA("the reviewed tip", m.Source.ReviewTip); err != nil {
 		return fmt.Errorf("stage-1 manifest: %w", err)
@@ -1266,6 +1330,7 @@ func (m Stage1Manifest) InvariantTuple() map[string]string {
 		"source_profile":          string(mustDigestOf(m.SourceProfile)),
 		"training_lineage":        string(mustDigestOf(m.TrainingLineage)),
 		"training_authority_keys": strings.Join(m.TrainingAuthorityKeys, ","),
+		"builder_keys":            strings.Join(m.BuilderKeys, ","),
 		"component_registry":      string(m.Registry),
 		"store_receipt":           string(mustDigestOf(m.Store)),
 		"allowed_differences":     string(mustDigestOf(m.AllowedDifferences)),

@@ -37,7 +37,9 @@ func runWallStage1(args []string) error {
 	reviewTip := fs.String("review-tip", "", "the reviewed testbucket source tip (required)")
 	releaseSHA := fs.String("release-sha", "", "the SHA the release ref resolves to; it must equal the reviewed tip. A local binary cannot deliver a scored row")
 	binary := fs.String("binary", "", "path to the exact binary asset being delivered")
-	attestation := fs.String("build-attestation", "", "build-attestation identity for that binary")
+	attestation := fs.String("build-attestation", "", "the builder's SIGNED build attestation for that binary (JSON, from `wall attest`). It is verified here against the delivered binary digest and the reviewed tip; a sentence about the build is not evidence about it")
+	var builderKeys stringList
+	fs.Var(&builderKeys, "builder-key", "a PREDECLARED public key (hex) allowed to sign the build attestation; repeatable and required. An attestation verified against whatever signed it is one anybody can mint")
 	sourceProfile := fs.String("source-profile", "", "source-profile receipt JSON (required): the resolved Vitest closure")
 	storeReceipt := fs.String("store-receipt", "", "store receipt JSON (required): the admitted store's exact bytes, migration epoch, restore method, stale instant, and the classification of every row — including observed_zero, which is not a gap")
 	scorerPath := fs.String("scorer", "", "frozen scorer whose sealed training lineage this manifest binds")
@@ -120,7 +122,13 @@ func runWallStage1(args []string) error {
 	}
 	m.Source.ReviewTip = *reviewTip
 	m.Source.ReleaseRefSHA = *releaseSHA
-	m.Source.BuildAttestation = *attestation
+	if len(builderKeys) == 0 {
+		return fmt.Errorf("--builder-key is required: without a predeclared builder key the build attestation's own signature would authenticate it, and a build nobody can attribute is not an attested build")
+	}
+	m.BuilderKeys = builderKeys
+	if err := walltime.ReadJSONFile(*attestation, &m.Source.BuildAttestation); err != nil {
+		return fmt.Errorf("read the build attestation: %w", err)
+	}
 	binaryDigest, err := walltime.FileDigest(*binary)
 	if err != nil {
 		return fmt.Errorf("digest the binary asset: %w", err)

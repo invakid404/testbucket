@@ -222,12 +222,28 @@ func closureResolver(root string) func([]string) (map[string]string, map[string]
 			return nil, nil, err
 		}
 		execs := map[string]string{head: path}
+		// The DELEGATED program, when the head is only a launcher.
+		//
+		// The frozen Mandel façade is `pnpm exec tsx scripts/tb-vitest.ts`.
+		// Resolving argv[0] alone bound pnpm and called the closure complete,
+		// while the program that actually launches the TypeScript façade —
+		// the package-selected `tsx` shim — was never resolved, hashed or
+		// named. "The exact resolved executable path" has to mean the
+		// executable that runs, not the first word of the command line.
+		delegated, err := delegatedProgram(root, argv)
+		if err != nil {
+			return nil, nil, err
+		}
+		if delegated.name != "" {
+			execs[delegated.name] = delegated.path
+		}
 		tools := map[string]walltime.ToolIdentity{}
-		// The head is the program that ran; node and npm are the toolchain it
-		// ran on. All three are bound, deduplicated by name, because the same
-		// resolved path under two toolchains is two different observations.
-		for _, name := range dedupe([]string{head, "node", "npm"}) {
-			t, err := resolveTool(root, name)
+		// The head and any delegated program are what ran; node and npm are
+		// the toolchain they ran on. All are bound, deduplicated by name,
+		// because the same resolved path under two toolchains is two different
+		// observations.
+		for _, name := range dedupe([]string{head, delegated.name, "node", "npm"}) {
+			t, err := resolveToolAt(root, name, execs[name])
 			if err != nil {
 				return nil, nil, err
 			}
@@ -235,6 +251,65 @@ func closureResolver(root string) func([]string) (map[string]string, map[string]
 		}
 		return execs, tools, nil
 	}
+}
+
+// packageRunners are the launchers whose next non-flag argument is a PACKAGE
+// EXECUTABLE they select and execute, rather than a file they read.
+var packageRunners = map[string]map[string]bool{
+	"pnpm": {"exec": true, "dlx": true},
+	"npm":  {"exec": true},
+	"yarn": {"exec": true, "dlx": true},
+	"bun":  {"x": true},
+	"npx":  {},
+}
+
+type delegated struct{ name, path string }
+
+// delegatedProgram resolves the executable a launcher selects.
+//
+// It looks where the package manager looks — the project's `node_modules/.bin`
+// under the acquisition cwd, then PATH — because that is what decides which
+// bytes run. A launcher whose delegated program cannot be resolved is an
+// unbound input and fails closed, exactly as an unresolvable head does: the
+// façade would run something, and the bundle could not say what.
+func delegatedProgram(root string, argv []string) (delegated, error) {
+	if len(argv) < 2 {
+		return delegated{}, nil
+	}
+	sub, ok := packageRunners[filepath.Base(argv[0])]
+	if !ok {
+		return delegated{}, nil
+	}
+	rest := argv[1:]
+	// `npx <prog>` delegates directly; `pnpm exec <prog>` needs its
+	// subcommand first.
+	if len(sub) > 0 {
+		if !sub[rest[0]] {
+			return delegated{}, nil
+		}
+		rest = rest[1:]
+	}
+	for len(rest) > 0 && strings.HasPrefix(rest[0], "-") {
+		rest = rest[1:]
+	}
+	if len(rest) == 0 {
+		return delegated{}, nil
+	}
+	name := rest[0]
+	if p := filepath.Join(root, "node_modules", ".bin", name); fileExists(p) {
+		return delegated{name: name, path: p}, nil
+	}
+	p, err := exec.LookPath(name)
+	if err != nil {
+		return delegated{}, fmt.Errorf("resolve the %s-selected executable %q under %s: %w; the program that actually launches the façade may not be left unbound",
+			argv[0], name, root, err)
+	}
+	return delegated{name: name, path: p}, nil
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 // resolveProgram finds the exact file a program name runs. `testbucket` names
@@ -260,9 +335,20 @@ func resolveProgram(name string) (string, error) {
 // alone is a program's own account of itself, and two builds can tell the
 // same story.
 func resolveTool(root, name string) (walltime.ToolIdentity, error) {
-	path, err := resolveProgram(name)
-	if err != nil {
-		return walltime.ToolIdentity{}, err
+	return resolveToolAt(root, name, "")
+}
+
+// resolveToolAt is resolveTool for a program whose path is already known —
+// a package-selected shim is not on PATH, and asking PATH for it would either
+// fail or resolve a different installation.
+func resolveToolAt(root, name, known string) (walltime.ToolIdentity, error) {
+	path := known
+	if path == "" {
+		var err error
+		path, err = resolveProgram(name)
+		if err != nil {
+			return walltime.ToolIdentity{}, err
+		}
 	}
 	integrity, err := walltime.FileDigest(path)
 	if err != nil {
@@ -323,6 +409,14 @@ func runWallReplay(args []string) error {
 	registryPath := fs.String("registry", "", "frozen Aeta component-registry template. Required when the issued receipt binds per-bucket documents: an independent replay that skipped them would leave exactly those documents unre-derived")
 	attest := fs.String("attest", "", "write a SIGNED replay attestation here (signing key from TB_WALL_REPLAY_KEY). `wall verify` requires one, signed by a key Stage 1 declared as a replay signer and distinct from the authority key: comparing the planner's account of its own output to itself proves nothing, and neither does having the issuer of the plan re-check it")
 	verifierID := fs.String("verifier-id", "", "identity of the party running this replay (required with --attest)")
+	// The four identities the ACTION will stamp onto every measured record.
+	// Replaying the documents proves the plan; it says nothing about the
+	// separate strings a caller passes to the wrapper, and a mismatch there
+	// used to be discovered only by verification AFTER the bucket had run.
+	expectStage1 := fs.String("expect-stage1", "", "the Stage-1 digest the measured records will carry. Compared with this replay's own derivation and refused before anything is measured: verification after the fact can refuse the row, it cannot un-run it")
+	expectStage2 := fs.String("expect-stage2", "", "the Stage-2 digest the measured records will carry")
+	expectRegistry := fs.String("expect-registry", "", "the Aeta component-registry digest the measured records will carry")
+	expectVerifier := fs.String("expect-verifier-id", "", "the verifier identity the measured records will carry; it must be non-empty for a scored row, because a record naming no verifier is attributable to none")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -416,8 +510,25 @@ func runWallReplay(args []string) error {
 	if err := deriveDocuments(res, *registryPath, ""); err != nil {
 		return err
 	}
+	// The registry's own identity, derived here rather than taken from the
+	// receipt, so the value compared below is one this replay computed.
+	var registryDigest walltime.Digest
+	if *registryPath != "" {
+		var reg walltime.AetaRegistry
+		if err := walltime.ReadJSONFile(*registryPath, &reg); err != nil {
+			return err
+		}
+		if registryDigest, err = reg.DigestOf(); err != nil {
+			return err
+		}
+	}
 	if err := issued.Matches(res.Receipt); err != nil {
 		return fmt.Errorf("the replayed plan does not match the issued receipt: %w", err)
+	}
+	// The identities the ACTION will stamp on every measured record, compared
+	// with the ones this replay just derived — BEFORE anything is measured.
+	if err := checkRecordIdentities(issued, stage1, registryDigest, *expectStage1, *expectStage2, *expectRegistry, *expectVerifier); err != nil {
+		return err
 	}
 	if *attest != "" {
 		if err := writeReplayAttestation(*attest, *verifierID, issued, bundle, res.Receipt); err != nil {
@@ -431,6 +542,57 @@ func runWallReplay(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "testbucket wall: replay reproduced the plan exactly\n  full document: %s\n  semantic:      %s\n",
 		res.Receipt.PlanDigest, res.Receipt.SemanticDigest)
+	return nil
+}
+
+// checkRecordIdentities compares the four identities a caller will stamp onto
+// every measured record with the ones this replay independently derived.
+//
+// The pre-flight replayed the frozen documents and stopped there. But
+// `run-bucket` takes those four values as SEPARATE caller strings and writes
+// them onto every record, so an empty or mismatched one passed the pre-flight,
+// opened the action envelope, ran the tests, and was refused only afterwards by
+// verification. Refusal after the work has run is not the contract's
+// before-AT_start equivalence — it can invalidate the row, it cannot un-measure
+// it, and the runner has already spent the time.
+//
+// An expectation nobody supplied is not checked: this command is also used
+// outside the action, where those strings do not exist. The workflow supplies
+// all four, and the eligible guard refuses a scored request that omits them.
+func checkRecordIdentities(issued walltime.Stage2Receipt, stage1, registry walltime.Digest, wantStage1, wantStage2, wantRegistry, wantVerifier string) error {
+	stage2, err := issued.DigestOf()
+	if err != nil {
+		return err
+	}
+	var problems []string
+	for _, c := range []struct {
+		what, supplied string
+		derived        walltime.Digest
+	}{
+		{"--expect-stage1", wantStage1, stage1},
+		{"--expect-stage2", wantStage2, stage2},
+		{"--expect-registry", wantRegistry, registry},
+	} {
+		if strings.TrimSpace(c.supplied) == "" {
+			continue
+		}
+		if c.derived == "" {
+			problems = append(problems, fmt.Sprintf("%s was supplied as %s, but this replay derived no such identity to compare it with", c.what, c.supplied))
+			continue
+		}
+		if walltime.Digest(strings.TrimSpace(c.supplied)) != c.derived {
+			problems = append(problems, fmt.Sprintf("the records will be stamped %s=%s, but the frozen documents derive %s", c.what, c.supplied, c.derived))
+		}
+	}
+	// The verifier identity has no document to derive it from; what a
+	// pre-flight can prove about it is that it exists. A record naming no
+	// verifier is attributable to none, and that is decidable here.
+	if wantVerifier != "" && strings.TrimSpace(wantVerifier) == "" {
+		problems = append(problems, "--expect-verifier-id is blank; a record that names no verifier identity is attributable to nobody")
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("the identities the measured records will carry do not match the frozen plan, and no measured work may start:\n  %s", strings.Join(problems, "\n  "))
+	}
 	return nil
 }
 

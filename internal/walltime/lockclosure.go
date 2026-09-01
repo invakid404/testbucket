@@ -16,7 +16,28 @@ import (
 const (
 	LockParserNPM  = "npm-lock"
 	LockParserPNPM = "pnpm-lock"
+	// LockParserVersion is the version of THIS implementation. A receipt that
+	// names a different one is naming a parser that did not run.
+	LockParserVersion = "tb.lockclosure/v2"
 )
+
+// LockParserIdentity is the identity of the implementation that actually
+// re-derives a closure for this parser name.
+//
+// A receipt used to carry a parser name, version and digest of which only the
+// NAME was ever consulted: production dispatched on it and ran its own code,
+// so the receipt could claim any version and any bytes and nothing compared
+// them with the parser that ran. The digest here is the SHA-256 of the running
+// binary — the one identity available at run time that actually contains this
+// parser — which is the same identity Stage 1 binds for the verifier.
+func LockParserIdentity(name string) (ParserIdentity, error) {
+	switch name {
+	case LockParserNPM, LockParserPNPM:
+		return ParserIdentity{Name: name, Version: LockParserVersion, Digest: SelfDigest()}, nil
+	default:
+		return ParserIdentity{}, fmt.Errorf("lock parser %q is not one this verifier can re-derive a closure with (%s, %s)", name, LockParserNPM, LockParserPNPM)
+	}
+}
 
 // LockedPackage is one RESOLVED NODE as the LOCKFILE states it.
 //
@@ -34,11 +55,23 @@ const (
 type LockedPackage struct {
 	// Key is the lock's own identity for this node, and the closure's key.
 	Key string
-	// Name and Version are parsed out of Key for the rules that are about a
-	// package rather than about a node.
-	Name      string
-	Version   string
+	// Name and Version are the package this node resolves. Version comes from
+	// the entry's own `version:` field when it has one: a URL resolution keys
+	// the node by its tarball, and reading the version out of that key reports
+	// a URL where a version belongs.
+	Name    string
+	Version string
+	// Integrity is the lock's recorded integrity, EMPTY when the resolution
+	// carries none. Empty is not "fine": a node with no integrity is not
+	// pinned, and the source profile refuses it unless the receipt declares
+	// that exception explicitly. Tarball is retained so such a declaration has
+	// something to name.
 	Integrity string
+	Tarball   string
+	// PeerContext is the parenthesised peer resolution a pnpm snapshot node
+	// carries, empty for a package-metadata node. Two peer contexts of one
+	// package@version are two nodes in the graph the façade loads.
+	PeerContext string
 }
 
 // DeriveLockClosure re-derives the complete resolved package closure from the
@@ -117,70 +150,158 @@ func packageNameFromPath(path string) string {
 	return path[i+len("node_modules/"):]
 }
 
-var pnpmIntegrity = regexp.MustCompile(`integrity:\s*([^,}\s]+)`)
+var (
+	pnpmIntegrity = regexp.MustCompile(`integrity:\s*([^,}\s]+)`)
+	pnpmTarball   = regexp.MustCompile(`tarball:\s*([^,}\s]+)`)
+	pnpmVersion   = regexp.MustCompile(`^\s*version:\s*(.+?)\s*$`)
+)
 
-// derivePNPMLock reads the `packages:` section of a pnpm-lock.yaml v9. Keys
-// there are `name@version` with an optional parenthesised peer suffix, and the
-// integrity lives in the entry's `resolution:` mapping.
+// derivePNPMLock reads BOTH sections of a pnpm-lock.yaml v9.
+//
+// `packages:` holds the resolution metadata — version, integrity, tarball —
+// keyed by `name@version`. `snapshots:` holds the actual dependency graph,
+// keyed by `name@version` plus the parenthesised PEER CONTEXT it was resolved
+// under. The two are one closure: the metadata says what a package is, the
+// snapshot says which of possibly several peer resolutions the façade loads.
+//
+// Reading only `packages:` looked complete and was not. The frozen Mandel lock
+// has 2810 package entries and 1845 snapshots, 474 of them peer-qualified, and
+// seven packages appear under more than one peer context — including
+// `vitest@4.1.10` and `@vitest/mocker@4.1.10`. A closure that stopped at the
+// first section silently dropped every one of those distinct nodes while
+// reporting a node count that matched the section it had read.
 //
 // It is a deliberately narrow reader rather than a general YAML parser: it
 // accepts exactly the shape pnpm writes and refuses anything else, because a
 // tolerant parser that guessed at an unfamiliar line would be re-deriving a
 // closure from a document it had not actually understood.
 func derivePNPMLock(lock []byte) (map[string]LockedPackage, error) {
-	out := map[string]LockedPackage{}
 	lines := strings.Split(strings.ReplaceAll(string(lock), "\r\n", "\n"), "\n")
-	inPackages := false
-	current := ""
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
-			continue
-		}
-		indent := len(line) - len(strings.TrimLeft(line, " "))
-		if indent == 0 {
-			inPackages = strings.TrimSpace(line) == "packages:"
-			current = ""
-			continue
-		}
-		if !inPackages {
-			continue
-		}
-		if indent == 2 && strings.HasSuffix(strings.TrimRight(line, " "), ":") {
-			key := strings.TrimSuffix(strings.TrimSpace(line), ":")
-			key = strings.Trim(key, `'"`)
-			name, version := splitPnpmKey(key)
-			if name == "" || version == "" {
-				return nil, fmt.Errorf("pnpm-lock.yaml package key %q is not name@version", key)
-			}
-			// Keyed by the lock's OWN key, peer/snapshot suffix and all. Two
-			// versions of one name are two nodes, and one name under two peer
-			// contexts is two nodes; both are what the lock resolved.
-			if prev, ok := out[key]; ok && prev.Version != version {
-				return nil, fmt.Errorf("pnpm-lock.yaml repeats key %q with two versions (%s and %s)", key, prev.Version, version)
-			}
-			current = key
-			out[key] = LockedPackage{Key: key, Name: name, Version: version, Integrity: out[key].Integrity}
-			continue
-		}
-		if current != "" && strings.Contains(line, "integrity:") {
-			if m := pnpmIntegrity.FindStringSubmatch(line); m != nil {
-				e := out[current]
-				e.Integrity = strings.Trim(m[1], `'"`)
-				out[current] = e
-			}
-		}
+	packages, err := pnpmSection(lines, "packages:")
+	if err != nil {
+		return nil, err
 	}
-	if len(out) == 0 {
+	if len(packages) == 0 {
 		return nil, fmt.Errorf("pnpm-lock.yaml resolves no packages; the `packages:` section is missing or empty")
+	}
+	out := map[string]LockedPackage{}
+	for key, body := range packages {
+		node, err := pnpmNode(key, body)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = node
+	}
+
+	// Snapshots inherit their metadata from the package entry for the same
+	// name@version. A snapshot with no such entry is a graph node whose
+	// resolution nobody recorded, which is exactly the kind of gap this
+	// closure exists to make visible.
+	snapshots, err := pnpmSection(lines, "snapshots:")
+	if err != nil {
+		return nil, err
+	}
+	for key := range snapshots {
+		base, peer := splitPnpmPeerContext(key)
+		if peer == "" {
+			if _, ok := out[key]; ok {
+				// An unqualified snapshot names the same node as its package
+				// entry; there is nothing further to represent.
+				continue
+			}
+		}
+		meta, ok := out[base]
+		if !ok {
+			return nil, fmt.Errorf("pnpm-lock.yaml snapshot %q has no `packages:` entry for %q, so its resolution metadata is unrecorded", key, base)
+		}
+		node := meta
+		node.Key, node.PeerContext = key, peer
+		out[key] = node
 	}
 	return out, nil
 }
 
-// splitPnpmKey reads the name and version OUT of a lock key, leaving the key
-// itself intact as the node's identity. A peer suffix is ignored for this
-// purpose only — `@vitest/runner@4.1.10(vite@7.0.0)` is version 4.1.10 of
-// @vitest/runner — and the split is at the LAST '@' so a scoped name keeps its
-// leading one.
+// pnpmSection returns the two-space-indented entries of one top-level section,
+// each mapped to its indented body lines.
+func pnpmSection(lines []string, header string) (map[string][]string, error) {
+	out := map[string][]string{}
+	inSection := false
+	current := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if indent == 0 {
+			inSection = trimmed == header
+			current = ""
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		if indent == 2 && strings.HasSuffix(strings.TrimRight(line, " "), ":") {
+			key := strings.Trim(strings.TrimSuffix(trimmed, ":"), `'"`)
+			if key == "" {
+				return nil, fmt.Errorf("pnpm-lock.yaml has an empty key in %s", header)
+			}
+			current = key
+			if _, ok := out[key]; !ok {
+				out[key] = nil
+			}
+			continue
+		}
+		if current != "" {
+			out[current] = append(out[current], line)
+		}
+	}
+	return out, nil
+}
+
+// pnpmNode reads one `packages:` entry into a resolved node.
+func pnpmNode(key string, body []string) (LockedPackage, error) {
+	base, peer := splitPnpmPeerContext(key)
+	name, version := splitPnpmKey(base)
+	if name == "" {
+		return LockedPackage{}, fmt.Errorf("pnpm-lock.yaml package key %q is not name@version", key)
+	}
+	node := LockedPackage{Key: key, Name: name, Version: version, PeerContext: peer}
+	for _, line := range body {
+		if m := pnpmIntegrity.FindStringSubmatch(line); m != nil && node.Integrity == "" {
+			node.Integrity = strings.Trim(m[1], `'"`)
+		}
+		if m := pnpmTarball.FindStringSubmatch(line); m != nil && node.Tarball == "" {
+			node.Tarball = strings.Trim(m[1], `'"`)
+		}
+		// The entry's OWN version wins. A URL resolution keys the node by its
+		// tarball — `xlsx@https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz`
+		// in the frozen Mandel lock — and splitting that key at its last '@'
+		// reports a URL fragment where a version belongs.
+		if m := pnpmVersion.FindStringSubmatch(line); m != nil {
+			node.Version = strings.Trim(m[1], `'"`)
+		}
+	}
+	if node.Version == "" {
+		return LockedPackage{}, fmt.Errorf("pnpm-lock.yaml package %q records no version", key)
+	}
+	return node, nil
+}
+
+// splitPnpmPeerContext separates `name@version` from its `(peer@x)(peer@y)`
+// suffix. Nested parentheses are ordinary in pnpm peer contexts, so the split
+// is at the first top-level '(' rather than by matching pairs.
+func splitPnpmPeerContext(key string) (base, peer string) {
+	if i := strings.Index(key, "("); i >= 0 {
+		return key[:i], key[i:]
+	}
+	return key, ""
+}
+
+// splitPnpmKey reads the name and the KEY'S version out of a peer-stripped
+// lock key. The split is at the LAST '@' so a scoped name keeps its leading
+// one. The version it returns is provisional: an entry's own `version:` field
+// overrides it, which is what makes a URL resolution report a version.
 func splitPnpmKey(key string) (string, string) {
 	if i := strings.Index(key, "("); i >= 0 {
 		key = key[:i]
