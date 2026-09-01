@@ -361,10 +361,24 @@ jobs:
         env:
           TB_AUTHORITY: ${{ inputs.authority }}
           TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+          TB_FROZEN_INPUTS: ${{ inputs.frozen-inputs-artifact }}
+          TB_VERIFY_REQUIRE: ${{ inputs.verify-require }}
         run: |
           set -euo pipefail
           fail=0
           say() { echo "frozen plan — $1" >&2; fail=1; }
+          # THE INPUTS THEMSELVES, before the authority that approves them.
+          #
+          # An authority cannot approve inputs that do not exist. Without the
+          # frozen artifact the download step is skipped, `Plan the buckets`
+          # receives an empty bundle and stage1, and the ORDINARY live planner
+          # runs over the working tree and the restored store — deriving a
+          # matrix from inputs no Stage-1 manifest ever authorised. The matrix
+          # job refuses afterwards, but that refusal can only stop AT_start; it
+          # cannot make the plan that already happened a frozen one.
+          if [ -z "$TB_FROZEN_INPUTS" ]; then
+            say "verify-require=$TB_VERIFY_REQUIRE needs frozen-inputs-artifact. Without it there is no planning-input bundle and no Stage-1 manifest, so this job would plan LIVE from the working tree and the restored store — and the contract puts the authority's approval of the frozen inputs before either role plans. A downstream refusal cannot un-derive that matrix."
+          fi
           if [ -z "$TB_AUTHORITY_KEY" ]; then
             say "needs authority-key. An owner-authority signature must be VERIFIED before the plan exists, and a signature checked against whatever signed it accepts any self-generated key."
           fi
@@ -372,7 +386,7 @@ jobs:
             say "needs authority=ewj2-campaign. The frozen contract names exactly one protected environment that may approve Stage-1 inputs before either role plans. A key signs under any label it is given, so checking the key alone lets a manifest approved elsewhere drive the frozen planner — and a downstream refusal cannot un-derive the matrix this job is about to produce."
           fi
           [ "$fail" -eq 0 ] || exit 1
-          echo "frozen plan: the protected authority and its key are both bound before planning"
+          echo "frozen plan: the frozen inputs, the protected authority and its key are all bound before planning"
 
       - name: Plan the buckets
         id: plan

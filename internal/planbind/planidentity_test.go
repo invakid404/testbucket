@@ -116,6 +116,77 @@ func TestTheBundleBindsTheCompleteRequiredInventory(t *testing.T) {
 	}
 }
 
+// TestARealReceiptIsComparedByEveryClaimItCarries joins the two halves that
+// were repaired separately: the production DERIVATION and the production
+// COMPARISON.
+//
+// Issuance was made honest one round before the comparison was made complete,
+// which is exactly the arrangement that hides a gap — the receipt stated the
+// truth and the replay would have accepted a lie. Planning twice and comparing
+// real receipts is the only check that spans both.
+func TestARealReceiptIsComparedByEveryClaimItCarries(t *testing.T) {
+	// ONE bundle, planned twice. The bundle carries its own root, so two
+	// bundles acquired from two directories are two different frozen inputs
+	// and would differ for an uninteresting reason; the property under test is
+	// that the same frozen inputs derive the same receipt.
+	root := t.TempDir()
+	bundle, err := Acquire(baseAcquire(t, root, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := func(t *testing.T) walltime.Stage2Receipt {
+		t.Helper()
+		res, err := Plan(context.Background(), PlanOptions{Bundle: bundle, Stage1: "sha256:stage1"})
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		return res.Receipt
+	}
+	issued := plan(t)
+
+	// Two independent derivations of the same frozen inputs agree, including
+	// every field the comparison now reaches.
+	if err := issued.Matches(plan(t)); err != nil {
+		t.Fatalf("two independent derivations of the same bundle disagree: %v", err)
+	}
+
+	// And each claim, mutated on a REAL receipt, is caught.
+	for _, tc := range []struct {
+		name string
+		edit func(*walltime.Stage2Receipt)
+		want string
+	}{
+		{"a claimed full-plan implementation nobody ran", func(r *walltime.Stage2Receipt) {
+			r.Algorithms.FullPlan.Implementation = "sha256:never-executed"
+		}, "full-plan digest algorithm mismatch"},
+		{"a claimed semantic-plan canonicaliser nobody ran", func(r *walltime.Stage2Receipt) {
+			r.Algorithms.SemanticPlan.Canonicalizer = "some-other-canonicaliser"
+		}, "semantic-plan digest algorithm mismatch"},
+		{"an input access that did not happen", func(r *walltime.Stage2Receipt) {
+			r.InputAccess = append(append([]walltime.InputAccess(nil), r.InputAccess...),
+				walltime.InputAccess{Field: "an-input-nobody-read", Digest: "sha256:invented"})
+		}, "input-access mismatch"},
+		{"a planner result the plan does not produce", func(r *walltime.Stage2Receipt) {
+			r.PlannerResult = "k=99 buckets=99 units=99"
+		}, "planner verifier result mismatch"},
+		{"a renderer result the plan does not produce", func(r *walltime.Stage2Receipt) {
+			r.RendererResult = "invocations=999"
+		}, "renderer verifier result mismatch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tampered := issued
+			tc.edit(&tampered)
+			err := tampered.Matches(plan(t))
+			if err == nil {
+				t.Fatalf("an independent replay accepted %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // TestStage2RecordsTheImplementationsThatRan: the receipt used to copy the
 // bundle's algorithm identities, so it repeated a claim rather than reporting
 // what executed.

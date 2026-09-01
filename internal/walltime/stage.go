@@ -1713,6 +1713,53 @@ func (r Stage2Receipt) Matches(other Stage2Receipt) error {
 			r.Stage1Approval.Authority, r.Stage1Approval.KeyID,
 			other.Stage1Approval.Authority, other.Stage1Approval.KeyID)
 	}
+	// The ALGORITHM IDENTITIES. A receipt can claim one implementation while
+	// the replay ran another and still produce matching digests today —
+	// digests agree until the day the two implementations diverge, which is
+	// precisely the day this comparison is for. The contract asks the replay
+	// to reject a projection-version mismatch, and only comparing the
+	// identities does that.
+	for _, a := range []struct {
+		what      string
+		got, want AlgorithmIdentity
+	}{
+		{"full-plan digest algorithm", r.Algorithms.FullPlan, other.Algorithms.FullPlan},
+		{"semantic-plan digest algorithm", r.Algorithms.SemanticPlan, other.Algorithms.SemanticPlan},
+	} {
+		if a.got != a.want {
+			return fmt.Errorf("%s mismatch: the receipt records %s/%s/%s, the replay ran %s/%s/%s",
+				a.what, a.got.Name, a.got.Canonicalizer, a.got.Implementation,
+				a.want.Name, a.want.Canonicalizer, a.want.Implementation)
+		}
+	}
+	// The INPUT-ACCESS RECEIPT, in order. It is the record of which frozen
+	// inputs the planner actually read, so a receipt claiming a different set
+	// is claiming a different derivation — one whose plan digest happens to
+	// agree because the inputs it did read produced the same output.
+	if len(r.InputAccess) != len(other.InputAccess) {
+		return fmt.Errorf("input-access mismatch: the receipt records %d access(es), the replay recomputed %d", len(r.InputAccess), len(other.InputAccess))
+	}
+	for i := range r.InputAccess {
+		if r.InputAccess[i] != other.InputAccess[i] {
+			return fmt.Errorf("input-access record %d mismatch: the receipt records %s=%s, the replay recomputed %s=%s",
+				i, r.InputAccess[i].Field, r.InputAccess[i].Digest,
+				other.InputAccess[i].Field, other.InputAccess[i].Digest)
+		}
+	}
+	// The DETERMINISTIC VERIFIER RESULTS. The contract names them as things
+	// Stage 2 records and the replay reruns; a result nobody compares is a
+	// sentence in a file.
+	for _, v := range []struct {
+		what      string
+		got, want string
+	}{
+		{"planner verifier result", r.PlannerResult, other.PlannerResult},
+		{"renderer verifier result", r.RendererResult, other.RendererResult},
+	} {
+		if v.got != v.want {
+			return fmt.Errorf("%s mismatch: the receipt records %q, the replay recomputed %q", v.what, v.got, v.want)
+		}
+	}
 	// The per-bucket bindings are compared too. Aggregate digests say the two
 	// parties derived the same plan; only these say they derived the same
 	// documents the buckets will be verified against.

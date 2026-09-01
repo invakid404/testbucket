@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -39,6 +41,78 @@ func TestTheExactAuthorityPrecedesPlanning(t *testing.T) {
 	}
 	if !strings.Contains(steps[guard].body, walltime.CampaignAuthority) {
 		t.Errorf("the plan-job guard does not require the exact protected authority %q", walltime.CampaignAuthority)
+	}
+}
+
+// TestEligiblePlanningRequiresTheFrozenInputsBeforeItPlans is the F1
+// regression, and it is about the INPUTS rather than the authority.
+//
+// An authority cannot approve inputs that do not exist. The guard checked the
+// exact label and the key, but not `frozen-inputs-artifact` — so an eligible
+// request that omitted it passed, the download step was skipped, `Plan the
+// buckets` received an empty bundle and stage1, and the ORDINARY live planner
+// derived a matrix from the working tree and the restored store. The matrix job
+// refuses afterwards, but that only stops AT_start; it cannot make the plan
+// that already happened a frozen one.
+func TestEligiblePlanningRequiresTheFrozenInputsBeforeItPlans(t *testing.T) {
+	steps := workflowJobSteps(t, "plan")
+	guard, plan := -1, -1
+	for i, step := range steps {
+		switch step.name {
+		case "Refuse a frozen plan without the exact protected authority":
+			guard = i
+		case "Plan the buckets":
+			plan = i
+		}
+	}
+	if guard < 0 || plan < 0 || guard >= plan {
+		t.Fatalf("could not establish a pre-plan guard: guard=%d plan=%d", guard, plan)
+	}
+	body := steps[guard].body
+	// The artifact must be READ by the guard...
+	if !strings.Contains(body, "TB_FROZEN_INPUTS: ${{ inputs.frozen-inputs-artifact }}") {
+		t.Error("the pre-plan guard never reads frozen-inputs-artifact, so an eligible request can reach the live planner without one")
+	}
+	// ...and its absence must be a refusal, not a note.
+	if !strings.Contains(body, `if [ -z "$TB_FROZEN_INPUTS" ]`) {
+		t.Error("the pre-plan guard does not refuse an empty frozen-inputs-artifact")
+	}
+	// The download the plan depends on is conditional on the same input, which
+	// is why its absence silently selects the live planner rather than failing.
+	for i, step := range steps {
+		if step.name != "Download the frozen planning inputs" {
+			continue
+		}
+		if i > guard {
+			t.Errorf("the frozen-input download is step %d and the guard is step %d; the guard must precede the plan, and the download it gates on must not follow it", i, guard)
+		}
+	}
+}
+
+// TestTheScoredExampleSuppliesTheFrozenInputs: the documented scored
+// invocation is the one most likely to be copied, and it named only the
+// documents artifact — describing a fail-closed path that in fact planned live
+// first.
+func TestTheScoredExampleSuppliesTheFrozenInputs(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	at := strings.Index(text, "verify-require: eligible")
+	if at < 0 {
+		t.Fatal("the README has no scored example")
+	}
+	// The example block runs to the end of its fenced snippet.
+	end := strings.Index(text[at:], "```")
+	if end < 0 {
+		t.Fatal("the scored example is not a fenced block")
+	}
+	example := text[at : at+end]
+	for _, want := range []string{"frozen-inputs-artifact:", "frozen-documents-artifact:"} {
+		if !strings.Contains(example, want) {
+			t.Errorf("the documented scored example omits %s; a reader copying it would plan live before being refused", want)
+		}
 	}
 }
 

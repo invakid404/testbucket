@@ -584,10 +584,16 @@ called — not to your checkout. Plain `./` would resolve against the workspace,
 which for a called reusable workflow is *yours*. That needs a GitHub-hosted
 runner or a self-hosted runner ≥ 2.336.0.
 
-For a **scored** arm, add the campaign identities and hand the workflow the
-frozen documents — the signed manifest, the one authorised Stage-2 receipt, the
-independent replay attestation, the registry, and each bucket's forecast and
-projection — as an artifact:
+For a **scored** arm, add the campaign identities and hand the workflow BOTH
+frozen artifacts: the planning INPUTS the plan is derived from (the bundle, the
+signed Stage-1 manifest, the registry, the scorer) and the frozen DOCUMENTS the
+buckets are verified against (the one authorised Stage-2 receipt, the
+independent replay attestation, and each bucket's forecast and projection).
+
+Both are required, and the inputs artifact is required *first*: without it the
+plan job would derive its matrix live from the working tree and the restored
+store, and an authority cannot approve inputs that do not exist. The plan job
+refuses that before it plans.
 
 ```yaml
 with:
@@ -600,13 +606,19 @@ with:
   stage1-digest: sha256:…
   stage2-digest: sha256:…
   registry-digest: sha256:…
+  verifier-id: ewj2-verifier
   authority: ewj2-campaign
   authority-key: <hex public key>
+  frozen-inputs-artifact: testbucket-frozen-inputs-candidate
   frozen-documents-artifact: testbucket-frozen-candidate
 ```
 
-Without that artifact, `verify-require: eligible` fails closed — the verifier
-is being asked to prove something it has not been given, and saying so is the
+Without `frozen-inputs-artifact`, `verify-require: eligible` fails closed **in
+the plan job, before anything is planned** — there is no bundle and no Stage-1
+manifest, so the alternative is planning live from inputs nobody authorised,
+and a later refusal cannot un-derive that matrix. Without
+`frozen-documents-artifact` it fails closed at verification: the verifier is
+being asked to prove something it has not been given, and saying so is the
 right answer. So does an `eligible` request with no `wall-time-dir`: an
 eligible row is a *measured* row, and the workflow refuses that contradiction
 before any bucket runs rather than finishing green having proven nothing.
