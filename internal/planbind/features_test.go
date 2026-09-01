@@ -66,7 +66,7 @@ func TestPallocAllocatesWithoutTouchingTheMatrix(t *testing.T) {
 
 	// Pcheck projects the SAME frozen values the partition used, over the
 	// renderer's reported membership.
-	pcheck, err := PcheckFor(scored.Doc, -1, scored.Receipt.SemanticDigest, scored.Allocator)
+	pcheck, err := PcheckFor(scored.Doc, -1, scored.Receipt.SemanticDigest, scored.Receipt.MembershipDigest, scored.Allocator)
 	if err != nil {
 		t.Fatalf("PcheckFor: %v", err)
 	}

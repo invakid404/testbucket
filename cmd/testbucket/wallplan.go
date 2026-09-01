@@ -74,13 +74,26 @@ func runWallBundle(args []string) error {
 		return err
 	}
 	ctx := context.Background()
+
+	// ONE live discovery. Everything downstream — the target set, the project
+	// scoping for name listings, the bundle itself — is derived from these
+	// exact bytes. Calling Discover again would take a second observation that
+	// could disagree with the one being frozen, which is precisely the unbound
+	// input the bundle exists to close.
 	discovery, err := rnr.CaptureDiscovery(ctx)
 	if err != nil {
 		return err
 	}
-	live, err := rnr.Discover(ctx)
+	frozen, err := vitestrunner.New(vitestrunner.Options{
+		Root:   *root,
+		Frozen: &vitestrunner.FrozenInputs{Discovery: discovery},
+	})
 	if err != nil {
 		return err
+	}
+	live, err := frozen.Discover(ctx)
+	if err != nil {
+		return fmt.Errorf("parse the captured discovery snapshot: %w", err)
 	}
 
 	// Capture a runnable listing for exactly the targets the store has flagged
@@ -102,7 +115,7 @@ func runWallBundle(args []string) error {
 		}
 		sort.Strings(sliced)
 		for _, id := range sliced {
-			raw, err := rnr.CaptureRunnables(ctx, id)
+			raw, err := rnr.CaptureRunnables(ctx, id, discovery)
 			if err != nil {
 				return fmt.Errorf("capture runnables for %s: %w", id, err)
 			}
@@ -418,7 +431,7 @@ func writeDerivedDocuments(o frozenPlanOptions, res *planbind.Result) error {
 	}
 	for _, b := range res.Doc.Buckets {
 		if res.Allocator != nil {
-			pcheck, err := planbind.PcheckFor(res.Doc, b.Index, stage2, res.Allocator)
+			pcheck, err := planbind.PcheckFor(res.Doc, b.Index, stage2, res.Receipt.MembershipDigest, res.Allocator)
 			if err != nil {
 				return err
 			}

@@ -41,10 +41,20 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
+	// AT_start before ANYTHING else this process owns — before the records
+	// directory, the signing key and the writer. Those are action-owned work,
+	// and an envelope opened after them would report an action shorter than
+	// the one that ran. The action step's binary install necessarily precedes
+	// this, because there is no wrapper to read the clock until it exists; it
+	// is the one action-step operation outside A, and the realtime bracket on
+	// this record is what makes the gap visible against the GitHub step.
+	clock := NewSystemClock()
+	start := clock.Now()
+	probe(atStartReading, dir)
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	clock := NewSystemClock()
 	key, err := NewSigningKey()
 	if err != nil {
 		return nil, err
@@ -55,7 +65,6 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	}
 	defer w.Close()
 
-	start := clock.Now()
 	cont, err := NewContainment(containmentName(ExecOptions{Level: LevelAction, Run: run}), nil)
 	if err != nil {
 		return nil, err
@@ -203,13 +212,21 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	if err := peer.close(deadline); err != nil && terminal == TerminalPassed {
 		terminal, reason = TerminalWrapperError, err.Error()
 	}
+
+	// The epilogue — destroying the containment and removing the handoff — runs
+	// BEFORE the closing reading, because it is action-owned work and the
+	// contract puts AT_end after the final epilogue, not before it. What
+	// remains outside is one record write: the ledger closing itself.
+	_ = cont.Destroy()
+	_ = os.Remove(filepath.Join(dir, actionStateFile))
+	probe(atEndReading, dir)
 	if _, err := w.Append(Record{
 		Kind: "boundary", Role: RolePhysicalAction, Level: LevelAction, Boundary: "end",
 		Source: SourceWrapper, Run: st.Run, Containment: st.Containment,
 		Instant: clock.Now(), Terminal: terminal, Reason: reason,
+		Note: "observers reaped, containment destroyed and the action-state handoff removed before this reading; only this record's own write follows it",
 	}); err != nil {
 		return st, err
 	}
-	_ = cont.Destroy()
 	return st, nil
 }

@@ -78,7 +78,16 @@ func Exec(opt ExecOptions) (int, error) {
 	if opt.Timeout <= 0 {
 		opt.Timeout = DefaultTimeout
 	}
+
+	// AT_start / VB_start / V_start is the wrapper's FIRST owned operation, and
+	// that is meant literally: the reading is taken before the signing key, the
+	// writer, the records directory, the spec digests and the containment,
+	// because all of those are wrapper-owned work and an envelope that started
+	// after them would report an action shorter than the one that ran.
 	clock := NewSystemClock()
+	start := clock.Now()
+	probe(atStartReading, opt.Dir)
+
 	key, err := NewSigningKey()
 	if err != nil {
 		return 1, err
@@ -97,11 +106,6 @@ func Exec(opt ExecOptions) (int, error) {
 		AtomDigest:     opt.AtomDigest,
 		Desc:           opt.Desc,
 	}
-
-	// AT_start / VB_start / V_start: the wrapper's FIRST owned operation. Every
-	// containment, peer and observer cost after this point is inside the
-	// physical envelope, which is where the contract puts it.
-	start := clock.Now()
 
 	// Joining the parent containment before doing anything else is what makes
 	// this wrapper's own work — not just its child's — part of the enclosing
@@ -123,7 +127,18 @@ func Exec(opt ExecOptions) (int, error) {
 	if err != nil {
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "create containment: "+err.Error())
 	}
-	defer cont.Destroy()
+	// Cleanup is EXPLICIT rather than deferred, because a defer would run
+	// after the closing record and put real wrapper-owned work outside the
+	// envelope it belongs to. destroyed guards the error paths below, which
+	// still need it.
+	destroyed := false
+	destroy := func() {
+		if !destroyed {
+			destroyed = true
+			_ = cont.Destroy()
+		}
+	}
+	defer destroy()
 
 	if _, err := w.Append(Record{
 		Kind: "boundary", Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
@@ -140,7 +155,6 @@ func Exec(opt ExecOptions) (int, error) {
 		if err := writeContainmentHandoff(opt.Dir, cont.Identity()); err != nil {
 			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
 		}
-		defer os.Remove(scriptHandoffPath(opt.Dir))
 	}
 
 	deadline := time.Now().Add(opt.Timeout)
@@ -197,11 +211,25 @@ func Exec(opt ExecOptions) (int, error) {
 		}
 	}
 
+	if opt.Level == LevelScript {
+		// The handoff is script-owned work; removing it here rather than in a
+		// defer keeps it inside the envelope.
+		_ = os.Remove(scriptHandoffPath(opt.Dir))
+	}
+	destroy()
+	probe(atEndReading, opt.Dir)
+
+	// Only now, with the observers reaped, the containment destroyed and every
+	// other record flushed, is the closing reading taken. What remains outside
+	// is exactly one record write, which is the ledger closing itself and
+	// cannot be inside the interval it closes; the note says so rather than
+	// leaving a reader to assume otherwise.
 	if _, err := w.Append(Record{
 		Kind: "boundary", Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
 		Boundary: "end", Source: SourceWrapper, Seqno: opt.Seq, Run: opt.Run,
 		Containment: cont.Identity(), Instant: clock.Now(), Spec: spec,
 		Proc: proc, Terminal: termState, Reason: reason,
+		Note: "observers reaped, containment destroyed and all other records flushed before this reading; only this record's own write follows it",
 	}); err != nil {
 		return code, err
 	}
@@ -298,6 +326,28 @@ func runChild(opt ExecOptions, cont Containment) (int, ProcIdentity, string, str
 		state, reason = TerminalWrapperError, waitErr.Error()
 	}
 	return code, proc, state, reason
+}
+
+// atStartReading and atEndReading are called at the exact moments the physical
+// envelope opens and closes. They are nil in production and cost one nil check.
+//
+// They exist because the property that matters here — that the reading is
+// taken BEFORE the records directory, the signing key and the writer, and
+// AFTER the containment is destroyed and the handoff removed — cannot be
+// tested from timings. The setup costs tens of microseconds, so any threshold
+// small enough to catch a regression would be flaky. A probe that inspects the
+// observable state at the instant of the reading catches it exactly: if the
+// reading moves after the setup, the directory already exists when the probe
+// fires.
+var (
+	atStartReading func(dir string)
+	atEndReading   func(dir string)
+)
+
+func probe(hook func(string), dir string) {
+	if hook != nil {
+		hook(dir)
+	}
 }
 
 // errNoError distinguishes "Wait returned nil" from "Wait has not returned" in

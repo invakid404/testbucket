@@ -22,6 +22,17 @@ const (
 	synthStage2 = "sha256:0000000000000000000000000000000000000000000000000000000000000002"
 )
 
+// synthBinary is the executable identity the synthetic producers claim. It is
+// a real digest rather than a placeholder because Stage 1 binds it and the
+// verifier ties every record's execution context back to it.
+var synthBinary = DigestBytes([]byte("synthetic testbucket binary"))
+
+// synthContext builds a producer execution context in the production format,
+// so the verifier's binary binding is exercised rather than side-stepped.
+func synthContext(p Producer, n int) string {
+	return fmt.Sprintf("%s@%s#%d.1", p, shortDigest(synthBinary), n)
+}
+
 // synthRun describes one bucket's timeline in nanoseconds from an arbitrary
 // origin. Only the shape matters: A contains VB contains each V, and at every
 // level the peer brackets the trace.
@@ -126,10 +137,10 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 		if err != nil {
 			t.Fatal(err)
 		}
-		context := fmt.Sprintf("%s@synthetic#%d", producer, levelRank(level)*100+seq)
+		context := synthContext(producer, levelRank(level)*100+seq)
 		if s.sharedObserverContext && producer != ProducerPhysical {
 			key = sharedKey
-			context = fmt.Sprintf("observer@synthetic#%d", levelRank(level)*100+seq)
+			context = synthContext("observer", levelRank(level)*100+seq)
 		}
 		w, err := NewWriter(filepath.Join(s.dir, streamName(producer, level, seq)), producer, context, key)
 		if err != nil {

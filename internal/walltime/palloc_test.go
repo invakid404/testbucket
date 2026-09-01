@@ -188,8 +188,12 @@ func TestScorerFloorKeepsUnitsSchedulable(t *testing.T) {
 // the renderer's membership. It cannot score, so a unit with no frozen value
 // is an error rather than a silent zero.
 func TestPcheckProjectsFrozenValues(t *testing.T) {
+	scorer, err := TrainScorer(admissibleSet(), "test-scorer", 0.01)
+	if err != nil {
+		t.Fatal(err)
+	}
 	palloc := map[string]float64{"u1": 3, "u2": 4.5}
-	doc, err := BuildPcheck("sha256:stage2", "test-scorer", palloc, []PcheckInvocation{
+	doc, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer, palloc, []PcheckInvocation{
 		{Seq: 0, BucketIndex: 1, Units: []string{"u1", "u2"}},
 	})
 	if err != nil {
@@ -198,9 +202,68 @@ func TestPcheckProjectsFrozenValues(t *testing.T) {
 	if got := doc.Invocations[0].PredictedNs; got != int64(7.5*float64(second)) {
 		t.Errorf("Pcheck = %d ns, want 7.5 s", got)
 	}
-	if _, err := BuildPcheck("sha256:stage2", "test-scorer", palloc, []PcheckInvocation{
+	if _, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer, palloc, []PcheckInvocation{
 		{Seq: 0, Units: []string{"u1", "unknown"}},
 	}); err == nil {
 		t.Errorf("a unit with no frozen Palloc value was projected as zero")
+	}
+}
+
+// TestPcheckRecomputes is the audit half: the projection has to be checkable
+// from the document's own frozen values, and an edited number must not survive
+// that check. Digesting the unit NAMES alone — which is what the projection
+// used to do — would let the same membership carry any prediction at all.
+func TestPcheckRecomputes(t *testing.T) {
+	scorer, err := TrainScorer(admissibleSet(), "test-scorer", 0.01)
+	if err != nil {
+		t.Fatal(err)
+	}
+	palloc := map[string]float64{"u1": 3, "u2": 4.5}
+	doc, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer, palloc, []PcheckInvocation{
+		{Seq: 0, BucketIndex: 1, Units: []string{"u1", "u2"}},
+		{Seq: 1, BucketIndex: 1, Units: []string{"u1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if problems := doc.Recompute(); len(problems) != 0 {
+		t.Fatalf("a freshly built projection did not recompute: %v", problems)
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*PcheckDocument)
+		want string
+	}{
+		{"a prediction edited after the fact", func(d *PcheckDocument) {
+			d.Invocations[0].PredictedNs = int64(2 * second)
+		}, "sums to"},
+		{"a frozen value edited after the fact", func(d *PcheckDocument) {
+			d.Palloc["u1"] = 99
+		}, "digests to"},
+		{"membership widened after the fact", func(d *PcheckDocument) {
+			d.Invocations[1].Units = []string{"u1", "u2"}
+		}, "digest"},
+		{"a unit dropped from the frozen values", func(d *PcheckDocument) {
+			delete(d.Palloc, "u2")
+		}, "no frozen Palloc value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edited, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer,
+				map[string]float64{"u1": 3, "u2": 4.5}, []PcheckInvocation{
+					{Seq: 0, BucketIndex: 1, Units: []string{"u1", "u2"}},
+					{Seq: 1, BucketIndex: 1, Units: []string{"u1"}},
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.edit(edited)
+			problems := edited.Recompute()
+			if len(problems) == 0 {
+				t.Fatalf("the edit survived recomputation")
+			}
+			if !strings.Contains(strings.Join(problems, "; "), tc.want) {
+				t.Errorf("problems %v do not mention %q", problems, tc.want)
+			}
+		})
 	}
 }

@@ -468,7 +468,10 @@ func runWallVerify(args []string) error {
 	aeta := fs.String("aeta", "", "instantiated pre-action Aeta document for the ETA-completeness gate")
 	pcheck := fs.String("pcheck", "", "post-render Pcheck projection for the predictor gate")
 	registry := fs.String("registry", "", "frozen Aeta component-registry template; without it ETA completeness cannot be proven")
-	require := fs.String("require", "complete", "verdict this command exits non-zero below: complete (well-formed records) or eligible (scorable under every frozen gate)")
+	require := fs.String("require", "complete", "verdict this command exits non-zero below: complete (well-formed records) or eligible (scorable under every frozen ROW gate; the campaign-scope gates are decided by `wall campaign`)")
+	authority := fs.String("authority", "", "the protected environment the Stage-1 manifest must name")
+	var authorityKeys stringList
+	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable. Without one the verifier will not treat any signature as authority approval, because a self-generated key would otherwise pass")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -478,6 +481,7 @@ func runWallVerify(args []string) error {
 	v, err := walltime.VerifyDir(walltime.VerifyOptions{
 		Dir: *dir, Stage1Path: *stage1, Stage2Path: *stage2,
 		AetaPath: *aeta, PcheckPath: *pcheck, RegistryPath: *registry,
+		AuthorityKeys: authorityKeys, Authority: *authority,
 	})
 	if err != nil {
 		return err

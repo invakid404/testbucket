@@ -56,10 +56,85 @@ inputs:
       descendant escaped. Create it in a prior step, e.g.
       `sudo mkdir -p /sys/fs/cgroup/testbucket && sudo chown -R "$(id -u)" /sys/fs/cgroup/testbucket`.
     default: ""
+  campaign-id:
+    description: 'Campaign identity stamped on every record.'
+    default: ""
+  stage1-digest:
+    description: >-
+      Digest of the signed Stage-1 input manifest that authorised this plan
+      (`testbucket wall digest --file stage1.json`). Every record binds it.
+      Without it the records name no authorised inputs and the verifier reports
+      the run INELIGIBLE, which is correct but unscorable.
+    default: ""
+  stage2-digest:
+    description: >-
+      Digest of the Stage-2 derived-plan receipt this bucket was fanned out
+      from. Every record binds it, so a measurement can be tied to exactly one
+      authorised plan.
+    default: ""
+  registry-digest:
+    description: 'Digest of the frozen Aeta component-registry template in force.'
+    default: ""
+  verifier-id:
+    description: 'Delivery-bound verifier identity recorded on every record.'
+    default: ""
+  verify-require:
+    description: >-
+      What `wall verify` must be able to say before this step passes: `complete`
+      (the records are well formed) or `eligible` (this row is scorable — which
+      additionally needs a real containment and clock, the frozen documents
+      below, and every row-scope gate inside its threshold). A campaign arm
+      uses `eligible`.
+    default: complete
+  stage1-file:
+    description: 'Path to the signed Stage-1 manifest, for `wall verify` (needed by verify-require=eligible).'
+    default: ""
+  stage2-file:
+    description: 'Path to the Stage-2 derived-plan receipt, for `wall verify`.'
+    default: ""
+  registry-file:
+    description: 'Path to the frozen Aeta component registry, for `wall verify`.'
+    default: ""
+  aeta-file:
+    description: 'Path to this bucket''s instantiated pre-action Aeta, for `wall verify`.'
+    default: ""
+  pcheck-file:
+    description: 'Path to this bucket''s post-render Pcheck projection, for `wall verify`.'
+    default: ""
+  authority-key:
+    description: >-
+      PREDECLARED public key (hex) of the protected campaign environment. The
+      verifier will not treat a Stage-1 signature as authority approval without
+      one: a self-generated key would otherwise pass.
+    default: ""
+  authority:
+    description: 'Protected environment name the Stage-1 manifest must name.'
+    default: ""
 
 runs:
   using: composite
   steps:
+    # A scored row needs an immutable delivery identity: the contract is
+    # explicit that a moving tag is descriptive metadata, not an identity. The
+    # opt-in measured run may still use the alias, because it only ever claims
+    # `complete`.
+    - name: Refuse a moving alias for a scored row
+      if: inputs.verify-require == 'eligible'
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$TB_VERSION" in
+          v[0-9]*.[0-9]*.[0-9]*) ;;
+          [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+          *)
+            echo "verify-require=eligible needs an immutable testbucket version (an exact vX.Y.Z or a full commit SHA), got '$TB_VERSION'." >&2
+            echo "A moving alias is descriptive metadata, not a delivery identity, and a row delivered through one cannot be scored." >&2
+            exit 1
+            ;;
+        esac
+
     # The Go runner needs the binary for `testbucket render`; a Vitest bucket's
     # script prints its own default-reporter log, so it needs no binary — UNLESS
     # it is being measured, which is the wrapper's own binary.
@@ -84,19 +159,31 @@ runs:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
         BUCKET_NAME: ${{ inputs.name }}
+        TB_CAMPAIGN_ID: ${{ inputs.campaign-id }}
+        TB_STAGE1: ${{ inputs.stage1-digest }}
+        TB_STAGE2: ${{ inputs.stage2-digest }}
+        TB_REGISTRY: ${{ inputs.registry-digest }}
+        TB_VERIFIER_ID: ${{ inputs.verifier-id }}
       run: |
         set -euo pipefail
-        mkdir -p "$TB_WALL_DIR"
+        # The records directory is created by `wall begin` itself, INSIDE the
+        # envelope: creating it here would put action-owned work before
+        # AT_start and report an action shorter than the one that ran.
         testbucket wall begin \
           --dir "$TB_WALL_DIR" \
           --bucket-id "$BUCKET_NAME" \
+          --campaign-id "$TB_CAMPAIGN_ID" \
           --run-id "${GITHUB_RUN_ID:-}" \
           --attempt-id "${GITHUB_RUN_ATTEMPT:-}" \
           --repository "${GITHUB_REPOSITORY:-}" \
           --workflow-run "${GITHUB_RUN_ID:-}" \
           --job "${GITHUB_JOB:-}" \
           --step "run-bucket" \
-          --step-attempt "${GITHUB_RUN_ATTEMPT:-}"
+          --step-attempt "${GITHUB_RUN_ATTEMPT:-}" \
+          --stage1 "$TB_STAGE1" \
+          --stage2 "$TB_STAGE2" \
+          --registry "$TB_REGISTRY" \
+          --verifier-id "$TB_VERIFIER_ID"
 
     # A consumer's own per-runner provisioning, run once before the bucket's test
     # command. Passed through the environment and executed as a bash block (never
@@ -159,6 +246,9 @@ runs:
           # VB: the complete generated script under its own physical envelope,
           # containment peer and independent trace. The wrapper exits with the
           # script's status, so a red bucket stays red.
+          # The run identity is inherited from the action state `wall begin`
+          # wrote, so the script and its invocations bind the same Stage-1 and
+          # Stage-2 receipts the action does.
           testbucket wall exec --dir "$TB_WALL_DIR" --level script \
             --desc "$BUCKET_NAME" -- bash "$RUNNER_TEMP/testbucket-bucket.sh"
           status=$?
@@ -207,4 +297,29 @@ runs:
       shell: bash
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
-      run: testbucket wall verify --dir "$TB_WALL_DIR" --require complete
+        TB_REQUIRE: ${{ inputs.verify-require }}
+        TB_STAGE1_FILE: ${{ inputs.stage1-file }}
+        TB_STAGE2_FILE: ${{ inputs.stage2-file }}
+        TB_REGISTRY_FILE: ${{ inputs.registry-file }}
+        TB_AETA_FILE: ${{ inputs.aeta-file }}
+        TB_PCHECK_FILE: ${{ inputs.pcheck-file }}
+        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_AUTHORITY: ${{ inputs.authority }}
+      run: |
+        set -euo pipefail
+        # Each frozen document is passed only when supplied, so the default
+        # opt-in run still verifies structurally while a campaign arm can ask
+        # the harder question. Nothing is defaulted: a document the verifier
+        # was not given is a document it reports as missing.
+        # `if` blocks rather than `[ -n x ] && args+=(...)`: under `set -e` a
+        # trailing test that is false makes the whole step fail, which would
+        # turn "this consumer passed no Aeta file" into a red bucket.
+        args=(--dir "$TB_WALL_DIR" --require "$TB_REQUIRE")
+        if [ -n "$TB_STAGE1_FILE" ]; then args+=(--stage1 "$TB_STAGE1_FILE"); fi
+        if [ -n "$TB_STAGE2_FILE" ]; then args+=(--stage2 "$TB_STAGE2_FILE"); fi
+        if [ -n "$TB_REGISTRY_FILE" ]; then args+=(--registry "$TB_REGISTRY_FILE"); fi
+        if [ -n "$TB_AETA_FILE" ]; then args+=(--aeta "$TB_AETA_FILE"); fi
+        if [ -n "$TB_PCHECK_FILE" ]; then args+=(--pcheck "$TB_PCHECK_FILE"); fi
+        if [ -n "$TB_AUTHORITY_KEY" ]; then args+=(--authority-key "$TB_AUTHORITY_KEY"); fi
+        if [ -n "$TB_AUTHORITY" ]; then args+=(--authority "$TB_AUTHORITY"); fi
+        testbucket wall verify "${args[@]}"

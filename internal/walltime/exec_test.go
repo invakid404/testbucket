@@ -385,3 +385,99 @@ func TestScriptPublishesItsContainmentWhileItRuns(t *testing.T) {
 			seen.ID, seen.Inode, recs[0].Containment.ID, recs[0].Containment.Inode)
 	}
 }
+
+// TestEnvelopeCoversEveryWrapperOwnedOperation is the endpoint-coverage test.
+//
+// The contract puts A from the FIRST action-owned operation through the FINAL
+// epilogue, and the tempting shortcut is to open the envelope after the
+// wrapper's own setup and close it before its own cleanup — which reports an
+// action shorter than the one that ran. Timings cannot catch that: the setup
+// costs tens of microseconds. The probes below inspect the observable state at
+// the instant of each reading instead, so a reading that moves after the setup
+// finds a directory that already exists and fails here.
+func TestEnvelopeCoversEveryWrapperOwnedOperation(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "records")
+
+	var startState, endState error
+	atStartReading = func(d string) {
+		if _, err := os.Stat(d); err == nil {
+			startState = fmt.Errorf("the records directory already existed when the envelope opened: creating it is action-owned work and belongs INSIDE A")
+			return
+		}
+		if entries, err := os.ReadDir(parent); err == nil && len(entries) != 0 {
+			startState = fmt.Errorf("the wrapper had already written %d file(s) when the envelope opened", len(entries))
+		}
+	}
+	atEndReading = func(d string) {
+		if _, err := os.Stat(filepath.Join(d, actionStateFile)); err == nil {
+			endState = fmt.Errorf("the action-state handoff still existed when the envelope closed: removing it is epilogue work and belongs INSIDE A")
+		}
+	}
+	t.Cleanup(func() { atStartReading, atEndReading = nil, nil })
+
+	run := RunIdentity{BucketID: "b1", Stage2: "sha256:test"}
+	if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
+		t.Fatalf("BeginAction: %v", err)
+	}
+	if startState != nil {
+		t.Errorf("BeginAction: %v", startState)
+	}
+	if _, err := EndAction(dir, TerminalPassed, ""); err != nil {
+		t.Fatalf("EndAction: %v", err)
+	}
+	if endState != nil {
+		t.Errorf("EndAction: %v", endState)
+	}
+
+	// The same rule for a command envelope: the reading precedes the signing
+	// key, the writer and the stream file.
+	execDir := filepath.Join(parent, "exec-records")
+	startState = nil
+	atStartReading = func(d string) {
+		if _, err := os.Stat(filepath.Join(d, streamName(ProducerPhysical, LevelInvocation, 0))); err == nil {
+			startState = fmt.Errorf("the physical stream already existed when the envelope opened")
+		}
+	}
+	if _, err := Exec(ExecOptions{
+		Level: LevelInvocation, Dir: execDir, Cwd: parent, Timeout: 30 * time.Second,
+		Argv: []string{"sh", "-c", "true"},
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if startState != nil {
+		t.Errorf("Exec: %v", startState)
+	}
+}
+
+// TestEnvelopeBracketsTheWholeCall is the coarse companion: whatever else
+// happens, A must lie inside the wall-clock window of the call that produced
+// it. It is a sanity bound, not the coverage proof above.
+func TestEnvelopeBracketsTheWholeCall(t *testing.T) {
+	dir := t.TempDir()
+	clock := NewSystemClock()
+	before := clock.Now()
+	if _, err := Exec(ExecOptions{
+		Level: LevelInvocation, Dir: dir, Cwd: dir, Timeout: 30 * time.Second,
+		Argv: []string{"sh", "-c", "true"},
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	after := clock.Now()
+	recs, err := ReadRecords(filepath.Join(dir, streamName(ProducerPhysical, LevelInvocation, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start, end Nanos
+	for _, r := range recs {
+		switch r.Boundary {
+		case "start":
+			start = r.Instant.Mono
+		case "end":
+			end = r.Instant.Mono
+		}
+	}
+	if start < before.Mono || end > after.Mono {
+		t.Errorf("the envelope [%d,%d] is not inside the call [%d,%d]", start, end, before.Mono, after.Mono)
+	}
+}

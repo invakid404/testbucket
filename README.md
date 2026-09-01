@@ -353,10 +353,22 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   stays terminal and retained; it never becomes a duration.
 - A rewritten record breaks a hash chain the verifier recomputes.
 - `wall verify --require complete` asks whether the records are well formed;
-  `--require eligible` asks whether they may be **scored**, which additionally
-  needs a real clock, a real containment, signatures, the frozen Stage-1 and
-  Stage-2 documents, and every gate inside its threshold. Absent evidence never
-  passes either.
+  `--require eligible` asks whether this **row** may be scored, which
+  additionally needs a real clock, a real containment, signatures, the frozen
+  Stage-1 and Stage-2 documents re-derived rather than believed, and every
+  row-scope gate inside its threshold. Absent evidence never passes either.
+- Gates carry a **scope**. An individual error limit is decided by one row; a
+  mean over eighty rows is not, and `wall verify` reports those as
+  `campaign`-scope without ever passing them. `wall campaign` decides those,
+  and it checks the population first: five pairs, ten runs, eighty action rows
+  at eight buckets each, three UTC dates inside fourteen days, every run
+  retained with its terminal state, and one verifier verdict named per row.
+  Five pairs of half-sized runs is not most of a campaign — it is a different
+  denominator, and it fails.
+- Authority approval needs a **predeclared** key
+  (`wall verify --authority-key`). Verifying a signature against whatever
+  signed the document accepts any self-generated key, so a run with no
+  predeclared authority is reported ineligible rather than trusted.
 
 ### A reproducible plan
 

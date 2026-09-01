@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
+	"time"
 )
 
 // The frozen numeric gates. They are constants, not configuration: a threshold
@@ -43,11 +45,23 @@ const (
 	ResidualFraction       = 0.005
 
 	// ScoredActionRows is the campaign's action population: ten eligible
-	// workflow runs of eight buckets. A statistic over fewer rows is not a
-	// smaller sample, it is an incomplete one.
+	// workflow runs — five pairs, two arms — of eight buckets each. A
+	// statistic over fewer rows is not a smaller sample, it is an incomplete
+	// one, and EvaluateCampaign enforces the count rather than trusting the
+	// caller to supply it.
 	ScoredActionRows = 80
 	// CampaignPairs is the number of randomized baseline/candidate pairs.
 	CampaignPairs = 5
+	// BucketsPerRun is K for the scored profile. Every eligible run
+	// contributes exactly this many action observations; a run with fewer is
+	// an incomplete run, not a smaller one.
+	BucketsPerRun = 8
+	// CampaignDates is the minimum number of distinct UTC dates the five pairs
+	// must span, and CampaignWindow the maximum span between the first and
+	// last run. Both exist so a campaign cannot be five runs of one hour on
+	// one machine's quiet afternoon.
+	CampaignDates  = 3
+	CampaignWindow = 14 * 24 * time.Hour
 )
 
 // Durations in nanoseconds, so every comparison in this package is exact
@@ -57,11 +71,25 @@ const (
 	second      = int64(1_000_000_000)
 )
 
+// Gate scopes. The distinction is load-bearing: an individual error limit can
+// be decided from one row, and a mean over eighty rows cannot. Reporting both
+// against one run is how a single measurement ends up claiming a population
+// statistic it never had.
+const (
+	// ScopeRow is a gate one verified row decides for itself.
+	ScopeRow = "row"
+	// ScopeCampaign is a gate only the full frozen population decides. A
+	// per-run verdict reports it with its population and never passes it.
+	ScopeCampaign = "campaign"
+)
+
 // GateResult is one frozen threshold's outcome. Population is carried with the
 // result because "MAE 12 ms" over three rows is not the gate the contract
 // froze over eighty.
 type GateResult struct {
-	Name       string `json:"name"`
+	Name string `json:"name"`
+	// Scope says which population decides this gate.
+	Scope      string `json:"scope,omitempty"`
 	Required   string `json:"required"`
 	Observed   string `json:"observed"`
 	Population int    `json:"population"`
@@ -110,6 +138,7 @@ func (r Reconciliation) Max() int64 {
 func (r Reconciliation) Gate(expected int) GateResult {
 	res := GateResult{
 		Name:       fmt.Sprintf("reconciliation:%s", r.Level),
+		Scope:      ScopeRow,
 		Required:   fmt.Sprintf("MAE <= %s and every |error| <= %s", dur(ReconMAELimit), dur(ReconMaxLimit)),
 		Observed:   fmt.Sprintf("MAE %s, max %s", dur(r.MAE()), dur(r.Max())),
 		Population: len(r.Deltas),
@@ -145,8 +174,8 @@ type PredictorSample struct {
 func EvaluatePredictor(samples []PredictorSample) []GateResult {
 	if len(samples) == 0 {
 		return []GateResult{{
-			Name:     "predictor:pcheck-vs-v",
-			Required: fmt.Sprintf("invocation MAE <= %s", dur(PcheckInvocationMAELimit)),
+			Name: "predictor:invocation-max", Scope: ScopeRow,
+			Required: fmt.Sprintf("every |error| <= %s", dur(PcheckInvocationMaxLimit)),
 			Observed: "no sample", Detail: "no frozen projection was paired with an observed invocation",
 		}}
 	}
@@ -181,18 +210,31 @@ func EvaluatePredictor(samples []PredictorSample) []GateResult {
 
 	return []GateResult{
 		{
-			Name: "predictor:invocation-mae", Required: "<= " + dur(PcheckInvocationMAELimit),
+			Name: "predictor:invocation-mae", Scope: ScopeCampaign, Required: "<= " + dur(PcheckInvocationMAELimit),
 			Observed: dur(invMAE), Population: len(samples), Pass: invMAE <= PcheckInvocationMAELimit,
 		},
 		{
-			Name: "predictor:invocation-max", Required: "<= " + dur(PcheckInvocationMaxLimit),
+			Name: "predictor:invocation-max", Scope: ScopeRow, Required: "<= " + dur(PcheckInvocationMaxLimit),
 			Observed: dur(worst), Population: len(samples), Pass: worst <= PcheckInvocationMaxLimit,
 		},
 		{
-			Name: "predictor:bucket-mae", Required: "<= " + dur(PcheckBucketMAELimit),
+			Name: "predictor:bucket-mae", Scope: ScopeRow, Required: "<= " + dur(PcheckBucketMAELimit),
 			Observed: dur(bucketMAE), Population: len(bucketErrs), Pass: bucketMAE <= PcheckBucketMAELimit,
 		},
 	}
+}
+
+// RowScope selects the gates one verified row decides for itself. The rest are
+// campaign-scope and belong to `wall campaign` over the full population; a
+// per-run verdict reports them without ever passing them.
+func RowScope(gates []GateResult) []GateResult {
+	var out []GateResult
+	for _, g := range gates {
+		if g.Scope == ScopeRow {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // AetaSample pairs one bucket's pre-action forecast with the observed complete
@@ -211,7 +253,7 @@ type AetaSample struct {
 func EvaluateAeta(samples []AetaSample, expected int) []GateResult {
 	if len(samples) == 0 {
 		return []GateResult{{
-			Name: "aeta:point-mae", Required: "<= " + dur(AetaMAELimit), Observed: "no sample",
+			Name: "aeta:point-max", Scope: ScopeRow, Required: "<= " + dur(AetaMaxLimit), Observed: "no sample",
 			Expected: expected, Detail: "no pre-action forecast was instantiated",
 		}}
 	}
@@ -239,14 +281,14 @@ func EvaluateAeta(samples []AetaSample, expected int) []GateResult {
 	mae := sum / int64(len(samples))
 	full := expected == 0 || len(samples) >= expected
 	return []GateResult{
-		{Name: "aeta:point-mae", Required: "<= " + dur(AetaMAELimit), Observed: dur(mae),
+		{Name: "aeta:point-mae", Scope: ScopeCampaign, Required: "<= " + dur(AetaMAELimit), Observed: dur(mae),
 			Population: len(samples), Expected: expected, Pass: full && mae <= AetaMAELimit},
-		{Name: "aeta:point-max", Required: "<= " + dur(AetaMaxLimit), Observed: dur(worst),
+		{Name: "aeta:point-max", Scope: ScopeRow, Required: "<= " + dur(AetaMaxLimit), Observed: dur(worst),
 			Population: len(samples), Expected: expected, Pass: full && worst <= AetaMaxLimit},
-		{Name: "aeta:interval-contains-a", Required: "every A within its own [L,U]",
+		{Name: "aeta:interval-contains-a", Scope: ScopeRow, Required: "every A within its own [L,U]",
 			Observed: fmt.Sprintf("%d/%d", contained, len(samples)), Population: len(samples),
 			Expected: expected, Pass: full && contained == len(samples)},
-		{Name: "aeta:interval-width", Required: fmt.Sprintf("<= max(%s, %.2f * point)", dur(AetaMinWidth), AetaWidthFraction),
+		{Name: "aeta:interval-width", Scope: ScopeRow, Required: fmt.Sprintf("<= max(%s, %.2f * point)", dur(AetaMinWidth), AetaWidthFraction),
 			Observed: fmt.Sprintf("%d/%d within limit", widthOK, len(samples)), Population: len(samples),
 			Expected: expected, Pass: full && widthOK == len(samples)},
 	}
@@ -255,9 +297,26 @@ func EvaluateAeta(samples []AetaSample, expected int) []GateResult {
 // CampaignRun is one workflow run's per-bucket complete action times for one
 // arm. Bucket rows are not independent primary samples; the run-level Amax and
 // TA are.
+//
+// StartedAt and Terminal are not decoration. The frozen campaign spans at
+// least three UTC dates within fourteen days and is intention-to-treat: a run
+// that failed, was cancelled or was incomplete stays in the population as a
+// non-passing row rather than being dropped, and a population with no dates
+// cannot be checked for either rule.
 type CampaignRun struct {
-	RunID    string  `json:"run_id"`
+	RunID string `json:"run_id"`
+	// StartedAt is the run's UTC instant, RFC3339.
+	StartedAt string `json:"started_at"`
+	// Terminal is the run's retained outcome: passed, failed, cancelled, ...
+	Terminal string `json:"terminal"`
+	// ActionNs is one complete physical A per bucket. It must hold exactly
+	// BucketsPerRun entries.
 	ActionNs []int64 `json:"action_ns"`
+	// VerdictDigests names the per-row verdict each observation came from —
+	// one per bucket, in the same order — so every number in a campaign can be
+	// traced back to the records and the verifier verdict that produced it. A
+	// population assembled from bare durations is a spreadsheet, not evidence.
+	VerdictDigests []Digest `json:"verdict_digests"`
 }
 
 // Amax is the makespan of the run: the longest complete action.
@@ -303,11 +362,17 @@ func (p CampaignPair) RA() float64 {
 	return float64(p.Candidate.Amax()) / float64(p.Baseline.Amax())
 }
 
-// EvaluateCampaign applies the frozen decision rule to the five pairs. It is
-// the whole rule, including the population check: five pairs is not a
-// convention here, it is the gate.
+// EvaluateCampaign applies the frozen decision rule to the five pairs.
+//
+// It is the WHOLE rule, and the population is part of it. Five pairs of
+// ten-bucket runs is not "most of" a campaign of eight-bucket runs: the
+// denominators differ, and a ratio taken over half the rows answers a
+// different question. So the population is checked first and, when it is
+// short, every downstream gate is reported incomplete rather than passing on
+// the numbers it happened to be handed.
 func EvaluateCampaign(pairs []CampaignPair) []GateResult {
-	full := len(pairs) == CampaignPairs
+	population := campaignPopulation(pairs)
+	full := population.Pass
 	var ra []float64
 	var daB, daC []float64
 	var taB, taC []int64
@@ -334,30 +399,126 @@ func EvaluateCampaign(pairs []CampaignPair) []GateResult {
 	}
 	medRA := medianFloat(ra)
 	out := []GateResult{
-		{Name: "campaign:action-improvement", Required: "median(RA) <= 0.95", Observed: fmt.Sprintf("%.4f", medRA),
+		population,
+		{Name: "campaign:action-improvement", Scope: ScopeCampaign, Required: "median(RA) <= 0.95", Observed: fmt.Sprintf("%.4f", medRA),
 			Population: len(pairs), Expected: CampaignPairs, Pass: full && medRA <= 0.95},
-		{Name: "campaign:pairs-not-worse", Required: "at least 4/5 pairs with RA <= 1.00",
+		{Name: "campaign:pairs-not-worse", Scope: ScopeCampaign, Required: "at least 4/5 pairs with RA <= 1.00",
 			Observed: fmt.Sprintf("%d/%d", within, len(pairs)), Population: len(pairs), Expected: CampaignPairs,
 			Pass: full && within >= 4},
-		{Name: "campaign:tail-non-regression", Required: "every RA <= 1.10 and max Amax[C] <= 1.05 * max Amax[B]",
+		{Name: "campaign:tail-non-regression", Scope: ScopeCampaign, Required: "every RA <= 1.10 and max Amax[C] <= 1.05 * max Amax[B]",
 			Observed:   fmt.Sprintf("tail %v, %s vs %s", tailOK, dur(maxC), dur(maxB)),
 			Population: len(pairs), Expected: CampaignPairs,
 			Pass: full && tailOK && float64(maxC) <= 1.05*float64(maxB)},
-		{Name: "campaign:equality", Required: "median(DA[C]) <= 0.95 * median(DA[B])",
+		{Name: "campaign:equality", Scope: ScopeCampaign, Required: "median(DA[C]) <= 0.95 * median(DA[B])",
 			Observed:   fmt.Sprintf("%.4f vs %.4f", medianFloat(daC), medianFloat(daB)),
 			Population: len(pairs), Expected: CampaignPairs,
 			Pass: full && medianFloat(daC) <= 0.95*medianFloat(daB)},
-		{Name: "campaign:total-action-cost", Required: "median(TA[C]) <= 1.05 * median(TA[B])",
+		{Name: "campaign:total-action-cost", Scope: ScopeCampaign, Required: "median(TA[C]) <= 1.05 * median(TA[B])",
 			Observed:   fmt.Sprintf("%s vs %s", dur(medianNs(taC)), dur(medianNs(taB))),
 			Population: len(pairs), Expected: CampaignPairs,
 			Pass: full && float64(medianNs(taC)) <= 1.05*float64(medianNs(taB))},
 	}
 	if !full {
 		for i := range out {
-			out[i].Detail = fmt.Sprintf("population is %d of the frozen %d pairs", len(pairs), CampaignPairs)
+			if out[i].Name == population.Name {
+				continue
+			}
+			out[i].Detail = "the population is incomplete, so this statistic answers a different question than the frozen gate"
 		}
 	}
 	return out
+}
+
+// campaignPopulation is the gate the frozen thresholds are defined over:
+// exactly five pairs, ten eligible runs, eighty complete action observations
+// per arm, every run contributing exactly K rows, at least three distinct UTC
+// dates, a window of at most fourteen days, and every run retained with its
+// terminal state.
+//
+// It is a gate and not a precondition on purpose. A short campaign is a
+// reportable FAIL with its own line, not an error the caller can catch and
+// paper over.
+func campaignPopulation(pairs []CampaignPair) GateResult {
+	res := GateResult{
+		Name: "campaign:population", Scope: ScopeCampaign,
+		Required: fmt.Sprintf("%d pairs, %d runs, %d action rows (%d per run), >= %d UTC dates within %s, every run retained",
+			CampaignPairs, CampaignPairs*2, ScoredActionRows, BucketsPerRun, CampaignDates, CampaignWindow),
+		Expected: CampaignPairs,
+	}
+	var problems []string
+	if len(pairs) != CampaignPairs {
+		problems = append(problems, fmt.Sprintf("%d pairs", len(pairs)))
+	}
+	res.Population = len(pairs)
+
+	rowsPerArm := map[string]int{}
+	rows := 0
+	dates := map[string]bool{}
+	var earliest, latest time.Time
+	runs := 0
+	for i, p := range pairs {
+		for arm, r := range map[string]CampaignRun{"baseline": p.Baseline, "candidate": p.Candidate} {
+			runs++
+			rows += len(r.ActionNs)
+			rowsPerArm[arm] += len(r.ActionNs)
+			if len(r.ActionNs) != BucketsPerRun {
+				problems = append(problems, fmt.Sprintf("pair %d %s run %q contributed %d of %d buckets",
+					i, arm, r.RunID, len(r.ActionNs), BucketsPerRun))
+			}
+			for j, ns := range r.ActionNs {
+				if ns <= 0 {
+					problems = append(problems, fmt.Sprintf("pair %d %s bucket %d has no positive complete action", i, arm, j))
+				}
+			}
+			if len(r.VerdictDigests) != len(r.ActionNs) {
+				problems = append(problems, fmt.Sprintf("pair %d %s run %q names %d verdict(s) for %d action row(s); every row must be traceable to the verdict that verified it",
+					i, arm, r.RunID, len(r.VerdictDigests), len(r.ActionNs)))
+			}
+			for j, d := range r.VerdictDigests {
+				if d == "" {
+					problems = append(problems, fmt.Sprintf("pair %d %s bucket %d names no verdict", i, arm, j))
+				}
+			}
+			// Intention-to-treat: a non-passing run is retained AND makes its
+			// pair non-passing. It is never dropped to keep the count.
+			if r.Terminal != TerminalPassed {
+				problems = append(problems, fmt.Sprintf("pair %d %s run %q is terminal %q", i, arm, r.RunID, firstNonEmptyStr(r.Terminal, "unstated")))
+			}
+			t, err := time.Parse(time.RFC3339, r.StartedAt)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("pair %d %s run %q has no RFC3339 start instant", i, arm, r.RunID))
+				continue
+			}
+			t = t.UTC()
+			dates[t.Format("2006-01-02")] = true
+			if earliest.IsZero() || t.Before(earliest) {
+				earliest = t
+			}
+			if latest.IsZero() || t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	if runs != CampaignPairs*2 {
+		problems = append(problems, fmt.Sprintf("%d eligible runs, want %d", runs, CampaignPairs*2))
+	}
+	if rows != ScoredActionRows {
+		problems = append(problems, fmt.Sprintf("%d action rows, want %d", rows, ScoredActionRows))
+	}
+	if len(dates) < CampaignDates {
+		problems = append(problems, fmt.Sprintf("%d distinct UTC date(s), want at least %d", len(dates), CampaignDates))
+	}
+	if !earliest.IsZero() && latest.Sub(earliest) > CampaignWindow {
+		problems = append(problems, fmt.Sprintf("the runs span %s, longer than %s", latest.Sub(earliest), CampaignWindow))
+	}
+	res.Observed = fmt.Sprintf("%d pairs, %d runs, %d/%d action rows (%d baseline, %d candidate), %d UTC date(s)",
+		len(pairs), runs, rows, ScoredActionRows, rowsPerArm["baseline"], rowsPerArm["candidate"], len(dates))
+	if len(problems) == 0 {
+		res.Pass = true
+		return res
+	}
+	res.Detail = strings.Join(problems, "; ")
+	return res
 }
 
 // medianNs is the conventional even-n arithmetic mean of the two middle

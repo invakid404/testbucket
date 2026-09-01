@@ -1,6 +1,10 @@
 package walltime
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 // The gates are the whole point of the measurement, so they are tested at
 // their edges: one nanosecond either side of a frozen threshold, and the
@@ -113,17 +117,48 @@ func TestAetaGates(t *testing.T) {
 // TestCampaignDecisionRule exercises the frozen five-pair rule, including the
 // two ways a candidate that looks better on average still fails.
 func TestCampaignDecisionRule(t *testing.T) {
-	// The baseline is imbalanced (one long bucket, three short); the candidate
-	// is even. That is the shape the campaign is meant to reward: a smaller
-	// makespan AND a smaller makespan-over-median.
-	pair := func(bmax, cmax int64) CampaignPair {
-		b := CampaignRun{RunID: "b", ActionNs: []int64{bmax, bmax - 10*second, bmax - 20*second, bmax - 30*second}}
-		c := CampaignRun{RunID: "c", ActionNs: []int64{cmax, cmax, cmax, cmax}}
-		return CampaignPair{Baseline: b, Candidate: c}
+	// The baseline is imbalanced (one long bucket, the rest shorter); the
+	// candidate is even. That is the shape the campaign is meant to reward: a
+	// smaller makespan AND a smaller makespan-over-median.
+	//
+	// Every run carries exactly K=8 buckets, a UTC start instant and a
+	// terminal state, because the population is part of the frozen rule and a
+	// test that asserted PASS on half a campaign would be asserting that the
+	// rule does not apply.
+	buckets := func(top int64, step int64) []int64 {
+		out := make([]int64, BucketsPerRun)
+		for i := range out {
+			out[i] = top - int64(i)*step
+		}
+		return out
 	}
+	// One verdict per action row: a campaign number that cannot be traced back
+	// to the records that produced it is not evidence.
+	verdicts := func(prefix string) []Digest {
+		out := make([]Digest, BucketsPerRun)
+		for i := range out {
+			out[i] = Digest(fmt.Sprintf("sha256:%s-%d", prefix, i))
+		}
+		return out
+	}
+	day := 0
+	pair := func(bmax, cmax int64) CampaignPair {
+		// Three distinct UTC dates inside the fourteen-day window.
+		start := fmt.Sprintf("2026-09-%02dT0%d:00:00Z", 1+day%3, day%9)
+		day++
+		return CampaignPair{
+			Baseline: CampaignRun{RunID: "b", StartedAt: start, Terminal: TerminalPassed,
+				ActionNs: buckets(bmax, 5*second), VerdictDigests: verdicts("b")},
+			Candidate: CampaignRun{RunID: "c", StartedAt: start, Terminal: TerminalPassed,
+				ActionNs: buckets(cmax, 0), VerdictDigests: verdicts("c")},
+		}
+	}
+	// The candidate is flat and slightly cheaper in total: a real improvement
+	// buys a smaller makespan without buying it with more total work, which is
+	// exactly what campaign:total-action-cost is there to stop.
 	good := []CampaignPair{
-		pair(100*second, 88*second), pair(102*second, 90*second), pair(99*second, 87*second),
-		pair(101*second, 89*second), pair(100*second, 88*second),
+		pair(100*second, 84*second), pair(102*second, 86*second), pair(99*second, 83*second),
+		pair(101*second, 85*second), pair(100*second, 84*second),
 	}
 	for _, g := range EvaluateCampaign(good) {
 		if !g.Pass {
@@ -135,6 +170,75 @@ func TestCampaignDecisionRule(t *testing.T) {
 		if g.Pass {
 			t.Errorf("gate %s passed on 4 of %d pairs", g.Name, CampaignPairs)
 		}
+	}
+
+	// And neither is five pairs of half-sized runs. This is the exact
+	// adversarial replay that got past the calculator before: 5 pairs, 40
+	// action rows per arm, every ratio healthy.
+	half := make([]CampaignPair, len(good))
+	for i, p := range good {
+		p.Baseline.ActionNs = p.Baseline.ActionNs[:BucketsPerRun/2]
+		p.Candidate.ActionNs = p.Candidate.ActionNs[:BucketsPerRun/2]
+		half[i] = p
+	}
+	sawPopulation := false
+	for _, g := range EvaluateCampaign(half) {
+		if g.Pass {
+			t.Errorf("gate %s passed on %d of %d action rows", g.Name, ScoredActionRows/2, ScoredActionRows)
+		}
+		if g.Name == "campaign:population" {
+			sawPopulation = true
+			if !strings.Contains(g.Detail, "action rows") {
+				t.Errorf("the population gate does not name the short row count: %s", g.Detail)
+			}
+		}
+	}
+	if !sawPopulation {
+		t.Errorf("EvaluateCampaign reported no population gate")
+	}
+
+	// Each remaining population rule, one at a time.
+	for _, tc := range []struct {
+		name string
+		edit func([]CampaignPair) []CampaignPair
+		want string
+	}{
+		{"a run on one UTC date only", func(p []CampaignPair) []CampaignPair {
+			for i := range p {
+				p[i].Baseline.StartedAt, p[i].Candidate.StartedAt = "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z"
+			}
+			return p
+		}, "UTC date"},
+		{"runs spread beyond the window", func(p []CampaignPair) []CampaignPair {
+			p[4].Baseline.StartedAt, p[4].Candidate.StartedAt = "2026-10-30T00:00:00Z", "2026-10-30T01:00:00Z"
+			return p
+		}, "span"},
+		{"a cancelled run is retained and non-passing", func(p []CampaignPair) []CampaignPair {
+			p[2].Candidate.Terminal = TerminalCancelled
+			return p
+		}, "terminal"},
+		{"a run with no start instant", func(p []CampaignPair) []CampaignPair {
+			p[1].Baseline.StartedAt = ""
+			return p
+		}, "RFC3339"},
+		{"an action row that names no verdict", func(p []CampaignPair) []CampaignPair {
+			p[3].Candidate.VerdictDigests = p[3].Candidate.VerdictDigests[:BucketsPerRun-1]
+			return p
+		}, "traceable to the verdict"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edited := tc.edit(clonePairs(good))
+			gates := EvaluateCampaign(edited)
+			if gates[0].Name != "campaign:population" {
+				t.Fatalf("the population gate is not first: %s", gates[0].Name)
+			}
+			if gates[0].Pass {
+				t.Fatalf("the population gate passed")
+			}
+			if !strings.Contains(gates[0].Detail, tc.want) {
+				t.Errorf("detail %q does not mention %q", gates[0].Detail, tc.want)
+			}
+		})
 	}
 	// A single regressing tail fails even with a healthy median.
 	tail := append([]CampaignPair(nil), good...)
@@ -148,6 +252,20 @@ func TestCampaignDecisionRule(t *testing.T) {
 	if !failed["campaign:tail-non-regression"] {
 		t.Errorf("a 1.15 regression passed the tail gate")
 	}
+}
+
+// clonePairs deep-copies a campaign so one edit does not leak into the next
+// case.
+func clonePairs(in []CampaignPair) []CampaignPair {
+	out := make([]CampaignPair, len(in))
+	for i, p := range in {
+		p.Baseline.ActionNs = append([]int64(nil), p.Baseline.ActionNs...)
+		p.Candidate.ActionNs = append([]int64(nil), p.Candidate.ActionNs...)
+		p.Baseline.VerdictDigests = append([]Digest(nil), p.Baseline.VerdictDigests...)
+		p.Candidate.VerdictDigests = append([]Digest(nil), p.Candidate.VerdictDigests...)
+		out[i] = p
+	}
+	return out
 }
 
 func TestMedianIsConventional(t *testing.T) {

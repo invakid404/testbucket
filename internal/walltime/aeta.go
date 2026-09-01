@@ -155,15 +155,64 @@ type InstantiatedComponent struct {
 
 // AetaInstance is the pre-action forecast for one bucket: a point and a FINITE
 // interval.
+//
+// It carries the INPUTS it was instantiated from, so a verifier can re-run the
+// frozen formulas and compare rather than believe the point it was handed. A
+// forecast nobody can recompute is an allowance, and the contract is explicit
+// that a post-action adjustment is an ETA-completeness failure even when the
+// trace was exact.
 type AetaInstance struct {
 	Kind           string                  `json:"kind"`
 	RegistryDigest Digest                  `json:"registry_digest"`
 	Stage2         Digest                  `json:"stage2_digest"`
 	BucketID       string                  `json:"bucket_id"`
+	Inputs         AetaInputs              `json:"inputs"`
 	Components     []InstantiatedComponent `json:"components"`
 	PointNs        int64                   `json:"point_ns"`
 	LowerNs        int64                   `json:"lower_ns"`
 	UpperNs        int64                   `json:"upper_ns"`
+}
+
+// Recompute re-instantiates this forecast from the frozen registry and the
+// inputs it names, and reports every disagreement. Component by component: a
+// total that happens to match while a component was edited is still a
+// different forecast.
+func (a AetaInstance) Recompute(r AetaRegistry) []string {
+	var problems []string
+	if a.Kind != AetaKind {
+		problems = append(problems, fmt.Sprintf("kind is %q, want %q", a.Kind, AetaKind))
+	}
+	d, err := r.DigestOf()
+	if err != nil {
+		return append(problems, "the registry cannot be digested: "+err.Error())
+	}
+	if a.RegistryDigest != d {
+		return append(problems, fmt.Sprintf("it names registry %s but the supplied registry digests to %s", a.RegistryDigest, d))
+	}
+	if a.Inputs.Stage2 != a.Stage2 {
+		problems = append(problems, fmt.Sprintf("its inputs name Stage-2 %s but the instance names %s", a.Inputs.Stage2, a.Stage2))
+	}
+	want, err := r.Instantiate(a.Inputs)
+	if err != nil {
+		return append(problems, "re-instantiating from the frozen template failed: "+err.Error())
+	}
+	if want.PointNs != a.PointNs || want.LowerNs != a.LowerNs || want.UpperNs != a.UpperNs {
+		problems = append(problems, fmt.Sprintf("the frozen template gives [%s, %s, %s] but the instance claims [%s, %s, %s]",
+			dur(want.LowerNs), dur(want.PointNs), dur(want.UpperNs),
+			dur(a.LowerNs), dur(a.PointNs), dur(a.UpperNs)))
+	}
+	if len(want.Components) != len(a.Components) {
+		problems = append(problems, fmt.Sprintf("the frozen template instantiates %d components but the instance carries %d", len(want.Components), len(a.Components)))
+		return problems
+	}
+	for i, c := range want.Components {
+		got := a.Components[i]
+		if got.ID != c.ID || got.Class != c.Class || got.PointNs != c.PointNs || got.LowerNs != c.LowerNs || got.UpperNs != c.UpperNs {
+			problems = append(problems, fmt.Sprintf("component %q was instantiated as %s but the frozen formula gives %s",
+				got.ID, dur(got.PointNs), dur(c.PointNs)))
+		}
+	}
+	return problems
 }
 
 // Instantiate applies the frozen formulas to verified inputs. It cannot add a
@@ -180,7 +229,7 @@ func (r AetaRegistry) Instantiate(in AetaInputs) (*AetaInstance, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &AetaInstance{Kind: AetaKind, RegistryDigest: d, Stage2: in.Stage2, BucketID: in.BucketID}
+	out := &AetaInstance{Kind: AetaKind, RegistryDigest: d, Stage2: in.Stage2, BucketID: in.BucketID, Inputs: in}
 	var residualTotal int64
 	comps := append([]Component(nil), r.Components...)
 	sort.Slice(comps, func(i, j int) bool { return comps[i].ID < comps[j].ID })

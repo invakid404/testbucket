@@ -293,9 +293,21 @@ func (r *Runner) CaptureDiscovery(ctx context.Context) ([]byte, error) {
 
 // CaptureRunnables returns the raw `vitest list` bytes for one file, for the
 // same reason.
-func (r *Runner) CaptureRunnables(ctx context.Context, fileID string) ([]byte, error) {
+//
+// discovery is the ALREADY CAPTURED discovery snapshot. It is passed in rather
+// than resolved so that scoping this listing to the file's own project reuses
+// the one bound observation instead of taking a second, unbound one that could
+// disagree with it.
+func (r *Runner) CaptureRunnables(ctx context.Context, fileID string, discovery []byte) ([]byte, error) {
 	if r.frozen != nil {
 		return nil, fmt.Errorf("vitest: this runner is replaying a frozen bundle; there is nothing live to capture")
+	}
+	if r.projectByFile == nil && len(discovery) > 0 {
+		m, err := parseProjects(r.root, discovery)
+		if err != nil {
+			return nil, err
+		}
+		r.projectByFile = m
 	}
 	project, err := r.projectFor(ctx, fileID)
 	if err != nil {
@@ -361,6 +373,17 @@ func filterPathArg(fileID string) string {
 // means a single-project config (no scoping needed).
 func (r *Runner) projectFor(ctx context.Context, fileID string) (string, error) {
 	if r.projectByFile == nil {
+		if r.frozen != nil {
+			// A frozen runner has bound discovery bytes; running a second
+			// listing to answer the same question would be exactly the
+			// unbound input the bundle exists to close.
+			m, err := parseProjects(r.root, r.frozen.Discovery)
+			if err != nil {
+				return "", err
+			}
+			r.projectByFile = m
+			return r.projectByFile[fileID], nil
+		}
 		out, err := r.tool.run(ctx, r.root, "list", "--filesOnly", "--json")
 		if err != nil {
 			return "", r.discoveryError(err)

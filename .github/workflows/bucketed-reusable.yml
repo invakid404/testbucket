@@ -99,6 +99,46 @@ on:
           than scored: a process group cannot prove that no descendant escaped.
         type: string
         default: ""
+      campaign-id:
+        description: 'Campaign identity stamped on every wall-time record.'
+        type: string
+        default: ""
+      stage1-digest:
+        description: >-
+          Digest of the signed Stage-1 input manifest that authorised the plan.
+          Every record binds it; without it the records name no authorised
+          inputs and the run is reported INELIGIBLE.
+        type: string
+        default: ""
+      stage2-digest:
+        description: 'Digest of the Stage-2 derived-plan receipt this matrix was fanned out from.'
+        type: string
+        default: ""
+      registry-digest:
+        description: 'Digest of the frozen Aeta component-registry template in force.'
+        type: string
+        default: ""
+      verifier-id:
+        description: 'Delivery-bound verifier identity recorded on every record.'
+        type: string
+        default: ""
+      verify-require:
+        description: >-
+          What `wall verify` must be able to say before a bucket passes:
+          `complete` or `eligible`. A campaign arm uses `eligible`, which also
+          requires an immutable testbucket-version identity.
+        type: string
+        default: complete
+      authority:
+        description: 'Protected environment name the Stage-1 manifest must name.'
+        type: string
+        default: ""
+      authority-key:
+        description: >-
+          PREDECLARED authority public key (hex). The verifier will not treat a
+          Stage-1 signature as authority approval without one.
+        type: string
+        default: ""
       runs-on:
         description: 'Runner label for every job.'
         type: string
@@ -215,6 +255,14 @@ jobs:
           setup-command: ${{ inputs.setup-command }}
           wall-time-dir: ${{ inputs.wall-time-dir }}
           cgroup-root: ${{ inputs.cgroup-root }}
+          campaign-id: ${{ inputs.campaign-id }}
+          stage1-digest: ${{ inputs.stage1-digest }}
+          stage2-digest: ${{ inputs.stage2-digest }}
+          registry-digest: ${{ inputs.registry-digest }}
+          verifier-id: ${{ inputs.verifier-id }}
+          verify-require: ${{ inputs.verify-require }}
+          authority: ${{ inputs.authority }}
+          authority-key: ${{ inputs.authority-key }}
 
       - name: Upload timing events
         # if: always() so a red bucket still contributes what it measured;

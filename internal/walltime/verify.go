@@ -125,6 +125,13 @@ type VerifyOptions struct {
 	// ETA-completeness gate cannot pass — which is the correct answer, not a
 	// reason to skip the gate.
 	RegistryPath string
+	// AuthorityKeys are the PREDECLARED public keys of the protected campaign
+	// environment. An empty set is not "accept any key": it means no authority
+	// was declared, and the run is ineligible.
+	AuthorityKeys []string
+	// Authority, when set, is the protected environment name the manifest must
+	// name.
+	Authority string
 }
 
 // VerifyDir loads a records directory and verifies it.
@@ -153,16 +160,26 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	v.Recon = reconcile(envelopes)
 	summarise(v, envelopes)
 
-	verifyStageBinding(v, opt, recs)
+	bound := verifyStageBinding(v, opt, recs)
 	registry := loadRegistry(v, opt)
-	aeta := loadAeta(v, opt, registry)
+	if registry != nil && bound.stage1 != "" && bound.registry != "" {
+		if d, err := registry.DigestOf(); err == nil && d != bound.registry {
+			v.add("WT-017", SeverityIneligible,
+				fmt.Sprintf("Stage 1 binds component registry %s but the supplied registry digests to %s", bound.registry, d))
+		}
+	}
+	aeta := loadAeta(v, opt, registry, bound.stage2)
 	if registry != nil {
 		v.Findings = append(v.Findings, registry.CheckCompleteness(v.Phases, aeta)...)
 	}
-	evaluateGates(v, opt, aeta)
+	evaluateGates(v, opt, aeta, bound)
 
 	v.Complete = !v.has(SeverityTerminal)
-	v.Eligible = v.Complete && !v.has(SeverityIneligible) && allGatesPass(v.Gates)
+	// Eligibility is a ROW question: are these records a scorable observation?
+	// The campaign-scope gates in the table are decided by `wall campaign`
+	// over the full frozen population, and a single run must never be able to
+	// claim one of them.
+	v.Eligible = v.Complete && !v.has(SeverityIneligible) && allGatesPass(RowScope(v.Gates))
 	return v, nil
 }
 
@@ -677,7 +694,8 @@ func summarise(v *Verdict, envs []Envelope) {
 // verifyStageBinding proves the records were produced under the frozen inputs
 // and the single derived plan. A record that names no Stage-2 receipt might
 // have measured a plan nobody authorised, so it is not scorable.
-func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) {
+func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdentities {
+	var bound boundIdentities
 	var stage1 *Stage1Manifest
 	var stage2 *Stage2Receipt
 	if opt.Stage1Path != "" {
@@ -704,8 +722,21 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) {
 	} else {
 		v.add("WT-018", SeverityIneligible, "no Stage-2 derived-plan receipt was supplied; the records are not bound to one authorised plan")
 	}
+	if stage1 != nil {
+		bound.registry = stage1.Registry
+		bound.scorer = stage1.TrainingLineage.ScorerDigest
+	}
+	if stage2 != nil {
+		bound.membership = stage2.MembershipDigest
+		if d, err := stage2.DigestOf(); err == nil {
+			bound.stage2 = d
+		}
+	}
 	if stage1 != nil && stage2 != nil {
 		d1, err := stage1.DigestOf()
+		if err == nil {
+			bound.stage1 = d1
+		}
 		if err == nil && stage2.Stage1Digest != d1 {
 			v.add("WT-018", SeverityIneligible,
 				fmt.Sprintf("the Stage-2 receipt names parent %s but the supplied Stage-1 manifest digests to %s", stage2.Stage1Digest, d1))
@@ -715,13 +746,7 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) {
 			v.add("WT-018", SeverityIneligible,
 				fmt.Sprintf("the Stage-2 receipt names input bundle %s but Stage 1 binds %s", stage2.BundleDigest, bd))
 		}
-		if sig := stage1.Signature; sig != nil {
-			if err := VerifySigned(sig, d1, nil); err != nil {
-				v.add("WT-018", SeverityIneligible, fmt.Sprintf("stage-1 authority signature: %v", err))
-			}
-		} else {
-			v.add("WT-018", SeverityIneligible, "the Stage-1 manifest is unsigned; only the protected campaign authority may authorise inputs")
-		}
+		verifyAuthority(v, opt, stage1, d1)
 	}
 	// Every boundary record must carry the same Stage-1/Stage-2 identity.
 	for _, r := range recs {
@@ -737,6 +762,80 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) {
 			if d, err := stage2.DigestOf(); err == nil && r.Run.Stage2 != d {
 				v.add("WT-018", SeverityIneligible,
 					fmt.Sprintf("%s/%s record %d is bound to Stage-2 receipt %s, not the supplied %s", r.Producer, r.Level, r.Seq, r.Run.Stage2, d))
+				break
+			}
+		}
+	}
+	if stage1 != nil {
+		verifyProducerBinaries(v, stage1.Instrumentation, recs)
+	}
+	return bound
+}
+
+// verifyAuthority checks the Stage-1 signature against a PREDECLARED authority
+// key.
+//
+// Passing an empty allowed-key set would accept any self-generated key, which
+// is not an authority check at all: the point of the protected environment is
+// that one identity, chosen before the campaign, authorises inputs. So a run
+// with no predeclared key is ineligible — loudly — rather than trusting
+// whatever signed the manifest.
+func verifyAuthority(v *Verdict, opt VerifyOptions, m *Stage1Manifest, digest Digest) {
+	if m.Signature == nil {
+		v.add("WT-018", SeverityIneligible,
+			"the Stage-1 manifest is unsigned; only the protected campaign authority may authorise inputs")
+		return
+	}
+	if len(opt.AuthorityKeys) == 0 {
+		v.add("WT-018", SeverityIneligible,
+			fmt.Sprintf("the Stage-1 manifest is signed by %s but no authority key was predeclared to this verifier, so any self-generated key would pass", m.Signature.KeyID))
+		return
+	}
+	if err := VerifySigned(m.Signature, digest, opt.AuthorityKeys); err != nil {
+		v.add("WT-018", SeverityIneligible, fmt.Sprintf("stage-1 authority signature: %v", err))
+		return
+	}
+	if m.Signature.Authority != opt.Authority && opt.Authority != "" {
+		v.add("WT-018", SeverityIneligible,
+			fmt.Sprintf("the Stage-1 manifest names authority %q, not the expected %q", m.Signature.Authority, opt.Authority))
+	}
+}
+
+// verifyProducerBinaries binds each producer's records to the binary identity
+// Stage 1 approved.
+//
+// The per-record signing keys are minted per run and cannot be predeclared —
+// they do not exist when the manifest is signed. What CAN be bound is the
+// binary allowed to mint them, and every ProducerID carries the digest of the
+// executable that wrote the record, so the check is a real delivery binding
+// rather than a field nobody reads.
+func verifyProducerBinaries(v *Verdict, id InstrumentationIdentity, recs []Record) {
+	want := map[Producer]Digest{
+		ProducerPhysical: id.PhysicalBinary,
+		ProducerPeer:     id.PeerBinary,
+		ProducerTrace:    id.TraceBinary,
+	}
+	reported := map[Producer]map[string]bool{}
+	for _, r := range recs {
+		if r.ProducerID == "" {
+			continue
+		}
+		if reported[r.Producer] == nil {
+			reported[r.Producer] = map[string]bool{}
+		}
+		reported[r.Producer][r.ProducerID] = true
+	}
+	for producer, digest := range want {
+		if digest == "" {
+			v.add("WT-018", SeverityIneligible,
+				fmt.Sprintf("Stage 1 binds no binary identity for the %s, so its records cannot be tied to an approved build", producer))
+			continue
+		}
+		for context := range reported[producer] {
+			if !strings.Contains(context, shortDigest(digest)) {
+				v.add("WT-018", SeverityIneligible,
+					fmt.Sprintf("a %s record was written by execution context %q, which is not the binary Stage 1 approved (%s)",
+						producer, context, digest))
 				break
 			}
 		}
@@ -760,7 +859,11 @@ func loadRegistry(v *Verdict, opt VerifyOptions) *AetaRegistry {
 	return &r
 }
 
-func loadAeta(v *Verdict, opt VerifyOptions, registry *AetaRegistry) *AetaInstance {
+// loadAeta reads the pre-action forecast and RE-DERIVES it from the frozen
+// template. A forecast that is merely well-formed proves nothing: the whole
+// point of the two-stage freeze is that Stage 2 could only instantiate, so the
+// verifier instantiates too and compares component by component.
+func loadAeta(v *Verdict, opt VerifyOptions, registry *AetaRegistry, stage2 Digest) *AetaInstance {
 	if opt.AetaPath == "" {
 		return nil
 	}
@@ -769,16 +872,22 @@ func loadAeta(v *Verdict, opt VerifyOptions, registry *AetaRegistry) *AetaInstan
 		v.add("WT-017", SeverityIneligible, fmt.Sprintf("aeta instance: %v", err))
 		return nil
 	}
-	if a.Kind != AetaKind {
-		v.add("WT-017", SeverityIneligible, fmt.Sprintf("aeta instance kind %q, want %q", a.Kind, AetaKind))
+	if registry == nil {
+		v.add("WT-017", SeverityIneligible,
+			"a pre-action forecast was supplied with no frozen registry, so it cannot be re-derived and cannot be scored")
 		return nil
 	}
-	if registry != nil {
-		if d, err := registry.DigestOf(); err == nil && a.RegistryDigest != d {
-			v.add("WT-017", SeverityIneligible,
-				fmt.Sprintf("the instantiated Aeta names registry %s but the supplied registry digests to %s", a.RegistryDigest, d))
-			return nil
-		}
+	for _, p := range a.Recompute(*registry) {
+		v.add("WT-017", SeverityIneligible, "the pre-action forecast does not re-derive from the frozen template: "+p)
+	}
+	if stage2 != "" && a.Stage2 != stage2 {
+		v.add("WT-017", SeverityIneligible,
+			fmt.Sprintf("the pre-action forecast names Stage-2 %s, not the verified %s", a.Stage2, stage2))
+	}
+	if v.has(SeverityIneligible) {
+		// Still return it: the gates should report the numbers the run
+		// actually claimed, alongside the finding that says they are unbound.
+		return &a
 	}
 	return &a
 }
@@ -786,7 +895,18 @@ func loadAeta(v *Verdict, opt VerifyOptions, registry *AetaRegistry) *AetaInstan
 // evaluateGates runs every applicable frozen gate. A gate with no evidence
 // does not disappear: it is reported with an empty population and does not
 // pass.
-func evaluateGates(v *Verdict, opt VerifyOptions, aeta *AetaInstance) {
+// boundIdentities are the verified plan identities the derived documents must
+// name. They come from the Stage-1/Stage-2 documents, not from the documents
+// being checked.
+type boundIdentities struct {
+	stage1     Digest
+	stage2     Digest
+	membership Digest
+	scorer     Digest
+	registry   Digest
+}
+
+func evaluateGates(v *Verdict, opt VerifyOptions, aeta *AetaInstance, bound boundIdentities) {
 	expected := map[Level]int{LevelAction: 1, LevelScript: 1}
 	for _, r := range v.Recon {
 		v.Gates = append(v.Gates, r.Gate(expected[r.Level]))
@@ -807,32 +927,58 @@ func evaluateGates(v *Verdict, opt VerifyOptions, aeta *AetaInstance) {
 		}
 	}
 	if opt.PcheckPath != "" {
-		v.Gates = append(v.Gates, predictorGates(v, opt)...)
+		v.Gates = append(v.Gates, predictorGates(v, opt, bound.stage2, bound.membership, bound.scorer)...)
 	} else {
 		v.Gates = append(v.Gates, GateResult{
-			Name: "predictor:pcheck-vs-v", Required: "<= " + dur(PcheckInvocationMAELimit),
+			Name: "predictor:invocation-max", Scope: ScopeRow, Required: "<= " + dur(PcheckInvocationMaxLimit),
 			Observed: "no projection", Detail: "no frozen Pcheck projection was supplied",
 		})
 	}
 	if aeta != nil {
+		// expected is 1 because this is a ROW: the individual-error, interval
+		// and width rules are decided here, and the population mean is
+		// reported campaign-scope, where it belongs.
 		v.Gates = append(v.Gates, EvaluateAeta([]AetaSample{aeta.Sample(v.ActionNs)}, 1)...)
 	} else {
 		v.Gates = append(v.Gates, GateResult{
-			Name: "aeta:point-mae", Required: "<= " + dur(AetaMAELimit),
+			Name: "aeta:point-max", Scope: ScopeRow, Required: "<= " + dur(AetaMaxLimit),
 			Observed: "no forecast", Detail: "no pre-action Aeta instance was supplied",
 		})
 	}
+	for i := range v.Gates {
+		if v.Gates[i].Scope == ScopeCampaign {
+			v.Gates[i].Pass = false
+			v.Gates[i].Expected = ScoredActionRows
+			v.Gates[i].Detail = firstNonEmptyStr(v.Gates[i].Detail,
+				"campaign-scope: decided by `wall campaign` over the full frozen population, never by one row")
+		}
+	}
 }
 
-func predictorGates(v *Verdict, opt VerifyOptions) []GateResult {
+// predictorGates reads the audit projection, RECOMPUTES every prediction from
+// the frozen values it carries, and binds it to the verified plan before
+// comparing anything to an observation. A projection nobody can recompute is a
+// number, and a number that names no plan is not an audit of this one.
+func predictorGates(v *Verdict, opt VerifyOptions, stage2, membership, scorer Digest) []GateResult {
 	var doc PcheckDocument
 	if err := ReadJSONFile(opt.PcheckPath, &doc); err != nil {
 		v.add("WT-019", SeverityIneligible, fmt.Sprintf("pcheck projection: %v", err))
 		return nil
 	}
-	if doc.Kind != PcheckKind {
-		v.add("WT-019", SeverityIneligible, fmt.Sprintf("pcheck kind %q, want %q", doc.Kind, PcheckKind))
-		return nil
+	for _, p := range doc.Recompute() {
+		v.add("WT-019", SeverityIneligible, "the Pcheck projection does not recompute: "+p)
+	}
+	if stage2 != "" && doc.Stage2 != stage2 {
+		v.add("WT-019", SeverityIneligible,
+			fmt.Sprintf("the Pcheck projection names Stage-2 %s, not the verified %s", doc.Stage2, stage2))
+	}
+	if membership != "" && doc.MembershipDigest != membership {
+		v.add("WT-019", SeverityIneligible,
+			fmt.Sprintf("the Pcheck projection covers membership %s but the verified plan rendered %s", doc.MembershipDigest, membership))
+	}
+	if scorer != "" && doc.ScorerDigest != scorer {
+		v.add("WT-019", SeverityIneligible,
+			fmt.Sprintf("the Pcheck projection came from scorer %s but Stage 1 binds %s", doc.ScorerDigest, scorer))
 	}
 	observed := map[int]int64{}
 	for _, e := range v.Envelopes {
@@ -873,13 +1019,18 @@ func (v *Verdict) Write(out io.Writer) error {
 			fmt.Fprintf(w, "  %s\t%s\t(%s)\n", p.Parent, p.Name(), dur(p.Duration()))
 		}
 	}
-	fmt.Fprintf(w, "\ngate\trequired\tobserved\tn\tresult\n")
+	fmt.Fprintf(w, "\ngate\tscope\trequired\tobserved\tn\tresult\n")
 	for _, g := range v.Gates {
 		result := "FAIL"
-		if g.Pass {
+		switch {
+		case g.Pass:
 			result = "pass"
+		case g.Scope == ScopeCampaign:
+			// A campaign-scope gate is not failing here; it is simply not this
+			// row's to decide, and printing FAIL would read as a defect.
+			result = "campaign"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", g.Name, g.Required, g.Observed, g.Population, result)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n", g.Name, g.Scope, g.Required, g.Observed, g.Population, result)
 		if g.Detail != "" {
 			fmt.Fprintf(w, "\t\t%s\n", g.Detail)
 		}
@@ -891,7 +1042,9 @@ func (v *Verdict) Write(out io.Writer) error {
 		}
 	}
 	fmt.Fprintf(w, "\ncomplete: %v\teligible: %v\n", v.Complete, v.Eligible)
-	if !v.Eligible {
+	if v.Eligible {
+		fmt.Fprintf(w, "this row qualifies; the campaign-scope gates above are decided by `wall campaign` over the full frozen population.\n")
+	} else {
 		fmt.Fprintf(w, "this run contributes 0 scored rows; an absent measurement never fills a denominator.\n")
 	}
 	return w.Flush()

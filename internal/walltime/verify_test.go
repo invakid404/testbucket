@@ -1,6 +1,9 @@
 package walltime
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +20,10 @@ type frozenDocs struct {
 	aeta     string
 	pcheck   string
 	digest   Digest
+	// authority is the PREDECLARED public key of the protected environment.
+	// The verifier refuses to treat a signature as authority approval without
+	// one, so the fixture has to carry it the way a campaign would.
+	authority string
 }
 
 func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
@@ -26,7 +33,12 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := testManifest(bundle)
+	reg := testRegistry()
+	regDigest, err := reg.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := testManifest(bundle, regDigest)
 	key, err := NewSigningKey()
 	if err != nil {
 		t.Fatal(err)
@@ -44,25 +56,33 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 		t.Fatal(err)
 	}
 
-	reg := testRegistry()
 	aeta, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 5.18, Invocations: len(s.invocations), Stage2: r2})
 	if err != nil {
 		t.Fatalf("Instantiate: %v", err)
 	}
-	pcheck := &PcheckDocument{Kind: PcheckKind, Stage2: r2, ScorerID: "synthetic"}
+	// The projection is built the way production builds it, so the verifier's
+	// recomputation is exercised against a real document rather than a
+	// hand-written one that happens to agree.
+	palloc := map[string]float64{}
+	var invocations []PcheckInvocation
 	for i, inv := range s.invocations {
-		pcheck.Invocations = append(pcheck.Invocations, PcheckInvocation{
-			Seq: i, BucketIndex: 1, Units: []string{"u"}, PredictedNs: inv[1] - inv[0] + 250_000_000,
-		})
+		unit := fmt.Sprintf("t%d.spec.ts", i)
+		palloc[unit] = float64(inv[1]-inv[0]+250_000_000) / float64(second)
+		invocations = append(invocations, PcheckInvocation{Seq: i, BucketIndex: 1, Units: []string{unit}})
+	}
+	pcheck, err := BuildPcheck(r2, receipt.MembershipDigest, testScorer(), palloc, invocations)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	docs := frozenDocs{
-		stage1:   filepath.Join(dir, "stage1.json"),
-		stage2:   filepath.Join(dir, "stage2.json"),
-		registry: filepath.Join(dir, "registry.json"),
-		aeta:     filepath.Join(dir, "aeta.json"),
-		pcheck:   filepath.Join(dir, "pcheck.json"),
-		digest:   r2,
+		stage1:    filepath.Join(dir, "stage1.json"),
+		stage2:    filepath.Join(dir, "stage2.json"),
+		registry:  filepath.Join(dir, "registry.json"),
+		aeta:      filepath.Join(dir, "aeta.json"),
+		pcheck:    filepath.Join(dir, "pcheck.json"),
+		digest:    r2,
+		authority: m.Signature.KeyID,
 	}
 	for path, v := range map[string]any{
 		docs.stage1: m, docs.stage2: receipt, docs.registry: reg, docs.aeta: aeta, docs.pcheck: pcheck,
@@ -105,7 +125,23 @@ func testBundle() PlanningInputBundle {
 	return b
 }
 
-func testManifest(b PlanningInputBundle) Stage1Manifest {
+// testScorer is the frozen scorer the synthetic Pcheck came from; Stage 1
+// binds its digest through the training lineage.
+func testScorer() Scorer {
+	return Scorer{
+		Kind: ScorerKind, ID: "synthetic", Version: "1",
+		FeatureSchema: []string{"runnable_count"},
+		Coefficients:  map[string]float64{"runnable_count": 1},
+		Intercept:     1, Floor: 0.1,
+		Lineage: TrainingLineageID{
+			ReceiptSetDigest: "sha256:sealed", Cutoff: "2026-08-30T00:00:00Z",
+			Epoch: "vitest-4.1.10", ScorerID: "synthetic",
+			Algorithm: "ridge-least-squares", TieBreak: "unit_id_ascending",
+		},
+	}
+}
+
+func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	m := Stage1Manifest{Kind: Stage1Kind, Role: "candidate", Bundle: b}
 	m.Actions = map[string]ActionIdentity{
 		"plan":       {Commit: "693a1998", ContentDigest: "sha256:plan"},
@@ -123,14 +159,19 @@ func testManifest(b PlanningInputBundle) Stage1Manifest {
 		Integrities: map[string]string{"vitest": "sha512-a", "@vitest/runner": "sha512-b"},
 	}
 	m.Instrumentation = InstrumentationIdentity{
-		Schema: SchemaVersion, PhysicalBinary: "sha256:tb", PeerBinary: "sha256:tb",
-		TraceBinary: "sha256:tb", VerifierBinary: "sha256:tb",
+		Schema: SchemaVersion, PhysicalBinary: synthBinary, PeerBinary: synthBinary,
+		TraceBinary: synthBinary, VerifierBinary: synthBinary,
 		ContainmentPolicy: "cgroup2-dedicated-subtree", ChildAdmission: "clone-into-cgroup",
 		EndpointOrder: "physical<=peer<=trace", CancellationPolicy: "signal-containment-wait-reap",
 		RawSourceTaxonomy: []string{SourceContainment, SourceProcessLifecycle, SourceReporter, SourceWrapper},
 	}
 	m.AllowedDifferences = []string{"testbucket source/action/binary tuple"}
-	m.Registry = "sha256:registry"
+	m.Registry = registry
+	sc := testScorer()
+	m.TrainingLineage = sc.Lineage
+	if d, err := sc.DigestOf(); err == nil {
+		m.TrainingLineage.ScorerDigest = d
+	}
 	return m
 }
 
@@ -200,6 +241,7 @@ func verifySynth(t *testing.T, mutate mutation, tweak func(*synthRun)) *Verdict 
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		AuthorityKeys: []string{docs.authority}, Authority: "ewj2-campaign",
 	})
 	if err != nil {
 		t.Fatalf("VerifyDir: %v", err)
@@ -216,9 +258,17 @@ func TestVerifierScoresACompleteBoundRun(t *testing.T) {
 	for _, f := range v.Findings {
 		t.Errorf("unexpected finding %s/%s: %s", f.Code, f.Severity, f.Detail)
 	}
-	for _, g := range v.Gates {
+	// Row-scope gates are the ones a single verified row decides. The
+	// campaign-scope entries in the table are reported, never passed, and
+	// belong to `wall campaign` over the full population.
+	for _, g := range RowScope(v.Gates) {
 		if !g.Pass {
-			t.Errorf("gate %s failed: required %s, observed %s (%s)", g.Name, g.Required, g.Observed, g.Detail)
+			t.Errorf("row gate %s failed: required %s, observed %s (%s)", g.Name, g.Required, g.Observed, g.Detail)
+		}
+	}
+	for _, g := range v.Gates {
+		if g.Scope == ScopeCampaign && g.Pass {
+			t.Errorf("campaign gate %s passed on a single row", g.Name)
 		}
 	}
 	if !v.Complete || !v.Eligible {
@@ -379,5 +429,173 @@ func TestVerifierRefusesAnEmptyDirectory(t *testing.T) {
 	}
 	if v.Complete || v.Eligible {
 		t.Errorf("an empty directory verified as complete=%v eligible=%v", v.Complete, v.Eligible)
+	}
+}
+
+// TestVerifierRefusesUnboundDerivedDocuments covers the second half of the
+// audit: it is not enough that records are well formed and the frozen
+// documents exist. The forecast and the projection have to be RE-DERIVABLE and
+// bound to the same plan, or the 10/20-second and 5/10-second gates are
+// comparing observations against numbers somebody chose afterwards.
+func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
+	cases := []struct {
+		name string
+		// edit rewrites one frozen document on disk after it was written.
+		edit func(t *testing.T, docs frozenDocs)
+		// opts adjusts what the verifier was told to trust.
+		opts func(*VerifyOptions)
+		want string
+	}{
+		{
+			name: "no predeclared authority key",
+			opts: func(o *VerifyOptions) { o.AuthorityKeys = nil },
+			want: "no authority key was predeclared",
+		},
+		{
+			name: "a signature from a key nobody declared",
+			opts: func(o *VerifyOptions) { o.AuthorityKeys = []string{"00" + strings.Repeat("11", 31)} },
+			want: "not an authorised authority key",
+		},
+		{
+			name: "the manifest names another protected environment",
+			opts: func(o *VerifyOptions) { o.Authority = "some-other-environment" },
+			want: "names authority",
+		},
+		{
+			name: "a prediction edited after the action",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.pcheck, func(m map[string]any) {
+					invs := m["invocations"].([]any)
+					invs[0].(map[string]any)["predicted_ns"] = float64(1)
+				})
+			},
+			want: "does not recompute",
+		},
+		{
+			name: "a frozen Palloc value edited after the action",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.pcheck, func(m map[string]any) {
+					for k := range m["palloc"].(map[string]any) {
+						m["palloc"].(map[string]any)[k] = float64(99)
+					}
+				})
+			},
+			want: "does not recompute",
+		},
+		{
+			name: "a projection of some other plan's membership",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.pcheck, func(m map[string]any) {
+					m["rendered_membership_digest"] = "sha256:elsewhere"
+				})
+			},
+			want: "covers membership",
+		},
+		{
+			name: "a forecast point moved after the action",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.aeta, func(m map[string]any) {
+					m["point_ns"] = m["point_ns"].(float64) + 3e9
+				})
+			},
+			want: "does not re-derive",
+		},
+		{
+			name: "a forecast for another plan",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.aeta, func(m map[string]any) { m["stage2_digest"] = "sha256:elsewhere" })
+			},
+			want: "names Stage-2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := newSynthRun(filepath.Join(dir, "records"))
+			docs := writeFrozenDocs(t, dir, s)
+			s.stage2 = docs.digest
+			s.write(t, nil)
+			if tc.edit != nil {
+				tc.edit(t, docs)
+			}
+			opts := VerifyOptions{
+				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+				AuthorityKeys: []string{docs.authority}, Authority: "ewj2-campaign",
+			}
+			if tc.opts != nil {
+				tc.opts(&opts)
+			}
+			v, err := VerifyDir(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Errorf("the run remained eligible")
+			}
+			var details []string
+			for _, f := range v.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q; got:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+}
+
+// TestVerifierRefusesAnUnapprovedProducerBinary ties every record back to the
+// build Stage 1 approved. The per-record signing keys are minted per run and
+// cannot be predeclared; the binary that mints them can be.
+func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
+	dir := t.TempDir()
+	s := newSynthRun(filepath.Join(dir, "records"))
+	docs := writeFrozenDocs(t, dir, s)
+	s.stage2 = docs.digest
+	s.write(t, nil)
+	editJSON(t, docs.stage1, func(m map[string]any) {
+		m["instrumentation"].(map[string]any)["trace_binary"] = "sha256:" + strings.Repeat("ab", 32)
+	})
+	v, err := VerifyDir(VerifyOptions{
+		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		AuthorityKeys: []string{docs.authority},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Eligible {
+		t.Errorf("records from an unapproved build were scored")
+	}
+	found := false
+	for _, f := range v.Findings {
+		if strings.Contains(f.Detail, "not the binary Stage 1 approved") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no binary-identity finding: %+v", v.Findings)
+	}
+}
+
+// editJSON rewrites one field of a frozen document on disk, which is how a
+// post-hoc adjustment would actually arrive.
+func editJSON(t *testing.T, path string, edit func(map[string]any)) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	edit(m)
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

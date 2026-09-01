@@ -407,18 +407,98 @@ type PcheckInvocation struct {
 	Units       []string `json:"units"`
 	// PredictedNs is sum(Palloc[u]) over the verified immutable membership.
 	PredictedNs int64 `json:"predicted_ns"`
-	// PallocDigest references the frozen values this sum came from.
+	// PallocDigest covers the exact (unit, value) pairs this sum came from,
+	// not merely the unit names. Digesting the names alone would let the same
+	// membership carry any number at all, which is precisely the post-hoc
+	// value the audit exists to exclude.
 	PallocDigest Digest `json:"palloc_digest"`
 }
 
 // PcheckDocument is the post-render predictor-audit projection. It is emitted
 // AFTER rendering and can change nothing: it cannot re-run the partition,
 // alter topology, or become a scorer input.
+//
+// It carries the frozen Palloc values themselves so a verifier can RECOMPUTE
+// every projection rather than believe the numbers it was handed, and it names
+// the Stage-2 receipt, the rendered membership and the scorer it came from so
+// the recomputation is anchored to one authorised plan.
 type PcheckDocument struct {
-	Kind        string             `json:"kind"`
-	Stage2      Digest             `json:"stage2_digest"`
-	ScorerID    string             `json:"scorer_id"`
-	Invocations []PcheckInvocation `json:"invocations"`
+	Kind   string `json:"kind"`
+	Stage2 Digest `json:"stage2_digest"`
+	// MembershipDigest must equal the Stage-2 receipt's rendered-membership
+	// digest: a projection over some other membership is a projection of some
+	// other plan.
+	MembershipDigest Digest `json:"rendered_membership_digest"`
+	ScorerID         string `json:"scorer_id"`
+	// ScorerDigest is the frozen scorer these values came from, which Stage 1
+	// binds through the training lineage.
+	ScorerDigest Digest `json:"scorer_digest"`
+	// Palloc is the frozen per-unit allocation score. PallocDigest covers it.
+	Palloc       map[string]float64 `json:"palloc"`
+	PallocDigest Digest             `json:"palloc_digest"`
+	Invocations  []PcheckInvocation `json:"invocations"`
+}
+
+// PallocNs converts a frozen score in seconds to the integer nanoseconds the
+// projection and the gates compare in. One conversion, one place: two callers
+// rounding differently would make a recomputation disagree with the document
+// for a reason that has nothing to do with the plan.
+func PallocNs(seconds float64) int64 { return int64(seconds * float64(second)) }
+
+// PallocSubset is the (unit, value) map for one invocation's membership. It is
+// what each invocation's PallocDigest covers.
+func PallocSubset(palloc map[string]float64, units []string) (map[string]float64, error) {
+	out := make(map[string]float64, len(units))
+	for _, u := range units {
+		v, ok := palloc[u]
+		if !ok {
+			return nil, fmt.Errorf("unit %q has no frozen Palloc value", u)
+		}
+		out[u] = v
+	}
+	return out, nil
+}
+
+// Recompute re-derives every projection from the document's own frozen values
+// and reports what disagrees. It is the verifier's half of the audit: a
+// projection nobody can recompute is a number, not a prediction.
+func (d PcheckDocument) Recompute() []string {
+	var problems []string
+	if d.Kind != PcheckKind {
+		problems = append(problems, fmt.Sprintf("kind is %q, want %q", d.Kind, PcheckKind))
+	}
+	if len(d.Palloc) == 0 {
+		problems = append(problems, "the document carries no frozen Palloc values, so nothing can be recomputed")
+		return problems
+	}
+	if got, err := DigestJSON(d.Palloc); err != nil {
+		problems = append(problems, "the frozen Palloc map cannot be digested: "+err.Error())
+	} else if got != d.PallocDigest {
+		problems = append(problems, fmt.Sprintf("the frozen Palloc map digests to %s but the document claims %s", got, d.PallocDigest))
+	}
+	for _, inv := range d.Invocations {
+		subset, err := PallocSubset(d.Palloc, inv.Units)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("invocation %d: %v", inv.Seq, err))
+			continue
+		}
+		var sum float64
+		for _, v := range subset {
+			sum += v
+		}
+		if want := PallocNs(sum); want != inv.PredictedNs {
+			problems = append(problems, fmt.Sprintf("invocation %d projects %d ns but its membership sums to %d ns", inv.Seq, inv.PredictedNs, want))
+		}
+		got, err := DigestJSON(subset)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("invocation %d: %v", inv.Seq, err))
+			continue
+		}
+		if got != inv.PallocDigest {
+			problems = append(problems, fmt.Sprintf("invocation %d's membership values digest to %s but it claims %s", inv.Seq, got, inv.PallocDigest))
+		}
+	}
+	return problems
 }
 
 // PcheckKind is the audit projection's schema identity.
@@ -427,24 +507,41 @@ const PcheckKind = "tb.walltime.pcheck/v1"
 // BuildPcheck projects frozen Palloc values onto the renderer's deterministic
 // membership. It takes the values as data — it cannot call the scorer — so
 // there is no path by which a projection could re-score a unit.
-func BuildPcheck(stage2 Digest, scorerID string, palloc map[string]float64, membership []PcheckInvocation) (*PcheckDocument, error) {
-	doc := &PcheckDocument{Kind: PcheckKind, Stage2: stage2, ScorerID: scorerID}
-	for _, inv := range membership {
+func BuildPcheck(stage2, membership Digest, scorer Scorer, palloc map[string]float64, invocations []PcheckInvocation) (*PcheckDocument, error) {
+	scorerDigest, err := scorer.DigestOf()
+	if err != nil {
+		return nil, err
+	}
+	pallocDigest, err := DigestJSON(palloc)
+	if err != nil {
+		return nil, err
+	}
+	doc := &PcheckDocument{
+		Kind: PcheckKind, Stage2: stage2, MembershipDigest: membership,
+		ScorerID: scorer.ID, ScorerDigest: scorerDigest,
+		Palloc: palloc, PallocDigest: pallocDigest,
+	}
+	for _, inv := range invocations {
+		subset, err := PallocSubset(palloc, inv.Units)
+		if err != nil {
+			return nil, fmt.Errorf("pcheck: invocation %d: %w", inv.Seq, err)
+		}
 		var sum float64
-		for _, u := range inv.Units {
-			v, ok := palloc[u]
-			if !ok {
-				return nil, fmt.Errorf("pcheck: unit %q in invocation %d has no frozen Palloc value", u, inv.Seq)
-			}
+		for _, v := range subset {
 			sum += v
 		}
-		inv.PredictedNs = int64(sum * float64(second))
-		d, err := DigestJSON(inv.Units)
+		inv.PredictedNs = PallocNs(sum)
+		d, err := DigestJSON(subset)
 		if err != nil {
 			return nil, err
 		}
 		inv.PallocDigest = d
 		doc.Invocations = append(doc.Invocations, inv)
+	}
+	if problems := doc.Recompute(); len(problems) > 0 {
+		// A document this function just built must recompute; if it does not,
+		// the bug is here and shipping it would hide it in a later verdict.
+		return nil, fmt.Errorf("pcheck: the projection does not recompute: %s", strings.Join(problems, "; "))
 	}
 	return doc, nil
 }

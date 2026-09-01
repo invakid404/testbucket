@@ -151,11 +151,11 @@ func (a *Allocator) Values() map[string]float64 {
 //
 // It runs after rendering and changes nothing: it cannot re-run the partition,
 // alter topology, or feed the scorer.
-func PcheckFor(doc *core.PlanDocument, bucket int, stage2 walltime.Digest, a *Allocator) (*walltime.PcheckDocument, error) {
+func PcheckFor(doc *core.PlanDocument, bucket int, stage2, membership walltime.Digest, a *Allocator) (*walltime.PcheckDocument, error) {
 	if a == nil {
 		return nil, fmt.Errorf("planbind: no frozen allocation score, so there is nothing to project")
 	}
-	var membership []walltime.PcheckInvocation
+	var invocations []walltime.PcheckInvocation
 	for _, b := range doc.Buckets {
 		if bucket >= 0 && b.Index != bucket {
 			continue
@@ -163,12 +163,12 @@ func PcheckFor(doc *core.PlanDocument, bucket int, stage2 walltime.Digest, a *Al
 		for i, inv := range b.Invocations {
 			ids := append([]string(nil), inv.Units...)
 			sort.Strings(ids)
-			membership = append(membership, walltime.PcheckInvocation{
+			invocations = append(invocations, walltime.PcheckInvocation{
 				Seq: i, BucketIndex: b.Index, Units: ids,
 			})
 		}
 	}
-	return walltime.BuildPcheck(stage2, a.scorer.ID, a.Values(), membership)
+	return walltime.BuildPcheck(stage2, membership, a.scorer, a.Values(), invocations)
 }
 
 // PallocTotal is one bucket's frozen pre-KK Palloc total, which is what the

@@ -86,6 +86,60 @@ func TestRegistryRefusesUnboundedResidual(t *testing.T) {
 	}
 }
 
+// TestAetaRecomputes is the ETA half of the same audit: the forecast has to be
+// re-derivable from the frozen template and the inputs it names, component by
+// component, so a point edited after the action cannot pass the calibration
+// gate.
+func TestAetaRecomputes(t *testing.T) {
+	reg := minimalRegistry()
+	in := AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:s2"}
+	got, err := reg.Instantiate(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if problems := got.Recompute(reg); len(problems) != 0 {
+		t.Fatalf("a freshly instantiated forecast did not recompute: %v", problems)
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*AetaInstance)
+		want string
+	}{
+		{"the point moved after the action", func(a *AetaInstance) { a.PointNs += 5 * second }, "the frozen template gives"},
+		{"the interval widened after the action", func(a *AetaInstance) { a.UpperNs += 30 * second }, "the frozen template gives"},
+		{"one component was edited", func(a *AetaInstance) {
+			a.Components[0].PointNs += second
+			a.PointNs += second
+		}, "component"},
+		{"the inputs were restated", func(a *AetaInstance) { a.Inputs.Invocations = 99 }, "the frozen template gives"},
+		{"it names another plan", func(a *AetaInstance) { a.Stage2 = "sha256:other" }, "Stage-2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edited, err := reg.Instantiate(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.edit(edited)
+			problems := edited.Recompute(reg)
+			if len(problems) == 0 {
+				t.Fatalf("the edit survived recomputation")
+			}
+			if !strings.Contains(strings.Join(problems, "; "), tc.want) {
+				t.Errorf("problems %v do not mention %q", problems, tc.want)
+			}
+		})
+	}
+
+	// A forecast instantiated from a DIFFERENT registry cannot be checked
+	// against this one, and saying so is the answer rather than comparing
+	// numbers from two templates.
+	other := minimalRegistry()
+	other.Version = "2"
+	if problems := got.Recompute(other); len(problems) == 0 {
+		t.Errorf("a forecast from another registry recomputed against this one")
+	}
+}
+
 func TestResidualAllowanceIsCapped(t *testing.T) {
 	reg := minimalRegistry()
 	// A residual that instantiates above its own bound is refused outright.
