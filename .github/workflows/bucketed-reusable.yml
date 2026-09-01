@@ -455,6 +455,10 @@ jobs:
           TB_STAGE2_DIGEST: ${{ inputs.stage2-digest }}
           TB_REGISTRY_DIGEST: ${{ inputs.registry-digest }}
           TB_VERIFIER_ID: ${{ inputs.verifier-id }}
+          # The protected environment that must have approved Stage 1. The
+          # contract names exactly one, and a scored row approved under any
+          # other label is not a row this campaign authorised.
+          TB_AUTHORITY: ${{ inputs.authority }}
         run: |
           set -euo pipefail
           fail=0
@@ -484,8 +488,11 @@ jobs:
           if [ -z "$TB_VERIFIER_ID" ]; then
             say "needs verifier-id. A record that names no verifier identity is attributable to nobody."
           fi
+          if [ "$TB_AUTHORITY" != "ewj2-campaign" ]; then
+            say "needs authority=ewj2-campaign. The frozen contract names exactly one protected environment that may approve Stage-1 inputs; a correctly KEYED manifest approved under any other label is not one this campaign authorised, and the pre-flight cannot refuse a label nobody told it to require."
+          fi
           [ "$fail" -eq 0 ] || exit 1
-          echo "eligible request: wall directory, frozen inputs, authority key, run key and all four record identities are present"
+          echo "eligible request: wall directory, frozen inputs, authority key and label, run key and all four record identities are present"
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
@@ -572,6 +579,10 @@ jobs:
           registry: ${{ runner.temp }}/testbucket-frozen-inputs/registry.json
           scorer: ${{ inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
           authority-key: ${{ inputs.authority-key }}
+          # The EXACT protected environment, not just its key. A key can sign
+          # under any label, and which environment approved is the question the
+          # contract asks before AT_start.
+          authority: ${{ inputs.authority }}
           # The four identities run-bucket stamps onto every measured record,
           # compared here with what the replay derives. Without them a
           # mismatched or empty record identity opened the envelope, ran the

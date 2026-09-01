@@ -404,6 +404,7 @@ func runWallReplay(args []string) error {
 	stage1Path := fs.String("stage1", "", "Stage-1 manifest whose digest the receipt must name")
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex) the Stage-1 signature must come from; repeatable and required with --stage1")
+	authority := fs.String("authority", "", "the EXACT protected environment that must have approved Stage 1, e.g. "+walltime.CampaignAuthority+". Required with --stage1: a key check alone accepts a correctly keyed manifest approved under some other label, and this is the pre-action gate — a refusal afterwards cannot un-run the measured work")
 	scorerPath := fs.String("scorer", "", "the frozen scorer the plan allocated with; its digest must match the training lineage Stage 1 bound")
 	shardPlan := fs.String("shard-plan", "", "also write the replayed plan here")
 	registryPath := fs.String("registry", "", "frozen Aeta component-registry template. Required when the issued receipt binds per-bucket documents: an independent replay that skipped them would leave exactly those documents unre-derived")
@@ -463,8 +464,15 @@ func runWallReplay(args []string) error {
 		if len(authorityKeys) == 0 {
 			return fmt.Errorf("--stage1 needs at least one --authority-key: verifying a signature against whatever signed the document accepts any self-generated key")
 		}
-		if err := walltime.VerifySigned(m.Signature, d, authorityKeys); err != nil {
-			return fmt.Errorf("stage-1 authority signature: %w", err)
+		if strings.TrimSpace(*authority) == "" {
+			return fmt.Errorf("--stage1 needs --authority: the contract puts the PROTECTED environment's approval before the plan, and a key check alone accepts a correctly keyed manifest approved under some other label")
+		}
+		// The EXACT label, not merely a signature that is self-consistent with
+		// whatever label it carries. A key can sign under any name; which
+		// protected environment approved is the question the contract asks
+		// before AT_start.
+		if err := m.RequireApproval(authorityKeys, *authority); err != nil {
+			return err
 		}
 		stage1 = d
 		lineage = m.TrainingLineage
@@ -655,8 +663,18 @@ func writeReplayAttestation(path, verifierID string, issued walltime.Stage2Recei
 	if err != nil {
 		return err
 	}
+	// The retained authority and the identity the signature COVERS are the
+	// same string, and that string is the replaying party.
+	//
+	// This used to retain `ewj2-campaign` while signing over the verifier id,
+	// so the production writer emitted an artifact the production verifier
+	// rejected: signatures cover `authority NUL digest`, and the two halves
+	// disagreed. Naming the campaign authority here would have made them
+	// agree and erased the distinction the whole attestation exists for —
+	// the replay is independent precisely because it is NOT the party that
+	// authorised the plan.
 	a.Signature = &walltime.Signature{
-		Authority: "ewj2-campaign", KeyID: walltime.PublicKeyOf(key), Digest: d,
+		Authority: verifierID, KeyID: walltime.PublicKeyOf(key), Digest: d,
 		Value: walltime.SignApproval(verifierID, key, d),
 	}
 	if err := walltime.WriteJSONFile(path, a); err != nil {

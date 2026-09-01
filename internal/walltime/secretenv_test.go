@@ -8,9 +8,10 @@ import (
 	"testing"
 )
 
-// privateKeyEnv matches the naming convention every wall-time signing
-// capability follows.
-var privateKeyEnv = regexp.MustCompile(`"(TB_WALL_[A-Z0-9_]*KEY)"`)
+// wallPrivateKeyEnvPattern matches the naming convention every wall-time
+// signing capability follows. It is named distinctly so an external contract
+// control dropped into this package does not collide with it.
+var wallPrivateKeyEnvPattern = regexp.MustCompile(`"(TB_WALL_[A-Z0-9_]*KEY)"`)
 
 // TestEveryPrivateKeyEnvironmentVariableIsScrubbed scans the REPOSITORY, not
 // the denylist.
@@ -52,7 +53,7 @@ func TestEveryPrivateKeyEnvironmentVariableIsScrubbed(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for _, m := range privateKeyEnv.FindAllStringSubmatch(string(b), -1) {
+		for _, m := range wallPrivateKeyEnvPattern.FindAllStringSubmatch(string(b), -1) {
 			name := m[1]
 			// TB_WALL_DIR and the cgroup root are operational values, not
 			// capabilities; the pattern only matches names ending in KEY, and

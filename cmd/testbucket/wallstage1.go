@@ -52,7 +52,7 @@ func runWallStage1(args []string) error {
 	consumerCommit := fs.String("consumer-commit", "", "consumer commit")
 	workflowSHA := fs.String("caller-workflow-sha", "", "caller workflow commit SHA")
 	downstreamRef := fs.String("downstream-ref", "", "downstream ref the caller resolves")
-	authority := fs.String("authority", "ewj2-campaign", "protected environment that authorises these inputs")
+	authority := fs.String("authority", walltime.CampaignAuthority, "protected environment that authorises these inputs")
 	schedulePath := fs.String("campaign-schedule", "", "the authority-frozen campaign schedule JSON (required for a scored arm): the five predeclared pairs, which run is each arm, the randomisation seed and the UTC date each pair runs on. The contract freezes pair order before the first candidate run, and an order chosen afterwards from whatever ran is a selection nobody predeclared")
 	signers := fs.String("record-signers", "", "comma-separated PUBLIC halves of the run keys allowed to sign a measurement's roster and closing seal (required for a scored row): the wrapper mints its per-producer keys at run time, so what a manifest can bind is the key that attests to them — and without it the records authenticate only themselves")
 	replaySigners := fs.String("replay-signers", "", "comma-separated PUBLIC keys allowed to sign an independent Stage-2 replay attestation. They must not include the authority key: a replay signed by the party that authorised the plan is the planner checking its own work")

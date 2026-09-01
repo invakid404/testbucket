@@ -732,6 +732,73 @@ func TestObserversNeverInheritAWallTimeSecret(t *testing.T) {
 	}
 }
 
+// TestDetachedActionObserversAreScrubbed drives the OTHER launch path.
+//
+// The test above runs `Exec`, whose script and invocation observers are waited
+// children. `BeginAction` launches the ACTION peer and trace, and those are
+// detached so they can span the begin and end steps — which is precisely why a
+// capability leaked to them is the worst case: it lives for the whole measured
+// window rather than for one invocation. That path had no direct coverage, and
+// the builder-key leak was reported against exactly these two processes.
+func TestDetachedActionObserversAreScrubbed(t *testing.T) {
+	for _, name := range WallTimeSecretEnv {
+		t.Setenv(name, "detached-secret-for-"+name)
+	}
+	// BeginAction parses the run key while launching, so it needs a real one.
+	t.Setenv(RunKeyEnv, EncodeKey(mustSigningKey()))
+	t.Setenv("TB_WALL_CGROUP_ROOT", "/required/nonsecret/cgroup-root")
+	t.Setenv("TB_WALLTIME_DETACHED_AMBIENT", "must-survive")
+
+	original := ObserverLauncher
+	var launched []*exec.Cmd
+	ObserverLauncher = func(args []string) (*exec.Cmd, error) {
+		cmd, err := original(args)
+		if err == nil {
+			launched = append(launched, cmd)
+		}
+		return cmd, err
+	}
+	t.Cleanup(func() { ObserverLauncher = original })
+
+	dir := t.TempDir()
+	run := RunIdentity{CampaignID: "ewj2", RunID: "detached", BucketID: "bucket-0", Stage2: "sha256:stage2"}
+	if _, err := BeginAction(dir, run, 20*time.Second); err != nil {
+		t.Fatalf("BeginAction: %v", err)
+	}
+	if len(launched) != 2 {
+		t.Fatalf("BeginAction launched %d observer(s), want the action peer and trace", len(launched))
+	}
+	for i, cmd := range launched {
+		// Detached, which is the property that makes the leak durable.
+		if cmd.SysProcAttr == nil {
+			t.Errorf("action observer %d is not on the detached production path", i)
+		}
+		if cmd.Env == nil {
+			t.Errorf("action observer %d has a nil Env and would inherit every capability", i)
+			continue
+		}
+		got := map[string]string{}
+		for _, kv := range cmd.Env {
+			k, v, _ := strings.Cut(kv, "=")
+			got[k] = v
+		}
+		for _, name := range WallTimeSecretEnv {
+			if v, present := got[name]; present {
+				t.Errorf("action observer %d inherits %s=%q for the whole measured window", i, name, v)
+			}
+		}
+		if got["TB_WALL_CGROUP_ROOT"] != "/required/nonsecret/cgroup-root" {
+			t.Errorf("action observer %d lost the cgroup root it needs", i)
+		}
+		if got["TB_WALLTIME_DETACHED_AMBIENT"] != "must-survive" {
+			t.Errorf("action observer %d lost an ambient nonsecret value; the scrub is a denylist", i)
+		}
+	}
+	if _, err := EndAction(dir, TerminalPassed, ""); err != nil {
+		t.Fatalf("EndAction: %v", err)
+	}
+}
+
 // scrubSecrets is the mechanism itself, checked directly: nil means inherit,
 // which is the default that caused the defect.
 func TestScrubSecretsResolvesNilAndRemovesEverySecret(t *testing.T) {

@@ -21,6 +21,15 @@ import (
 const (
 	Stage1Kind = "tb.walltime.stage1/v1"
 	Stage2Kind = "tb.walltime.stage2/v1"
+	// CampaignAuthority is the protected environment the frozen contract names
+	// as the only one that may approve Stage-1 inputs, reviewed tips, release
+	// delivery, SemVer classification, campaign start, void or retry.
+	//
+	// It is a constant so the gates that must require it — the pre-action
+	// replay, the eligible guard and the release campaign — name the same
+	// thing, rather than each repeating a string that one of them could get
+	// wrong.
+	CampaignAuthority = "ewj2-campaign"
 	// BundleKind is the versioned planning-input bundle inside Stage 1.
 	//
 	// v2 is an INCOMPATIBLE schema change from v1: every snapshot now binds

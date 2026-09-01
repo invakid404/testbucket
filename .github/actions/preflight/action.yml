@@ -28,6 +28,17 @@ inputs:
       Required: a signature checked against whatever signed it accepts any
       self-generated key, which is the same as not checking.
     required: true
+  authority:
+    description: >-
+      The EXACT protected environment that must have approved `stage1`, e.g.
+      `ewj2-campaign`.
+
+      Required, and separate from the key. A key can sign under any label, so
+      checking the key alone accepts a correctly keyed manifest approved under
+      some other environment — and this is the gate the contract puts BEFORE
+      the measured action. A refusal afterwards can invalidate the row; it
+      cannot un-run it.
+    required: true
   registry:
     description: >-
       The frozen Aeta component-registry template. Needed because the receipt
@@ -91,6 +102,7 @@ runs:
         TB_REGISTRY: ${{ inputs.registry }}
         TB_SCORER: ${{ inputs.scorer }}
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_AUTHORITY: ${{ inputs.authority }}
         TB_STAGE1_DIGEST: ${{ inputs.stage1-digest }}
         TB_STAGE2_DIGEST: ${{ inputs.stage2-digest }}
         TB_REGISTRY_DIGEST: ${{ inputs.registry-digest }}
@@ -101,8 +113,12 @@ runs:
           echo "pre-flight needs an authority-key: without a predeclared key the Stage-1 signature would be checked against whatever signed it, which accepts any self-generated key." >&2
           exit 1
         fi
+        if [ -z "$TB_AUTHORITY" ]; then
+          echo "pre-flight needs an authority: a key can sign under any label, so checking the key alone accepts a manifest approved by some other protected environment." >&2
+          exit 1
+        fi
         args=(--bundle "$TB_BUNDLE" --stage2 "$TB_STAGE2" --stage1 "$TB_STAGE1"
-              --authority-key "$TB_AUTHORITY_KEY")
+              --authority-key "$TB_AUTHORITY_KEY" --authority "$TB_AUTHORITY")
         if [ -n "$TB_REGISTRY" ]; then args+=(--registry "$TB_REGISTRY"); fi
         if [ -n "$TB_SCORER" ]; then args+=(--scorer "$TB_SCORER"); fi
 

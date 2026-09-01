@@ -380,10 +380,14 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   retained with its terminal state, and one verifier verdict named per row.
   Five pairs of half-sized runs is not most of a campaign — it is a different
   denominator, and it fails.
-- Authority approval needs a **predeclared** key
-  (`wall verify --authority-key`). Verifying a signature against whatever
-  signed the document accepts any self-generated key, so a run with no
-  predeclared authority is reported ineligible rather than trusted.
+- Authority approval needs a **predeclared** key AND the **exact protected
+  environment**. Verifying a signature against whatever signed the document
+  accepts any self-generated key, so a run with no predeclared authority is
+  reported ineligible rather than trusted — and a key can sign under any label,
+  so `wall replay --stage1` also requires `--authority` and the eligible guard
+  requires exactly `ewj2-campaign`. Checking the key alone would accept a
+  correctly keyed manifest approved by some other environment, and this is the
+  gate that runs before the measured action rather than after it.
 - Scoring needs an **invocation manifest** and a **step attempt**. The first
   says what the authorised plan rendered, so the measured argv, selector, unit
   membership and atom closure are compared to it rather than merely recorded —
@@ -395,7 +399,10 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   own account of what it produced, and checking it against itself proves
   nothing, so `wall verify --replay` requires a signed attestation from a
   separate party that re-derived the same plan from the same frozen bytes
-  (`wall replay --attest`).
+  (`wall replay --attest`). That attestation is retained and signed under the
+  REPLAYING PARTY's identity, not the campaign authority's: naming the
+  authority there would erase the very distinction the attestation exists to
+  establish.
 - `wall campaign --index` assembles its population from **verifier verdicts**,
   not from durations in a file: every row must be an `eligible: true` verdict
   that names the same campaign, run and Stage-1 manifest, and each pair's two
@@ -514,7 +521,7 @@ testbucket plan --wall-bundle bundle.json --wall-stage1 stage1.json \
 # Replay it independently and ATTEST the result. `wall verify` requires this:
 # the receipt above is the planner's own account of its own output.
 testbucket wall replay --bundle bundle.json --stage2 stage2.json \
-  --stage1 stage1.json --authority-key "$KEY" \
+  --stage1 stage1.json --authority-key "$KEY" --authority ewj2-campaign \
   --attest replay.json --verifier-id independent-verifier
 ```
 
