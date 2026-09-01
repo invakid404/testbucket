@@ -1,0 +1,145 @@
+name: testbucket verify-wall
+description: >-
+  Verify a bucket's wall-time records against the frozen documents. It is a
+  SEPARATE action from run-bucket on purpose: the contract puts AT_end after
+  the final action epilogue, so verification cannot be a later step of the
+  action whose envelope it is checking — that would put action-owned work after
+  the interval that claims to contain it.
+
+inputs:
+  wall-time-dir:
+    description: 'Records directory the run-bucket action wrote (required).'
+    required: true
+  require:
+    description: >-
+      What the verifier must be able to say before this step passes: `complete`
+      (the records are well formed) or `eligible` (this row is scorable — which
+      additionally needs a real containment and clock, every frozen document
+      below, and every row-scope gate inside its threshold). A campaign arm
+      uses `eligible`.
+    default: complete
+  version:
+    description: 'testbucket binary to install; the verifier''s own delivery identity.'
+    default: v1
+  stage1-file:
+    description: 'The signed Stage-1 input manifest.'
+    default: ""
+  stage2-file:
+    description: 'The Stage-2 derived-plan receipt.'
+    default: ""
+  replay-file:
+    description: >-
+      The independent Stage-2 replay attestation (`wall replay --attest`). A
+      scored row needs one: comparing the planner''s account of its own output
+      to itself proves nothing.
+    default: ""
+  registry-file:
+    description: 'The frozen Aeta component-registry template.'
+    default: ""
+  aeta-file:
+    description: 'This bucket''s instantiated pre-action Aeta.'
+    default: ""
+  pcheck-file:
+    description: 'This bucket''s post-render Pcheck projection.'
+    default: ""
+  invocations-file:
+    description: >-
+      This bucket''s invocation manifest: what the authorised plan rendered.
+      Without it the measured argv, selector, unit membership and atom closure
+      are not checked against the plan, and two legal name slices of one file
+      cannot be told apart.
+    default: ""
+  step-attempt-file:
+    description: >-
+      The GitHub step-attempt diagnostic (A_GH). Non-gating — GitHub reports
+      whole seconds — but the contract requires it for identity sanity, and it
+      is what accounts for the wrapper install that necessarily precedes
+      AT_start. A campaign harness produces it after the job, e.g.
+      `gh api /repos/{owner}/{repo}/actions/jobs/{job_id}` reshaped into
+      {"kind":"tb.walltime.step-attempt/v1","attempt":{...}}.
+    default: ""
+  authority:
+    description: 'Protected environment the Stage-1 manifest must name.'
+    default: ""
+  authority-key:
+    description: >-
+      PREDECLARED authority public key (hex). The verifier will not treat a
+      Stage-1 signature as authority approval without one: a self-generated key
+      would otherwise pass.
+    default: ""
+  verdict-file:
+    description: >-
+      Write the machine-readable verdict here. A campaign assembles its
+      population from these, so a row whose verdict was never written cannot be
+      counted — which is the correct outcome, not a gap to paper over.
+    default: ""
+  records-artifact:
+    description: >-
+      Name the caller uploads the records under, echoed into the log so a
+      reader can find the evidence this verdict was derived from.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install testbucket
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    - name: Verify the wall-time records
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_REQUIRE: ${{ inputs.require }}
+        TB_STAGE1_FILE: ${{ inputs.stage1-file }}
+        TB_STAGE2_FILE: ${{ inputs.stage2-file }}
+        TB_REPLAY_FILE: ${{ inputs.replay-file }}
+        TB_REGISTRY_FILE: ${{ inputs.registry-file }}
+        TB_AETA_FILE: ${{ inputs.aeta-file }}
+        TB_PCHECK_FILE: ${{ inputs.pcheck-file }}
+        TB_INVOCATIONS_FILE: ${{ inputs.invocations-file }}
+        TB_STEP_ATTEMPT_FILE: ${{ inputs.step-attempt-file }}
+        TB_AUTHORITY: ${{ inputs.authority }}
+        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_VERDICT_FILE: ${{ inputs.verdict-file }}
+        TB_RECORDS_ARTIFACT: ${{ inputs.records-artifact }}
+      run: |
+        set -euo pipefail
+        # `if` blocks rather than `[ -n x ] && args+=(...)`: under `set -e` a
+        # trailing test that is false makes the whole step fail, which would
+        # turn "this consumer passed no Aeta file" into a red bucket.
+        args=(--dir "$TB_WALL_DIR" --require "$TB_REQUIRE")
+        if [ -n "$TB_STAGE1_FILE" ]; then args+=(--stage1 "$TB_STAGE1_FILE"); fi
+        if [ -n "$TB_STAGE2_FILE" ]; then args+=(--stage2 "$TB_STAGE2_FILE"); fi
+        if [ -n "$TB_REPLAY_FILE" ]; then args+=(--replay "$TB_REPLAY_FILE"); fi
+        if [ -n "$TB_REGISTRY_FILE" ]; then args+=(--registry "$TB_REGISTRY_FILE"); fi
+        if [ -n "$TB_AETA_FILE" ]; then args+=(--aeta "$TB_AETA_FILE"); fi
+        if [ -n "$TB_PCHECK_FILE" ]; then args+=(--pcheck "$TB_PCHECK_FILE"); fi
+        if [ -n "$TB_INVOCATIONS_FILE" ]; then args+=(--invocations "$TB_INVOCATIONS_FILE"); fi
+        if [ -n "$TB_STEP_ATTEMPT_FILE" ]; then args+=(--step-attempt "$TB_STEP_ATTEMPT_FILE"); fi
+        if [ -n "$TB_AUTHORITY" ]; then args+=(--authority "$TB_AUTHORITY"); fi
+        if [ -n "$TB_AUTHORITY_KEY" ]; then args+=(--authority-key "$TB_AUTHORITY_KEY"); fi
+        if [ -n "$TB_RECORDS_ARTIFACT" ]; then
+          echo "the records this verdict is derived from are uploaded as: $TB_RECORDS_ARTIFACT"
+        fi
+
+        # The human report always reaches the log. The machine verdict is
+        # written separately when asked for, because a campaign assembles its
+        # population from verdicts and cannot read a log.
+        #
+        # The verdict is written even when verification FAILS: campaign
+        # retention is intention-to-treat, so an ineligible row stays in the
+        # population as the reason a pair does not pass rather than vanishing.
+        # The step still fails.
+        status=0
+        testbucket wall verify "${args[@]}" || status=$?
+        if [ -n "$TB_VERDICT_FILE" ]; then
+          mkdir -p "$(dirname "$TB_VERDICT_FILE")"
+          testbucket wall verify "${args[@]}" --json > "$TB_VERDICT_FILE" || true
+        fi
+        exit "$status"

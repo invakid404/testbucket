@@ -59,12 +59,18 @@ func NewRawSnapshot(name string, argv []string, cwd string, b []byte) RawSnapsho
 // order. Order is part of the input because a planner that slices by name can
 // produce a different plan from the same names in a different sequence.
 type RunnableSnapshot struct {
-	TargetID string   `json:"target_id"`
-	Argv     []string `json:"argv,omitempty"`
-	Names    []string `json:"names"`
-	Empty    bool     `json:"empty"`
-	Bytes    []byte   `json:"bytes,omitempty"`
-	Digest   Digest   `json:"digest"`
+	TargetID string `json:"target_id"`
+	// Argv, Cwd and Env are this listing's own acquisition closure. A listing
+	// taken from a different directory or under a different environment is a
+	// different observation, and the bundle's promise is that a replay could
+	// say what taking it again would require.
+	Argv   []string          `json:"argv"`
+	Cwd    string            `json:"cwd"`
+	Env    map[string]string `json:"env"`
+	Names  []string          `json:"names"`
+	Empty  bool              `json:"empty"`
+	Bytes  []byte            `json:"bytes,omitempty"`
+	Digest Digest            `json:"digest"`
 }
 
 // ClockPolicy freezes the canonical planning instant. Ambient time.Now() is
@@ -166,6 +172,16 @@ func (b PlanningInputBundle) Validate() error {
 	if b.Clock.Policy == "" || b.Clock.Precision == "" || b.Clock.TimeZone == "" {
 		return fmt.Errorf("planning-input bundle: the clock policy is incomplete")
 	}
+	if len(b.Clock.PermittedSources) == 0 {
+		return fmt.Errorf("planning-input bundle: the clock policy names no permitted source, so any clock would be admissible")
+	}
+	stale, err := time.ParseDuration(b.Clock.StaleThreshold)
+	if err != nil {
+		return fmt.Errorf("planning-input bundle: stale threshold %q: %w", b.Clock.StaleThreshold, err)
+	}
+	if stale <= 0 {
+		return fmt.Errorf("planning-input bundle: the stale threshold is %s, so no store could ever be stale", b.Clock.StaleThreshold)
+	}
 	if len(b.Discovery) == 0 {
 		return fmt.Errorf("planning-input bundle: no discovery snapshot (an absent one must be recorded explicitly)")
 	}
@@ -175,6 +191,12 @@ func (b PlanningInputBundle) Validate() error {
 		}
 		if s.Empty != (len(s.Bytes) == 0) {
 			return fmt.Errorf("planning-input bundle: discovery snapshot %q disagrees with its own empty flag", s.Name)
+		}
+		// Each snapshot carries its OWN acquisition closure, not just the
+		// bundle's: two listings taken from different directories are
+		// different observations.
+		if s.Name == "" || len(s.Argv) == 0 || s.Cwd == "" {
+			return fmt.Errorf("planning-input bundle: discovery snapshot %q does not record how it was acquired (name, argv, cwd)", s.Name)
 		}
 	}
 	for _, s := range b.Runnables {
@@ -191,12 +213,25 @@ func (b PlanningInputBundle) Validate() error {
 		if len(s.Bytes) > 0 && len(s.Names) == 0 {
 			return fmt.Errorf("planning-input bundle: runnable snapshot %q carries bytes but no parsed names", s.TargetID)
 		}
+		if len(s.Argv) == 0 || s.Cwd == "" || s.Env == nil {
+			return fmt.Errorf("planning-input bundle: runnable snapshot %q does not record how it was acquired (argv, cwd, environment)", s.TargetID)
+		}
 	}
 	if b.Store.Digest != DigestBytes(b.Store.Bytes) {
 		return fmt.Errorf("planning-input bundle: the store snapshot does not match its digest")
 	}
 	if b.Algorithms.FullPlan.Name != FullPlanDigestAlgorithm || b.Algorithms.SemanticPlan.Name != SemanticPlanDigestAlgorithm {
 		return fmt.Errorf("planning-input bundle: unknown plan-digest algorithm identities")
+	}
+	// A digest algorithm is a name AND an implementation. Two implementations
+	// of one named algorithm can disagree, so binding the name alone leaves
+	// the thing that actually computed the digest unbound.
+	for label, a := range map[string]AlgorithmIdentity{
+		"full-plan": b.Algorithms.FullPlan, "semantic-plan": b.Algorithms.SemanticPlan,
+	} {
+		if a.Canonicalizer == "" || a.Implementation == "" {
+			return fmt.Errorf("planning-input bundle: the %s digest algorithm binds no canonicaliser or implementation identity", label)
+		}
 	}
 	if len(b.Parsers) == 0 {
 		return fmt.Errorf("planning-input bundle: no parser or policy identity is bound")
@@ -224,6 +259,9 @@ func (b PlanningInputBundle) Validate() error {
 	}
 	if len(b.Acquisition.Executables) == 0 {
 		return fmt.Errorf("planning-input bundle: no resolved executable path is bound, so \"npx\" could name two different binaries on two runners")
+	}
+	if len(b.Acquisition.Tools) == 0 {
+		return fmt.Errorf("planning-input bundle: no tool version is bound, so the same executable path could be two different toolchains")
 	}
 	if b.Acquisition.Env == nil {
 		return fmt.Errorf("planning-input bundle: the planning-relevant environment is unbound (an empty map is a bound fact; a missing one is not)")
@@ -284,6 +322,10 @@ type Stage1Manifest struct {
 	// SourceProfile proves the exact Vitest closure the lifecycle inventory
 	// was written against.
 	SourceProfile SourceProfileReceipt `json:"source_profile"`
+	// Store is the admitted timing store's provenance: its exact bytes, its
+	// migration epoch, how the copy was obtained, and the classification of
+	// every row.
+	Store StoreReceipt `json:"store_receipt"`
 	// TrainingLineage names the sealed offline training receipt set and the
 	// frozen scorer built from it. Runtime never reads a label; this is where
 	// the labels are allowed to have existed.
@@ -426,6 +468,104 @@ func requireSet(fields map[string]string) error {
 // binding it.
 func isImmutableImage(v string) bool {
 	return strings.Contains(v, "@sha256:") || strings.Contains(v, "@sha512:")
+}
+
+// StoreReceipt is the admitted timing store's provenance.
+//
+// It exists because the store FILE cannot carry these facts without a schema
+// change, and a schema change is a new epoch that would strand every existing
+// store. The receipt records them beside the store instead: the exact bytes,
+// the schema and migration identity, the token the weights were measured
+// under, and the classification of every row — including `observed_zero`,
+// which the contract insists stays distinct from missing, failed and
+// malformed. A zero that cannot be told from a gap is a gap.
+type StoreReceipt struct {
+	// Digest is the exact admitted bytes.
+	Digest Digest `json:"digest"`
+	Schema int    `json:"schema"`
+	// MigrationID names the migration epoch the store belongs to. A migration
+	// starts a new epoch and the old store is retained unchanged for audit, so
+	// a store with no migration identity cannot say which epoch it is in.
+	MigrationID string `json:"migration_id"`
+	Token       string `json:"token"`
+	// CacheKey and RestoreMethod are how the copy was obtained. A restore-key
+	// FALLBACK is never warm evidence, so the method is recorded rather than
+	// assumed.
+	CacheKey      string `json:"cache_key"`
+	RestoreMethod string `json:"restore_method"`
+	// StaleAt is the instant beyond which this store is not warm evidence.
+	StaleAt string `json:"stale_at"`
+	// Classifications counts the mutually exclusive row states. They must sum
+	// to Rows.
+	Classifications map[string]int `json:"classifications"`
+	Rows            int            `json:"rows"`
+	// Coverage is the live target set the store was recorded against.
+	Coverage []string `json:"coverage"`
+}
+
+// Row classification states. They are mutually exclusive, and `observed_zero`
+// is deliberately its own state: a measured zero is a measurement, and folding
+// it into "missing" would let a real observation disappear into a gap.
+const (
+	RowObservedPositive = "observed_positive"
+	RowObservedZero     = "observed_zero"
+	RowNoTests          = "no_tests"
+	RowMissing          = "missing"
+	RowFailed           = "failed"
+	RowCancelled        = "cancelled"
+	RowMalformed        = "malformed"
+	RowExcluded         = "excluded"
+)
+
+// StoreRowStates is every admissible classification, in report order.
+var StoreRowStates = []string{
+	RowObservedPositive, RowObservedZero, RowNoTests, RowMissing,
+	RowFailed, RowCancelled, RowMalformed, RowExcluded,
+}
+
+// Validate refuses a receipt that cannot support a warm claim.
+func (r StoreReceipt) Validate(now time.Time) error {
+	if err := requireSet(map[string]string{
+		"the store digest":        string(r.Digest),
+		"the migration id":        r.MigrationID,
+		"the comparability token": r.Token,
+		"the restore method":      r.RestoreMethod,
+		"the stale instant":       r.StaleAt,
+	}); err != nil {
+		return fmt.Errorf("store receipt %w", err)
+	}
+	// A restore-key fallback found SOME store, not THIS one. The contract is
+	// explicit that it never proves a warm input.
+	if r.RestoreMethod == "restore-key-fallback" {
+		return fmt.Errorf("store receipt: the copy came from a restore-key fallback, which found some store rather than the admitted one")
+	}
+	staleAt, err := parseInstant(r.StaleAt)
+	if err != nil {
+		return fmt.Errorf("store receipt: %w", err)
+	}
+	if !now.IsZero() && !now.Before(staleAt) {
+		return fmt.Errorf("store receipt: the store is stale as of %s, and a stale store is not warm evidence", r.StaleAt)
+	}
+	total := 0
+	for state, n := range r.Classifications {
+		known := false
+		for _, s := range StoreRowStates {
+			if s == state {
+				known = true
+			}
+		}
+		if !known {
+			return fmt.Errorf("store receipt: unknown row classification %q", state)
+		}
+		if n < 0 {
+			return fmt.Errorf("store receipt: classification %q counts %d rows", state, n)
+		}
+		total += n
+	}
+	if total != r.Rows {
+		return fmt.Errorf("store receipt: the classifications count %d rows but the store has %d", total, r.Rows)
+	}
+	return nil
 }
 
 // InstrumentationIdentity binds every producer and the verifier. A peer built
@@ -576,6 +716,16 @@ func (m Stage1Manifest) Validate() error {
 	if err := m.SourceProfile.Validate(); err != nil {
 		return err
 	}
+	// The store the weights came from: exact bytes, migration epoch, how the
+	// copy was obtained, and the classification of every row. The instant is
+	// zero here because staleness is a question for the moment of use, not of
+	// signing; the frozen planner asks it again with the canonical instant.
+	if err := m.Store.Validate(time.Time{}); err != nil {
+		return err
+	}
+	if m.Store.Digest != m.Bundle.Store.Digest {
+		return fmt.Errorf("stage-1 manifest: the store receipt describes %s but the bundle froze %s", m.Store.Digest, m.Bundle.Store.Digest)
+	}
 
 	// The sealed training lineage and the frozen component registry.
 	if err := requireSet(map[string]string{
@@ -622,6 +772,12 @@ func (m Stage1Manifest) Validate() error {
 // testbucket tuple, lives here: if two arms disagree on any of it, the pair
 // compared two different experiments.
 func (m Stage1Manifest) InvariantTuple() map[string]string {
+	// The rule is stated as an exclusion, so it is implemented as one: digest
+	// the WHOLE bundle and the WHOLE instrumentation identity, and list only
+	// the fields the candidate tuple is allowed to move. Enumerating what must
+	// match instead is how a field like file_parallelism or wall_dir ends up
+	// uncompared because nobody remembered to add it.
+	bundle := m.Bundle
 	out := map[string]string{
 		"consumer.repository":     m.Consumer.Repository,
 		"consumer.commit":         m.Consumer.Commit,
@@ -634,19 +790,43 @@ func (m Stage1Manifest) InvariantTuple() map[string]string {
 		"source_profile":          string(mustDigestOf(m.SourceProfile)),
 		"training_lineage":        string(mustDigestOf(m.TrainingLineage)),
 		"component_registry":      string(m.Registry),
-		"selection.k":             fmt.Sprint(m.Bundle.Selection.K),
-		"selection.count":         fmt.Sprint(m.Bundle.Selection.Count),
-		"selection.token":         m.Bundle.Selection.Token,
-		"selection.runner":        m.Bundle.Selection.Runner,
-		"selection.renderer":      m.Bundle.Selection.Renderer,
-		"selection.tie_break":     m.Bundle.Selection.TieBreak,
-		"store":                   string(m.Bundle.Store.Digest),
-		"clock.stale_threshold":   m.Bundle.Clock.StaleThreshold,
-		"instrumentation.schema":  m.Instrumentation.Schema,
-		"containment_policy":      m.Instrumentation.ContainmentPolicy,
-		"child_admission_policy":  m.Instrumentation.ChildAdmission,
-		"endpoint_order_policy":   m.Instrumentation.EndpointOrder,
-		"cancellation_policy":     m.Instrumentation.CancellationPolicy,
+		"store_receipt":           string(mustDigestOf(m.Store)),
+		"allowed_differences":     string(mustDigestOf(m.AllowedDifferences)),
+		// The entire planning-input bundle: discovery and runnable bytes, the
+		// acquisition closure, every parser and policy, both algorithm
+		// implementations, the absent-input claims, the selection AND the
+		// render configuration. Two arms that planned from different inputs
+		// did not run the same experiment.
+		"planning_input_bundle": string(mustDigestOf(bundle)),
+		// The entire instrumentation identity: producer and verifier binaries,
+		// every policy, and the raw-source taxonomy.
+		"instrumentation": string(mustDigestOf(m.Instrumentation)),
+	}
+	// Readable sub-keys for the fields a reader most often wants named in a
+	// diff. They are redundant with the bundle digest above and that is the
+	// point: the digest catches everything, these say what changed.
+	for k, v := range map[string]string{
+		"selection.k":              fmt.Sprint(bundle.Selection.K),
+		"selection.count":          fmt.Sprint(bundle.Selection.Count),
+		"selection.token":          bundle.Selection.Token,
+		"selection.runner":         bundle.Selection.Runner,
+		"selection.renderer":       bundle.Selection.Renderer,
+		"selection.tie_break":      bundle.Selection.TieBreak,
+		"render.events_dir":        bundle.Render.EventsDir,
+		"render.file_parallelism":  fmt.Sprint(bundle.Render.FileParallelism),
+		"render.wall_dir":          bundle.Render.WallDir,
+		"store":                    string(bundle.Store.Digest),
+		"clock.stale_threshold":    bundle.Clock.StaleThreshold,
+		"clock.policy":             bundle.Clock.Policy,
+		"instrumentation.schema":   m.Instrumentation.Schema,
+		"containment_policy":       m.Instrumentation.ContainmentPolicy,
+		"child_admission_policy":   m.Instrumentation.ChildAdmission,
+		"endpoint_order_policy":    m.Instrumentation.EndpointOrder,
+		"cancellation_policy":      m.Instrumentation.CancellationPolicy,
+		"instrumentation.verifier": string(m.Instrumentation.VerifierBinary),
+		"raw_source_taxonomy":      strings.Join(m.Instrumentation.RawSourceTaxonomy, ","),
+	} {
+		out[k] = v
 	}
 	return out
 }
@@ -741,6 +921,13 @@ func (r Stage2Receipt) Validate() error {
 	}
 	if r.Algorithms.FullPlan.Name != FullPlanDigestAlgorithm || r.Algorithms.SemanticPlan.Name != SemanticPlanDigestAlgorithm {
 		return fmt.Errorf("stage-2 receipt names unknown plan-digest algorithms")
+	}
+	for label, a := range map[string]AlgorithmIdentity{
+		"full-plan": r.Algorithms.FullPlan, "semantic-plan": r.Algorithms.SemanticPlan,
+	} {
+		if a.Canonicalizer == "" || a.Implementation == "" {
+			return fmt.Errorf("stage-2 receipt: the %s digest algorithm binds no canonicaliser or implementation identity", label)
+		}
 	}
 	// Every derived identity, not a representative sample. A receipt missing
 	// the atom digest cannot detect an atom split; missing the topology

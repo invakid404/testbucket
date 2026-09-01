@@ -56,6 +56,14 @@ inputs:
       descendant escaped. Create it in a prior step, e.g.
       `sudo mkdir -p /sys/fs/cgroup/testbucket && sudo chown -R "$(id -u)" /sys/fs/cgroup/testbucket`.
     default: ""
+  scored:
+    description: >-
+      Set to "true" for a campaign arm. It refuses a moving version alias,
+      because a row delivered through one has no immutable delivery identity.
+      Verification itself is a SEPARATE action (`verify-wall`) run after this
+      one: the contract puts AT_end after the final action epilogue, so
+      verification cannot be a later step of the same action.
+    default: "false"
   campaign-id:
     description: 'Campaign identity stamped on every record.'
     default: ""
@@ -78,50 +86,6 @@ inputs:
   verifier-id:
     description: 'Delivery-bound verifier identity recorded on every record.'
     default: ""
-  verify-require:
-    description: >-
-      What `wall verify` must be able to say before this step passes: `complete`
-      (the records are well formed) or `eligible` (this row is scorable — which
-      additionally needs a real containment and clock, the frozen documents
-      below, and every row-scope gate inside its threshold). A campaign arm
-      uses `eligible`.
-    default: complete
-  stage1-file:
-    description: 'Path to the signed Stage-1 manifest, for `wall verify` (needed by verify-require=eligible).'
-    default: ""
-  stage2-file:
-    description: 'Path to the Stage-2 derived-plan receipt, for `wall verify`.'
-    default: ""
-  replay-file:
-    description: >-
-      Path to the independent Stage-2 replay attestation (`wall replay
-      --attest`), for `wall verify`. A scored row needs one: comparing the
-      planner''s account of its own output to itself proves nothing.
-    default: ""
-  wall-records-artifact:
-    description: >-
-      Name the caller will upload this bucket''s records under. It is recorded
-      in the verification log so a reader can find the evidence a verdict was
-      derived from; this action does not upload it.
-    default: ""
-  registry-file:
-    description: 'Path to the frozen Aeta component registry, for `wall verify`.'
-    default: ""
-  aeta-file:
-    description: 'Path to this bucket''s instantiated pre-action Aeta, for `wall verify`.'
-    default: ""
-  pcheck-file:
-    description: 'Path to this bucket''s post-render Pcheck projection, for `wall verify`.'
-    default: ""
-  authority-key:
-    description: >-
-      PREDECLARED public key (hex) of the protected campaign environment. The
-      verifier will not treat a Stage-1 signature as authority approval without
-      one: a self-generated key would otherwise pass.
-    default: ""
-  authority:
-    description: 'Protected environment name the Stage-1 manifest must name.'
-    default: ""
 
 runs:
   using: composite
@@ -131,7 +95,7 @@ runs:
     # opt-in measured run may still use the alias, because it only ever claims
     # `complete`.
     - name: Refuse a moving alias for a scored row
-      if: inputs.verify-require == 'eligible'
+      if: inputs.scored == 'true'
       shell: bash
       env:
         TB_VERSION: ${{ inputs.version }}
@@ -141,7 +105,7 @@ runs:
           v[0-9]*.[0-9]*.[0-9]*) ;;
           [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
           *)
-            echo "verify-require=eligible needs an immutable testbucket version (an exact vX.Y.Z or a full commit SHA), got '$TB_VERSION'." >&2
+            echo "scored=true needs an immutable testbucket version (an exact vX.Y.Z or a full commit SHA), got '$TB_VERSION'." >&2
             echo "A moving alias is descriptive metadata, not a delivery identity, and a row delivered through one cannot be scored." >&2
             exit 1
             ;;
@@ -298,46 +262,3 @@ runs:
           reason="the bucket step outcome was $TB_OUTCOME"
         fi
         testbucket wall end --dir "$TB_WALL_DIR" --terminal "$terminal" --reason "$reason"
-
-    # Structural verification, in the job that produced the records: a broken
-    # chain, a missing endpoint or a copied reading is a defect in THIS run and
-    # should be visible here. Scoring eligibility is a separate, later question
-    # (`wall verify --require eligible`), because it needs the frozen Stage-1
-    # and Stage-2 documents this action does not have.
-    - name: Verify the wall-time records
-      if: always() && inputs.wall-time-dir != ''
-      shell: bash
-      env:
-        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
-        TB_REQUIRE: ${{ inputs.verify-require }}
-        TB_STAGE1_FILE: ${{ inputs.stage1-file }}
-        TB_STAGE2_FILE: ${{ inputs.stage2-file }}
-        TB_REPLAY_FILE: ${{ inputs.replay-file }}
-        TB_RECORDS_ARTIFACT: ${{ inputs.wall-records-artifact }}
-        TB_REGISTRY_FILE: ${{ inputs.registry-file }}
-        TB_AETA_FILE: ${{ inputs.aeta-file }}
-        TB_PCHECK_FILE: ${{ inputs.pcheck-file }}
-        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
-        TB_AUTHORITY: ${{ inputs.authority }}
-      run: |
-        set -euo pipefail
-        # Each frozen document is passed only when supplied, so the default
-        # opt-in run still verifies structurally while a campaign arm can ask
-        # the harder question. Nothing is defaulted: a document the verifier
-        # was not given is a document it reports as missing.
-        # `if` blocks rather than `[ -n x ] && args+=(...)`: under `set -e` a
-        # trailing test that is false makes the whole step fail, which would
-        # turn "this consumer passed no Aeta file" into a red bucket.
-        args=(--dir "$TB_WALL_DIR" --require "$TB_REQUIRE")
-        if [ -n "$TB_STAGE1_FILE" ]; then args+=(--stage1 "$TB_STAGE1_FILE"); fi
-        if [ -n "$TB_STAGE2_FILE" ]; then args+=(--stage2 "$TB_STAGE2_FILE"); fi
-        if [ -n "$TB_REPLAY_FILE" ]; then args+=(--replay "$TB_REPLAY_FILE"); fi
-        if [ -n "$TB_RECORDS_ARTIFACT" ]; then
-          echo "the records this verdict is derived from are uploaded as: $TB_RECORDS_ARTIFACT"
-        fi
-        if [ -n "$TB_REGISTRY_FILE" ]; then args+=(--registry "$TB_REGISTRY_FILE"); fi
-        if [ -n "$TB_AETA_FILE" ]; then args+=(--aeta "$TB_AETA_FILE"); fi
-        if [ -n "$TB_PCHECK_FILE" ]; then args+=(--pcheck "$TB_PCHECK_FILE"); fi
-        if [ -n "$TB_AUTHORITY_KEY" ]; then args+=(--authority-key "$TB_AUTHORITY_KEY"); fi
-        if [ -n "$TB_AUTHORITY" ]; then args+=(--authority "$TB_AUTHORITY"); fi
-        testbucket wall verify "${args[@]}"

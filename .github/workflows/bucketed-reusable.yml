@@ -17,11 +17,13 @@ name: testbucket bucketed (reusable)
 # gate inside `plan` is what makes the fan-out safe: it refuses to emit a matrix
 # unless every live target lands in exactly one bucket.
 #
-# The composite actions are referenced with the `$/` self-repository syntax, so
-# they resolve to THIS repo at the SAME ref the reusable workflow was called with
-# — the pinned actions for an external `@v1` consumer, and the local checkout for
-# testbucket's own pre-release dogfood. Plain `./` would resolve against the
-# CALLER's repo and break every external consumer.
+# The composite actions are referenced with `./`, GitHub's local-action syntax.
+# Inside a CALLED reusable workflow a local reference resolves against the
+# repository that contains the workflow file, so an external `@v1` consumer gets
+# this repo's actions at the ref it called, and testbucket's own dogfood gets the
+# local checkout. The earlier `$/` spelling was not a reference GitHub or
+# actionlint accepts ("ref is missing"), so a consumer could not resolve the
+# plan/run/record actions at all.
 
 on:
   workflow_call:
@@ -200,7 +202,7 @@ jobs:
 
       - name: Plan the buckets
         id: plan
-        uses: $/.github/actions/plan
+        uses: ./.github/actions/plan
         with:
           runner: ${{ inputs.runner }}
           k: ${{ inputs.k }}
@@ -268,7 +270,7 @@ jobs:
           path: ${{ runner.temp }}/testbucket-frozen
 
       - name: Run bucket ${{ matrix.bucket }}
-        uses: $/.github/actions/run-bucket
+        uses: ./.github/actions/run-bucket
         with:
           runner: ${{ inputs.runner }}
           script: ${{ matrix.script }}
@@ -285,21 +287,39 @@ jobs:
           stage2-digest: ${{ inputs.stage2-digest }}
           registry-digest: ${{ inputs.registry-digest }}
           verifier-id: ${{ inputs.verifier-id }}
-          verify-require: ${{ inputs.verify-require }}
+          scored: ${{ inputs.verify-require == 'eligible' }}
+
+      # Verification is its OWN action, run after run-bucket rather than inside
+      # it. The contract puts AT_end after the final action epilogue, so a
+      # verification step inside the run-bucket action would be action-owned
+      # work after the interval that claims to contain it.
+      - name: Verify bucket ${{ matrix.bucket }}
+        if: always() && inputs.wall-time-dir != ''
+        uses: ./.github/actions/verify-wall
+        with:
+          wall-time-dir: ${{ inputs.wall-time-dir }}
+          require: ${{ inputs.verify-require }}
+          version: ${{ inputs.testbucket-version }}
           authority: ${{ inputs.authority }}
           authority-key: ${{ inputs.authority-key }}
-          wall-records-artifact: ${{ inputs.wall-time-dir != '' && format('testbucket-wall-{0}-bucket-{1}', inputs.cache-scope, matrix.bucket) || '' }}
+          records-artifact: testbucket-wall-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
+          verdict-file: ${{ inputs.wall-time-dir }}/verdict.json
           stage1-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage1.json', runner.temp) || '' }}
           stage2-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage2.json', runner.temp) || '' }}
           replay-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/replay.json', runner.temp) || '' }}
           registry-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/registry.json', runner.temp) || '' }}
           aeta-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/aeta-{1}.json', runner.temp, matrix.bucket) || '' }}
           pcheck-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/pcheck-{1}.json', runner.temp, matrix.bucket) || '' }}
+          invocations-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/invocations-{1}.json', runner.temp, matrix.bucket) || '' }}
+          step-attempt-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/step-attempt-{1}.json', runner.temp, matrix.bucket) || '' }}
 
       # The raw records and the verdict ARE the evidence: a campaign assembles
       # its population from them, and a row whose records were discarded with
       # the runner cannot be re-verified by anyone.
-      - name: Upload the wall-time records
+      # The records AND the verdict derived from them travel together: a
+      # campaign assembles its population from verdicts, and a verdict with no
+      # records behind it cannot be re-checked by anyone.
+      - name: Upload the wall-time records and verdict
         if: always() && inputs.wall-time-dir != ''
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -373,7 +393,7 @@ jobs:
             testbucket-timings-${{ inputs.cache-scope }}-v1-
 
       - name: Audit and record the run
-        uses: $/.github/actions/record
+        uses: ./.github/actions/record
         with:
           runner: ${{ inputs.runner }}
           k: ${{ inputs.k }}

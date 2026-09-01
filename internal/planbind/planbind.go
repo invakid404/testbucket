@@ -119,9 +119,9 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 		PermittedSources: []string{"stage1_planning_input_bundle"},
 		StaleThreshold:   opt.StaleAfter.String(),
 	}
-	b.Discovery = []walltime.RawSnapshot{
-		walltime.NewRawSnapshot("vitest-discovery", opt.DiscoveryArgv, opt.Root, opt.Discovery),
-	}
+	discovery := walltime.NewRawSnapshot("vitest-discovery", opt.DiscoveryArgv, opt.Root, opt.Discovery)
+	discovery.Env = copyMap(opt.Env)
+	b.Discovery = []walltime.RawSnapshot{discovery}
 	for _, id := range sortedKeys(opt.Runnables) {
 		raw := opt.Runnables[id]
 		// The names are parsed HERE, through the bound parser, and frozen
@@ -139,6 +139,8 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 		b.Runnables = append(b.Runnables, walltime.RunnableSnapshot{
 			TargetID: id,
 			Argv:     []string{"vitest", "list", id, "--json"},
+			Cwd:      opt.Root,
+			Env:      copyMap(opt.Env),
 			Names:    names,
 			Empty:    len(raw) == 0,
 			Bytes:    raw,
@@ -163,6 +165,9 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 	b.Acquisition.Env = copyMap(opt.Env)
 	b.Acquisition.Executables = copyMap(opt.Executables)
 	b.Acquisition.Tools = copyMap(opt.Tools)
+	if len(b.Acquisition.Tools) == 0 {
+		return nil, fmt.Errorf("planbind: no tool version was captured; the same executable path can be two different toolchains")
+	}
 	b.Parsers = []walltime.ParserIdentity{
 		{Name: "vitest-discovery-parser", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("vitest-discovery-parser/" + ParserVersion))},
 		{Name: "vitest-runnable-parser", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("vitest-runnable-parser/" + ParserVersion))},
@@ -269,6 +274,19 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 	st, reason, err := core.ParseStore(b.Store.Bytes, b.Store.Name)
 	if err != nil {
 		return nil, err
+	}
+	// A STALE store is not warm evidence. The everyday planner warns and
+	// carries on — that is v0.2.2 behaviour and consumers depend on it — but
+	// the frozen path is where a warm claim is made, so here it is refused.
+	// The alternative is a scored row whose weights came from a store the
+	// contract says cannot support one.
+	if st != nil && st.UpdatedAt != "" {
+		recorded, perr := time.Parse(time.RFC3339, st.UpdatedAt)
+		if perr == nil && instant.Sub(recorded) > stale {
+			return nil, fmt.Errorf(
+				"planbind: the frozen store was recorded at %s, %s before the canonical planning instant and beyond the %s stale policy; a stale store is not warm evidence",
+				st.UpdatedAt, instant.Sub(recorded).Round(time.Hour), stale)
+		}
 	}
 
 	planOpt := core.PlanOptions{
@@ -447,16 +465,60 @@ func topologyProjection(doc *core.PlanDocument) map[string][]string {
 	return out
 }
 
-// membershipProjection is which targets each rendered invocation covers — the
+// membershipProjection is which UNITS each rendered invocation covers — the
 // immutable membership Pcheck projects over.
+//
+// It reads Invocation.Units, not the description. Two legal name slices of one
+// file have the same description and different units, so a membership digest
+// taken over descriptions cannot tell them apart — which is exactly the atom
+// and slice identity the contract makes terminal.
 func membershipProjection(doc *core.PlanDocument) map[string][]string {
 	out := map[string][]string{}
 	for _, b := range doc.Buckets {
 		for i, inv := range b.Invocations {
-			out[fmt.Sprintf("bucket-%d/inv-%d", b.Index, i)] = strings.Fields(inv.Desc)
+			key := fmt.Sprintf("bucket-%d/inv-%d", b.Index, i)
+			out[key] = append([]string(nil), inv.Units...)
+			sort.Strings(out[key])
 		}
 	}
 	return out
+}
+
+// InvocationManifestFor is the per-bucket document the verifier compares each
+// physical invocation record against.
+//
+// Without it the wrapper's Spec is an assertion travelling beside the plan
+// rather than a claim checked against it: the verifier could confirm that a
+// record names SOME argv and selector, but not that they are the ones the
+// authorised plan rendered.
+func InvocationManifestFor(doc *core.PlanDocument, bucket int, stage2 walltime.Digest) (*walltime.InvocationManifest, error) {
+	for _, b := range doc.Buckets {
+		if b.Index != bucket {
+			continue
+		}
+		m := &walltime.InvocationManifest{
+			Kind: walltime.InvocationManifestKind, Stage2: stage2,
+			BucketIndex: b.Index, BucketName: b.Name,
+		}
+		for i, inv := range b.Invocations {
+			units := append([]string(nil), inv.Units...)
+			sort.Strings(units)
+			atoms := append([]string(nil), inv.Atoms...)
+			sort.Strings(atoms)
+			m.Invocations = append(m.Invocations, walltime.InvocationIdentity{
+				Seq:            i,
+				ArgvDigest:     walltime.DigestJSONOrEmpty(inv.Args),
+				Cwd:            inv.Dir,
+				SelectorDigest: walltime.DigestJSONOrEmpty(inv.Selector),
+				UnitDigest:     walltime.DigestJSONOrEmpty(units),
+				AtomDigest:     walltime.DigestJSONOrEmpty(atoms),
+				Units:          units,
+				Atoms:          atoms,
+			})
+		}
+		return m, nil
+	}
+	return nil, fmt.Errorf("planbind: the plan has no bucket %d", bucket)
 }
 
 func invocationProjection(doc *core.PlanDocument) [][]runner.Invocation {

@@ -420,7 +420,7 @@ func runWallCampaign(args []string) error {
 	index := fs.String("index", "", "campaign index naming each arm's Stage-1 manifest and its per-bucket verifier verdicts. This is the only input that can produce a campaign result")
 	in := fs.String("in", "", "CALCULATOR ONLY: a JSON array of baseline/candidate pairs with durations already filled in. It exercises the arithmetic and can never pass, because nothing about those numbers is authenticated")
 	asJSON := fs.Bool("json", false, "write the gate results as JSON")
-	authority := fs.String("authority", "", "protected environment each arm's manifest must name")
+	authority := fs.String("authority", "", "protected environment each arm's manifest must name. A key says WHO signed; this says WHICH environment approved")
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable and required with --index")
 	if err := fs.Parse(args); err != nil {
@@ -429,8 +429,6 @@ func runWallCampaign(args []string) error {
 	if (*index == "") == (*in == "") {
 		return fmt.Errorf("pass exactly one of --index (a campaign) or --in (the calculator)")
 	}
-	_ = authority
-
 	var gates []walltime.GateResult
 	calculatorOnly := false
 	if *index != "" {
@@ -438,7 +436,7 @@ func runWallCampaign(args []string) error {
 		if err := walltime.ReadJSONFile(*index, &idx); err != nil {
 			return err
 		}
-		gates, _ = walltime.EvaluateCampaignIndex(idx, walltime.FileCampaignLoader{}, authorityKeys)
+		gates, _ = walltime.EvaluateCampaignIndex(idx, walltime.FileCampaignLoader{}, authorityKeys, *authority)
 	} else {
 		// The calculator path. It prints the arithmetic and ALWAYS fails: a
 		// number in a JSON file is not an observation, and the one thing this
@@ -494,6 +492,8 @@ func runWallVerify(args []string) error {
 	aeta := fs.String("aeta", "", "instantiated pre-action Aeta document for the ETA-completeness gate")
 	pcheck := fs.String("pcheck", "", "post-render Pcheck projection for the predictor gate")
 	registry := fs.String("registry", "", "frozen Aeta component-registry template; without it ETA completeness cannot be proven")
+	stepAttempt := fs.String("step-attempt", "", "GitHub step-attempt diagnostic (A_GH). Non-gating — GitHub reports seconds — but required for identity sanity and to account for the wrapper install that necessarily precedes AT_start")
+	invocations := fs.String("invocations", "", "this bucket's invocation manifest: what the authorised plan rendered. Without it the measured argv, selector, unit membership and atom closure are not checked against the plan")
 	replay := fs.String("replay", "", "independent Stage-2 replay attestation (`wall replay --attest`). Required to score: comparing the planner's account of its own output to itself proves nothing")
 	require := fs.String("require", "complete", "verdict this command exits non-zero below: complete (well-formed records) or eligible (scorable under every frozen ROW gate; the campaign-scope gates are decided by `wall campaign`)")
 	authority := fs.String("authority", "", "the protected environment the Stage-1 manifest must name")
@@ -508,7 +508,7 @@ func runWallVerify(args []string) error {
 	v, err := walltime.VerifyDir(walltime.VerifyOptions{
 		Dir: *dir, Stage1Path: *stage1, Stage2Path: *stage2,
 		AetaPath: *aeta, PcheckPath: *pcheck, RegistryPath: *registry,
-		ReplayPath:    *replay,
+		ReplayPath: *replay, InvocationsPath: *invocations, StepAttemptPath: *stepAttempt,
 		AuthorityKeys: authorityKeys, Authority: *authority,
 	})
 	if err != nil {

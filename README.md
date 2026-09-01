@@ -369,6 +369,13 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   (`wall verify --authority-key`). Verifying a signature against whatever
   signed the document accepts any self-generated key, so a run with no
   predeclared authority is reported ineligible rather than trusted.
+- Scoring needs an **invocation manifest** and a **step attempt**. The first
+  says what the authorised plan rendered, so the measured argv, selector, unit
+  membership and atom closure are compared to it rather than merely recorded —
+  two legal name slices of one file share a description and differ only there.
+  The second is A_GH: GitHub reports whole seconds, so it is never a gate, but
+  it says which step a ledger measured and accounts for the wrapper install
+  that necessarily precedes AT_start.
 - Scoring needs an **independent replay**. The Stage-2 receipt is the planner's
   own account of what it produced, and checking it against itself proves
   nothing, so `wall verify --replay` requires a signed attestation from a

@@ -105,15 +105,25 @@ type Verdict struct {
 	// Eligible means the measurement may be SCORED: complete, plus a scorable
 	// clock and containment, signed records, Stage-1/Stage-2 binding, and
 	// every applicable gate passing.
-	Eligible     bool             `json:"eligible"`
-	Envelopes    []Envelope       `json:"envelopes"`
-	Phases       []Phase          `json:"phases"`
-	Recon        []Reconciliation `json:"reconciliation"`
-	Gates        []GateResult     `json:"gates"`
-	Findings     []Finding        `json:"findings"`
-	ActionNs     int64            `json:"action_ns"`
-	ScriptNs     int64            `json:"script_ns"`
-	InvocationNs []int64          `json:"invocation_ns,omitempty"`
+	Eligible  bool             `json:"eligible"`
+	Envelopes []Envelope       `json:"envelopes"`
+	Phases    []Phase          `json:"phases"`
+	Recon     []Reconciliation `json:"reconciliation"`
+	Gates     []GateResult     `json:"gates"`
+	Findings  []Finding        `json:"findings"`
+	ActionNs  int64            `json:"action_ns"`
+	// ActionGHNs is A_GH: the GitHub step's own whole-second elapsed. It is a
+	// DIAGNOSTIC and never enters a gate, a balance or a prediction; it is
+	// recorded so a reader can see the action envelope against the step
+	// GitHub thinks ran.
+	ActionGHNs int64 `json:"action_gh_ns,omitempty"`
+	// BootstrapGapNs is the action-step time before AT_start — installing the
+	// wrapper, because there is no wrapper to read a clock until it exists.
+	// Derived from the step attempt at its resolution, explicitly not part of
+	// A, and reported rather than left invisible.
+	BootstrapGapNs int64   `json:"bootstrap_gap_ns,omitempty"`
+	ScriptNs       int64   `json:"script_ns"`
+	InvocationNs   []int64 `json:"invocation_ns,omitempty"`
 }
 
 // VerifyOptions selects what to verify and against which frozen documents.
@@ -130,6 +140,15 @@ type VerifyOptions struct {
 	// ETA-completeness gate cannot pass — which is the correct answer, not a
 	// reason to skip the gate.
 	RegistryPath string
+	// StepAttemptPath is the GitHub step-attempt diagnostic (A_GH). It is
+	// never a gate — GitHub reports seconds — but the contract requires it for
+	// identity sanity, and it is what makes the unmeasurable binary-install
+	// prefix visible instead of merely absent.
+	StepAttemptPath string
+	// InvocationsPath is the per-bucket invocation manifest: what the
+	// authorised plan rendered. Without it a measured Spec is an assertion
+	// travelling beside the plan rather than a claim checked against it.
+	InvocationsPath string
 	// ReplayPath is the independent Stage-2 replay attestation. Without it the
 	// records are bound to a receipt nobody re-derived, so the run cannot be
 	// scored: comparing the planner's account of its own output to itself
@@ -187,6 +206,8 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 				fmt.Sprintf("Stage 1 binds component registry %s but the supplied registry digests to %s", bound.registry, d))
 		}
 	}
+	verifyStepAttempt(v, opt, envelopes)
+	verifyInvocationIdentity(v, opt, envelopes, bound.stage2)
 	aeta := loadAeta(v, opt, registry, bound.stage2)
 	if registry != nil {
 		v.Findings = append(v.Findings, registry.CheckCompleteness(v.Phases, aeta)...)
@@ -245,6 +266,39 @@ type streamKey struct {
 	Ordinal  int
 }
 
+// boundaryCardinality is the rule that keeps a resumed stream honest.
+//
+// The action envelope is written by two processes — `wall begin` and `wall
+// end` — so a writer must be able to resume an existing stream. That
+// necessity is also a hazard: a correctly chained SECOND lifecycle appended to
+// the same stream would be silently widened into one apparent interval, first
+// start to last end, and a retry would read as a single long action. Exactly
+// one start and exactly one end per stream; anything else is a duplicate or a
+// retry, and both are terminal.
+func checkBoundaryCardinality(v *Verdict, key streamKey, recs []Record) {
+	starts, ends := 0, 0
+	for _, r := range recs {
+		if r.Kind != "boundary" {
+			continue
+		}
+		switch r.Boundary {
+		case "start":
+			starts++
+		case "end":
+			ends++
+		}
+	}
+	label := fmt.Sprintf("%s/%s[%d]", key.Producer, key.Level, key.Ordinal)
+	if starts > 1 {
+		v.add("WT-020", SeverityTerminal,
+			fmt.Sprintf("%s has %d start records; a second lifecycle in one stream is a duplicate or a retry, not a longer interval", label, starts))
+	}
+	if ends > 1 {
+		v.add("WT-020", SeverityTerminal,
+			fmt.Sprintf("%s has %d end records; a second lifecycle in one stream is a duplicate or a retry, not a longer interval", label, ends))
+	}
+}
+
 func groupStreams(recs []Record) map[streamKey][]Record {
 	out := map[streamKey][]Record{}
 	for _, r := range recs {
@@ -264,6 +318,8 @@ func groupStreams(recs []Record) map[streamKey][]Record {
 func verifyChains(v *Verdict, streams map[streamKey][]Record) {
 	for _, key := range sortedKeys(streams) {
 		recs := streams[key]
+		checkBoundaryCardinality(v, key, recs)
+		checkProducerConsistency(v, key, recs)
 		var prev Digest
 		for i, r := range recs {
 			if r.Schema != SchemaVersion {
@@ -294,6 +350,45 @@ func verifyChains(v *Verdict, streams map[streamKey][]Record) {
 			}
 			prev = r.Hash
 		}
+	}
+}
+
+// checkProducerConsistency refuses a stream written by two execution contexts.
+//
+// Streams are grouped by producer and level, not by ProducerID, because the
+// action stream is legitimately written by two processes. But those two must
+// be the same ROLE from the same binary; a stream carrying records from an
+// unrelated context is two runs' evidence in one file.
+func checkProducerConsistency(v *Verdict, key streamKey, recs []Record) {
+	seen := map[string]bool{}
+	for _, r := range recs {
+		if r.ProducerID != "" {
+			seen[r.ProducerID] = true
+		}
+	}
+	if len(seen) <= 1 {
+		return
+	}
+	// Two contexts are admissible only at the action level, where `wall begin`
+	// and `wall end` are genuinely different processes. Even there, they must
+	// agree on the binary — the part before the '#'.
+	binaries := map[string]bool{}
+	for id := range seen {
+		if i := strings.IndexByte(id, '#'); i >= 0 {
+			binaries[id[:i]] = true
+		} else {
+			binaries[id] = true
+		}
+	}
+	if key.Level != LevelAction {
+		v.add("WT-020", SeverityTerminal,
+			fmt.Sprintf("%s/%s[%d] was written by %d execution contexts; only the action stream spans two processes",
+				key.Producer, key.Level, key.Ordinal, len(seen)))
+		return
+	}
+	if len(binaries) > 1 {
+		v.add("WT-020", SeverityTerminal,
+			fmt.Sprintf("%s/%s[%d] was written by %d different binaries", key.Producer, key.Level, key.Ordinal, len(binaries)))
 	}
 }
 
@@ -929,6 +1024,109 @@ func loadRegistry(v *Verdict, opt VerifyOptions) *AetaRegistry {
 	return &r
 }
 
+// verifyStepAttempt cross-checks the action envelope against the one GitHub
+// step attempt it claims to be, and records A_GH and the bootstrap gap.
+//
+// The contract makes this diagnostic non-gating and still requires it: without
+// it, a ledger cannot say WHICH step it measured, and the action-step time
+// before AT_start — the wrapper's own installation — is invisible rather than
+// merely unmeasurable.
+func verifyStepAttempt(v *Verdict, opt VerifyOptions, envs []Envelope) {
+	var action *Envelope
+	for i := range envs {
+		if envs[i].Level == LevelAction {
+			action = &envs[i]
+		}
+	}
+	if opt.StepAttemptPath == "" {
+		if action != nil {
+			v.add("WT-022", SeverityIneligible,
+				"no GitHub step-attempt diagnostic was supplied, so the action envelope is not linked to the step that ran and the pre-AT_start bootstrap is unaccounted")
+		}
+		return
+	}
+	var doc StepAttemptDocument
+	if err := ReadJSONFile(opt.StepAttemptPath, &doc); err != nil {
+		v.add("WT-022", SeverityIneligible, fmt.Sprintf("step attempt: %v", err))
+		return
+	}
+	if doc.Kind != AGHKind {
+		v.add("WT-022", SeverityIneligible, fmt.Sprintf("step-attempt document kind %q, want %q", doc.Kind, AGHKind))
+		return
+	}
+	if action == nil || !action.Physical.OK {
+		v.add("WT-022", SeverityIneligible, "a step attempt was supplied but no complete action envelope was recorded")
+		return
+	}
+	for _, p := range doc.Attempt.CheckIdentity(v.Run, action.Physical.start, action.Physical.end) {
+		v.add("WT-022", SeverityIneligible, "step-attempt identity: "+p)
+	}
+	if ns, err := doc.Attempt.ElapsedNs(); err == nil {
+		v.ActionGHNs = ns
+	}
+	if gap, err := doc.Attempt.BootstrapGapNs(action.Physical.start); err == nil {
+		v.BootstrapGapNs = gap
+	}
+}
+
+// verifyInvocationIdentity compares every measured invocation against what the
+// authorised plan rendered: the argv, the working directory, the selector, the
+// unit membership and the atom closure.
+//
+// This is the check that makes the atom and slice controls MEASURED rather
+// than merely planned. Two legal name slices of one file share a description
+// and differ in their selector and unit membership; without this comparison a
+// run could measure one and report the other, and every planner-side test
+// would still be green.
+func verifyInvocationIdentity(v *Verdict, opt VerifyOptions, envs []Envelope, stage2 Digest) {
+	var measured []Envelope
+	for _, e := range envs {
+		if e.Level == LevelInvocation {
+			measured = append(measured, e)
+		}
+	}
+	if opt.InvocationsPath == "" {
+		if len(measured) > 0 {
+			v.add("WT-021", SeverityIneligible,
+				"no invocation manifest was supplied, so the measured argv, selector, unit membership and atom closure are not checked against the authorised plan")
+		}
+		return
+	}
+	var m InvocationManifest
+	if err := ReadJSONFile(opt.InvocationsPath, &m); err != nil {
+		v.add("WT-021", SeverityIneligible, fmt.Sprintf("invocation manifest: %v", err))
+		return
+	}
+	if m.Kind != InvocationManifestKind {
+		v.add("WT-021", SeverityIneligible, fmt.Sprintf("invocation manifest kind %q, want %q", m.Kind, InvocationManifestKind))
+		return
+	}
+	if stage2 != "" && m.Stage2 != stage2 {
+		v.add("WT-021", SeverityIneligible,
+			fmt.Sprintf("the invocation manifest names Stage-2 %s, not the verified %s", m.Stage2, stage2))
+	}
+	if len(m.Invocations) != len(measured) {
+		v.add("WT-021", SeverityIneligible,
+			fmt.Sprintf("the plan rendered %d invocation(s) but %d were measured", len(m.Invocations), len(measured)))
+	}
+	for _, e := range measured {
+		planned, ok := m.Find(e.Seq)
+		if !ok {
+			v.add("WT-021", SeverityIneligible,
+				fmt.Sprintf("invocation[%d] was measured but the authorised plan rendered no such invocation", e.Seq))
+			continue
+		}
+		if e.Spec == nil {
+			v.add("WT-021", SeverityIneligible,
+				fmt.Sprintf("invocation[%d] carries no spec, so what it ran cannot be compared to what was planned", e.Seq))
+			continue
+		}
+		for _, p := range planned.Compare(*e.Spec) {
+			v.add("WT-021", SeverityIneligible, fmt.Sprintf("invocation[%d] %s", e.Seq, p))
+		}
+	}
+}
+
 // loadAeta reads the pre-action forecast and RE-DERIVES it from the frozen
 // template. A forecast that is merely well-formed proves nothing: the whole
 // point of the two-stage freeze is that Stage 2 could only instantiate, so the
@@ -1110,6 +1308,13 @@ func (v *Verdict) Write(out io.Writer) error {
 		for _, f := range v.Findings {
 			fmt.Fprintf(w, "  %s\t%s\t%s\n", f.Code, f.Severity, f.Detail)
 		}
+	}
+	if v.ActionGHNs > 0 {
+		// A_GH and the bootstrap gap are printed together with A so the
+		// relationship is visible: the step is longer than the envelope, and
+		// the difference is named rather than left for a reader to wonder about.
+		fmt.Fprintf(w, "\nGitHub step (A_GH, whole seconds, diagnostic only)\t%s\n", dur(v.ActionGHNs))
+		fmt.Fprintf(w, "  of which before AT_start (wrapper install)\t%s\n", dur(v.BootstrapGapNs))
 	}
 	fmt.Fprintf(w, "\ncomplete: %v\teligible: %v\n", v.Complete, v.Eligible)
 	if v.Eligible {

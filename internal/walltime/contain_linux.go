@@ -49,7 +49,15 @@ func newContainment(name string, parent *ContainmentIdentity) (Containment, erro
 // identity survive a path being reused.
 func newCgroupUnder(root, name string) (Containment, error) {
 	dir := filepath.Join(root, name)
-	if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
+	// The containment must be FRESH. An existing directory has an unknown
+	// history — a previous run's members, a previous run's lifecycle — and
+	// observing it would attribute someone else's processes to this envelope.
+	// This is a hard failure, not a fallback to the unscored primitive: a name
+	// collision here means two runs believe they own the same containment.
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("walltime: containment %s already exists; a lifecycle must begin in a fresh containment, not one with an unknown history", dir)
+		}
 		return newProcessGroupContainment(name, fmt.Sprintf("mkdir %s: %v", dir, err))
 	}
 	info, err := os.Stat(dir)
@@ -103,11 +111,18 @@ func (c *cgroup2) Observe(observer string) (RawEvent, bool, error) {
 	if err != nil {
 		return RawEvent{}, false, err
 	}
+	// The membership snapshot is taken with the same observation, so
+	// "unpopulated" comes with the list that was empty rather than as a bare
+	// boolean. A read error here is not fatal: the events file is the
+	// authority on emptiness, and the snapshot is corroborating evidence.
+	procs, _ := c.Procs()
 	id := newRawEventID(observer)
 	ev := RawEvent{
 		ID:     id,
 		Digest: DigestBytes(append([]byte(id+"\x00"), b...)),
 		Source: SourceContainment,
+		Bytes:  b,
+		Procs:  procs,
 	}
 	return ev, cgroupPopulated(b), nil
 }

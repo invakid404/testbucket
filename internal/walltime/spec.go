@@ -37,6 +37,71 @@ func MarshalSpec(s InvocationSpec) (string, error) {
 	return string(b), nil
 }
 
+// InvocationManifestKind identifies the per-bucket document that says what
+// each rendered invocation was PLANNED to be.
+const InvocationManifestKind = "tb.walltime.invocations/v1"
+
+// InvocationIdentity is one rendered invocation as the authorised plan
+// rendered it.
+type InvocationIdentity struct {
+	Seq            int      `json:"seq"`
+	ArgvDigest     Digest   `json:"argv_digest"`
+	Cwd            string   `json:"cwd"`
+	SelectorDigest Digest   `json:"selector_digest"`
+	UnitDigest     Digest   `json:"unit_digest"`
+	AtomDigest     Digest   `json:"atom_digest"`
+	Units          []string `json:"units"`
+	Atoms          []string `json:"atoms,omitempty"`
+}
+
+// InvocationManifest is what the verifier compares each measured invocation
+// record against.
+//
+// Without it a wrapper's Spec travels BESIDE the plan rather than being
+// checked against it: a verifier could confirm that a record names some argv
+// and some selector, but not that they are the ones the authorised plan
+// rendered — and for two legal name slices of one file, "some selector" is
+// exactly the difference that matters.
+type InvocationManifest struct {
+	Kind        string               `json:"kind"`
+	Stage2      Digest               `json:"stage2_digest"`
+	BucketIndex int                  `json:"bucket"`
+	BucketName  string               `json:"bucket_name"`
+	Invocations []InvocationIdentity `json:"invocations"`
+}
+
+// Find returns the planned identity of one invocation.
+func (m InvocationManifest) Find(seq int) (InvocationIdentity, bool) {
+	for _, inv := range m.Invocations {
+		if inv.Seq == seq {
+			return inv, true
+		}
+	}
+	return InvocationIdentity{}, false
+}
+
+// Compare checks a measured spec against the planned identity and reports
+// every disagreement.
+func (i InvocationIdentity) Compare(spec SpecIdentity) []string {
+	var problems []string
+	if spec.ArgvDigest != i.ArgvDigest {
+		problems = append(problems, fmt.Sprintf("argv digest %s, planned %s", spec.ArgvDigest, i.ArgvDigest))
+	}
+	if spec.Cwd != i.Cwd {
+		problems = append(problems, fmt.Sprintf("cwd %q, planned %q", spec.Cwd, i.Cwd))
+	}
+	if spec.SelectorDigest != i.SelectorDigest {
+		problems = append(problems, fmt.Sprintf("selector digest %s, planned %s", spec.SelectorDigest, i.SelectorDigest))
+	}
+	if spec.UnitDigest != i.UnitDigest {
+		problems = append(problems, fmt.Sprintf("unit membership digest %s, planned %s", spec.UnitDigest, i.UnitDigest))
+	}
+	if spec.AtomDigest != i.AtomDigest {
+		problems = append(problems, fmt.Sprintf("atom digest %s, planned %s", spec.AtomDigest, i.AtomDigest))
+	}
+	return problems
+}
+
 // LoadInvocationSpec reads a spec written by the generated script.
 func LoadInvocationSpec(path string) (*InvocationSpec, error) {
 	b, err := os.ReadFile(path)

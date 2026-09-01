@@ -39,6 +39,7 @@ func runWallStage1(args []string) error {
 	binary := fs.String("binary", "", "path to the exact binary asset being delivered")
 	attestation := fs.String("build-attestation", "", "build-attestation identity for that binary")
 	sourceProfile := fs.String("source-profile", "", "source-profile receipt JSON (required): the resolved Vitest closure")
+	storeReceipt := fs.String("store-receipt", "", "store receipt JSON (required): the admitted store's exact bytes, migration epoch, restore method, stale instant, and the classification of every row — including observed_zero, which is not a gap")
 	scorerPath := fs.String("scorer", "", "frozen scorer whose sealed training lineage this manifest binds")
 	registryPath := fs.String("registry", "", "frozen Aeta component-registry template")
 	runnerImage := fs.String("runner-image", "", "immutable runner image identity, e.g. ubuntu-24.04@sha256:… — never an alias such as ubuntu-latest, which two arms could resolve differently")
@@ -90,10 +91,14 @@ func runWallStage1(args []string) error {
 	if err := walltime.ReadJSONFile(*sourceProfile, &profile); err != nil {
 		return err
 	}
+	var store walltime.StoreReceipt
+	if err := walltime.ReadJSONFile(*storeReceipt, &store); err != nil {
+		return err
+	}
 
 	m := walltime.Stage1Manifest{
 		Kind: walltime.Stage1Kind, Role: *role, Bundle: bundle,
-		SourceProfile: profile, Actions: map[string]walltime.ActionIdentity{},
+		SourceProfile: profile, Store: store, Actions: map[string]walltime.ActionIdentity{},
 	}
 	// Each action directory is digested as the contract specifies — sorted
 	// (relative path, mode, sha256), symlinks rejected — so "the action that

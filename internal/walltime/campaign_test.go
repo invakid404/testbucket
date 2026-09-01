@@ -103,7 +103,7 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 // and passes it.
 func TestCampaignIndexAuthenticatesEveryRow(t *testing.T) {
 	idx, loader, keys, _ := campaignFixture(t)
-	gates, problems := EvaluateCampaignIndex(idx, loader, keys)
+	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign")
 	if len(problems) != 0 {
 		t.Fatalf("an authenticated campaign reported problems: %v", problems)
 	}
@@ -199,6 +199,16 @@ func TestCampaignIndexRefusals(t *testing.T) {
 			want: "no authority key was predeclared",
 		},
 		{
+			name: "a manifest approved by another protected environment",
+			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
+				m := l.manifests["candidate.json"]
+				if err := m.Sign("some-other-environment", key); err != nil {
+					panic(err)
+				}
+			},
+			want: "not the required",
+		},
+		{
 			name: "an index that names no campaign",
 			edit: func(i *CampaignIndex, l memoryLoader, _ ed25519.PrivateKey) { i.CampaignID = "" },
 			want: "names no campaign",
@@ -213,7 +223,7 @@ func TestCampaignIndexRefusals(t *testing.T) {
 			if tc.keys != nil {
 				keys = tc.keys(keys)
 			}
-			gates, problems := EvaluateCampaignIndex(idx, loader, keys)
+			gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign")
 			if len(problems) == 0 {
 				t.Fatalf("the campaign authenticated")
 			}
@@ -236,7 +246,7 @@ func TestCampaignIndexRefusals(t *testing.T) {
 func TestUnauthenticatedRowsNeverReachTheArithmetic(t *testing.T) {
 	idx, loader, keys, _ := campaignFixture(t)
 	loader.verdicts["candidate-0-0.json"].Eligible = false
-	gates, _ := EvaluateCampaignIndex(idx, loader, keys)
+	gates, _ := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign")
 	if len(gates) != 1 || gates[0].Name != "campaign:authenticated-population" {
 		t.Fatalf("the arithmetic ran on an unauthenticated population: %d gate(s)", len(gates))
 	}

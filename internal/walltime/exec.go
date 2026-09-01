@@ -193,11 +193,12 @@ func Exec(opt ExecOptions) (int, error) {
 	traceErr := trace.close(deadline)
 	peerErr := peer.close(deadline)
 
+	members, note := membershipSnapshot(cont)
 	if _, err := w.Append(Record{
 		Kind: "process_tree", Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
 		Source: SourceProcessLifecycle, Seqno: opt.Seq, Run: opt.Run,
 		Containment: cont.Identity(), Proc: proc, Instant: clock.Now(),
-		Note: membershipNote(cont),
+		RawProcs: members, Note: note,
 	}); err != nil {
 		return code, err
 	}
@@ -374,12 +375,15 @@ func waitContainmentEmpty(cont Containment, deadline time.Time) error {
 	}
 }
 
-func membershipNote(cont Containment) string {
+// membershipSnapshot returns the containment membership at close. The LIST is
+// retained, not a count: "0 members" and "these are the members" answer
+// different questions, and only the second one lets a reader check the first.
+func membershipSnapshot(cont Containment) ([]int, string) {
 	pids, err := cont.Procs()
 	if err != nil {
-		return "cgroup.procs unreadable: " + err.Error()
+		return nil, "cgroup.procs unreadable: " + err.Error()
 	}
-	return fmt.Sprintf("cgroup.procs members at close: %d", len(pids))
+	return pids, fmt.Sprintf("cgroup.procs members at close: %d", len(pids))
 }
 
 // ObserverLauncher builds the command that runs one independent observer. It

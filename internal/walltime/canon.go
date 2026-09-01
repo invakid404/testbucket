@@ -55,6 +55,23 @@ func DigestJSON(v any) (Digest, error) {
 	return DigestBytes(b), nil
 }
 
+// DigestJSONOrEmpty digests a value, or returns the empty digest when there is
+// nothing to digest. It exists so a renderer can fill an identity field
+// without deciding what an absent identity hashes to.
+func DigestJSONOrEmpty(v any) Digest {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.([]string); ok && len(s) == 0 {
+		return ""
+	}
+	d, err := DigestJSON(v)
+	if err != nil {
+		return ""
+	}
+	return d
+}
+
 // CanonicalJSON renders v as RFC 8785 canonical JSON: object members sorted by
 // UTF-16 code unit, no insignificant whitespace, minimal string escapes, and
 // ECMAScript number formatting.

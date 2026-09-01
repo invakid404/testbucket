@@ -143,7 +143,7 @@ func runWallBundle(args []string) error {
 		DiscoveryArgv: discoveryArgv(*vitestCommand, *vitestDiscovery, *vitestDiscoveryCommand),
 		Discovery:     discovery, Runnables: runnables,
 		Env: planningEnv(), Executables: resolvedExecutables(*vitestCommand),
-		Tools:      map[string]string{},
+		Tools:      resolvedTools(*root),
 		Repository: *repository, Commit: *commit, Tree: *tree,
 		EventsDir: *eventsDir, FileParallelism: *fileParallelism, WallDir: *wallDir,
 	})
@@ -206,6 +206,33 @@ func resolvedExecutables(command string) map[string]string {
 		out[base[0]] = p
 	} else {
 		out[base[0]] = "unresolved"
+	}
+	return out
+}
+
+// resolvedTools records the versions of the tools that produced the discovery
+// snapshot. An executable PATH says which file ran; a version says what it
+// was, and the same path on two runners can be two different toolchains.
+//
+// A tool that cannot be interrogated is recorded as unresolved rather than
+// omitted: "we could not tell" is a bound fact, and a missing key is not.
+func resolvedTools(root string) map[string]string {
+	out := map[string]string{}
+	for _, tool := range []struct {
+		name string
+		argv []string
+	}{
+		{"node", []string{"node", "--version"}},
+		{"npm", []string{"npm", "--version"}},
+	} {
+		cmd := exec.Command(tool.argv[0], tool.argv[1:]...)
+		cmd.Dir = root
+		b, err := cmd.Output()
+		if err != nil {
+			out[tool.name] = "unresolved"
+			continue
+		}
+		out[tool.name] = strings.TrimSpace(string(b))
 	}
 	return out
 }
@@ -522,6 +549,15 @@ func writeDerivedDocuments(o frozenPlanOptions, res *planbind.Result) error {
 			if err := walltime.WriteJSONFile(filepath.Join(o.outDir, fmt.Sprintf("pcheck-%d.json", b.Index)), pcheck); err != nil {
 				return err
 			}
+		}
+		// What the plan rendered for this bucket, so the verifier can compare
+		// each measured invocation to it rather than take the wrapper's word.
+		manifest, err := planbind.InvocationManifestFor(res.Doc, b.Index, stage2)
+		if err != nil {
+			return err
+		}
+		if err := walltime.WriteJSONFile(filepath.Join(o.outDir, fmt.Sprintf("invocations-%d.json", b.Index)), manifest); err != nil {
+			return err
 		}
 		if registry == nil {
 			continue

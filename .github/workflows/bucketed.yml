@@ -53,7 +53,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Bucketed: the plan -> matrix -> test -> record loop, consumed exactly the way
   # a downstream repo consumes it — through the reusable workflow, whose composite
-  # actions resolve to this repo at this commit (the `$/` self-reference). The
+  # actions resolve to this repo at this commit (a `./` local reference). The
   # single K knob is `k`; a real consumer suite runs it at 6+.
   bucketed:
     uses: ./.github/workflows/bucketed-reusable.yml

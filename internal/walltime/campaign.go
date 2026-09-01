@@ -79,7 +79,7 @@ func (FileCampaignLoader) Manifest(path string) (*Stage1Manifest, error) {
 // enumerated candidate tuple; and every manifest is signed by a predeclared
 // authority. A number that survives all of that is evidence. A number in a
 // JSON file is not.
-func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []string) ([]CampaignPair, []string) {
+func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []string, authority string) ([]CampaignPair, []string) {
 	var problems []string
 	if index.Kind != CampaignIndexKind {
 		problems = append(problems, fmt.Sprintf("campaign index kind is %q, want %q", index.Kind, CampaignIndexKind))
@@ -93,8 +93,8 @@ func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []st
 
 	var pairs []CampaignPair
 	for i, ref := range index.Pairs {
-		baseline, bm, bp := loadArm(index, ref.Baseline, "baseline", i, loader, authorityKeys)
-		candidate, cm, cp := loadArm(index, ref.Candidate, "candidate", i, loader, authorityKeys)
+		baseline, bm, bp := loadArm(index, ref.Baseline, "baseline", i, loader, authorityKeys, authority)
+		candidate, cm, cp := loadArm(index, ref.Candidate, "candidate", i, loader, authorityKeys, authority)
 		problems = append(problems, bp...)
 		problems = append(problems, cp...)
 		if bm != nil && cm != nil {
@@ -109,7 +109,7 @@ func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []st
 
 // loadArm authenticates one arm and returns its run, its manifest and every
 // reason it is not admissible.
-func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader CampaignLoader, authorityKeys []string) (CampaignRun, *Stage1Manifest, []string) {
+func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader CampaignLoader, authorityKeys []string, authority string) (CampaignRun, *Stage1Manifest, []string) {
 	where := fmt.Sprintf("pair %d %s run %q", pair, role, arm.RunID)
 	var problems []string
 	run := CampaignRun{RunID: arm.RunID, StartedAt: arm.StartedAt, Terminal: arm.Terminal}
@@ -130,6 +130,12 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 			problems = append(problems, fmt.Sprintf("%s: %v", where, err))
 		} else if err := VerifySigned(m.Signature, d, authorityKeys); err != nil {
 			problems = append(problems, fmt.Sprintf("%s manifest authority: %v", where, err))
+		} else if authority != "" && m.Signature.Authority != authority {
+			// A key is WHO signed; the authority is WHICH protected
+			// environment approved. Checking only the key would accept a
+			// manifest approved by a different environment that happens to
+			// share a signer.
+			problems = append(problems, fmt.Sprintf("%s manifest names authority %q, not the required %q", where, m.Signature.Authority, authority))
 		} else {
 			manifest, manifestDigest = m, d
 		}
@@ -179,8 +185,8 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 // population, then apply the frozen rule to it. A campaign that cannot be
 // authenticated does not reach the arithmetic, because a ratio over
 // unauthenticated rows answers a question nobody asked.
-func EvaluateCampaignIndex(index CampaignIndex, loader CampaignLoader, authorityKeys []string) ([]GateResult, []string) {
-	pairs, problems := LoadCampaign(index, loader, authorityKeys)
+func EvaluateCampaignIndex(index CampaignIndex, loader CampaignLoader, authorityKeys []string, authority string) ([]GateResult, []string) {
+	pairs, problems := LoadCampaign(index, loader, authorityKeys, authority)
 	sort.Strings(problems)
 	if len(problems) > 0 {
 		return []GateResult{{

@@ -68,6 +68,7 @@ func (p *processGroup) Observe(observer string) (RawEvent, bool, error) {
 	state := "populated=" + strconv.FormatBool(populated) + ";pgid=" + strconv.Itoa(pgid)
 	return RawEvent{
 		ID:     id,
+		Bytes:  []byte(state),
 		Digest: DigestBytes([]byte(id + "\x00" + state)),
 		// A process-group probe is a process-lifecycle observation, not a
 		// containment event; naming it honestly is what lets the verifier see

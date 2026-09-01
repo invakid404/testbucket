@@ -36,6 +36,17 @@ type RawEvent struct {
 	// Source is the taxonomy class; only SourceContainment and
 	// SourceProcessLifecycle may delimit a lifecycle.
 	Source string
+	// Bytes is the EXACT kernel output this observation was derived from, and
+	// it is retained rather than hashed away. A digest proves a record was not
+	// edited; it does not let anyone else re-read what the kernel actually
+	// said. The contract asks for retained raw evidence, and a digest of
+	// discarded bytes is not evidence, it is a receipt for evidence.
+	Bytes []byte
+	// Procs is the containment membership snapshot taken with the same read:
+	// which processes were in the containment when this transition was
+	// observed. "Populated: no" with a membership list is checkable; a boolean
+	// is a claim.
+	Procs []int
 }
 
 // Containment is the level-owned process container. The physical wrapper

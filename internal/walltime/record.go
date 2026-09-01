@@ -209,6 +209,12 @@ type Record struct {
 	// identity matches.
 	RawEventID     string `json:"raw_event_id,omitempty"`
 	RawEventDigest Digest `json:"raw_event_digest,omitempty"`
+	// RawEventBytes is the exact kernel output the endpoint was derived from,
+	// retained so a later reader can re-derive the conclusion rather than
+	// trust it. RawProcs is the containment membership snapshot taken with the
+	// same read.
+	RawEventBytes []byte `json:"raw_event_bytes,omitempty"`
+	RawProcs      []int  `json:"raw_procs,omitempty"`
 	// Phase names a trace phase (invocation lifecycle, inter-invocation gap,
 	// script epilogue).
 	Phase string `json:"phase,omitempty"`

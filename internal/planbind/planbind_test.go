@@ -20,7 +20,7 @@ const discoveryJSON = `[{"file":"tests/alpha.spec.ts"},{"file":"tests/beta.spec.
 const storeJSON = `{
   "schema": 1,
   "flags": "vitest",
-  "updated_at": "2026-08-20T00:00:00Z",
+  "updated_at": "2026-08-30T00:00:00Z",
   "units": {
     "tests/alpha.spec.ts": {"seconds": 90, "samples": 4, "split": "run", "split_into": 2,
       "tests": {"alpha one": 60, "alpha two": 30}},
@@ -195,10 +195,12 @@ func TestColdStartIsBoundAsAColdStart(t *testing.T) {
 		Root: root, Runner: "vitest", Instant: time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC),
 		StaleAfter: 14 * 24 * time.Hour, K: 2, Count: 1, Token: "vitest",
 		StorePath: filepath.Join(root, "absent.json"), StoreAbsent: true,
-		Discovery:   []byte(discoveryJSON),
-		Executables: map[string]string{"npx": "/usr/local/bin/npx"},
-		Env:         map[string]string{},
-		Repository:  "example/mandel", Commit: testCommit, Tree: "sha256:tree",
+		Discovery:     []byte(discoveryJSON),
+		DiscoveryArgv: []string{"npx", "vitest", "list", "--filesOnly", "--json"},
+		Executables:   map[string]string{"npx": "/usr/local/bin/npx"},
+		Tools:         map[string]string{"node": "24.19.0"},
+		Env:           map[string]string{},
+		Repository:    "example/mandel", Commit: testCommit, Tree: "sha256:tree",
 	})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
@@ -243,5 +245,38 @@ func TestWallRenderedScriptCarriesItsSpecs(t *testing.T) {
 	}
 	if res.Receipt.ScriptDigest == plainRes.Receipt.ScriptDigest {
 		t.Errorf("wrapping every invocation did not change the script digest")
+	}
+}
+
+// TestFrozenPlanRefusesAStaleStore is the warm-evidence rule at the only place
+// a warm claim is made.
+//
+// The everyday planner warns about a stale store and carries on — that is
+// v0.2.2 behaviour and consumers depend on it. The frozen path is different:
+// it is where a scored row's weights come from, and the contract says a stale
+// store is not warm evidence, so planning from one is refused rather than
+// annotated.
+func TestFrozenPlanRefusesAStaleStore(t *testing.T) {
+	root := t.TempDir()
+	b := acquire(t, root, func(o *AcquireOptions) {
+		// The fixture store was recorded on 2026-08-30; move the canonical
+		// instant well past the frozen 14-day policy.
+		o.Instant = time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	})
+	_, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	if err == nil {
+		t.Fatalf("the frozen path planned from a stale store")
+	}
+	if !strings.Contains(err.Error(), "not warm evidence") {
+		t.Errorf("error %q does not say why a stale store is inadmissible", err)
+	}
+
+	// Inside the policy it plans normally: the rule is about staleness, not
+	// about age.
+	fresh := acquire(t, root, func(o *AcquireOptions) {
+		o.Instant = time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	})
+	if _, err := Plan(context.Background(), PlanOptions{Bundle: fresh, Stage1: "sha256:stage1"}); err != nil {
+		t.Errorf("a store inside the stale policy was refused: %v", err)
 	}
 }

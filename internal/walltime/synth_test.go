@@ -72,6 +72,21 @@ func newSynthRun(dir string) *synthRun {
 	}
 }
 
+// spec is invocation i's identity, built once so the records and the
+// invocation manifest that checks them cannot drift apart in the fixture the
+// way they must not drift apart in production.
+func (s *synthRun) spec(i int) SpecIdentity {
+	argv := []string{"vitest", "run", fmt.Sprintf("./t%d.spec.ts", i)}
+	selector := []string{fmt.Sprintf("t%d.spec.ts", i)}
+	return SpecIdentity{
+		ArgvDigest:     mustDigest(argv),
+		Cwd:            "/repo",
+		SelectorDigest: mustDigest(selector),
+		UnitDigest:     mustDigest([]string{fmt.Sprintf("t%d.spec.ts", i)}),
+		Desc:           fmt.Sprintf("t%d.spec.ts", i),
+	}
+}
+
 // mutation is applied to a record just before it is written, so a test can
 // break exactly one invariant.
 type mutation func(level Level, seq int, producer Producer, boundary string, r *Record)
@@ -85,12 +100,8 @@ func (s *synthRun) write(t *testing.T, mutate mutation) {
 	s.writeLevel(t, LevelAction, 0, actionStart, actionEnd, nil, mutate)
 	s.writeLevel(t, LevelScript, 0, scriptStart, scriptEnd, nil, mutate)
 	for i, inv := range s.invocations {
-		spec := &SpecIdentity{
-			ArgvDigest: mustDigest([]string{"vitest", "run", fmt.Sprintf("./t%d.spec.ts", i)}),
-			Cwd:        "/repo",
-			Desc:       fmt.Sprintf("t%d.spec.ts", i),
-		}
-		s.writeLevel(t, LevelInvocation, i, inv[0], inv[1], spec, mutate)
+		spec := s.spec(i)
+		s.writeLevel(t, LevelInvocation, i, inv[0], inv[1], &spec, mutate)
 	}
 }
 
@@ -108,7 +119,12 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 	}
 	peerStart, peerEnd := start+s.bootstrapNs, end-s.suffixNs
 	traceStart, traceEnd := peerStart+s.peerLeadNs, peerEnd-s.peerLeadNs
-	run := RunIdentity{BucketID: "b1", RunID: "r1", Stage2: s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001"}
+	run := RunIdentity{
+		CampaignID: "ewj2", BucketID: "b1", RunID: "r1",
+		Repository: "example/mandel", WorkflowRun: "run-1", Job: "test",
+		Step: "run-bucket", StepAttempt: "1",
+		Stage2: s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+	}
 
 	type point struct {
 		producer Producer

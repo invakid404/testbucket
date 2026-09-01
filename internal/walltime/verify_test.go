@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // frozenDocs is the set of documents a SCORABLE run must be bound to: the
@@ -16,13 +17,15 @@ import (
 // component registry, the instantiated pre-action forecast, and the
 // post-render Pcheck projection.
 type frozenDocs struct {
-	stage1   string
-	stage2   string
-	registry string
-	aeta     string
-	pcheck   string
-	replay   string
-	digest   Digest
+	stage1      string
+	stage2      string
+	registry    string
+	aeta        string
+	pcheck      string
+	replay      string
+	invocations string
+	stepAttempt string
+	digest      Digest
 	// authority is the PREDECLARED public key of the protected environment.
 	// The verifier refuses to treat a signature as authority approval without
 	// one, so the fixture has to carry it the way a campaign would.
@@ -95,19 +98,53 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 		Value: signValue(key, rd),
 	}
 
+	// What the plan rendered for this bucket. The synthetic run's specs are
+	// built from the same values, so the verifier's comparison is exercised
+	// against a manifest that genuinely describes it.
+	manifest := InvocationManifest{
+		Kind: InvocationManifestKind, Stage2: r2, BucketIndex: 1, BucketName: "bucket-1",
+	}
+	for i := range s.invocations {
+		spec := s.spec(i)
+		manifest.Invocations = append(manifest.Invocations, InvocationIdentity{
+			Seq: i, ArgvDigest: spec.ArgvDigest, Cwd: spec.Cwd,
+			SelectorDigest: spec.SelectorDigest, UnitDigest: spec.UnitDigest,
+			AtomDigest: spec.AtomDigest,
+			Units:      []string{fmt.Sprintf("t%d.spec.ts", i)},
+		})
+	}
+
+	// The step attempt the action ran as. The synthetic records carry realtime
+	// brackets derived from their monotonic readings, so the window below is
+	// built from the same origin — widened, because the API reports seconds.
+	firstInv, lastInv := s.invocations[0], s.invocations[len(s.invocations)-1]
+	actionStart := firstInv[0] - 100_000_000 - 500_000_000
+	actionEnd := lastInv[1] + 80_000_000 + 300_000_000
+	step := StepAttemptDocument{Kind: AGHKind, Attempt: StepAttempt{
+		Repository: "example/mandel", WorkflowRun: "run-1", Job: "test",
+		Step: "run-bucket", Attempt: "1", Precision: "1s",
+		// The step starts before AT_start (the wrapper install) and ends after
+		// AT_end, which is what a real step attempt looks like.
+		StartedAt:   time.Unix(0, actionStart).UTC().Add(-3 * time.Second).Format(time.RFC3339),
+		CompletedAt: time.Unix(0, actionEnd).UTC().Add(2 * time.Second).Format(time.RFC3339),
+	}}
+
 	docs := frozenDocs{
-		stage1:    filepath.Join(dir, "stage1.json"),
-		stage2:    filepath.Join(dir, "stage2.json"),
-		registry:  filepath.Join(dir, "registry.json"),
-		aeta:      filepath.Join(dir, "aeta.json"),
-		pcheck:    filepath.Join(dir, "pcheck.json"),
-		replay:    filepath.Join(dir, "replay.json"),
-		digest:    r2,
-		authority: m.Signature.KeyID,
+		stage1:      filepath.Join(dir, "stage1.json"),
+		stage2:      filepath.Join(dir, "stage2.json"),
+		registry:    filepath.Join(dir, "registry.json"),
+		aeta:        filepath.Join(dir, "aeta.json"),
+		pcheck:      filepath.Join(dir, "pcheck.json"),
+		replay:      filepath.Join(dir, "replay.json"),
+		invocations: filepath.Join(dir, "invocations.json"),
+		stepAttempt: filepath.Join(dir, "step-attempt.json"),
+		digest:      r2,
+		authority:   m.Signature.KeyID,
 	}
 	for path, v := range map[string]any{
 		docs.stage1: m, docs.stage2: receipt, docs.registry: reg,
 		docs.aeta: aeta, docs.pcheck: pcheck, docs.replay: replay,
+		docs.invocations: manifest, docs.stepAttempt: step,
 	} {
 		if err := WriteJSONFile(path, v); err != nil {
 			t.Fatal(err)
@@ -192,6 +229,17 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	m.Consumer.Facade = "sha256:facade"
 	m.Consumer.Config = "sha256:config"
 	m.Consumer.Lockfile = "sha256:lock"
+	m.Store = StoreReceipt{
+		Digest: b.Store.Digest, Schema: 1, MigrationID: "store/v1", Token: "vitest",
+		CacheKey: "testbucket-timings-demo-v1", RestoreMethod: "exact-key",
+		StaleAt: "2099-01-01T00:00:00Z",
+		// A measured zero is its own state, not a gap.
+		Classifications: map[string]int{
+			RowObservedPositive: 3, RowObservedZero: 1, RowNoTests: 1,
+		},
+		Rows:     5,
+		Coverage: []string{"tests/alpha.spec.ts"},
+	}
 	m.SourceProfile = SourceProfileReceipt{
 		Repository: "example/mandel", Commit: testConsumerCommit, Facade: "sha256:facade",
 		Config: "sha256:config", Lockfile: "sha256:lock",
@@ -282,8 +330,9 @@ func verifySynth(t *testing.T, mutate mutation, tweak func(*synthRun)) *Verdict 
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
-		ReplayPath:    docs.replay,
-		AuthorityKeys: []string{docs.authority}, Authority: "ewj2-campaign",
+		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+		StepAttemptPath: docs.stepAttempt,
+		AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
 	})
 	if err != nil {
 		t.Fatalf("VerifyDir: %v", err)
@@ -580,6 +629,48 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			want: "unsigned",
 		},
 		{
+			name: "no invocation manifest to check the measured specs against",
+			opts: func(o *VerifyOptions) { o.InvocationsPath = "" },
+			want: "not checked against the authorised plan",
+		},
+		{
+			name: "a measured invocation that selected something else",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.invocations, func(m map[string]any) {
+					invs := m["invocations"].([]any)
+					invs[0].(map[string]any)["selector_digest"] = "sha256:another-selection"
+				})
+			},
+			want: "selector digest",
+		},
+		{
+			name: "a measured invocation covering different units",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.invocations, func(m map[string]any) {
+					invs := m["invocations"].([]any)
+					invs[1].(map[string]any)["unit_digest"] = "sha256:different-membership"
+				})
+			},
+			want: "unit membership digest",
+		},
+		{
+			name: "a plan that rendered more invocations than ran",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.invocations, func(m map[string]any) {
+					invs := m["invocations"].([]any)
+					m["invocations"] = append(invs, map[string]any{"seq": float64(9)})
+				})
+			},
+			want: "were measured",
+		},
+		{
+			name: "an invocation manifest for another plan",
+			edit: func(t *testing.T, docs frozenDocs) {
+				editJSON(t, docs.invocations, func(m map[string]any) { m["stage2_digest"] = "sha256:elsewhere" })
+			},
+			want: "invocation manifest names Stage-2",
+		},
+		{
 			name: "a forecast for another plan",
 			edit: func(t *testing.T, docs frozenDocs) {
 				editJSON(t, docs.aeta, func(m map[string]any) { m["stage2_digest"] = "sha256:elsewhere" })
@@ -600,8 +691,9 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			opts := VerifyOptions{
 				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
-				ReplayPath:    docs.replay,
-				AuthorityKeys: []string{docs.authority}, Authority: "ewj2-campaign",
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				StepAttemptPath: docs.stepAttempt,
+				AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
 			}
 			if tc.opts != nil {
 				tc.opts(&opts)
@@ -639,8 +731,9 @@ func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
 		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
-		ReplayPath:    docs.replay,
-		AuthorityKeys: []string{docs.authority},
+		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+		StepAttemptPath: docs.stepAttempt,
+		AuthorityKeys:   []string{docs.authority},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -840,5 +933,344 @@ func TestCompareArmsFindsEveryUnequalInvariant(t *testing.T) {
 	same := testManifest(testBundle(), regDigest)
 	if diffs := CompareArms(same, same); len(diffs) == 0 {
 		t.Errorf("two candidate manifests were accepted as a baseline/candidate pair")
+	}
+}
+
+// TestVerifierRefusesADuplicateLifecycle is the retry rule.
+//
+// The action stream is written by two processes, so a writer must be able to
+// resume it — and that necessity is the hazard: a correctly chained SECOND
+// lifecycle appended to the same stream would otherwise be widened into one
+// apparent interval, first start to last end, and a retried action would read
+// as a single long one.
+func TestVerifierRefusesADuplicateLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	s := newSynthRun(filepath.Join(dir, "records"))
+	s.write(t, nil)
+
+	// Append a second, correctly chained action lifecycle: exactly what a
+	// retry that resumed the stream would produce.
+	path := filepath.Join(s.dir, streamName(ProducerPhysical, LevelAction, 0))
+	recs, err := ReadRecords(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := NewSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWriter(path, ProducerPhysical, recs[0].ProducerID, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range recs {
+		if r.Kind != "boundary" {
+			continue
+		}
+		r.Instant.Mono += Nanos(60 * second)
+		if _, err := w.Append(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := VerifyDir(VerifyOptions{Dir: s.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Complete {
+		t.Errorf("a stream with two lifecycles verified as complete")
+	}
+	found := false
+	for _, f := range v.Findings {
+		if f.Code == "WT-020" && strings.Contains(f.Detail, "duplicate or a retry") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no WT-020 duplicate finding: %+v", v.Findings)
+	}
+}
+
+// TestRawEvidenceIsRetained: a digest proves a record was not edited; it does
+// not let anyone re-read what the kernel actually said. The contract asks for
+// retained raw evidence, and a digest of discarded bytes is a receipt for
+// evidence rather than evidence.
+func TestRawEvidenceIsRetained(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Exec(ExecOptions{
+		Level: LevelInvocation, Dir: dir, Cwd: dir, Timeout: 30 * time.Second,
+		Argv: []string{"sh", "-c", "true"},
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	recs, err := ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundaries, trees := 0, 0
+	for _, r := range recs {
+		switch {
+		case r.Kind == "boundary" && r.Producer != ProducerPhysical:
+			boundaries++
+			if len(r.RawEventBytes) == 0 {
+				t.Errorf("%s %s boundary retained no raw bytes, only a digest of them", r.Producer, r.Boundary)
+			}
+			if r.RawEventDigest == "" {
+				t.Errorf("%s %s boundary has no raw evidence digest", r.Producer, r.Boundary)
+			}
+		case r.Kind == "process_tree":
+			trees++
+			if r.Note == "" {
+				t.Errorf("the process-tree record carries no membership note")
+			}
+		}
+	}
+	if boundaries != 4 {
+		t.Errorf("saw %d peer/trace boundary records, want 4", boundaries)
+	}
+	if trees != 1 {
+		t.Errorf("saw %d process-tree records, want 1", trees)
+	}
+}
+
+// TestStoreReceiptDistinguishesEveryRowState is the store-provenance rule.
+//
+// A measured zero is a measurement. Folding it into "missing" would let a real
+// observation disappear into a gap, and the contract is explicit that
+// observed_zero stays distinct from missing, failed, cancelled and malformed —
+// and that a stale store or a restore-key fallback is not warm evidence at all.
+func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
+	base := func() StoreReceipt {
+		return StoreReceipt{
+			Digest: "sha256:store", Schema: 1, MigrationID: "store/v1", Token: "vitest",
+			CacheKey: "k", RestoreMethod: "exact-key", StaleAt: "2099-01-01T00:00:00Z",
+			Classifications: map[string]int{
+				RowObservedPositive: 3, RowObservedZero: 1, RowMissing: 1, RowFailed: 1,
+			},
+			Rows: 6,
+		}
+	}
+	if err := base().Validate(time.Time{}); err != nil {
+		t.Fatalf("a complete store receipt was rejected: %v", err)
+	}
+	// Every state the contract names is admissible and separately counted.
+	all := base()
+	all.Classifications = map[string]int{}
+	for i, state := range StoreRowStates {
+		all.Classifications[state] = i + 1
+	}
+	all.Rows = 0
+	for _, n := range all.Classifications {
+		all.Rows += n
+	}
+	if err := all.Validate(time.Time{}); err != nil {
+		t.Errorf("the full set of row states was rejected: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		edit func(*StoreReceipt)
+		now  time.Time
+		want string
+	}{
+		{"no migration epoch", func(r *StoreReceipt) { r.MigrationID = "" }, time.Time{}, "migration id"},
+		{"a restore-key fallback", func(r *StoreReceipt) { r.RestoreMethod = "restore-key-fallback" }, time.Time{}, "restore-key fallback"},
+		{"a stale store at the moment of use", func(r *StoreReceipt) { r.StaleAt = "2020-01-01T00:00:00Z" },
+			time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), "not warm evidence"},
+		{"a classification nobody defined", func(r *StoreReceipt) { r.Classifications["probably_fine"] = 1; r.Rows++ },
+			time.Time{}, "unknown row classification"},
+		{"counts that do not add up", func(r *StoreReceipt) { r.Rows = 99 }, time.Time{}, "count 6 rows but the store has 99"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := base()
+			tc.edit(&r)
+			err := r.Validate(tc.now)
+			if err == nil {
+				t.Fatalf("the receipt validated")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestCompareArmsCatchesEveryBundleAndInstrumentationDifference: the rule is
+// stated as an exclusion, so it is implemented as one. Digesting the whole
+// bundle and the whole instrumentation identity is what stops a field like
+// file_parallelism or the raw-source taxonomy from going uncompared because
+// nobody remembered to add it to a list.
+func TestCompareArmsCatchesEveryBundleAndInstrumentationDifference(t *testing.T) {
+	reg := testRegistry()
+	regDigest, err := reg.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := testManifest(testBundle(), regDigest)
+	baseline.Role = "baseline"
+
+	for _, tc := range []struct {
+		name string
+		edit func(*Stage1Manifest)
+	}{
+		{"a different intra-bucket parallelism", func(m *Stage1Manifest) { m.Bundle.Render.FileParallelism = 4 }},
+		{"a different records directory", func(m *Stage1Manifest) { m.Bundle.Render.WallDir = "/somewhere/else" }},
+		{"a different events directory", func(m *Stage1Manifest) { m.Bundle.Render.EventsDir = "/other/events" }},
+		{"different discovery bytes", func(m *Stage1Manifest) {
+			m.Bundle.Discovery = []RawSnapshot{NewRawSnapshot("d", []string{"x"}, "/repo", []byte("[]"))}
+		}},
+		{"a different parser version", func(m *Stage1Manifest) {
+			m.Bundle.Parsers[0].Version = "v9.9"
+		}},
+		{"a different digest implementation", func(m *Stage1Manifest) {
+			m.Bundle.Algorithms.FullPlan.Implementation = "some-other-build"
+		}},
+		{"a different acquisition environment", func(m *Stage1Manifest) {
+			m.Bundle.Acquisition.Env = map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": "other/"}
+		}},
+		{"a different absent-input claim", func(m *Stage1Manifest) {
+			m.Bundle.AbsentInputs = append(m.Bundle.AbsentInputs, "something else")
+		}},
+		{"a different peer binary", func(m *Stage1Manifest) {
+			m.Instrumentation.PeerBinary = Digest("sha256:" + strings.Repeat("99", 32))
+		}},
+		{"a different raw-source taxonomy", func(m *Stage1Manifest) {
+			m.Instrumentation.RawSourceTaxonomy = []string{SourceContainment}
+		}},
+		{"a different store receipt", func(m *Stage1Manifest) { m.Store.MigrationID = "store/v2" }},
+		{"a different allowed-difference matrix", func(m *Stage1Manifest) {
+			m.AllowedDifferences = []string{"anything we like"}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testManifest(testBundle(), regDigest)
+			tc.edit(&c)
+			if diffs := CompareArms(baseline, c); len(diffs) == 0 {
+				t.Errorf("the difference was not reported")
+			}
+		})
+	}
+}
+
+// TestStepAttemptIsIdentityNotAGate is the A_GH rule.
+//
+// GitHub reports step timestamps at one-second resolution, so this can never
+// be a sub-second measurement — the contract says so, and the interval is
+// widened by its declared precision before anything is compared. What it CAN
+// do is say which step a ledger measured, and make the wrapper-install prefix
+// that necessarily precedes AT_start visible rather than merely absent.
+func TestStepAttemptIsIdentityNotAGate(t *testing.T) {
+	dir := t.TempDir()
+	s := newSynthRun(filepath.Join(dir, "records"))
+	docs := writeFrozenDocs(t, dir, s)
+	s.stage2 = docs.digest
+	s.write(t, nil)
+
+	opts := VerifyOptions{
+		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+		RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck,
+		ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+		StepAttemptPath: docs.stepAttempt,
+		AuthorityKeys:   []string{docs.authority}, Authority: "ewj2-campaign",
+	}
+	v, err := VerifyDir(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.Eligible {
+		t.Fatalf("a run with a matching step attempt was not eligible: %+v", v.Findings)
+	}
+	// A_GH is longer than A, and the difference before AT_start is named.
+	if v.ActionGHNs <= v.ActionNs {
+		t.Errorf("A_GH %d ns is not longer than A %d ns", v.ActionGHNs, v.ActionNs)
+	}
+	if v.BootstrapGapNs <= 0 {
+		t.Errorf("the pre-AT_start bootstrap was not accounted: %d ns", v.BootstrapGapNs)
+	}
+	// And it is a DIAGNOSTIC: no gate is named after it.
+	for _, g := range v.Gates {
+		if strings.Contains(g.Name, "a_gh") || strings.Contains(g.Name, "step") {
+			t.Errorf("A_GH became a gate: %s", g.Name)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		edit func(*StepAttemptDocument)
+		opts func(*VerifyOptions)
+		want string
+	}{
+		{name: "no step attempt at all", opts: func(o *VerifyOptions) { o.StepAttemptPath = "" },
+			want: "not linked to the step that ran"},
+		{name: "linked to another job", edit: func(d *StepAttemptDocument) { d.Attempt.Job = "some-other-job" },
+			want: "the records name job"},
+		{name: "linked to another attempt", edit: func(d *StepAttemptDocument) { d.Attempt.Attempt = "7" },
+			want: "step attempt"},
+		{name: "an envelope outside the step window", edit: func(d *StepAttemptDocument) {
+			d.Attempt.StartedAt = "2099-01-01T00:00:00Z"
+			d.Attempt.CompletedAt = "2099-01-01T00:01:00Z"
+		}, want: "outside the step attempt's precision-widened interval"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := opts
+			if tc.edit != nil {
+				var doc StepAttemptDocument
+				if err := ReadJSONFile(docs.stepAttempt, &doc); err != nil {
+					t.Fatal(err)
+				}
+				tc.edit(&doc)
+				path := filepath.Join(t.TempDir(), "step.json")
+				if err := WriteJSONFile(path, doc); err != nil {
+					t.Fatal(err)
+				}
+				o.StepAttemptPath = path
+			}
+			if tc.opts != nil {
+				tc.opts(&o)
+			}
+			got, err := VerifyDir(o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Eligible {
+				t.Errorf("the run remained eligible")
+			}
+			var details []string
+			for _, f := range got.Findings {
+				details = append(details, f.Detail)
+			}
+			if !strings.Contains(strings.Join(details, "\n"), tc.want) {
+				t.Errorf("no finding mentions %q:\n%s", tc.want, strings.Join(details, "\n"))
+			}
+		})
+	}
+
+	// A sub-second difference can never fail it: that is what "widened by the
+	// declared precision" means, and it is why this is not a measurement.
+	var doc StepAttemptDocument
+	if err := ReadJSONFile(docs.stepAttempt, &doc); err != nil {
+		t.Fatal(err)
+	}
+	shifted := doc
+	start, _, err := doc.Attempt.Window()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shifted.Attempt.StartedAt = start.Add(900 * time.Millisecond).Format(time.RFC3339Nano)
+	path := filepath.Join(t.TempDir(), "shifted.json")
+	if err := WriteJSONFile(path, shifted); err != nil {
+		t.Fatal(err)
+	}
+	o := opts
+	o.StepAttemptPath = path
+	got, err := VerifyDir(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Eligible {
+		t.Errorf("a sub-second shift inside the declared precision failed the check: %+v", got.Findings)
 	}
 }

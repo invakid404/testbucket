@@ -47,24 +47,37 @@ func (r *Runner) Render(b runner.Bucket) runner.Rendered {
 }
 
 func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
+	// The invocation index is assigned in emission order, so the reporter's
+	// per-invocation output file — part of the executed argv — is known when
+	// the invocation is built rather than bolted on at line-render time. That
+	// makes Invocation.Args the ACTUAL argv in both the measured and unmeasured
+	// paths, which is what lets the measured record be compared to the plan.
+	seq := 0
 	// Vitest is a Node runner: every bucket needs Node set up.
 	out := runner.Rendered{NeedsNode: true}
 
 	var wholeFiles []string
 	var wholeUnits []string
+	var wholeAtoms []string
 	type slice struct {
 		id    string
 		file  string
 		names []string
+		atoms []string
 	}
 	var slices []slice
 
 	for _, u := range b.Units {
 		if u.Kind == runner.KindRunSlice && len(u.Packages) == 1 && len(u.Run) > 0 {
-			slices = append(slices, slice{id: u.ID, file: u.Packages[0].ID, names: append([]string(nil), u.Run...)})
+			slices = append(slices, slice{
+				id: u.ID, file: u.Packages[0].ID,
+				names: append([]string(nil), u.Run...),
+				atoms: atomKeys(u.Packages),
+			})
 			continue
 		}
 		wholeUnits = append(wholeUnits, u.ID)
+		wholeAtoms = append(wholeAtoms, atomKeys(u.Packages)...)
 		for _, p := range u.Packages {
 			wholeFiles = append(wholeFiles, p.ID)
 		}
@@ -75,14 +88,19 @@ func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
 		sort.Strings(wholeFiles)
 		wholeFiles = dedupe(wholeFiles)
 		sort.Strings(wholeUnits)
-		inv := vitestInvocation(cfg, wholeFiles, nil)
+		inv := vitestInvocation(cfg, wholeFiles, nil, b.Index, seq)
+		seq++
 		inv.Units = wholeUnits
+		sort.Strings(wholeAtoms)
+		inv.Atoms = dedupe(wholeAtoms)
 		invs = append(invs, inv)
 	}
 	sort.Slice(slices, func(i, j int) bool { return slices[i].id < slices[j].id })
 	for _, s := range slices {
-		inv := vitestInvocation(cfg, []string{s.file}, s.names)
+		inv := vitestInvocation(cfg, []string{s.file}, s.names, b.Index, seq)
+		seq++
 		inv.Units = []string{s.id}
+		inv.Atoms = s.atoms
 		invs = append(invs, inv)
 	}
 
@@ -97,7 +115,7 @@ func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
 
 // vitestInvocation builds one `vitest run` call. names, when non-empty, add an
 // anchored -t name filter selecting exactly those tests.
-func vitestInvocation(cfg renderConfig, files, names []string) runner.Invocation {
+func vitestInvocation(cfg renderConfig, files, names []string, bucket, seq int) runner.Invocation {
 	args := append([]string(nil), cfg.command...)
 	args = append(args, "run")
 	// Intra-bucket file concurrency (#22). Default (1) stays serial so a bucket's
@@ -135,9 +153,44 @@ func vitestInvocation(cfg renderConfig, files, names []string) runner.Invocation
 	for _, f := range files {
 		args = append(args, filterPathArg(f))
 	}
+	if cfg.eventsDir != "" {
+		// A second reporter writes machine-readable JSON for `ingest` while the
+		// default reporter keeps the console log human-readable; the JSON goes
+		// to a per-bucket file the record job collects. It is part of the argv
+		// that actually runs, so it belongs in Args.
+		args = append(args, "--reporter=default", "--reporter=json",
+			fmt.Sprintf("--outputFile.json=%s/bucket-%d-%02d.json", strings.TrimSuffix(cfg.eventsDir, "/"), bucket, seq))
+	}
 	// Desc keeps the canonical ids: it is the human/plan-facing identity, and it
 	// must keep matching the store keys and the ids the reporter reports.
-	return runner.Invocation{Dir: cfg.rootRel, Args: args, Desc: strings.Join(files, " ")}
+	//
+	// Selector is what this call SELECTS, and it is not the same thing. For a
+	// whole-file call the two coincide; for a name slice the selector also
+	// carries the -t pattern, which is precisely what tells two legal slices of
+	// one file apart. Deriving a selector from Desc would throw that away.
+	selector := append([]string(nil), files...)
+	if len(names) > 0 {
+		sorted := append([]string(nil), names...)
+		sort.Strings(sorted)
+		selector = append(selector, "-t", runPattern(sorted))
+	}
+	return runner.Invocation{
+		Dir: cfg.rootRel, Args: args, Desc: strings.Join(files, " "), Selector: selector,
+	}
+}
+
+// atomKeys is the sorted co-scheduling keys of a unit's targets. A target that
+// mixes freely has none; the empty key is dropped rather than recorded as a
+// key that everything shares.
+func atomKeys(pkgs []runner.LivePackage) []string {
+	var out []string
+	for _, p := range pkgs {
+		if k := p.AtomKey(); k != "" {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return dedupe(out)
 }
 
 func shellLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string {
@@ -154,13 +207,6 @@ func shellLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string 
 		}
 		sb.WriteString(shellQuote(a))
 	}
-	if cfg.eventsDir != "" {
-		// A second reporter writes machine-readable JSON for `ingest` while the
-		// default reporter keeps the console log human-readable; the JSON goes to
-		// a per-bucket file the record job collects.
-		fmt.Fprintf(&sb, " --reporter=default --reporter=json --outputFile.json=%s",
-			shellQuote(fmt.Sprintf("%s/bucket-%d-%02d.json", strings.TrimSuffix(cfg.eventsDir, "/"), bucket, seq)))
-	}
 	sb.WriteString(" )")
 	return sb.String()
 }
@@ -175,14 +221,11 @@ func shellLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string 
 // script bytes are what the Stage-2 receipt digests. A spec that lived
 // elsewhere could change without changing the plan.
 func wallLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string {
-	args := append([]string(nil), inv.Args...)
-	if cfg.eventsDir != "" {
-		args = append(args, "--reporter=default", "--reporter=json",
-			fmt.Sprintf("--outputFile.json=%s/bucket-%d-%02d.json", strings.TrimSuffix(cfg.eventsDir, "/"), bucket, seq))
-	}
-	spec, err := walltime.MarshalSpec(walltime.InvocationSpec{
-		Seq: seq, Argv: args, Cwd: inv.Dir, Selector: strings.Fields(inv.Desc), Desc: inv.Desc,
-	})
+	// The spec carries the SELECTOR the renderer chose and the identities of
+	// what this call covers, so the measured record can be compared to the
+	// plan rather than merely accompany it. Args is already the argv that
+	// runs, reporter flags included.
+	spec, err := walltime.MarshalSpec(MeasuredSpec(inv, seq))
 	if err != nil {
 		// MarshalSpec fails only on a value encoding/json cannot represent,
 		// which an argv of strings cannot be; a panic here would be a bug in
@@ -203,6 +246,19 @@ func wallLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string {
 	sb.WriteString(" --spec ")
 	sb.WriteString(shellQuote(specPath))
 	return sb.String()
+}
+
+// MeasuredSpec is the invocation spec the measured script writes and the
+// verifier compares against. One function builds it, so the plan's expectation
+// and the wrapper's record cannot disagree about what the identity of an
+// invocation is.
+func MeasuredSpec(inv runner.Invocation, seq int) walltime.InvocationSpec {
+	return walltime.InvocationSpec{
+		Seq: seq, Argv: append([]string(nil), inv.Args...), Cwd: inv.Dir,
+		Selector: inv.Selector, Desc: inv.Desc,
+		UnitDigest: walltime.DigestJSONOrEmpty(inv.Units),
+		AtomDigest: walltime.DigestJSONOrEmpty(inv.Atoms),
+	}
 }
 
 func shellQuote(s string) string {
