@@ -38,15 +38,33 @@ inputs:
       block; a failure fails the bucket before any test runs. Empty = no setup
       step ⇒ unchanged behavior.
     default: ""
+  wall-time-dir:
+    description: >-
+      Optional records directory for complete-action wall-time measurement
+      (--runner vitest). When set, the whole action runs inside a physical
+      envelope with its own containment peer and independent trace: `wall begin`
+      opens it before setup, the setup command and the bucket script run inside
+      the action containment, and `wall end` closes it after verified-empty
+      containment. It MUST match the --wall-dir the plan baked into the script.
+      Empty = no measurement ⇒ byte-identical behavior to before.
+    default: ""
+  cgroup-root:
+    description: >-
+      Delegated cgroup-v2 subtree the wrapper may create containments under
+      (TB_WALL_CGROUP_ROOT). Without it the run is recorded in full and reported
+      INELIGIBLE rather than scored — a process group cannot prove that no
+      descendant escaped. Create it in a prior step, e.g.
+      `sudo mkdir -p /sys/fs/cgroup/testbucket && sudo chown -R "$(id -u)" /sys/fs/cgroup/testbucket`.
+    default: ""
 
 runs:
   using: composite
   steps:
-    # Only the Go runner needs the binary here (for `testbucket render`); a Vitest
-    # bucket's script prints its own default-reporter log, so it needs no binary —
-    # and therefore no Go on a Vitest runner even in local-install mode.
+    # The Go runner needs the binary for `testbucket render`; a Vitest bucket's
+    # script prints its own default-reporter log, so it needs no binary — UNLESS
+    # it is being measured, which is the wrapper's own binary.
     - name: Install testbucket
-      if: inputs.runner == 'go'
+      if: inputs.runner == 'go' || inputs.wall-time-dir != ''
       shell: bash
       env:
         TB_VERSION: ${{ inputs.version }}
@@ -55,20 +73,58 @@ runs:
         GH_TOKEN: ${{ github.token }}
       run: bash "${{ github.action_path }}/../install-testbucket.sh"
 
+    # AT_start. This is deliberately the FIRST action-owned operation: the
+    # containment, the two observer processes and their admission handshakes are
+    # all real action time, and starting the envelope after them would make A
+    # smaller than the action actually was.
+    - name: Open the wall-time action envelope
+      if: inputs.wall-time-dir != ''
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        BUCKET_NAME: ${{ inputs.name }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$TB_WALL_DIR"
+        testbucket wall begin \
+          --dir "$TB_WALL_DIR" \
+          --bucket-id "$BUCKET_NAME" \
+          --run-id "${GITHUB_RUN_ID:-}" \
+          --attempt-id "${GITHUB_RUN_ATTEMPT:-}" \
+          --repository "${GITHUB_REPOSITORY:-}" \
+          --workflow-run "${GITHUB_RUN_ID:-}" \
+          --job "${GITHUB_JOB:-}" \
+          --step "run-bucket" \
+          --step-attempt "${GITHUB_RUN_ATTEMPT:-}"
+
     # A consumer's own per-runner provisioning, run once before the bucket's test
     # command. Passed through the environment and executed as a bash block (never
     # spliced into the command line): the command is consumer-supplied data, and
     # splicing it into a run: line is how a workflow grows an injection. `-e` so a
     # failed provisioning step fails the bucket instead of leaking into the tests.
+    #
+    # Under measurement it runs through `wall run`, which admits it to the ACTION
+    # containment first: setup is real action-owned work, and work outside the
+    # containment is work the trace cannot see.
     - name: Set up the bucket
       if: inputs.setup-command != ''
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         TB_SETUP_COMMAND: ${{ inputs.setup-command }}
-      run: bash -eo pipefail -c "$TB_SETUP_COMMAND"
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+      run: |
+        set -euo pipefail
+        if [ -n "$TB_WALL_DIR" ]; then
+          testbucket wall run --dir "$TB_WALL_DIR" -- bash -eo pipefail -c "$TB_SETUP_COMMAND"
+        else
+          bash -eo pipefail -c "$TB_SETUP_COMMAND"
+        fi
 
     - name: Run the bucket
+      id: run
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
@@ -81,6 +137,8 @@ runs:
         BUCKET_NAME: ${{ inputs.name }}
         BUCKET_EST: ${{ inputs.est-seconds }}
         TB_EVENTS_DIR: ${{ inputs.events-dir }}
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
       run: |
         set -euo pipefail
         # The generated script tees its events into this directory; create it
@@ -97,7 +155,14 @@ runs:
         # for the record job. The status taken is the SCRIPT's (PIPESTATUS[0]),
         # never the renderer's.
         set +e
-        if [ "$TB_RUNNER" = "go" ]; then
+        if [ -n "$TB_WALL_DIR" ]; then
+          # VB: the complete generated script under its own physical envelope,
+          # containment peer and independent trace. The wrapper exits with the
+          # script's status, so a red bucket stays red.
+          testbucket wall exec --dir "$TB_WALL_DIR" --level script \
+            --desc "$BUCKET_NAME" -- bash "$RUNNER_TEMP/testbucket-bucket.sh"
+          status=$?
+        elif [ "$TB_RUNNER" = "go" ]; then
           # Go's script emits `go test -json` on stdout; pipe it through
           # `testbucket render` to reproduce the plain test log for humans.
           bash "$RUNNER_TEMP/testbucket-bucket.sh" | testbucket render
@@ -110,3 +175,36 @@ runs:
         fi
         set -e
         exit "$status"
+
+    # AT_end, after verified-empty containment. It runs even when the bucket
+    # failed: a failed bucket is still a complete measurement of a failed
+    # bucket, and an envelope left open would be a missing row rather than a
+    # recorded failure.
+    - name: Close the wall-time action envelope
+      if: always() && inputs.wall-time-dir != ''
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_OUTCOME: ${{ steps.run.outcome }}
+      run: |
+        set -euo pipefail
+        terminal=passed
+        reason=""
+        if [ "$TB_OUTCOME" != "success" ]; then
+          terminal=failed
+          reason="the bucket step outcome was $TB_OUTCOME"
+        fi
+        testbucket wall end --dir "$TB_WALL_DIR" --terminal "$terminal" --reason "$reason"
+
+    # Structural verification, in the job that produced the records: a broken
+    # chain, a missing endpoint or a copied reading is a defect in THIS run and
+    # should be visible here. Scoring eligibility is a separate, later question
+    # (`wall verify --require eligible`), because it needs the frozen Stage-1
+    # and Stage-2 documents this action does not have.
+    - name: Verify the wall-time records
+      if: always() && inputs.wall-time-dir != ''
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+      run: testbucket wall verify --dir "$TB_WALL_DIR" --require complete

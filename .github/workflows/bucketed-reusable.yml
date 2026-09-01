@@ -83,6 +83,22 @@ on:
         description: 'Forwarded to plan + test: a shell command run once per job, in the working-directory, before the plan/test command — a per-runner provisioning seam (DB binaries, codegen, toolchains). Empty = no setup step.'
         type: string
         default: ""
+      wall-time-dir:
+        description: >-
+          Forwarded to plan + test (runner: vitest): records directory for
+          complete-action wall-time measurement. When set, the whole Run-bucket
+          action runs inside a physical envelope with its own containment peer
+          and independent trace, and each invocation gets one of its own. Empty
+          = no measurement ⇒ unchanged behavior.
+        type: string
+        default: ""
+      cgroup-root:
+        description: >-
+          Delegated cgroup-v2 subtree the wrapper may create containments under.
+          Without it the run is recorded in full and reported INELIGIBLE rather
+          than scored: a process group cannot prove that no descendant escaped.
+        type: string
+        default: ""
       runs-on:
         description: 'Runner label for every job.'
         type: string
@@ -146,6 +162,7 @@ jobs:
           node-prefixes: ${{ inputs.node-prefixes }}
           exclude-module: ${{ inputs.exclude-module }}
           setup-command: ${{ inputs.setup-command }}
+          wall-time-dir: ${{ inputs.wall-time-dir }}
 
       - name: Upload the shard plan
         if: always()
@@ -196,6 +213,8 @@ jobs:
           version: ${{ inputs.testbucket-version }}
           working-directory: ${{ inputs.working-directory }}
           setup-command: ${{ inputs.setup-command }}
+          wall-time-dir: ${{ inputs.wall-time-dir }}
+          cgroup-root: ${{ inputs.cgroup-root }}
 
       - name: Upload timing events
         # if: always() so a red bucket still contributes what it measured;

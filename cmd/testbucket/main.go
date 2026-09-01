@@ -258,6 +258,18 @@ func resolveCount(runnerKind string, count int, explicit bool) (int, error) {
 	return count, nil
 }
 
+// checkWallDirRunner refuses --wall-dir on the Go adapter rather than ignoring
+// it. Wall-time measurement is Vitest-only today: the Go adapter's events,
+// count shards and `-race -count=100` contract are deliberately untouched, and
+// a flag that silently does nothing is how a consumer ends up believing a
+// campaign was instrumented when it was not.
+func checkWallDirRunner(runnerKind, wallDir string) error {
+	if strings.TrimSpace(wallDir) == "" || runnerKind == "vitest" {
+		return nil
+	}
+	return fmt.Errorf("--wall-dir needs --runner vitest: complete-action wall-time measurement is Vitest-only today, and the Go adapter is deliberately left unchanged")
+}
+
 // splitPrefixes turns a comma-separated flag into a prefix list, empty for the
 // empty string (the default) rather than a single empty prefix.
 func splitPrefixes(s string) []string {
@@ -342,6 +354,9 @@ func runPlan(args []string) error {
 	}
 	if *fileParallelism < 1 {
 		return fmt.Errorf("--file-parallelism must be >= 1, got %d", *fileParallelism)
+	}
+	if err := checkWallDirRunner(*runnerKind, *wallDir); err != nil {
+		return err
 	}
 
 	opt := core.PlanOptions{

@@ -21,6 +21,10 @@ usage:
   testbucket wall exec    [flags] -- cmd...
                                    run one command under a physical envelope
                                    (VB or V) with its own peer and collector
+  testbucket wall run     [flags] -- cmd...
+                                   run an action-owned command inside the action
+                                   containment, with no envelope of its own (a
+                                   per-bucket setup command)
   testbucket wall observe [flags]  INTERNAL: the peer/collector process itself
   testbucket wall verify  [flags]  verify a records directory and report
                                    eligibility, reconciliation and every gate
@@ -49,6 +53,8 @@ func runWall(args []string) error {
 		return runWallEnd(args[1:])
 	case "exec":
 		return runWallExec(args[1:])
+	case "run":
+		return runWallRun(args[1:])
 	case "observe":
 		return runWallObserve(args[1:])
 	case "verify":
@@ -207,6 +213,29 @@ func runWallExec(args []string) error {
 	}
 	// The measured command's status is the status of this process: a wrapper
 	// that swallowed a failing bucket would make a red run look green.
+	if code != 0 {
+		os.Exit(code)
+	}
+	return nil
+}
+
+func runWallRun(args []string) error {
+	fs := flag.NewFlagSet("wall run", flag.ExitOnError)
+	dir := fs.String("dir", "", "records directory (required)")
+	cwd := fs.String("cwd", "", "working directory for the command")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" {
+		return fmt.Errorf("--dir is required")
+	}
+	if len(fs.Args()) == 0 {
+		return fmt.Errorf("no command: pass it after --")
+	}
+	code, err := walltime.RunInAction(*dir, fs.Args(), *cwd, os.Stdout, os.Stderr)
+	if err != nil {
+		return err
+	}
 	if code != 0 {
 		os.Exit(code)
 	}

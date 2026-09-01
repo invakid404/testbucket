@@ -68,6 +68,16 @@ inputs:
       resolved. Runs as a bash block; a failure fails the plan. Empty = no setup
       step ⇒ unchanged behavior.
     default: ""
+  wall-time-dir:
+    description: >-
+      Optional records directory for complete-action wall-time measurement
+      (runner: vitest). When set, every rendered invocation in the generated
+      script runs under `testbucket wall exec`, so it gets a physical envelope,
+      a containment peer and an independent trace. It MUST match the
+      wall-time-dir the run-bucket action is given: the script names the
+      directory, and a mismatch would write records nobody verifies. Empty = no
+      measurement ⇒ byte-identical script to before.
+    default: ""
 
 outputs:
   matrix:
@@ -117,6 +127,7 @@ runs:
         TB_VITEST_COMMAND: ${{ inputs.vitest-command }}
         TB_NODE_PREFIXES: ${{ inputs.node-prefixes }}
         TB_EXCLUDE_MODULE: ${{ inputs.exclude-module }}
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
       run: |
         set -euo pipefail
         if [ -f "$TB_STORE" ]; then
@@ -145,6 +156,13 @@ runs:
         while IFS= read -r mod; do
           [ -n "$mod" ] && extra+=(--exclude-module "$mod")
         done <<< "$TB_EXCLUDE_MODULE"
+
+        # Wall-time measurement is opt-in and Vitest-only. Passing the flag only
+        # when it is set keeps the generated script byte-identical for everyone
+        # who has not asked for it.
+        if [ -n "$TB_WALL_DIR" ]; then
+          extra+=(--wall-dir "$TB_WALL_DIR")
+        fi
 
         # --json puts the fromJSON matrix on stdout and the loaded-vs-missing
         # summary on stderr, so the summary lands in this log while the matrix

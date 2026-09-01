@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 )
@@ -99,6 +100,43 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		return nil, err
 	}
 	return st, nil
+}
+
+// RunInAction runs one action-owned command INSIDE the action containment,
+// without giving it an envelope of its own.
+//
+// It is what a per-bucket setup command needs: that work is real action time
+// and it must be inside the containment lifecycle the peer and the collector
+// are bracketing, but it is not the bucket script and giving it a second
+// script envelope would misname it. Its duration lands in the physical action
+// prologue, where the Aeta registry forecasts it.
+func RunInAction(dir string, argv []string, cwd string, stdout, stderr *os.File) (int, error) {
+	if len(argv) == 0 {
+		return 1, fmt.Errorf("walltime: no command to run")
+	}
+	st, err := LoadActionState(dir)
+	if err != nil {
+		return 1, err
+	}
+	if err := joinContainment(st.Containment, os.Getpid()); err != nil {
+		return 1, fmt.Errorf("walltime: join action containment: %w", err)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = cwd
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if err := cmd.Run(); err != nil {
+		if cmd.ProcessState != nil {
+			return cmd.ProcessState.ExitCode(), nil
+		}
+		return 1, err
+	}
+	return 0, nil
 }
 
 // LoadActionState reads the handoff `wall begin` left behind.
