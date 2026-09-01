@@ -356,11 +356,17 @@ func testSourceProfile() SourceProfileReceipt {
 		Lockfile:    DigestBytes(lock),
 		FacadeBytes: []byte(testFacade), ConfigBytes: []byte(testViteConfig), LockfileBytes: lock,
 		ParserID: ParserIdentity{Name: LockParserPNPM, Version: "9", Digest: "sha256:lockparser"},
+		// EXACTLY what the lockfile resolves — every package, not just the
+		// Vitest family. tinyrainbow is here because the lock resolves it: a
+		// fixture that called itself complete while omitting it is what let
+		// the partial-closure defect through.
 		Packages: map[string]string{
 			"vitest": RequiredVitest, "@vitest/runner": RequiredVitest, "@vitest/expect": RequiredVitest,
+			"tinyrainbow": "2.0.0",
 		},
 		Integrities: map[string]string{
 			"vitest": "sha512-vitest", "@vitest/runner": "sha512-runner", "@vitest/expect": "sha512-expect",
+			"tinyrainbow": "sha512-tinyrainbow",
 		},
 	}
 }

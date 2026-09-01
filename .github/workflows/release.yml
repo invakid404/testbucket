@@ -49,6 +49,33 @@ jobs:
         with:
           go-version: "1.27.0"
 
+      # BUILD THE ACTUAL RELEASE ARTIFACTS — but publish nothing yet.
+      #
+      # This is the same goreleaser invocation that used to publish, with the
+      # publishing half skipped. It produces the four platform binaries, their
+      # four archives and the checksums file in ./dist from the tagged tree,
+      # with the real release ldflags — the exact bytes that will be uploaded.
+      #
+      # It runs BEFORE the campaign gate so the gate can hash what is about to
+      # be published. The gate used to read a committed digest string instead,
+      # which meant the campaign was compared to a claim about the delivery
+      # rather than to the delivery: a matching declaration could authorise
+      # whatever was built afterwards, and one digest could not identify four
+      # platform artifacts at all.
+      - name: Build the release artifacts (no publish)
+        # Pinned to a reviewed commit SHA (third-party code); bump via an
+        # explicit PR. goreleaser itself is pinned to an exact version in the
+        # same spirit.
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "2.18.0"
+          # --clean is safe to re-run. --skip=publish,announce stops after the
+          # artifacts exist: nothing reaches GitHub until the gate below has
+          # passed over these exact bytes.
+          args: release --clean --skip=publish,announce
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       # THE CAMPAIGN GATE. The frozen acceptance contract prohibits release
       # until an authenticated five-pair / ten-run / eighty-action-row campaign
       # across at least three UTC dates has passed, assembled from eligible
@@ -61,13 +88,11 @@ jobs:
       # every frozen gate passes, so this delegates the decision to the same
       # code a validator runs rather than reimplementing it here.
       #
-      # It is also bound to THIS release. The gate used to run the evaluator
-      # with no expected delivery at all, and the evaluator only asked each arm
-      # to agree with itself — so a valid campaign committed once at
-      # campaign/index.json authorised every later tag, and the binary built
-      # here was never compared to the one the campaign was measured with.
-      # `--release-sha` and `--release-binary` supply both, and the
-      # release-binding gate does not pass without them.
+      # It is bound to THIS release, by identity and by bytes. `--release-sha`
+      # is the immutable commit the tag resolves to, and every `--release-artifact`
+      # is hashed HERE from a file goreleaser just produced. There is no flag
+      # that accepts a digest as a string, so the gate cannot be satisfied by a
+      # declaration about assets nobody hashed.
       - name: Refuse a release with no passing campaign
         env:
           # Path, inside the tagged tree, to the campaign index naming the
@@ -82,14 +107,6 @@ jobs:
           # the tag NAME: a tag is descriptive metadata that can be moved, and
           # a moved tag must not inherit another commit's evidence.
           TB_RELEASE_SHA: ${{ github.sha }}
-          # The digest of the binary asset the campaign's candidate arms were
-          # actually delivered with, declared inside the tagged tree beside the
-          # index it belongs to. It is a committed, reviewed file rather than a
-          # repository variable so it is immutable at the tag, and rather than
-          # the digest of the binary built two lines below because that one is
-          # an ordinary `go build` of the gate's own tool, not the published
-          # release artifact.
-          TB_CAMPAIGN_BINARY_DIGEST_FILE: campaign/release-binary.sha256
         run: |
           set -euo pipefail
           if [ ! -f "$TB_CAMPAIGN_INDEX" ]; then
@@ -104,43 +121,79 @@ jobs:
             echo "A campaign verified against whatever signed it accepts any self-generated key." >&2
             exit 1
           fi
-          if [ ! -f "$TB_CAMPAIGN_BINARY_DIGEST_FILE" ]; then
-            echo "REFUSED: no delivered-binary digest at $TB_CAMPAIGN_BINARY_DIGEST_FILE." >&2
-            echo "A campaign that bound a binary nobody compared authorises an asset it never saw." >&2
+
+          # Every asset goreleaser just built, read out of its own manifest
+          # rather than guessed from a glob: artifacts.json is what goreleaser
+          # says it produced, and a glob that missed one would gate a subset
+          # while publishing the whole set. jq is preinstalled on the runner
+          # and is already used by the alias job below.
+          mapfile -t assets < <(jq -r '.[] | select(.type=="Binary" or .type=="Archive" or .type=="Checksum") | .path' dist/artifacts.json)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "REFUSED: goreleaser produced no binaries, archives or checksums to gate." >&2
             exit 1
           fi
-          TB_RELEASE_BINARY_DIGEST="$(tr -d ' \t\n\r' < "$TB_CAMPAIGN_BINARY_DIGEST_FILE")"
-          if [ -z "$TB_RELEASE_BINARY_DIGEST" ]; then
-            echo "REFUSED: $TB_CAMPAIGN_BINARY_DIGEST_FILE is empty." >&2
-            exit 1
-          fi
-          go build -o "$RUNNER_TEMP/testbucket" ./cmd/testbucket
+          args=()
+          for a in "${assets[@]}"; do
+            if [ ! -f "$a" ]; then
+              echo "REFUSED: goreleaser's manifest names $a, which does not exist." >&2
+              exit 1
+            fi
+            args+=(--release-artifact "$a")
+          done
+          echo "gating ${#assets[@]} artifact(s) hashed from their actual bytes:"
+          sha256sum "${assets[@]}"
+
+          go build -o "$RUNNER_TEMP/testbucket-gate" ./cmd/testbucket
           # Non-zero unless every frozen gate passes over the full population
           # AND every candidate arm of that population reviewed, was released
-          # from, and delivered exactly this commit and this binary.
-          "$RUNNER_TEMP/testbucket" wall campaign \
+          # from, and delivered one of the artifacts hashed above.
+          "$RUNNER_TEMP/testbucket-gate" wall campaign \
             --index "$TB_CAMPAIGN_INDEX" \
             --authority "$TB_CAMPAIGN_AUTHORITY" \
             --authority-key "$TB_CAMPAIGN_AUTHORITY_KEY" \
             --release-sha "$TB_RELEASE_SHA" \
-            --release-binary-digest "$TB_RELEASE_BINARY_DIGEST"
+            "${args[@]}"
           echo "campaign gate: the frozen decision rule passes over the retained population,"
-          echo "and that population authorises exactly $TB_RELEASE_SHA"
+          echo "and that population authorises exactly $TB_RELEASE_SHA and these exact bytes"
 
-
-      - name: Run goreleaser
-        # Pinned to a reviewed commit SHA (third-party code with a write token);
-        # bump via an explicit PR. goreleaser itself is pinned to an exact
-        # version in the same spirit.
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
-        with:
-          version: "2.18.0"
-          # --clean is safe to re-run: replace_existing_artifacts is enabled in
-          # .goreleaser.yaml, so a rerun after a transient failure replaces the
-          # assets instead of failing with `already_exists`.
-          args: release --clean
+      # PUBLISH THE GATED BYTES. Not a second goreleaser run: a rebuild would
+      # publish artifacts the gate never saw, which is the whole defect this
+      # step exists to avoid. These are the files hashed above, uploaded as-is.
+      #
+      # Rerunning after a transient upload failure is safe — `gh release
+      # upload --clobber` replaces same-named assets, which is what
+      # `replace_existing_artifacts` did for goreleaser.
+      - name: Publish the gated artifacts
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          TB_RELEASE_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/checksums.txt)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "no gated artifacts to publish" >&2
+            exit 1
+          fi
+
+          # A pre-release tag (v1.2.3-rc.1) publishes as a prerelease, which is
+          # what `prerelease: auto` did.
+          prerelease=()
+          if printf '%s' "$TAG" | grep -q -- '-'; then
+            prerelease=(--prerelease)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --title "$TAG" \
+              --target "$TB_RELEASE_SHA" \
+              --generate-notes \
+              "${prerelease[@]}"
+          fi
+          echo "published $TAG from $TB_RELEASE_SHA with ${#assets[@]} gated asset(s)"
 
   # The major alias (v1) is a SEPARATE, independently-retryable job: if the
   # release published but this failed transiently, rerunning just recomputes and

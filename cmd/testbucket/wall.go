@@ -459,8 +459,8 @@ func runWallCampaign(args []string) error {
 	asJSON := fs.Bool("json", false, "write the gate results as JSON")
 	authority := fs.String("authority", "", "protected environment each arm's manifest must name. A key says WHO signed; this says WHICH environment approved")
 	releaseSHA := fs.String("release-sha", "", "the full 40-hex commit the release ref resolves to. A campaign is evidence for the delivery it was produced for, so the release-binding gate does not pass without it — and every arm's reviewed tip and release ref must be this commit")
-	releaseBinary := fs.String("release-binary", "", "path to the EXACT binary asset being published; its digest is computed here. Use this when the asset is in hand")
-	releaseBinaryDigest := fs.String("release-binary-digest", "", "SHA-256 of the exact binary asset being published, when the asset itself is not in hand — e.g. a release gate reading the digest its own immutable tagged tree declares. Exactly one of --release-binary and --release-binary-digest may be given")
+	var releaseArtifacts stringList
+	fs.Var(&releaseArtifacts, "release-artifact", "path to one asset about to be published; repeatable, and its digest is computed HERE from the bytes on disk. A release publishes several files, and the campaign's delivered binary must be one of them. There is deliberately no flag that accepts a digest as a string: a gate that reads a declaration compares its manifests to a claim about the delivery rather than to the delivery")
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable and required with --index")
 	if err := fs.Parse(args); err != nil {
@@ -470,18 +470,14 @@ func runWallCampaign(args []string) error {
 		return fmt.Errorf("pass exactly one of --index (a campaign) or --in (the calculator)")
 	}
 	release := walltime.CampaignRelease{SHA: strings.TrimSpace(*releaseSHA)}
-	if strings.TrimSpace(*releaseBinary) != "" && strings.TrimSpace(*releaseBinaryDigest) != "" {
-		return fmt.Errorf("pass at most one of --release-binary and --release-binary-digest; two statements of the delivered artifact can disagree")
-	}
-	switch {
-	case strings.TrimSpace(*releaseBinary) != "":
-		d, err := walltime.FileDigest(*releaseBinary)
+	for _, path := range releaseArtifacts {
+		d, err := walltime.FileDigest(path)
 		if err != nil {
-			return fmt.Errorf("digest the binary asset being released: %w", err)
+			return fmt.Errorf("digest the published artifact %s: %w", path, err)
 		}
-		release.BinaryDigest = d
-	case strings.TrimSpace(*releaseBinaryDigest) != "":
-		release.BinaryDigest = walltime.Digest(strings.TrimSpace(*releaseBinaryDigest))
+		release.Artifacts = append(release.Artifacts, walltime.ReleaseArtifact{
+			Name: filepath.Base(path), Digest: d,
+		})
 	}
 	var gates []walltime.GateResult
 	calculatorOnly := false

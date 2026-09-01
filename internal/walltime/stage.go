@@ -605,13 +605,28 @@ func (r SourceProfileReceipt) Validate() error {
 			return fmt.Errorf("source profile: the closure records integrity %q for %s but the bound lockfile records %q", r.Integrities[n], n, d.Integrity)
 		}
 	}
+	// COMPLETE means complete. The closure is the sorted resolved
+	// package/version/integrity set the façade actually loads, and a receipt
+	// that declares a subset of it has not bound that set — it has bound the
+	// part it chose to mention.
+	//
+	// This used to require presence only for `vitest` and `@vitest/*`, on the
+	// reasoning that those are the packages the version rule is about. But the
+	// contract binds the closure, not a family within it: the façade loads a
+	// transitive graph, a substituted non-Vitest dependency in that graph
+	// changes what ran, and a receipt that can omit it cannot tell the two
+	// trees apart. The candidate's own fixture demonstrated the gap — it
+	// described itself as "exactly what the lockfile resolves" while omitting
+	// a package the same lockfile resolved.
+	var missing []string
 	sawRunner := false
 	for _, n := range sortedLockNames(derived) {
-		if !IsVitestPackage(n) {
+		if _, ok := r.Packages[n]; !ok {
+			missing = append(missing, n)
 			continue
 		}
-		if _, ok := r.Packages[n]; !ok {
-			return fmt.Errorf("source profile: the bound lockfile resolves %s but the declared closure omits it; a partial closure cannot prove what the façade loads", n)
+		if !IsVitestPackage(n) {
+			continue
 		}
 		if derived[n].Version != RequiredVitest {
 			return fmt.Errorf("source profile: %s is %s, not %s; this starts a new source-inventory epoch", n, derived[n].Version, RequiredVitest)
@@ -622,6 +637,10 @@ func (r SourceProfileReceipt) Validate() error {
 		if n == "@vitest/runner" {
 			sawRunner = true
 		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("source profile: the bound lockfile resolves %d package(s) the declared closure omits (%s); a partial closure cannot prove what the façade loads",
+			len(missing), strings.Join(missing, ", "))
 	}
 	if r.Packages["vitest"] == "" {
 		return fmt.Errorf("source profile: the closure does not contain vitest")

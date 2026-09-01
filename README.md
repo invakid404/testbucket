@@ -403,11 +403,15 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   enumerated candidate tuple. `--in` still runs the arithmetic on a
   hand-written file and always exits non-zero, because a number in a JSON file
   is not an observation.
-- A campaign authorises the **delivery it was produced for**. `wall campaign`
-  takes `--release-sha` and the delivered artifact's digest, and every pair's
-  candidate arm must have reviewed, been released from, and delivered exactly
-  that commit and that binary. With no expected delivery supplied the
-  release-binding gate does not pass: historical evidence stays auditable, and
+- A campaign authorises the **delivery it was produced for**, by identity and
+  by bytes. `wall campaign` takes `--release-sha` and a repeatable
+  `--release-artifact <path>`, hashing every asset about to be published from
+  the file on disk; every pair's candidate arm must have reviewed, been
+  released from, and delivered one of those exact artifacts. There is no flag
+  that accepts a digest as a string, so the gate cannot be satisfied by a
+  declaration about assets nobody hashed, and a release publishes the same
+  bytes the gate saw rather than a later rebuild. With no expected delivery
+  supplied the gate does not pass: historical evidence stays auditable, and
   authorises nothing else.
 - Scoring needs the **sealed training set**, not a digest of it. `wall verify
   --training-set` revalidates it under the training authority the Stage-1
@@ -420,7 +424,11 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   bound fact about a failure, and `wall bundle` refuses to freeze one rather
   than planning on it. The source profile carries the exact façade, config and
   lockfile bytes, and its package closure is re-derived from the lock instead
-  of read back from the receipt.
+  of read back from the receipt — the WHOLE closure, not the Vitest family
+  within it, because a substituted transitive dependency changes what ran and a
+  receipt that may omit it cannot tell the two trees apart. The real adapter
+  fixture is pinned to that same frozen version, and a test reads the committed
+  manifest and lockfile so the pin cannot drift away from it.
 
 ### A reproducible plan
 

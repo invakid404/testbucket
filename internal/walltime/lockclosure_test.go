@@ -91,17 +91,19 @@ func TestTheSourceProfileClosureIsCheckedAgainstTheLock(t *testing.T) {
 			r.Integrities["@vitest/invented"] = "sha512-invented"
 		}, "which the bound lockfile does not resolve"},
 		{"a version the lock disagrees with", func(r *SourceProfileReceipt) {
-			r.Packages["tinyrainbow"] = "2.0.0"
-			r.Integrities["tinyrainbow"] = "sha512-tinyrainbow"
 			r.Packages["vitest"] = "4.1.11"
 		}, "the bound lockfile resolves"},
+		{"a non-Vitest package the closure omits", func(r *SourceProfileReceipt) {
+			delete(r.Packages, "tinyrainbow")
+			delete(r.Integrities, "tinyrainbow")
+		}, "the declared closure omits"},
 		{"an integrity the lock disagrees with", func(r *SourceProfileReceipt) {
 			r.Integrities["vitest"] = "sha512-somethingelse"
 		}, "but the bound lockfile records"},
 		{"a Vitest-family package the closure omits", func(r *SourceProfileReceipt) {
 			delete(r.Packages, "@vitest/expect")
 			delete(r.Integrities, "@vitest/expect")
-		}, "the declared closure omits it"},
+		}, "the declared closure omits"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

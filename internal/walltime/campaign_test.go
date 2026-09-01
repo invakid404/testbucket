@@ -41,7 +41,15 @@ var candidateBinaryDigest = DigestBytes([]byte("candidate testbucket binary"))
 // candidate arm's reviewed tip and its exact built binary. A campaign
 // authorises this delivery and no other.
 func testRelease() CampaignRelease {
-	return CampaignRelease{SHA: testTip, BinaryDigest: candidateBinaryDigest}
+	// The set a real gate hashes: the platform binary the campaign was
+	// delivered with, plus the other assets published beside it.
+	return CampaignRelease{SHA: testTip, Artifacts: []ReleaseArtifact{
+		{Name: "testbucket_linux_amd64", Digest: candidateBinaryDigest},
+		{Name: "testbucket_linux_arm64", Digest: DigestBytes([]byte("linux arm64 binary"))},
+		{Name: "testbucket_darwin_amd64", Digest: DigestBytes([]byte("darwin amd64 binary"))},
+		{Name: "testbucket_darwin_arm64", Digest: DigestBytes([]byte("darwin arm64 binary"))},
+		{Name: "checksums.txt", Digest: DigestBytes([]byte("checksums"))},
+	}}
 }
 
 // campaignFixture builds a fully authenticated five-pair campaign: signed
@@ -367,14 +375,21 @@ func TestACampaignAuthorisesOnlyTheDeliveryItWasProducedFor(t *testing.T) {
 	}{
 		{"no expected delivery at all", CampaignRelease{},
 			"cannot authorise any release"},
-		{"an abbreviated release SHA", CampaignRelease{SHA: "693a1998", BinaryDigest: candidateBinaryDigest},
+		{"an abbreviated release SHA", CampaignRelease{SHA: "693a1998", Artifacts: testRelease().Artifacts},
 			"full 40"},
-		{"no binary identity", CampaignRelease{SHA: testTip},
+		{"no hashed artifact at all", CampaignRelease{SHA: testTip},
 			"authorises an asset it never saw"},
-		{"another commit", CampaignRelease{SHA: otherSHA, BinaryDigest: candidateBinaryDigest},
+		{"an artifact supplied with no digest", CampaignRelease{SHA: testTip,
+			Artifacts: []ReleaseArtifact{{Name: "testbucket_linux_amd64"}}},
+			"supplied with no digest"},
+		{"another commit", CampaignRelease{SHA: otherSHA, Artifacts: testRelease().Artifacts},
 			"not the " + otherSHA + " being released"},
-		{"another binary from the right commit", CampaignRelease{SHA: testTip, BinaryDigest: "sha256:locally-built"},
-			"not the sha256:locally-built being published"},
+		{"artifacts none of which is the delivered binary", CampaignRelease{SHA: testTip,
+			Artifacts: []ReleaseArtifact{
+				{Name: "testbucket_linux_amd64", Digest: DigestBytes([]byte("a later, differently built binary"))},
+				{Name: "checksums.txt", Digest: DigestBytes([]byte("checksums"))},
+			}},
+			"is not among the 2 artifact(s) being published"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			idx, loader, keys, _ := campaignFixture(t)
@@ -399,6 +414,33 @@ func TestACampaignAuthorisesOnlyTheDeliveryItWasProducedFor(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTheReleaseBindingNamesEveryPublishedArtifact: a release is not one file.
+// The gate must record the whole set it hashed, so a reader of the verdict can
+// see which bytes were authorised rather than only that "a" binary matched.
+func TestTheReleaseBindingNamesEveryPublishedArtifact(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	release := testRelease()
+	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", release)
+	if len(problems) != 0 {
+		t.Fatalf("the fixture campaign is not authenticated: %v", problems)
+	}
+	for _, g := range gates {
+		if g.Name != "campaign:release-binding" {
+			continue
+		}
+		if !g.Pass {
+			t.Fatalf("the campaign did not authorise its own delivery: %s (%s)", g.Observed, g.Detail)
+		}
+		for _, a := range release.Artifacts {
+			if !strings.Contains(g.Detail, a.Name) {
+				t.Errorf("the gate does not name published artifact %q: %s", a.Name, g.Detail)
+			}
+		}
+		return
+	}
+	t.Fatal("no release-binding gate was reported")
 }
 
 // TestTheRightDeliveryPassesTheReleaseBinding is the positive control: the
