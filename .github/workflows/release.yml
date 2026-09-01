@@ -49,6 +49,49 @@ jobs:
         with:
           go-version: "1.27.0"
 
+      # THE CAMPAIGN GATE. The frozen acceptance contract prohibits release
+      # until an authenticated five-pair / ten-run / eighty-action-row campaign
+      # across at least three UTC dates has passed, assembled from eligible
+      # verifier verdicts. Without this step the rule lived only in documents,
+      # and any `v*` tag push published a release regardless.
+      #
+      # It fails CLOSED: absent evidence, unreadable evidence and a campaign
+      # whose gates did not pass are all refusals. `wall campaign --index`
+      # assembles its population from signed verdicts and exits non-zero unless
+      # every frozen gate passes, so this delegates the decision to the same
+      # code a validator runs rather than reimplementing it here.
+      - name: Refuse a release with no passing campaign
+        env:
+          # Path, inside the tagged tree, to the campaign index naming the
+          # five pairs and their per-bucket verdicts. There is deliberately no
+          # override and no skip: a release that could opt out of this gate
+          # would not be gated.
+          TB_CAMPAIGN_INDEX: campaign/index.json
+          TB_CAMPAIGN_AUTHORITY: ewj2-campaign
+          TB_CAMPAIGN_AUTHORITY_KEY: ${{ vars.TB_CAMPAIGN_AUTHORITY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$TB_CAMPAIGN_INDEX" ]; then
+            echo "REFUSED: no campaign index at $TB_CAMPAIGN_INDEX." >&2
+            echo "The frozen acceptance contract prohibits a release until an authenticated" >&2
+            echo "five-pair / ten-run / eighty-action-row campaign across at least three UTC" >&2
+            echo "dates has passed. Tagging does not satisfy that rule; producing the evidence does." >&2
+            exit 1
+          fi
+          if [ -z "$TB_CAMPAIGN_AUTHORITY_KEY" ]; then
+            echo "REFUSED: no predeclared campaign authority key (repository variable TB_CAMPAIGN_AUTHORITY_KEY)." >&2
+            echo "A campaign verified against whatever signed it accepts any self-generated key." >&2
+            exit 1
+          fi
+          go build -o "$RUNNER_TEMP/testbucket" ./cmd/testbucket
+          # Non-zero unless every frozen gate passes over the full population.
+          "$RUNNER_TEMP/testbucket" wall campaign \
+            --index "$TB_CAMPAIGN_INDEX" \
+            --authority "$TB_CAMPAIGN_AUTHORITY" \
+            --authority-key "$TB_CAMPAIGN_AUTHORITY_KEY"
+          echo "campaign gate: the frozen decision rule passes over the retained population"
+
+
       - name: Run goreleaser
         # Pinned to a reviewed commit SHA (third-party code with a write token);
         # bump via an explicit PR. goreleaser itself is pinned to an exact

@@ -40,6 +40,18 @@ func (e *timeoutError) Error() string {
 	return fmt.Sprintf("%s %s timed out after %s", e.program, strings.Join(e.args, " "), e.after)
 }
 
+// argv is the EXACT command line run() would execute for these args: the
+// configured program, its leading args, then the call's own. It is derived from
+// the same fields run() uses, so a provenance record taken from it cannot
+// describe a different invocation than the one that happened.
+func (t nodetool) argv(args ...string) []string {
+	if len(t.command) == 0 {
+		return nil
+	}
+	out := append([]string(nil), t.command...)
+	return append(out, args...)
+}
+
 func (t nodetool) context(ctx context.Context) (context.Context, context.CancelFunc) {
 	if t.timeout <= 0 {
 		return context.WithCancel(ctx)

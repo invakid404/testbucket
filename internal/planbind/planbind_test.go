@@ -66,10 +66,15 @@ func baseAcquire(t *testing.T, root string, mutate func(*AcquireOptions)) Acquir
 		DiscoveryArgv: []string{"npx", "vitest", "list", "--filesOnly", "--json"},
 		Discovery:     []byte(discoveryJSON),
 		Runnables:     map[string][]byte{"tests/alpha.spec.ts": []byte(runnableJSON)},
-		Env:           map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": ""},
-		Executables:   map[string]string{"npx": "/usr/local/bin/npx"},
-		Tools:         map[string]string{"node": "24.19.0"},
-		Repository:    "example/mandel", Commit: testCommit, Tree: "sha256:tree",
+		// The argv that actually produced that listing, as the caller reports
+		// it. The bundle refuses a listing whose provenance nobody supplied.
+		RunnableArgv: map[string][]string{
+			"tests/alpha.spec.ts": {"npx", "vitest", "list", "tests/alpha.spec.ts", "--json"},
+		},
+		Env:         map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": ""},
+		Executables: map[string]string{"npx": "/usr/local/bin/npx"},
+		Tools:       map[string]string{"node": "24.19.0"},
+		Repository:  "example/mandel", Commit: testCommit, Tree: "sha256:tree",
 	}
 	if mutate != nil {
 		mutate(&opt)
@@ -368,5 +373,40 @@ func TestAColdStartCannotCarryAWarmStore(t *testing.T) {
 		t.Errorf("a bundle claiming a present store with no bytes validated")
 	} else if !strings.Contains(err.Error(), "must be bound as one") {
 		t.Errorf("error %q does not name the contradiction", err)
+	}
+}
+
+// A frozen input's provenance is the record of what produced it. The runnable
+// listings used to record `["vitest","list",<id>,"--json"]` unconditionally —
+// a plausible-looking command that was never run, and never could have been
+// when the consumer configures its own Vitest invocation (Mandel's is
+// `pnpm exec tsx scripts/tb-vitest.ts`).
+//
+// That is worse than recording nothing: a replay follows the record, gets
+// different bytes, and has nothing to explain the difference.
+func TestARunnableListingRecordsTheCommandThatProducedIt(t *testing.T) {
+	root := t.TempDir()
+	// A consumer's own façade, nothing like the invented default.
+	facade := []string{"pnpm", "exec", "tsx", "scripts/tb-vitest.ts", "list", "tests/alpha.spec.ts", "--json"}
+	b := acquire(t, root, func(o *AcquireOptions) {
+		o.RunnableArgv = map[string][]string{"tests/alpha.spec.ts": facade}
+	})
+
+	if len(b.Runnables) != 1 {
+		t.Fatalf("the fixture froze %d runnable listing(s), want 1", len(b.Runnables))
+	}
+	got := b.Runnables[0].Argv
+	if strings.Join(got, " ") != strings.Join(facade, " ") {
+		t.Errorf("the listing records %v, not the command that produced it %v", got, facade)
+	}
+
+	// And a listing whose provenance nobody supplied is refused rather than
+	// filled in with a guess.
+	if _, err := Acquire(baseAcquire(t, root, func(o *AcquireOptions) {
+		o.RunnableArgv = nil
+	})); err == nil {
+		t.Errorf("a runnable listing with no acquisition argv was accepted")
+	} else if !strings.Contains(err.Error(), "provenance is invented") {
+		t.Errorf("error %q does not name the missing provenance", err)
 	}
 }

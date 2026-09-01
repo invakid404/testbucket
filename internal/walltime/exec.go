@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -485,6 +486,20 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 	}
 	defer keyR.Close()
 	cmd.ExtraFiles = append(cmd.ExtraFiles, keyR)
+	// The observer's environment is SCRUBBED of every wall-time secret.
+	//
+	// A nil Cmd.Env hands the child this process's whole environment, and
+	// `wall begin` holds the run key while it launches these two. The action
+	// level then detaches them so they outlive the opening step and span the
+	// measured work — so an inherited key would sit in a live process for the
+	// entire window the measured script runs in, readable by any same-uid
+	// workload through /proc/<pid>/environ.
+	//
+	// That would hand a hostile workload the ability to sign replacement
+	// rosters and closing seals: not an ineligible row, but a forged
+	// attestation that verifies. The observer needs none of these values — its
+	// own signing key arrives on an inherited descriptor — so it gets none.
+	cmd.Env = scrubSecrets(cmd.Env)
 	if detached {
 		// The action-level observers outlive the step that started them:
 		// `wall begin` and `wall end` are two different Actions steps, so the
@@ -532,6 +547,45 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 // observerKeyFD is the descriptor an observer reads its signing key from. It
 // is 3 because Go places ExtraFiles immediately after stdin/stdout/stderr.
 const observerKeyFD = 3
+
+// WallTimeSecretEnv is every environment variable this package treats as a
+// secret. A process that does not need one must not carry one: these are
+// capabilities, and a capability that outlives the step it was granted to is
+// no longer scoped to that step.
+var WallTimeSecretEnv = []string{
+	RunKeyEnv,               // signs the roster and the closing seal
+	"TB_WALL_AUTHORITY_KEY", // approves Stage-1 inputs
+	"TB_WALL_VERIFIER_KEY",  // signs a verifier verdict
+	"TB_WALL_REPLAY_KEY",    // signs an independent replay attestation
+}
+
+// scrubSecrets removes every wall-time secret from an environment.
+//
+// A nil env means "inherit", which is what exec.Cmd does by default, so nil is
+// resolved to the current environment HERE rather than left to the child. It
+// scrubs whatever the launcher supplied rather than rebuilding from
+// os.Environ(), so a caller that deliberately set something on the command —
+// a test harness selecting its dispatch mode, say — keeps it.
+//
+// It is a denylist rather than an allowlist because an observer legitimately
+// needs the ambient environment — PATH, HOME, the cgroup root, the runner's
+// own variables — and an allowlist would silently break on the first runner
+// that requires something nobody enumerated. What must not travel is
+// enumerable and short.
+func scrubSecrets(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.Contains(WallTimeSecretEnv, name) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
 
 // ReadKeyFD reads a signing key handed down an inherited descriptor.
 func ReadKeyFD(fd int) (ed25519.PrivateKey, error) {

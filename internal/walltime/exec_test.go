@@ -663,3 +663,108 @@ func TestAPreWriterBootstrapFailureIsRetained(t *testing.T) {
 		t.Errorf("a bootstrap failure was scored")
 	}
 }
+
+// The run key is a STEP capability, and the action-level observers are
+// deliberately detached so they outlive the step that started them and span
+// the measured work. An inherited key would therefore sit in a live process
+// for exactly the window a hostile same-uid workload is running in, readable
+// through /proc/<pid>/environ — and recovering it buys the ability to sign
+// replacement rosters and closing seals, which is a forged attestation that
+// verifies rather than an ineligible row.
+//
+// The YAML step-binding test cannot see this: it scans the action's own step
+// bodies and knows nothing about what a child inherits. This checks the
+// environment the observer is actually launched with.
+func TestObserversNeverInheritAWallTimeSecret(t *testing.T) {
+	// Every secret is set, so the test fails if a new one is added to the
+	// scrub list without being covered here — and fails if any is missed.
+	for _, name := range WallTimeSecretEnv {
+		t.Setenv(name, "secret-value-for-"+name)
+	}
+	// An ambient variable the observer legitimately needs, to prove the scrub
+	// is a denylist and not a wholesale drop.
+	t.Setenv("TB_WALLTIME_TEST_AMBIENT", "must-survive")
+
+	original := ObserverLauncher
+	var launched []*exec.Cmd
+	ObserverLauncher = func(args []string) (*exec.Cmd, error) {
+		cmd, err := original(args)
+		if err != nil {
+			return nil, err
+		}
+		launched = append(launched, cmd)
+		return cmd, nil
+	}
+	t.Cleanup(func() { ObserverLauncher = original })
+
+	dir := t.TempDir()
+	run := RunIdentity{CampaignID: "ewj2", RunID: "r1", BucketID: "bucket-1", Stage2: "sha256:test"}
+	// Both levels: the action level detaches, the script level does not, and
+	// neither may carry a secret.
+	if _, err := Exec(ExecOptions{
+		Level: LevelScript, Dir: dir, Run: run, Timeout: time.Minute,
+		Argv: []string{"true"},
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if len(launched) == 0 {
+		t.Fatalf("no observer was launched, so this test proved nothing")
+	}
+
+	for _, cmd := range launched {
+		if cmd.Env == nil {
+			t.Errorf("an observer was launched with a nil Env, which inherits this process's whole environment including every secret")
+			continue
+		}
+		got := map[string]string{}
+		for _, kv := range cmd.Env {
+			k, v, _ := strings.Cut(kv, "=")
+			got[k] = v
+		}
+		for _, name := range WallTimeSecretEnv {
+			if v, present := got[name]; present {
+				t.Errorf("an observer inherits %s=%q; a detached observer holding it exposes the key for the whole measured window", name, v)
+			}
+		}
+		if got["TB_WALLTIME_TEST_AMBIENT"] != "must-survive" {
+			t.Errorf("the scrub dropped an ambient variable the observer needs; it is a denylist, not an allowlist")
+		}
+	}
+}
+
+// scrubSecrets is the mechanism itself, checked directly: nil means inherit,
+// which is the default that caused the defect.
+func TestScrubSecretsResolvesNilAndRemovesEverySecret(t *testing.T) {
+	for _, name := range WallTimeSecretEnv {
+		t.Setenv(name, "leaked")
+	}
+	t.Setenv("TB_WALLTIME_TEST_KEEP", "kept")
+
+	for _, tc := range []struct {
+		name string
+		in   []string
+	}{
+		{name: "nil inherits, and must still be scrubbed", in: nil},
+		{name: "an explicit environment is scrubbed in place", in: append(os.Environ(), "TB_EXTRA=1")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := scrubSecrets(tc.in)
+			if out == nil {
+				t.Fatalf("scrubSecrets returned nil, which the child would resolve to the full environment")
+			}
+			seen := map[string]bool{}
+			for _, kv := range out {
+				k, _, _ := strings.Cut(kv, "=")
+				seen[k] = true
+			}
+			for _, name := range WallTimeSecretEnv {
+				if seen[name] {
+					t.Errorf("%s survived the scrub", name)
+				}
+			}
+			if !seen["TB_WALLTIME_TEST_KEEP"] {
+				t.Errorf("a non-secret variable did not survive the scrub")
+			}
+		})
+	}
+}

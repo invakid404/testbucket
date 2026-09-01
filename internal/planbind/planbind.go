@@ -74,6 +74,12 @@ type AcquireOptions struct {
 	// Runnables maps a file id to its raw listing bytes, for name-sliced
 	// targets. An empty map is recorded as an explicit absent input.
 	Runnables map[string][]byte
+	// RunnableArgv is the EXACT command that produced each of those listings.
+	// It is supplied by the caller that ran them rather than reconstructed
+	// here: this package cannot know the configured Vitest command, and a
+	// provenance record naming a command nobody executed would send a replay
+	// after the wrong bytes with nothing to explain the difference.
+	RunnableArgv map[string][]string
 	// Env is the planning-relevant environment, Executables the resolved tool
 	// paths, Tools their versions. They are recorded so an independent
 	// verifier can say what it would take to reproduce the acquisition.
@@ -136,9 +142,13 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 		if len(raw) > 0 && len(names) == 0 {
 			return nil, fmt.Errorf("planbind: the runnable listing for %s parsed to no names; a target flagged for slicing with no runnable universe cannot be sliced", id)
 		}
+		argv := opt.RunnableArgv[id]
+		if len(argv) == 0 {
+			return nil, fmt.Errorf("planbind: the runnable listing for %s records no acquisition argv; a frozen input whose provenance is invented cannot be replayed", id)
+		}
 		b.Runnables = append(b.Runnables, walltime.RunnableSnapshot{
 			TargetID: id,
-			Argv:     []string{"vitest", "list", id, "--json"},
+			Argv:     append([]string(nil), argv...),
 			Cwd:      opt.Root,
 			Env:      copyMap(opt.Env),
 			Names:    names,

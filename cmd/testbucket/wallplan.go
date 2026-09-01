@@ -118,6 +118,7 @@ func runWallBundle(args []string) error {
 	if err != nil {
 		return err
 	}
+	runnableArgv := map[string][]string{}
 	if st != nil {
 		var sliced []string
 		for _, p := range live {
@@ -128,11 +129,15 @@ func runWallBundle(args []string) error {
 		}
 		sort.Strings(sliced)
 		for _, id := range sliced {
-			raw, err := rnr.CaptureRunnables(ctx, id, discovery)
+			raw, argv, err := rnr.CaptureRunnables(ctx, id, discovery)
 			if err != nil {
 				return fmt.Errorf("capture runnables for %s: %w", id, err)
 			}
-			runnables[id] = raw
+			// The argv that ACTUALLY ran, not a reconstruction of it. A
+			// provenance record naming a command nobody executed is worse than
+			// none: a replay would reproduce it, get different bytes, and have
+			// nothing to explain the difference.
+			runnables[id], runnableArgv[id] = raw, argv
 		}
 	}
 
@@ -141,7 +146,7 @@ func runWallBundle(args []string) error {
 		K: *k, Count: 1, Token: rnr.CanonicalToken(),
 		StorePath: *store, StoreBytes: storeBytes, StoreAbsent: storeAbsent,
 		DiscoveryArgv: discoveryArgv(*vitestCommand, *vitestDiscovery, *vitestDiscoveryCommand),
-		Discovery:     discovery, Runnables: runnables,
+		Discovery:     discovery, Runnables: runnables, RunnableArgv: runnableArgv,
 		Env: planningEnv(), Executables: resolvedExecutables(*vitestCommand),
 		Tools:      resolvedTools(*root),
 		Repository: *repository, Commit: *commit, Tree: *tree,

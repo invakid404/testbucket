@@ -298,26 +298,31 @@ func (r *Runner) CaptureDiscovery(ctx context.Context) ([]byte, error) {
 // than resolved so that scoping this listing to the file's own project reuses
 // the one bound observation instead of taking a second, unbound one that could
 // disagree with it.
-func (r *Runner) CaptureRunnables(ctx context.Context, fileID string, discovery []byte) ([]byte, error) {
+// It returns the EXACT argv it ran alongside the bytes. The bundle records
+// that argv as the listing's provenance, and a provenance record that names a
+// command nobody ran is worse than none: a replay would reproduce it, get
+// different bytes, and have no way to see why.
+func (r *Runner) CaptureRunnables(ctx context.Context, fileID string, discovery []byte) ([]byte, []string, error) {
 	if r.frozen != nil {
-		return nil, fmt.Errorf("vitest: this runner is replaying a frozen bundle; there is nothing live to capture")
+		return nil, nil, fmt.Errorf("vitest: this runner is replaying a frozen bundle; there is nothing live to capture")
 	}
 	if r.projectByFile == nil && len(discovery) > 0 {
 		m, err := parseProjects(r.root, discovery)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		r.projectByFile = m
 	}
 	project, err := r.projectFor(ctx, fileID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out, err := r.tool.run(ctx, r.root, runnablesArgs(project, fileID)...)
+	args := runnablesArgs(project, fileID)
+	out, err := r.tool.run(ctx, r.root, args...)
 	if err != nil {
-		return nil, r.runnablesError(fileID, project, err)
+		return nil, nil, r.runnablesError(fileID, project, err)
 	}
-	return out, nil
+	return out, r.tool.argv(args...), nil
 }
 
 // runnablesArgs builds the `vitest list` invocation for one file's names:
