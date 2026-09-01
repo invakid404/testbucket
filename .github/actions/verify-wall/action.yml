@@ -79,6 +79,17 @@ inputs:
       population from these, so a row whose verdict was never written cannot be
       counted — which is the correct outcome, not a gap to paper over.
     default: ""
+  record-signer:
+    description: >-
+      The PUBLIC half of the run key that signed this measurement's signer
+      roster and closing seal. The Stage-1 manifest normally declares it and is
+      the authoritative source; passing it here lets a caller state the
+      expectation independently, and the two sets are unioned.
+
+      It is a public key, so it is an input rather than a secret. Its private
+      half is bound only to run-bucket's `wall begin` and `wall end` steps and
+      never to the measured script.
+    default: ""
   verifier-key:
     description: >-
       The verifier''s own ed25519 signing key. A campaign counts a row only if
@@ -151,6 +162,7 @@ runs:
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
         TB_VERDICT_FILE: ${{ inputs.verdict-file }}
         TB_WALL_VERIFIER_KEY: ${{ inputs.verifier-key }}
+        TB_RECORD_SIGNER: ${{ inputs.record-signer }}
         TB_RECORDS_ARTIFACT: ${{ inputs.records-artifact }}
       run: |
         set -euo pipefail
@@ -171,6 +183,7 @@ runs:
         if [ -n "$TB_EVENTS_DIR" ]; then args+=(--events "$TB_EVENTS_DIR" --runner "$TB_RUNNER"); fi
         if [ -n "$TB_AUTHORITY" ]; then args+=(--authority "$TB_AUTHORITY"); fi
         if [ -n "$TB_AUTHORITY_KEY" ]; then args+=(--authority-key "$TB_AUTHORITY_KEY"); fi
+        if [ -n "$TB_RECORD_SIGNER" ]; then args+=(--record-signer "$TB_RECORD_SIGNER"); fi
         if [ -n "$TB_RECORDS_ARTIFACT" ]; then
           echo "the records this verdict is derived from are uploaded as: $TB_RECORDS_ARTIFACT"
         fi

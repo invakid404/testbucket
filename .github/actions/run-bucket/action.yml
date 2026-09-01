@@ -73,6 +73,27 @@ inputs:
       one: the contract puts AT_end after the final action epilogue, so
       verification cannot be a later step of the same action.
     default: "false"
+  run-key:
+    description: >-
+      The run key: the ed25519 signing key that attests this measurement's
+      signer ROSTER and its closing SEAL. Required for an eligible scored row —
+      without it both documents are written unsigned and the verifier reports
+      WT-023, because a record set authenticated only by the keys it carries is
+      what a forger would also produce.
+
+      It is bound to exactly two steps of this action, `wall begin` and
+      `wall end`, and to NEITHER the setup command nor the measured bucket
+      script. That is not tidiness, it is the entire mechanism: a step-scoped
+      `env:` is not visible to other steps, so the work being measured cannot
+      produce a roster, cannot produce a seal, and cannot alter either once the
+      seal exists. Widening this to the run step would make the whole signer
+      set forgeable by the thing it is meant to attest.
+
+      Pass a secret, never a literal. The corresponding PUBLIC key must be
+      declared in the Stage-1 manifest's record-signers and handed to
+      `verify-wall`, or the verifier has nothing to check the attestations
+      against.
+    default: ""
   campaign-id:
     description: 'Campaign identity stamped on every record.'
     default: ""
@@ -149,6 +170,9 @@ runs:
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        # The run key, scoped to THIS step. `wall begin` seals the signer
+        # roster with it before the measured script exists.
+        TB_WALL_RUN_KEY: ${{ inputs.run-key }}
         BUCKET_NAME: ${{ inputs.name }}
         TB_CAMPAIGN_ID: ${{ inputs.campaign-id }}
         TB_STAGE1: ${{ inputs.stage1-digest }}
@@ -313,6 +337,10 @@ runs:
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        # The run key again, scoped to THIS step. `wall end` seals the exact
+        # bytes of every stream and of the key log with it, after the measured
+        # script has finished and in a step that script was never in.
+        TB_WALL_RUN_KEY: ${{ inputs.run-key }}
         TB_OUTCOME: ${{ steps.run.outcome }}
       run: |
         set -euo pipefail

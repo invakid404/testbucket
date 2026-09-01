@@ -538,6 +538,8 @@ func runWallVerify(args []string) error {
 	runnerKind := fs.String("runner", "go", "which adapter's event parser reads --events: go or vitest")
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable. Without one the verifier will not treat any signature as authority approval, because a self-generated key would otherwise pass")
+	var recordSigners stringList
+	fs.Var(&recordSigners, "record-signer", "a PREDECLARED run-key PUBLIC key (hex) allowed to sign this measurement's signer roster and closing seal; repeatable. The Stage-1 manifest normally declares these and is the authoritative source; this lets a caller state them independently, and the two sets are unioned")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -549,7 +551,7 @@ func runWallVerify(args []string) error {
 		AetaPath: *aeta, PcheckPath: *pcheck, RegistryPath: *registry, ScorerPath: *scorer,
 		ReplayPath: *replay, InvocationsPath: *invocations, StepAttemptPath: *stepAttempt,
 		Audit:         coverageAudit(*shardPlan, *eventsDir, *runnerKind),
-		AuthorityKeys: authorityKeys, Authority: *authority,
+		AuthorityKeys: authorityKeys, Authority: *authority, SignerKeys: recordSigners,
 	})
 	if err != nil {
 		return err

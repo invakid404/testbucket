@@ -162,6 +162,31 @@ on:
           secret.
         type: string
         default: ""
+      run-key-secret:
+        description: >-
+          Name of a secret holding the RUN KEY: the ed25519 private key that
+          signs each bucket's signer roster and closing seal. Required for an
+          eligible scored row — without it both attestations are written
+          unsigned and every verdict is WT-023 ineligible, because records
+          authenticated only by the keys they carry are what a forger would
+          also produce.
+
+          The workflow binds it to exactly two steps of the run-bucket action,
+          `wall begin` and `wall end`, and to neither the setup command nor the
+          measured bucket script. A step-scoped value is invisible to other
+          steps, which is precisely why the measured work cannot mint a roster,
+          cannot mint a seal, and cannot alter either after the seal exists.
+        type: string
+        default: ""
+      record-signer:
+        description: >-
+          The PUBLIC half of that run key, handed to the verifier so it has
+          something to check the roster and seal against. The Stage-1 manifest
+          normally declares it too and remains the authoritative source; the
+          two sets are unioned. It is public, so it is an input rather than a
+          secret.
+        type: string
+        default: ""
       verifier-key-secret:
         description: >-
           Name of a secret holding the verifier''s ed25519 signing key, used to
@@ -453,6 +478,11 @@ jobs:
           runner: ${{ inputs.runner }}
           script: ${{ matrix.script }}
           name: ${{ matrix.name }}
+          # Bound by the ACTION to `wall begin` and `wall end` only. It must
+          # never reach the setup command or the measured script: those are the
+          # work being attested, and a signer set the measured work can produce
+          # attests nothing.
+          run-key: ${{ inputs.run-key-secret != '' && secrets[inputs.run-key-secret] || '' }}
           est-seconds: ${{ matrix.est_seconds }}
           events-dir: /tmp/testbucket-events
           version: ${{ inputs.testbucket-version }}
@@ -535,6 +565,7 @@ jobs:
           records-artifact: testbucket-wall-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
           verdict-file: ${{ inputs.wall-time-dir }}/verdict.json
           verifier-key: ${{ inputs.verifier-key-secret != '' && secrets[inputs.verifier-key-secret] || '' }}
+          record-signer: ${{ inputs.record-signer }}
           stage1-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage1.json', runner.temp) || '' }}
           # The derived documents come from the PLANNER when the arm was
           # planned from a frozen bundle: they are the one authorised plan's
