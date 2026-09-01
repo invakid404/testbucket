@@ -421,7 +421,17 @@ jobs:
           TB_WALL_DIR: ${{ inputs.wall-time-dir }}
           TB_FROZEN_INPUTS: ${{ inputs.frozen-inputs-artifact }}
           TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
-          TB_RUN_KEY_SET: ${{ (secrets.run-key != '' || inputs.run-key-secret != '') && 'yes' || 'no' }}
+          # The RESOLVED run key, not the fact that a selector was typed.
+          # `run-key-secret` names a secret; a direct external caller can name
+          # one that maps to nothing here, and then the name is nonempty while
+          # `secrets[<name>]` — the value `run-bucket` is actually given below
+          # — is empty. Testing the NAME let exactly that request pass this
+          # guard, pre-flight the plan, open the action envelope and run the
+          # tests, only to be refused WT-023 afterwards: fail-later, which is
+          # the one thing this step exists to prevent. So the predicate is the
+          # SAME expression the `run-key:` input of `run-bucket` is given,
+          # compared against empty. It yields `yes` or `no` and never the key.
+          TB_RUN_KEY_SET: ${{ (secrets.run-key != '' && secrets.run-key || (inputs.run-key-secret != '' && secrets[inputs.run-key-secret] || '')) != '' && 'yes' || 'no' }}
         run: |
           set -euo pipefail
           fail=0
@@ -437,7 +447,7 @@ jobs:
             say "needs authority-key. A Stage-1 signature checked against whatever signed it accepts any self-generated key, which is the same as not checking."
           fi
           if [ "$TB_RUN_KEY_SET" != "yes" ]; then
-            say "needs a run key (the run-key secret, or run-key-secret naming one). Without it the signer roster and the closing seal are written unsigned and every row is WT-023 ineligible."
+            say "needs a run key that RESOLVES here (the run-key secret, or run-key-secret naming one this workflow can actually read). Without a value the signer roster and the closing seal are written unsigned and every row is WT-023 ineligible; a secret name that maps to nothing is no key at all."
           fi
           [ "$fail" -eq 0 ] || exit 1
           echo "eligible request: wall directory, frozen inputs, authority key and run key are all present"
