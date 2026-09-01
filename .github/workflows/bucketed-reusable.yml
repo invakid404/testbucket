@@ -4,7 +4,7 @@ name: testbucket bucketed (reusable)
 #
 #   jobs:
 #     tests:
-#       uses: invakid404/testbucket/.github/workflows/bucketed-reusable.yml@v1
+#       uses: invakid404/testbucket/.github/workflows/bucketed-reusable.yml@v0
 #       with:
 #         runner: go       # or vitest
 #         k: "6"
@@ -19,7 +19,7 @@ name: testbucket bucketed (reusable)
 #
 # The composite actions are referenced with the `$/` SELF-REPOSITORY syntax, so
 # they resolve to THIS repo at the SAME ref the reusable workflow was called
-# with — the pinned actions for an external `@v1` consumer, and the local
+# with — the pinned actions for an external `@v0` consumer, and the local
 # checkout for testbucket's own pre-release dogfood.
 #
 # Plain `./` would resolve against the WORKSPACE, which for a called reusable
@@ -65,9 +65,13 @@ on:
         type: string
         default: default
       testbucket-version:
-        description: 'Which testbucket binary the actions install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
+        description: >-
+          Which testbucket binary the actions install: the moving `v0` alias
+          (the default — this project is deliberately pre-1.0), an exact
+          `vX.Y.Z`, or "local" to build from the checked-out source. A scored
+          arm must pin an exact `vX.Y.Z`.
         type: string
-        default: v1
+        default: v0
       go-version:
         description: 'Go toolchain version (runner: go).'
         type: string

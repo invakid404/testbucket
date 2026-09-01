@@ -41,10 +41,12 @@ inputs:
   version:
     description: >-
       testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
-      `vX.Y.Z`, or "local" to build from the checked-out source. NOTE: the
-      default `v1` resolves only once a 1.x release is published; while this
-      project is on 0.x, pin an exact tag (or `v0`).
-    default: v1
+      `vX.Y.Z`, or "local" to build from the checked-out source. The default is
+      the moving `v0` alias, which resolves to the highest published 0.x
+      release — this project is deliberately pre-1.0. A scored arm must pin an
+      exact `vX.Y.Z` instead: an alias is descriptive metadata, not a delivery
+      identity.
+    default: v0
 
 runs:
   using: composite

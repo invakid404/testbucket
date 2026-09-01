@@ -515,11 +515,12 @@ narrow its caller's permissions, so declaring it here would break every caller
 that grants less. Without it the collector says so and exits 0, and the
 verifier reports the row ineligible.
 
-**On `version`:** every action defaults to `v1`, which resolves only once a 1.x
-release exists. While this project is on 0.x, pin an exact tag (or `v0`). A
-scored arm *must* pin an exact `vX.Y.Z`: the installer downloads and
-checksum-verifies a release asset, and there is no asset at an arbitrary commit
-SHA, so a SHA is refused rather than advertised as deliverable.
+**On `version`:** every action defaults to the moving `v0` alias, which
+resolves to the highest published 0.x release — this project is deliberately
+pre-1.0. A scored arm *must* pin an exact `vX.Y.Z`: an alias is descriptive
+metadata rather than a delivery identity, and the installer downloads and
+checksum-verifies a release asset, so a commit SHA — which has no asset — is
+refused rather than advertised as deliverable.
 
 Wall-time measurement is Vitest-only today. `--wall-dir` with `--runner go` is
 **refused**, not ignored: a flag that silently does nothing is how a consumer

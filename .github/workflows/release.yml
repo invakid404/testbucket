@@ -3,8 +3,10 @@ name: Release
 # Cut a release from a version tag. Pushing `vX.Y.Z` builds the cross-platform
 # CLI binaries (linux/darwin x amd64/arm64) with goreleaser, publishes a GitHub
 # Release with the tar.gz archives + a checksums file, and points the
-# `v<major>` alias tag (e.g. v1) at the HIGHEST stable release of that major so
-# consumers can pin the reusable actions at @v1 — the standard convention.
+# `v<major>` alias tag at the HIGHEST stable release of that major so consumers
+# can pin the reusable actions at that alias — the standard convention. While
+# this project is pre-1.0 that alias is `v0`, which is what every action's
+# `version` input defaults to.
 #
 # Validate the build WITHOUT publishing at any time:
 #   goreleaser release --snapshot --clean
