@@ -214,21 +214,13 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 	if b.Acquisition.Executables, b.Acquisition.Tools, err = resolveFor(opt, b.Acquisition.Argv, "the bundle acquisition closure"); err != nil {
 		return nil, err
 	}
-	b.Parsers = []walltime.ParserIdentity{
-		{Name: "vitest-discovery-parser", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("vitest-discovery-parser/" + ParserVersion))},
-		{Name: "vitest-runnable-parser", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("vitest-runnable-parser/" + ParserVersion))},
-		{Name: "suffix-collision-atomiser", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("suffix-collision-atomiser/" + ParserVersion))},
-		{Name: "store-schema", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("store-schema/" + ParserVersion))},
-		{Name: "staleness-policy", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("staleness-policy/" + ParserVersion))},
-		{Name: "kk-partitioner", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("kk-partitioner/" + ParserVersion))},
-		{Name: "vitest-renderer", Version: ParserVersion, Digest: walltime.DigestBytes([]byte("vitest-renderer/" + ParserVersion))},
-	}
-	b.Algorithms.FullPlan = walltime.AlgorithmIdentity{
-		Name: walltime.FullPlanDigestAlgorithm, Canonicalizer: walltime.CanonAlgorithm, Implementation: ParserVersion,
-	}
-	b.Algorithms.SemanticPlan = walltime.AlgorithmIdentity{
-		Name: walltime.SemanticPlanDigestAlgorithm, Canonicalizer: walltime.CanonAlgorithm, Implementation: ParserVersion,
-	}
+	// The identities of the implementations that will RUN, not labels for
+	// them. Every stage the contract names is bound, and each digest is the
+	// binary this build is — so a reader who can reproduce the binary can
+	// reproduce every identity here.
+	b.Parsers = walltime.ImplementedParserIdentities()
+	b.Algorithms.FullPlan = walltime.ImplementedFullPlanAlgorithm()
+	b.Algorithms.SemanticPlan = walltime.ImplementedSemanticPlanAlgorithm()
 	b.Selection.K = opt.K
 	b.Selection.Count = opt.Count
 	b.Selection.Token = opt.Token
@@ -417,8 +409,13 @@ func deriveReceipt(stage1 walltime.Digest, b *walltime.PlanningInputBundle, doc 
 		PlannerResult:    fmt.Sprintf("k=%d buckets=%d units=%d", doc.K, len(doc.Buckets), doc.Summary.ScheduledUnits),
 		RendererResult:   fmt.Sprintf("invocations=%d", countInvocations(doc)),
 	}
-	r.Algorithms.FullPlan = b.Algorithms.FullPlan
-	r.Algorithms.SemanticPlan = b.Algorithms.SemanticPlan
+	// The identities of the implementations that JUST RAN, taken from this
+	// build rather than copied out of the bundle. Echoing the bundle made the
+	// receipt repeat a claim; the bundle is now checked against these same
+	// values before the planner executes, so recording them directly is what
+	// makes Stage 2 a statement about what happened.
+	r.Algorithms.FullPlan = walltime.ImplementedFullPlanAlgorithm()
+	r.Algorithms.SemanticPlan = walltime.ImplementedSemanticPlanAlgorithm()
 	return r, r.Validate()
 }
 

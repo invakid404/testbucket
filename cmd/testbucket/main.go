@@ -33,6 +33,7 @@ import (
 	"github.com/invakid404/testbucket/internal/runner"
 	"github.com/invakid404/testbucket/internal/runner/gorunner"
 	"github.com/invakid404/testbucket/internal/runner/vitestrunner"
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
 // Build metadata, injected at release time via -ldflags -X (goreleaser fills
@@ -323,7 +324,7 @@ func runPlan(args []string) error {
 	pallocScorer := fs.String("palloc-scorer", "", "frozen pre-plan scorer (--wall-bundle): KK then packs by Palloc while est_seconds keeps reporting the store's measured weights. Without it the partition uses the store weights, which is not campaign eligible")
 	wallRegistry := fs.String("wall-registry", "", "frozen Aeta component-registry template (--wall-bundle), instantiated per bucket into --wall-out-dir")
 	wallOutDir := fs.String("wall-out-dir", "", "write the per-bucket derived documents (Palloc, Pcheck, Aeta) here (--wall-bundle)")
-	wallAuthority := fs.String("wall-authority", "", "the protected environment the Stage-1 manifest must name (--wall-bundle)")
+	wallAuthority := fs.String("wall-authority", "", "the EXACT protected environment the Stage-1 manifest must name, e.g. "+walltime.CampaignAuthority+". REQUIRED with --wall-bundle: the contract puts the protected authority's approval BEFORE either role plans, and a key can sign under any label — so a key check alone lets a manifest approved elsewhere drive the frozen planner")
 	var wallAuthorityKeys stringList
 	fs.Var(&wallAuthorityKeys, "wall-authority-key", "a PREDECLARED authority public key (hex); repeatable. REQUIRED with --wall-bundle: the contract puts an owner-authority signature on the planning inputs BEFORE the plan exists, and a post-run verifier can refuse a row but cannot un-run an action or restore an approval that never happened")
 	nodePrefixes := fs.String("node-prefixes", "", "comma-separated package-dir prefixes whose buckets need Node set up (empty = none; a consumer opts in)")

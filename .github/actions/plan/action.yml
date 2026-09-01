@@ -125,8 +125,15 @@ inputs:
     default: ""
   authority:
     description: >-
-      Protected environment the Stage-1 manifest must name. A key says WHO
-      signed; this says WHICH environment approved.
+      The EXACT protected environment the Stage-1 manifest must name, e.g.
+      `ewj2-campaign`. A key says WHO signed; this says WHICH environment
+      approved, and the contract requires that approval BEFORE either role
+      plans.
+
+      REQUIRED with `bundle`. A key can sign under any label, so checking the
+      key alone lets a manifest approved by some other environment drive the
+      frozen planner — and by the time a downstream gate notices, the matrix
+      and the Stage-2 material already exist.
     default: ""
   derived-out:
     description: >-
@@ -210,9 +217,12 @@ runs:
             echo "a frozen bundle needs an authority-key: an owner-authority signature must be VERIFIED before the plan exists, and checking a signature against whatever signed it accepts any self-generated key." >&2
             exit 1
           fi
+          if [ -z "$TB_AUTHORITY" ]; then
+            echo "a frozen bundle needs an authority: a key can sign under any label, so checking the key alone lets a manifest approved by some other protected environment drive the frozen planner — and the contract puts that approval before either role plans." >&2
+            exit 1
+          fi
           frozen=(--wall-bundle "$TB_BUNDLE" --wall-stage1 "$TB_STAGE1" --shard-plan "$TB_SHARD_PLAN")
-          frozen+=(--wall-authority-key "$TB_AUTHORITY_KEY")
-          if [ -n "$TB_AUTHORITY" ]; then frozen+=(--wall-authority "$TB_AUTHORITY"); fi
+          frozen+=(--wall-authority-key "$TB_AUTHORITY_KEY" --wall-authority "$TB_AUTHORITY")
           if [ -n "$TB_STAGE2_OUT" ]; then frozen+=(--wall-stage2 "$TB_STAGE2_OUT"); fi
           if [ -n "$TB_SCORER" ]; then frozen+=(--palloc-scorer "$TB_SCORER"); fi
           if [ -n "$TB_REGISTRY" ]; then frozen+=(--wall-registry "$TB_REGISTRY"); fi

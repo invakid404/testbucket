@@ -302,9 +302,11 @@ func testBundle() PlanningInputBundle {
 	b.Acquisition.Env = map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": "shared/f/lib/cases/"}
 	b.Acquisition.Executables = map[string]string{"testbucket": "/usr/local/bin/testbucket"}
 	b.Acquisition.Tools = testTools("testbucket")
-	b.Parsers = []ParserIdentity{{Name: "vitest-discovery", Version: "v0.2.2", Digest: "sha256:parser"}}
-	b.Algorithms.FullPlan = AlgorithmIdentity{Name: FullPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: "testbucket"}
-	b.Algorithms.SemanticPlan = AlgorithmIdentity{Name: SemanticPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: "testbucket"}
+	// The identities of the implementations that would actually run — the
+	// complete inventory, not a label for one of them.
+	b.Parsers = ImplementedParserIdentities()
+	b.Algorithms.FullPlan = ImplementedFullPlanAlgorithm()
+	b.Algorithms.SemanticPlan = ImplementedSemanticPlanAlgorithm()
 	b.Selection.K = 8
 	b.Selection.Count = 1
 	b.Selection.Token = "vitest"
@@ -1481,6 +1483,20 @@ func TestBundleBindsItsAcquisitionClosure(t *testing.T) {
 		{"a parser with no digest", func(b *PlanningInputBundle) {
 			b.Parsers = []ParserIdentity{{Name: "x", Version: "1"}}
 		}, "no version or digest"},
+		{"a parser identity the implementation does not match", func(b *PlanningInputBundle) {
+			b.Parsers = append([]ParserIdentity(nil), b.Parsers...)
+			b.Parsers[0].Digest = DigestBytes([]byte("invented parser bytes"))
+		}, "the implementation that will run"},
+		{"an incomplete parser inventory", func(b *PlanningInputBundle) {
+			b.Parsers = ImplementedParserIdentities()[1:]
+		}, "is not bound at all"},
+		{"a parser this build does not implement", func(b *PlanningInputBundle) {
+			b.Parsers = append(ImplementedParserIdentities(),
+				ParserIdentity{Name: "invented-policy", Version: PlanImplementationVersion, Digest: SelfDigest()})
+		}, "no such parser or policy"},
+		{"an invented full-plan algorithm implementation", func(b *PlanningInputBundle) {
+			b.Algorithms.FullPlan.Implementation = "some-other-implementation"
+		}, "the implementation that will run"},
 		{"a runnable listing with bytes but no names", func(b *PlanningInputBundle) {
 			raw := []byte(`[{"name":"a","file":"x.spec.ts"}]`)
 			b.Runnables = []RunnableSnapshot{{TargetID: "x.spec.ts", Bytes: raw, Digest: DigestBytes(raw)}}

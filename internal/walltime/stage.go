@@ -400,6 +400,16 @@ func (b PlanningInputBundle) Validate() error {
 			return fmt.Errorf("planning-input bundle: parser %q has no version or digest", p.Name)
 		}
 	}
+	// The COMPLETE inventory, and the implementations that will actually run.
+	//
+	// The field checks above prove only that a caller filled three fields in.
+	// The digests were SHA-256 of label strings, the inventory was missing the
+	// lock parser, unit expansion and coverage outright, and nothing ever
+	// compared any of it with the code the planner executes — so the bundle
+	// carried a claim and Stage 2 repeated it.
+	if err := CheckPlanImplementationIdentities(b); err != nil {
+		return err
+	}
 	// The source and acquisition closure: what tree the inputs came from, and
 	// what it would take to reproduce taking them.
 	if err := requireSet(map[string]string{
@@ -1571,7 +1581,17 @@ func (m Stage1Manifest) RequireApproval(authorityKeys []string, authority string
 	if err := VerifySigned(m.Signature, d, authorityKeys); err != nil {
 		return fmt.Errorf("stage-1 authority signature: %w", err)
 	}
-	if authority != "" && m.Signature.Authority != authority {
+	// An EMPTY expected authority is not a wildcard.
+	//
+	// It used to be: the label comparison ran only when a caller had supplied
+	// one, so the one call that mattered — the frozen planner's — could omit
+	// it and every label passed. This is the approval check; a caller that
+	// cannot say which protected environment must have approved is not in a
+	// position to accept the approval.
+	if strings.TrimSpace(authority) == "" {
+		return fmt.Errorf("no expected authority was named, so any protected environment's label would be accepted; the contract names exactly one that may approve Stage-1 inputs")
+	}
+	if m.Signature.Authority != authority {
 		return fmt.Errorf("the Stage-1 manifest names authority %q, not the required %q", m.Signature.Authority, authority)
 	}
 	return nil

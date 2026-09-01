@@ -347,6 +347,33 @@ jobs:
           name: ${{ inputs.frozen-inputs-artifact }}
           path: ${{ runner.temp }}/testbucket-frozen-inputs
 
+      # THE PLAN-JOB AUTHORITY GATE. The contract requires the protected
+      # environment's approval BEFORE either role plans, and this job is where
+      # the frozen planner runs — so the exact label has to be refused here,
+      # not in the downstream bucket job. By the time that job's guard runs,
+      # the matrix and the Stage-2 material already exist.
+      #
+      # It is scoped to the frozen/scored path. An ordinary unscored plan has
+      # no Stage-1 manifest to approve and is unaffected.
+      - name: Refuse a frozen plan without the exact protected authority
+        if: inputs.frozen-inputs-artifact != '' || inputs.verify-require == 'eligible'
+        shell: bash
+        env:
+          TB_AUTHORITY: ${{ inputs.authority }}
+          TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        run: |
+          set -euo pipefail
+          fail=0
+          say() { echo "frozen plan — $1" >&2; fail=1; }
+          if [ -z "$TB_AUTHORITY_KEY" ]; then
+            say "needs authority-key. An owner-authority signature must be VERIFIED before the plan exists, and a signature checked against whatever signed it accepts any self-generated key."
+          fi
+          if [ "$TB_AUTHORITY" != "ewj2-campaign" ]; then
+            say "needs authority=ewj2-campaign. The frozen contract names exactly one protected environment that may approve Stage-1 inputs before either role plans. A key signs under any label it is given, so checking the key alone lets a manifest approved elsewhere drive the frozen planner — and a downstream refusal cannot un-derive the matrix this job is about to produce."
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "frozen plan: the protected authority and its key are both bound before planning"
+
       - name: Plan the buckets
         id: plan
         uses: $/.github/actions/plan

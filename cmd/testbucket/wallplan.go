@@ -714,23 +714,32 @@ type frozenPlanOptions struct {
 
 func planFromBundle(o frozenPlanOptions) error {
 	bundlePath, stage1Path, stage2Path, shardPlan, asJSON := o.bundlePath, o.stage1Path, o.stage2Path, o.shardPlan, o.asJSON
-	var bundle walltime.PlanningInputBundle
-	if err := walltime.ReadJSONFile(bundlePath, &bundle); err != nil {
-		return err
-	}
-	// AUTHORISATION BEFORE PLANNING. The contract puts an owner-authority
-	// signature on the inputs before the plan exists, and the planner is where
-	// that has to be enforced: a post-run verifier can refuse the row, but it
-	// cannot un-run an action or restore an approval that never happened.
+
+	// AUTHORISATION BEFORE PLANNING — and before reading anything. The
+	// contract puts an owner-authority signature on the inputs before the plan
+	// exists, and the planner is where that has to be enforced: a post-run
+	// verifier can refuse the row, but it cannot un-run an action or restore
+	// an approval that never happened.
 	//
-	// Both are required on the frozen path. A frozen plan with no Stage-1 is
-	// an unauthorised plan wearing the frozen path's determinism, and a
-	// signature checked against whatever signed it is not an authority check.
+	// All three are required on the frozen path. A frozen plan with no Stage-1
+	// is an unauthorised plan wearing the frozen path's determinism; a
+	// signature checked against whatever signed it is not an authority check;
+	// and a key signs under any label it is given, so without the expected
+	// label a manifest approved by some other protected environment drives the
+	// frozen planner.
 	if stage1Path == "" {
 		return fmt.Errorf("--wall-stage1 is required: planning from a frozen bundle with no Stage-1 manifest is planning from inputs nobody authorised")
 	}
 	if len(o.authorityKeys) == 0 {
 		return fmt.Errorf("--wall-authority-key is required with --wall-stage1: verifying a signature against whatever signed the document accepts any self-generated key")
+	}
+	if strings.TrimSpace(o.authority) == "" {
+		return fmt.Errorf("--wall-authority is required with --wall-stage1: the contract puts the PROTECTED environment's approval before either role plans, and a key can sign under any label — so checking the key alone lets a manifest approved by some other environment drive the frozen planner")
+	}
+
+	var bundle walltime.PlanningInputBundle
+	if err := walltime.ReadJSONFile(bundlePath, &bundle); err != nil {
+		return err
 	}
 	var m walltime.Stage1Manifest
 	if err := walltime.ReadJSONFile(stage1Path, &m); err != nil {

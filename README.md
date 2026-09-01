@@ -384,10 +384,15 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   environment**. Verifying a signature against whatever signed the document
   accepts any self-generated key, so a run with no predeclared authority is
   reported ineligible rather than trusted — and a key can sign under any label,
-  so `wall replay --stage1` also requires `--authority` and the eligible guard
-  requires exactly `ewj2-campaign`. Checking the key alone would accept a
-  correctly keyed manifest approved by some other environment, and this is the
-  gate that runs before the measured action rather than after it.
+  so `wall replay --stage1` and `plan --wall-bundle` both require
+  `--authority`, and BOTH the plan job and the bucket job refuse anything but
+  exactly `ewj2-campaign`. Checking the key alone would accept a correctly
+  keyed manifest approved by some other environment. An empty expected
+  authority is not a wildcard: a caller that cannot say which protected
+  environment must have approved is not in a position to accept the approval.
+  The plan-job gate matters separately from the bucket-job one — the contract
+  puts approval before either role PLANS, and a refusal afterwards cannot
+  un-derive the matrix.
 - Scoring needs an **invocation manifest** and a **step attempt**. The first
   says what the authorised plan rendered, so the measured argv, selector, unit
   membership and atom closure are compared to it rather than merely recorded —
@@ -473,6 +478,14 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   label carries — campaign, candidate, run and holdout, all in the signed
   receipt — and evidence decoding refuses unknown fields, so an identity the
   schema does not model cannot slip past the checks that read it.
+- The bundle binds the **implementations that will run**, not labels for them.
+  Every stage the contract names — discovery, runnable parsing, lock, stale
+  policy, unit expansion, suffix collision, coverage, selection, rendering and
+  the store schema — has an identity whose digest is the binary about to
+  execute, and the planner and the independent replay both compare every claim
+  against that before deriving anything. Stage 2 records the implementations
+  that ran rather than echoing the bundle. Digests of label strings identified
+  a parser's NAME and said nothing about its bytes.
 - Every frozen listing binds the **closure of its own argv**: the exact
   command, cwd, planning-relevant environment, resolved executable path and a
   complete tool/version/integrity closure. An unresolved or empty identity is a
