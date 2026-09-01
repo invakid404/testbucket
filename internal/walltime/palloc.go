@@ -255,8 +255,14 @@ type Scorer struct {
 	Lineage TrainingLineageID `json:"lineage"`
 }
 
-// DigestOf is the scorer's identity.
-func (s Scorer) DigestOf() (Digest, error) { return DigestJSON(s) }
+// DigestOf is the scorer's identity. The lineage's own ScorerDigest field is
+// excluded before hashing for the obvious reason: a document cannot contain
+// its own digest, and leaving it in would make the identity unreproducible.
+func (s Scorer) DigestOf() (Digest, error) {
+	c := s
+	c.Lineage.ScorerDigest = ""
+	return DigestJSON(c)
+}
 
 // Score is the whole runtime allocation surface:
 // Palloc[u] = frozen_scorer(frozen_preplan_unit_feature_vector[u]).
