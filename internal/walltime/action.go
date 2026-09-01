@@ -58,21 +58,39 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	start := clock.Now()
 	probe(atStartReading, dir)
 
+	// The operations BEFORE a writer exists still have to leave a record.
+	//
+	// A_start has already been read, so from here the action has begun; a
+	// failure that returned silently would be indistinguishable from an action
+	// that never started, which is exactly the retention the contract forbids
+	// losing. Each of these is retained on a best-effort basis — the retention
+	// path mints its own key and writer, so it can record a failure of the key
+	// or the writer as long as the directory is writable, and when even that
+	// is impossible the error is still returned rather than swallowed.
+	preWriter := func(what string, err error) error {
+		retainActionTerminal(dir, run, TerminalWrapperError, what+": "+err.Error())
+		return fmt.Errorf("walltime: %s: %w", what, err)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+		// Nothing can be retained into a directory that does not exist, and
+		// saying so is more useful than a bare mkdir error.
+		return nil, fmt.Errorf("walltime: create the records directory (no terminal record can be retained without it): %w", err)
+	}
+	if err := probeErr(atRecordsDir, dir); err != nil {
+		return nil, preWriter("prepare the records directory", err)
 	}
 	key, err := NewSigningKey()
 	if err != nil {
-		return nil, err
+		return nil, preWriter("mint the action signing key", err)
 	}
 	w, err := NewWriter(filepath.Join(dir, streamName(ProducerPhysical, LevelAction, 0)), ProducerPhysical, ProducerID(ProducerPhysical), key)
 	if err != nil {
-		return nil, err
+		return nil, preWriter("open the action record stream", err)
 	}
 	defer w.Close()
 	runKey, err := RunKeyFromEnv()
 	if err != nil {
-		return nil, err
+		return nil, preWriter("read the run key", err)
 	}
 
 	// From here on every failure is RETAINED. A bootstrap that dies without a

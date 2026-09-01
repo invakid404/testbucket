@@ -609,20 +609,28 @@ func coverageAudit(shardPlan, eventsDir, runnerKind string) walltime.AuditFunc {
 		return nil
 	}
 	return func(bucketID string) (*walltime.AuditEvidence, error) {
-		// The digest of the EXACT document this audit derives its expected
-		// population from, canonicalised with the frozen full-plan algorithm.
-		// The verifier compares it to the Stage-2 receipt: without that, a
-		// plan substituted after planning to describe only the work that ran
-		// audits as complete, and every other artifact stays valid.
-		planDigest, err := fullPlanDigest(shardPlan)
+		// ONE read, and everything below derives from it.
+		//
+		// The digest, the bucket lookup and the expected coverage all describe
+		// "the plan", and a path re-read three times is three plans. Taking
+		// the digest from the authorised file and the expected coverage from a
+		// narrowed one substituted in between produces an audit that reports
+		// the Stage-2-matching digest over a population that was never
+		// planned — which is the substitution the digest exists to catch,
+		// wearing the digest as a disguise.
+		doc, err := core.ParseShardPlan(shardPlan)
 		if err != nil {
 			return nil, err
 		}
-		index, err := core.BucketIndexOf(shardPlan, bucketID)
+		planDigest, err := walltime.DigestJSON(doc)
 		if err != nil {
 			return nil, err
 		}
-		planned, err := core.LoadPlannedCoverageForBucket(shardPlan, index)
+		index, err := core.BucketIndexIn(doc, bucketID)
+		if err != nil {
+			return nil, err
+		}
+		planned, err := core.PlannedCoverageForBucket(doc, index)
 		if err != nil {
 			return nil, err
 		}
@@ -685,14 +693,14 @@ func coverageAudit(shardPlan, eventsDir, runnerKind string) walltime.AuditFunc {
 // in-memory document; the artifact is written indented, and a re-serialisation
 // that differed only in whitespace would read as a substituted plan. Parsing
 // and re-canonicalising compares the plan, which is what is being bound.
+//
+// The audit itself does NOT call this: it parses once and digests the document
+// it actually used, so its digest and its expected coverage cannot describe two
+// different files. This remains for callers that only need the digest.
 func fullPlanDigest(path string) (walltime.Digest, error) {
-	data, err := os.ReadFile(path)
+	doc, err := core.ParseShardPlan(path)
 	if err != nil {
-		return "", fmt.Errorf("read shard plan: %w", err)
+		return "", err
 	}
-	var doc core.PlanDocument
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return "", fmt.Errorf("parse shard plan %s: %w", path, err)
-	}
-	return walltime.DigestJSON(&doc)
+	return walltime.DigestJSON(doc)
 }

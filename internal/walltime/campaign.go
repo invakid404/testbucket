@@ -152,7 +152,14 @@ func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []st
 func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader CampaignLoader, authorityKeys []string, authority string) (CampaignRun, *Stage1Manifest, []string) {
 	where := fmt.Sprintf("pair %d %s run %q", pair, role, arm.RunID)
 	var problems []string
-	run := CampaignRun{RunID: arm.RunID, StartedAt: arm.StartedAt, Terminal: arm.Terminal}
+	// StartedAt and Terminal are deliberately NOT taken from the arm. The
+	// campaign index is an unsigned file, and these two fields decide the
+	// three-UTC-date rule, the fourteen-day window and intention-to-treat
+	// retention — an index that claimed schedule-shaped dates and "passed"
+	// over a genuine signed row set would satisfy all three with none of the
+	// facts authenticated. They are derived from the verdicts below and the
+	// index's own claims are checked against them.
+	run := CampaignRun{RunID: arm.RunID}
 
 	var manifest *Stage1Manifest
 	var manifestDigest Digest
@@ -272,6 +279,24 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 		if len(v.Recon) == 0 {
 			problems = append(problems, row+" retains no like-for-like reconciliation, so the campaign-wide peer/trace population cannot be computed over it")
 		}
+		// The row's own AUTHENTICATED start and outcome, carried by the signed
+		// verdict and derived there from the action envelope's records. Every
+		// bucket of one run is one workflow run, so they must agree; the
+		// earliest start is the run's, and any disagreement about the outcome
+		// is reported rather than resolved.
+		if v.StartedAt == "" {
+			problems = append(problems, row+" carries no authenticated start instant, so the campaign's date and window rules would rest on the unsigned index")
+		} else if run.StartedAt == "" || v.StartedAt < run.StartedAt {
+			run.StartedAt = v.StartedAt
+		}
+		if v.Terminal == "" {
+			problems = append(problems, row+" carries no authenticated terminal state, so intention-to-treat retention would rest on the unsigned index")
+		} else if run.Terminal == "" {
+			run.Terminal = v.Terminal
+		} else if run.Terminal != v.Terminal {
+			problems = append(problems, fmt.Sprintf("%s reports terminal %q but an earlier bucket of the same run reports %q", row, v.Terminal, run.Terminal))
+		}
+
 		// COPIED, not aliased. A Reconciliation carries a slice, so appending
 		// the struct would leave the campaign's aggregate sharing memory with
 		// the signed verdict it came from — and anything that later touched
@@ -283,7 +308,32 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 			})
 		}
 	}
+	problems = append(problems, checkArmClaims(where, arm, run)...)
 	return run, manifest, problems
+}
+
+// checkArmClaims compares what the campaign index SAYS about a run with what
+// its signed verdicts SHOW.
+//
+// The index is convenient — it is how a harness names runs and orders pairs —
+// but it is a plain file. Where it repeats a fact the evidence already
+// carries, the two must agree, and the evidence decides. An index that could
+// restate the date or the outcome would be able to move a run into the
+// three-date window, or report a cancelled run as passed, over a row set that
+// is genuinely signed throughout.
+func checkArmClaims(where string, arm CampaignArm, run CampaignRun) []string {
+	var problems []string
+	if arm.StartedAt != "" && run.StartedAt != "" && utcDate(arm.StartedAt) != utcDate(run.StartedAt) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: the campaign index says it started on %s but its signed records say %s",
+			where, utcDate(arm.StartedAt), utcDate(run.StartedAt)))
+	}
+	if arm.Terminal != "" && run.Terminal != "" && arm.Terminal != run.Terminal {
+		problems = append(problems, fmt.Sprintf(
+			"%s: the campaign index says it %s but its signed records say %s",
+			where, arm.Terminal, run.Terminal))
+	}
+	return problems
 }
 
 // EvaluateCampaignIndex is the whole product decision: authenticate the

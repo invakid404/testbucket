@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 // Finding severities. The distinction that matters is between a run that is
@@ -124,6 +125,22 @@ type Verdict struct {
 	// which campaign, run and plan it belongs to could be counted into any of
 	// them.
 	Run RunIdentity `json:"run"`
+	// StartedAt and Terminal are the row's AUTHENTICATED outcome, derived from
+	// the action envelope's own records rather than asserted alongside them.
+	//
+	// A campaign decides the three-UTC-date rule, the fourteen-day window and
+	// intention-to-treat retention from these. Taken from the campaign index
+	// they are unsigned text, and an index that claimed schedule-shaped dates
+	// and "passed" over a genuine signed row set would satisfy all three
+	// without any of the facts being authenticated. Here they are covered by
+	// the verdict's signature and by the records digest behind it.
+	//
+	// StartedAt is the START of the action envelope's realtime bracket, in
+	// UTC. The bracket is what the wrapper actually observed around its
+	// monotonic reading; it is not A_GH, which the contract forbids from
+	// entering any success calculation.
+	StartedAt string `json:"started_at,omitempty"`
+	Terminal  string `json:"terminal,omitempty"`
 	// Complete means the records describe a well-formed measurement.
 	Complete bool `json:"complete"`
 	// Eligible means the measurement may be SCORED: complete, plus a scorable
@@ -143,12 +160,18 @@ type Verdict struct {
 	ActionGHNs int64 `json:"action_gh_ns,omitempty"`
 	// BootstrapGapNs is the action-step time before AT_start.
 	//
+	// It is DERIVED FROM A_GH, so it is reported and never gated. The contract
+	// makes A_GH an identity/sanity diagnostic that never enters balance,
+	// non-regression, prediction, or success calculation, and eligibility is a
+	// success calculation — a campaign's population is assembled from eligible
+	// rows. Anything here that changed a verdict would put a whole-second
+	// GitHub timestamp into the result.
+	//
 	// Under measurement the wrapper is installed by the CALLER, before the
 	// measured action starts, so `wall begin` is the action's first owned
 	// operation and this gap should be nothing but the runner's own step
-	// startup. It is GATED for that reason: a gap larger than A_GH's own
-	// resolution means action-owned work ran before the envelope opened, and
-	// A is then not the complete action elapsed the contract defines.
+	// startup. That ORDERING is the control; this number is how a reader sees
+	// it, not how it is enforced.
 	BootstrapGapNs int64   `json:"bootstrap_gap_ns,omitempty"`
 	ScriptNs       int64   `json:"script_ns"`
 	InvocationNs   []int64 `json:"invocation_ns,omitempty"`
@@ -252,6 +275,7 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 				fmt.Sprintf("Stage 1 binds component registry %s but the supplied registry digests to %s", bound.registry, d))
 		}
 	}
+	deriveOutcome(v, envelopes)
 	verifySignerSet(v, opt, bound.signers, recs)
 	verifyAudit(v, opt)
 	verifyStepAttempt(v, opt, envelopes)
@@ -1575,5 +1599,30 @@ func checkSidecarBinding(v *Verdict, opt VerifyOptions, kind string, bucket int,
 	}
 	if err := r.checkSidecar(kind, bucket, doc); err != nil {
 		v.add("WT-021", SeverityIneligible, err.Error())
+	}
+}
+
+// deriveOutcome reads the row's start instant and terminal state off the
+// ACTION ENVELOPE'S OWN RECORDS, so a campaign never has to take either on
+// assertion.
+//
+// The start is the beginning of the realtime bracket the wrapper observed
+// around its AT_start monotonic reading. That bracket is wrapper-produced,
+// hash-chained, signed and sealed — unlike the campaign index, which is a
+// plain file. It is deliberately NOT the GitHub step's timestamp: the contract
+// forbids A_GH from entering a success calculation, and the three-date and
+// fourteen-day rules decide campaign membership.
+func deriveOutcome(v *Verdict, envs []Envelope) {
+	for _, e := range envs {
+		if e.Level != LevelAction {
+			continue
+		}
+		v.Terminal = e.Terminal
+		if e.Physical.OK || e.Physical.start.Instant.Realtime != "" {
+			if before, _, err := e.Physical.start.Instant.RealtimeBracket(); err == nil {
+				v.StartedAt = before.UTC().Format(time.RFC3339Nano)
+			}
+		}
+		return
 	}
 }

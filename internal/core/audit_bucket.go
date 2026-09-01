@@ -22,6 +22,21 @@ import (
 // It is a separate entry point rather than a parameter on the existing one so
 // the audit consumers rely on stays byte-identical.
 func LoadPlannedCoverageForBucket(path string, bucket int) (*PlannedCoverage, error) {
+	doc, err := ParseShardPlan(path)
+	if err != nil {
+		return nil, err
+	}
+	return PlannedCoverageForBucket(doc, bucket)
+}
+
+// ParseShardPlan reads and parses a shard-plan artifact ONCE.
+//
+// The callers below take the parsed document rather than the path on purpose.
+// A path is re-readable, and a control that reads it more than once can have
+// each read see a different file: the digest could be taken from the
+// authorised plan and the expected coverage from a narrowed one substituted in
+// between, which is a complete-looking audit of an incomplete run.
+func ParseShardPlan(path string) (*PlanDocument, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read shard plan: %w", err)
@@ -30,6 +45,12 @@ func LoadPlannedCoverageForBucket(path string, bucket int) (*PlannedCoverage, er
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse shard plan %s: %w", path, err)
 	}
+	return &doc, nil
+}
+
+// PlannedCoverageForBucket derives one bucket's expected coverage from an
+// already-parsed plan.
+func PlannedCoverageForBucket(doc *PlanDocument, bucket int) (*PlannedCoverage, error) {
 	found := false
 	out := &PlannedCoverage{Invocations: map[string]int{}, Runnables: map[string][]string{}}
 	for _, b := range doc.Buckets {
@@ -58,7 +79,7 @@ func LoadPlannedCoverageForBucket(path string, bucket int) (*PlannedCoverage, er
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("shard plan %s has no bucket %d", path, bucket)
+		return nil, fmt.Errorf("the shard plan has no bucket %d", bucket)
 	}
 	return out, nil
 }
@@ -68,18 +89,19 @@ func LoadPlannedCoverageForBucket(path string, bucket int) (*PlannedCoverage, er
 // the mapping by parsing the name would break the first time a caller renames a
 // bucket.
 func BucketIndexOf(path, name string) (int, error) {
-	data, err := os.ReadFile(path)
+	doc, err := ParseShardPlan(path)
 	if err != nil {
-		return 0, fmt.Errorf("read shard plan: %w", err)
+		return 0, err
 	}
-	var doc PlanDocument
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return 0, fmt.Errorf("parse shard plan %s: %w", path, err)
-	}
+	return BucketIndexIn(doc, name)
+}
+
+// BucketIndexIn resolves a bucket name against an already-parsed plan.
+func BucketIndexIn(doc *PlanDocument, name string) (int, error) {
 	for _, b := range doc.Buckets {
 		if b.Name == name {
 			return b.Index, nil
 		}
 	}
-	return 0, fmt.Errorf("shard plan %s has no bucket named %q", path, name)
+	return 0, fmt.Errorf("the shard plan has no bucket named %q", name)
 }

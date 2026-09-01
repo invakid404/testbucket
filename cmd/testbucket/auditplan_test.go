@@ -131,3 +131,104 @@ func TestASubstitutedShardPlanIsCaughtOnlyByItsFullPlanDigest(t *testing.T) {
 		t.Errorf("the substituted plan reports the authorised digest, so the binding cannot tell them apart")
 	}
 }
+
+// The TOCTOU the single read closes.
+//
+// The digest, the bucket lookup and the expected coverage all describe "the
+// plan". Read from a path three times they can describe three plans: take the
+// digest from the authorised file, swap in a narrowed one, and the audit
+// reports a Stage-2-matching digest over a population that was never planned —
+// the substitution wearing the digest that exists to catch it as a disguise.
+//
+// The plan is therefore read ONCE. This test mutates the file while the audit
+// is mid-flight and requires the evidence to be self-consistent: whichever
+// snapshot it saw, its digest and its coverage must be that same snapshot's.
+func TestTheAuditPlanCannotChangeBetweenItsReads(t *testing.T) {
+	dir := t.TempDir()
+	authorised := &core.PlanDocument{
+		K: 1, Flags: "vitest", Algorithm: "kk-lpt", StorePath: "test-timings.json",
+		Buckets: []core.PlanBucket{{Index: 0, Name: "bucket-0", Units: []core.PlanUnit{
+			{ID: "pkg/a", Kind: runner.KindPackage, Packages: []string{"pkg/a"}, Seconds: 1.5},
+			{ID: "pkg/b", Kind: runner.KindPackage, Packages: []string{"pkg/b"}, Seconds: 2.5},
+		}}},
+	}
+	narrowed := &core.PlanDocument{
+		K: 1, Flags: "vitest", Algorithm: "kk-lpt", StorePath: "test-timings.json",
+		Buckets: []core.PlanBucket{{Index: 0, Name: "bucket-0", Units: []core.PlanUnit{
+			{ID: "pkg/a", Kind: runner.KindPackage, Packages: []string{"pkg/a"}, Seconds: 1.5},
+		}}},
+	}
+	path := filepath.Join(dir, "shard-plan.json")
+	write := func(doc *core.PlanDocument) {
+		b, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(authorised)
+
+	// Only pkg/a ran, so the run is complete against the narrowed plan and
+	// incomplete against the authorised one. The two snapshots disagree about
+	// the verdict, which is what makes the mid-flight swap worth attempting.
+	events := filepath.Join(dir, "events")
+	if err := os.MkdirAll(events, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(events, "b0.jsonl"),
+		[]byte(`{"Action":"pass","Package":"pkg/a","Elapsed":0.6}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	authorisedDigest, err := walltime.DigestJSON(authorised)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowedDigest, err := walltime.DigestJSON(narrowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hammer the file while the audit runs. One of the two snapshots wins each
+	// time; what must never happen is a mixture of both.
+	audit := coverageAudit(path, events, "go")
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				write(narrowed)
+				write(authorised)
+			}
+		}
+	}()
+	defer func() { close(stop); <-done }()
+
+	for i := 0; i < 200; i++ {
+		ev, err := audit("bucket-0")
+		if err != nil {
+			// A torn read is a parse failure, which fails closed. That is a
+			// correct outcome; an inconsistent success is not.
+			continue
+		}
+		clean := len(ev.Problems) == 0
+		switch ev.PlanDigest {
+		case authorisedDigest:
+			if clean {
+				t.Fatalf("the audit reported the authorised plan's digest over a population that audited clean; only the narrowed plan can audit clean here")
+			}
+		case narrowedDigest:
+			if !clean {
+				t.Fatalf("the audit reported the narrowed plan's digest but found problems; only the authorised plan has unmet coverage here")
+			}
+		default:
+			t.Fatalf("the audit reported plan %s, which is neither snapshot", ev.PlanDigest)
+		}
+	}
+}

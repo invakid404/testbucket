@@ -151,11 +151,22 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 		b.AbsentInputs = append(b.AbsentInputs, "runnable_listings: no name-sliced target in this plan")
 	}
 
-	if opt.StoreAbsent {
-		// A cold start is normal and must be BOUND as a cold start, so a
-		// replay cold-starts too instead of finding a store that appeared
-		// later.
+	// A cold start is normal and must be BOUND as a cold start, so a replay
+	// cold-starts too instead of finding a store that appeared later. The
+	// bound fact is StoreAbsent; the AbsentInputs line is the human-readable
+	// half of the same statement, and validation requires both to agree with
+	// the bytes.
+	//
+	// Absence is taken from the BYTES, not from the caller's flag. A caller
+	// that passed StoreAbsent=true alongside a warm store used to produce a
+	// bundle that validated and then planned from the weights it had just
+	// declared missing; deriving it here means the two can no longer disagree.
+	b.StoreAbsent = len(opt.StoreBytes) == 0
+	if b.StoreAbsent {
 		b.AbsentInputs = append(b.AbsentInputs, "store: cold start, no store at "+opt.StorePath)
+	}
+	if opt.StoreAbsent && !b.StoreAbsent {
+		return nil, fmt.Errorf("planbind: the caller declared the store at %s absent but supplied %d byte(s) of it; a cold start that plans from weights is not a cold start", opt.StorePath, len(opt.StoreBytes))
 	}
 	b.Store = walltime.NewRawSnapshot(opt.StorePath, nil, opt.Root, opt.StoreBytes)
 

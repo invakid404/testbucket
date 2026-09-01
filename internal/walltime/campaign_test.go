@@ -3,6 +3,7 @@ package walltime
 import (
 	"crypto/ed25519"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -117,6 +118,13 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 					InvocationNs:    invocationNs(observed),
 					PredictorSample: predictorSamples(b, observed),
 					Recon:           reconFor(len(invocationNs(observed))),
+					// The row's OWN start and outcome, as a verifier derives
+					// them from the action envelope's records. The fixture
+					// used to leave both to the unsigned index, which is how a
+					// campaign's date, window and retention rules ended up
+					// resting on a plain file.
+					StartedAt: scheduledInstant(pair),
+					Terminal:  TerminalPassed,
 					Run: RunIdentity{
 						CampaignID: "ewj2", RunID: runID, BucketID: fmt.Sprint(b), Stage1: stage1,
 					},
@@ -763,4 +771,130 @@ func resignManifest(t *testing.T, m *Stage1Manifest, key ed25519.PrivateKey, edi
 	if err := m.Sign("ewj2-campaign", key); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// The campaign index is a plain file. Where it repeats a fact the signed
+// evidence already carries — when a run started, how it ended — the two must
+// agree and the evidence decides.
+//
+// Both facts are load-bearing: the start decides the three-UTC-date rule and
+// the fourteen-day window, and the terminal state decides intention-to-treat
+// retention. Taken from the index, an attacker with a genuine, fully signed row
+// set could move a run into the window or report a cancelled run as passed
+// without touching a single authenticated byte.
+func TestTheIndexCannotRestateWhatTheRecordsShow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(idx *CampaignIndex, l memoryLoader, key ed25519.PrivateKey)
+		want string
+	}{
+		{
+			name: "the index moves a run to a different date",
+			edit: func(idx *CampaignIndex, _ memoryLoader, _ ed25519.PrivateKey) {
+				idx.Pairs[1].Baseline.StartedAt = "2026-09-03T01:00:00Z"
+			},
+			want: "the campaign index says it started on 2026-09-03 but its signed records say 2026-09-02",
+		},
+		{
+			name: "the index reports a cancelled run as passed",
+			edit: func(idx *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
+				for b := 0; b < BucketsPerRun; b++ {
+					resign(l.verdicts[fmt.Sprintf("candidate-3-%d.json", b)], key, func(v *Verdict) {
+						v.Terminal = TerminalCancelled
+					})
+				}
+				idx.Pairs[3].Candidate.Terminal = TerminalPassed
+			},
+			want: "the campaign index says it passed but its signed records say cancelled",
+		},
+		{
+			name: "a row carries no authenticated start at all",
+			edit: func(_ *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
+				resign(l.verdicts["baseline-0-2.json"], key, func(v *Verdict) { v.StartedAt = "" })
+			},
+			want: "carries no authenticated start instant",
+		},
+		{
+			name: "a row carries no authenticated terminal state",
+			edit: func(_ *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
+				resign(l.verdicts["candidate-4-1.json"], key, func(v *Verdict) { v.Terminal = "" })
+			},
+			want: "carries no authenticated terminal state",
+		},
+		{
+			name: "two buckets of one run disagree about the outcome",
+			edit: func(_ *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
+				resign(l.verdicts["baseline-2-5.json"], key, func(v *Verdict) {
+					v.Terminal = TerminalCrashUnclosed
+				})
+			},
+			want: "an earlier bucket of the same run reports",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, loader, keys, key := campaignFixture(t)
+			tc.edit(&idx, loader, key)
+
+			_, problems := LoadCampaign(idx, loader, keys, "ewj2-campaign")
+			if len(problems) == 0 {
+				t.Fatalf("an index that restated the evidence was accepted")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tc.want) {
+				t.Errorf("no problem mentions %q:\n%s", tc.want, strings.Join(problems, "\n"))
+			}
+		})
+	}
+}
+
+// And the population gates must read the AUTHENTICATED dates.
+//
+// The index here claims the three distinct UTC dates the contract requires,
+// while every signed record says the whole campaign ran on one afternoon. If
+// the gate read the index it would pass; it reads the records, so it fails.
+func TestThePopulationDatesComeFromTheRecords(t *testing.T) {
+	idx, loader, keys, key := campaignFixture(t)
+	for _, path := range sortedVerdictPaths(loader) {
+		resign(loader.verdicts[path], key, func(v *Verdict) {
+			v.StartedAt = "2026-09-01T01:00:00Z"
+		})
+	}
+	// The index keeps its schedule-shaped three dates, which is exactly the
+	// claim an attacker would make.
+	dates := map[string]bool{}
+	for _, p := range idx.Pairs {
+		dates[utcDate(p.Baseline.StartedAt)] = true
+	}
+	if len(dates) < CampaignDates {
+		t.Fatalf("the fixture index claims %d date(s); this test needs it to claim the full %d", len(dates), CampaignDates)
+	}
+
+	pairs, problems := LoadCampaign(idx, loader, keys, "ewj2-campaign")
+	// The restatement is itself refused, which is the F2 control.
+	if !strings.Contains(strings.Join(problems, "\n"), "but its signed records say") {
+		t.Errorf("an index claiming dates the records contradict was not refused:\n%s", strings.Join(problems, "\n"))
+	}
+	// And the gate, given the loaded population, decides on the records.
+	var dateGate *GateResult
+	gates := EvaluateCampaign(pairs)
+	for i := range gates {
+		if strings.Contains(gates[i].Name, "population") {
+			dateGate = &gates[i]
+		}
+	}
+	if dateGate == nil {
+		t.Fatalf("no population gate was reported")
+	}
+	if dateGate.Pass {
+		t.Errorf("a population whose records all fall on one UTC date passed the population gate: %s", dateGate.Observed)
+	}
+}
+
+// sortedVerdictPaths is every verdict in the loader, in a stable order.
+func sortedVerdictPaths(l memoryLoader) []string {
+	out := make([]string, 0, len(l.verdicts))
+	for p := range l.verdicts {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -112,6 +112,10 @@ type PlanningInputBundle struct {
 	Runnables []RunnableSnapshot `json:"runnables"`
 	// Store is the exact admitted timing store, bytes and all.
 	Store RawSnapshot `json:"store"`
+	// StoreAbsent is the cold start as a BOUND FACT rather than a sentence in
+	// AbsentInputs. Validation requires it to agree with the bytes, so a
+	// bundle cannot declare a cold start and then plan warm.
+	StoreAbsent bool `json:"store_absent"`
 	// Source identifies the tree the inputs were taken from.
 	Source struct {
 		Repository string `json:"repository"`
@@ -219,6 +223,29 @@ func (b PlanningInputBundle) Validate() error {
 	}
 	if b.Store.Digest != DigestBytes(b.Store.Bytes) {
 		return fmt.Errorf("planning-input bundle: the store snapshot does not match its digest")
+	}
+	// Store presence is STRUCTURAL, and absence and emptiness must agree with
+	// the bytes.
+	//
+	// Absence used to be a sentence in AbsentInputs while the snapshot carried
+	// whatever bytes it was given, so a bundle could declare a cold start and
+	// hand the planner a warm store — validating cleanly and planning from
+	// weights it had just said did not exist. Whether that is scored as a cold
+	// row or a warm one then depends on which half of the bundle a reader
+	// believes.
+	//
+	// A present but zero-byte store is bound as ABSENT: it carries no weights,
+	// nothing in the evidence distinguishes it from a missing file, and both
+	// are cold. An intentionally empty store is a store with bytes that parse
+	// to no units, which is a different and explicitly representable thing.
+	if b.StoreAbsent != (len(b.Store.Bytes) == 0) {
+		if b.StoreAbsent {
+			return fmt.Errorf("planning-input bundle: it declares the store absent but froze %d byte(s) of store; a cold start that plans from weights is not a cold start", len(b.Store.Bytes))
+		}
+		return fmt.Errorf("planning-input bundle: it declares a present store but froze no bytes; a store with nothing in it is a cold start and must be bound as one")
+	}
+	if b.Store.Empty != (len(b.Store.Bytes) == 0) {
+		return fmt.Errorf("planning-input bundle: the store snapshot disagrees with its own empty flag")
 	}
 	if b.Algorithms.FullPlan.Name != FullPlanDigestAlgorithm || b.Algorithms.SemanticPlan.Name != SemanticPlanDigestAlgorithm {
 		return fmt.Errorf("planning-input bundle: unknown plan-digest algorithm identities")

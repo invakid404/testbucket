@@ -602,3 +602,64 @@ func TestBootstrapFailureIsRetained(t *testing.T) {
 		t.Errorf("a failed bootstrap was scorable")
 	}
 }
+
+// AT_start is read before the records directory, the signing key and the
+// writer exist. Everything after that reading is action time, so a failure in
+// that window must still leave a terminal record: an action that died during
+// bootstrap and an action that never started are different facts, and a
+// campaign retains the first.
+//
+// The window has no writer yet, so the retention path mints its own. That is
+// the only thing that can be proved here — a real failure of the key or the
+// stream cannot be provoked on a working filesystem — so the failure is
+// injected at exactly the point the ledger is still empty.
+func TestAPreWriterBootstrapFailureIsRetained(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "records")
+	injected := fmt.Errorf("the runner's disk filled between the reading and the writer")
+
+	original := atRecordsDir
+	atRecordsDir = func(string) error { return injected }
+	t.Cleanup(func() { atRecordsDir = original })
+
+	run := RunIdentity{CampaignID: "ewj2", RunID: "r1", BucketID: "bucket-1", Stage2: "sha256:test"}
+	if _, err := BeginAction(dir, run, time.Minute); err == nil {
+		t.Fatalf("an injected bootstrap failure was not reported")
+	} else if !strings.Contains(err.Error(), injected.Error()) {
+		t.Errorf("error %q does not carry the cause", err)
+	}
+
+	recs, err := ReadDir(dir)
+	if err != nil {
+		t.Fatalf("the failure left no readable ledger: %v", err)
+	}
+	if len(recs) == 0 {
+		t.Fatalf("a bootstrap failure after AT_start left nothing in the ledger, so it cannot be told from an action that never started")
+	}
+	var terminal *Record
+	for i, r := range recs {
+		if r.Kind == "terminal" {
+			terminal = &recs[i]
+		}
+	}
+	if terminal == nil {
+		t.Fatalf("the ledger holds %d record(s) but none is terminal", len(recs))
+	}
+	if terminal.Terminal != TerminalWrapperError {
+		t.Errorf("the retained record is %q, want %q", terminal.Terminal, TerminalWrapperError)
+	}
+	if !strings.Contains(terminal.Reason, injected.Error()) {
+		t.Errorf("the retained reason %q does not say what failed", terminal.Reason)
+	}
+	if terminal.Run.RunID != run.RunID || terminal.Run.BucketID != run.BucketID {
+		t.Errorf("the retained record names run %+v, not the one that failed", terminal.Run)
+	}
+	// And it must be readable as an INCOMPLETE measurement rather than as a
+	// well-formed one: a retained failure is evidence, not a passing row.
+	v, err := VerifyDir(VerifyOptions{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Eligible {
+		t.Errorf("a bootstrap failure was scored")
+	}
+}

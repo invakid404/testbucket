@@ -360,12 +360,27 @@ var (
 	// containment and before it spawns anything, so a test can prove the
 	// ordering the inheritance depends on.
 	atContainmentJoin func(dir string)
+	// atRecordsDir fires after the records directory exists and before the
+	// signing key, so a test can INJECT a failure into the window between
+	// AT_start and the first writer. That window is the one place a bootstrap
+	// failure could previously return with nothing in the ledger, and its
+	// retention cannot be proved by any real error a test can provoke there.
+	atRecordsDir func(dir string) error
 )
 
 func probe(hook func(string), dir string) {
 	if hook != nil {
 		hook(dir)
 	}
+}
+
+// probeErr is probe for a hook that can fail, used to inject a pre-writer
+// bootstrap failure. It returns nil in production, where the hook is nil.
+func probeErr(hook func(string) error, dir string) error {
+	if hook == nil {
+		return nil
+	}
+	return hook(dir)
 }
 
 // errNoError distinguishes "Wait returned nil" from "Wait has not returned" in

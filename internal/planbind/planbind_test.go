@@ -319,3 +319,54 @@ func TestTheShardPlanArtifactIsWhatTheReceiptBinds(t *testing.T) {
 		t.Errorf("a plan with a unit removed kept the authorised full-plan digest")
 	}
 }
+
+// A bundle used to be able to declare the store absent and freeze a warm store
+// at the same time. It validated, and the planner then planned from the very
+// weights the bundle had just said did not exist — so whether the row was cold
+// or warm depended on which half of the bundle a reader believed.
+//
+// Store presence is now structural and derived from the bytes, and the
+// contradiction is refused before anything is planned.
+func TestAColdStartCannotCarryAWarmStore(t *testing.T) {
+	root := t.TempDir()
+
+	// The caller's flag no longer decides: absence is read off the bytes, and
+	// a flag that disagrees is refused at acquisition.
+	_, err := Acquire(baseAcquire(t, root, func(o *AcquireOptions) {
+		o.StoreAbsent = true
+	}))
+	if err == nil {
+		t.Fatalf("a caller declaring a warm store absent was accepted")
+	}
+	if !strings.Contains(err.Error(), "is not a cold start") {
+		t.Errorf("error %q does not name the contradiction", err)
+	}
+
+	// And the bundle itself is refused, however it was produced: an archived
+	// bundle is replayed by validating it, not by re-running Acquire.
+	warm := acquire(t, root, nil)
+	if warm.StoreAbsent {
+		t.Fatalf("the fixture bundle is cold; this test needs a warm one")
+	}
+	forged := *warm
+	forged.StoreAbsent = true
+	if err := forged.Validate(); err == nil {
+		t.Errorf("a bundle declaring a cold start over warm bytes validated")
+	} else if !strings.Contains(err.Error(), "is not a cold start") {
+		t.Errorf("error %q does not name the contradiction", err)
+	}
+	if _, err := Plan(context.Background(), PlanOptions{Bundle: &forged, Stage1: "sha256:stage1"}); err == nil {
+		t.Errorf("a bundle declaring a cold start over warm bytes was planned")
+	}
+
+	// The mirror image: a present store with no bytes is a cold start and has
+	// to be bound as one, so a warm CLAIM over no evidence is refused too.
+	claimed := *warm
+	claimed.Store = walltime.NewRawSnapshot(warm.Store.Name, nil, root, nil)
+	claimed.StoreAbsent = false
+	if err := claimed.Validate(); err == nil {
+		t.Errorf("a bundle claiming a present store with no bytes validated")
+	} else if !strings.Contains(err.Error(), "must be bound as one") {
+		t.Errorf("error %q does not name the contradiction", err)
+	}
+}
