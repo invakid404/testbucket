@@ -1907,7 +1907,14 @@ func (a ReplayAttestation) Verify(issued Stage2Receipt, issuedDigest, stage1 Dig
 			"it names verifier %q but was signed under authority %q; the retained verifier identity must be the identity that signed",
 			a.VerifierID, a.Signature.Authority))
 	}
-	if recordVerifierID != "" && a.VerifierID != recordVerifierID {
+	// A BLANK measured identity is not a match. It used to skip the
+	// comparison, so a row whose records named no verifier accepted any
+	// replay: uniform absence is not attribution, it is the absence of it.
+	if strings.TrimSpace(recordVerifierID) == "" {
+		problems = append(problems, "the measured records name no verifier identity, so nothing binds this replay to the row it attests")
+		return problems
+	}
+	if a.VerifierID != recordVerifierID {
 		problems = append(problems, fmt.Sprintf(
 			"it was produced by verifier %q, but the measured records were delivered against %q",
 			a.VerifierID, recordVerifierID))

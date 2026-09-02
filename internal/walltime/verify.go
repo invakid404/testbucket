@@ -262,6 +262,7 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	v.Envelopes = envelopes
 	verifyEndpoints(v, envelopes)
 	verifyIndependence(v, envelopes)
+	verifyRawEvidence(v, envelopes)
 	v.Phases = derivePartition(v, envelopes)
 	v.Recon = reconcile(envelopes)
 	summarise(v, envelopes)
@@ -335,6 +336,17 @@ func verifyRunIdentity(v *Verdict, recs []Record) {
 	}
 	if where == "" {
 		established, where = recs[0].Run, fmt.Sprintf("the first %s/%s record", recs[0].Producer, recs[0].Level)
+	}
+	// The verifier identity must EXIST, not merely be repeated consistently.
+	//
+	// runIdentityDiff answers "do these records agree", and a row whose every
+	// record, roster and seal repeats a blank verifier agrees with itself
+	// perfectly. It was then scorable: no record named who verified it, and
+	// nothing asked. Attribution is a property of the value, not of the
+	// agreement.
+	if strings.TrimSpace(established.VerifierID) == "" {
+		v.add("WT-026", SeverityIneligible, fmt.Sprintf(
+			"%s names no verifier identity; a row every record of which agrees about having no verifier is a row attributable to nobody", where))
 	}
 	for _, r := range recs {
 		if diff := runIdentityDiff(established, r.Run); diff != "" {
@@ -1195,7 +1207,19 @@ func verifyAuthority(v *Verdict, opt VerifyOptions, m *Stage1Manifest, digest Di
 		v.add("WT-018", SeverityIneligible, fmt.Sprintf("stage-1 authority signature: %v", err))
 		return
 	}
-	if m.Signature.Authority != opt.Authority && opt.Authority != "" {
+	// The EXPECTED LABEL IS REQUIRED. It used to be compared only when a
+	// caller supplied one, which made omitting it a wildcard: the approved
+	// keys were still enforced, but a key signs under whatever label it is
+	// given, so a manifest approved by some other protected environment passed
+	// whenever the caller said nothing. A verifier that cannot name the
+	// environment that must have approved is not in a position to accept the
+	// approval.
+	if strings.TrimSpace(opt.Authority) == "" {
+		v.add("WT-018", SeverityIneligible,
+			"no expected protected authority was named to this verifier, so a manifest approved under any label would pass; the contract names exactly one environment that may approve Stage-1 inputs")
+		return
+	}
+	if m.Signature.Authority != opt.Authority {
 		v.add("WT-018", SeverityIneligible,
 			fmt.Sprintf("the Stage-1 manifest names authority %q, not the expected %q", m.Signature.Authority, opt.Authority))
 	}

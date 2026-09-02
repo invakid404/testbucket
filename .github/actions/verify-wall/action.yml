@@ -82,9 +82,16 @@ inputs:
   record-signer:
     description: >-
       The PUBLIC half of the run key that signed this measurement's signer
-      roster and closing seal. The Stage-1 manifest normally declares it and is
-      the authoritative source; passing it here lets a caller state the
-      expectation independently, and the two sets are unioned.
+      roster and closing seal. The authority-signed Stage-1 manifest is the
+      authoritative source and WINS OUTRIGHT: when it declares any signer, a
+      key passed here is IGNORED rather than added to it. Expect a key stated
+      only here to be refused whenever Stage 1 declares its own. It is used
+      only when Stage 1 declares no signer at all — a case whose row is
+      ineligible on other grounds anyway.
+
+      The precedence is deliberate: `record-signer` is a caller input, so
+      unioning it would let a caller admit a roster and seal key the authority
+      never declared, while holding the matching run-key secret itself.
 
       It is a public key, so it is an input rather than a secret. Its private
       half is bound only to run-bucket's `wall begin` and `wall end` steps and

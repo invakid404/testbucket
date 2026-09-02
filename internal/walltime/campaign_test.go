@@ -168,12 +168,17 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 					Terminal:  TerminalPassed,
 					Run: RunIdentity{
 						CampaignID: "ewj2", RunID: runID, BucketID: fmt.Sprint(b), Stage1: stage1,
+						// The delivery-bound verifier that judged this row.
+						// It must be the identity the verdict is signed
+						// under, or the string is signed but attributable to
+						// nobody.
+						VerifierID: testVerdictIdentity,
 					},
 				}
 				// Signed by the VERDICT signer Stage 1 declares, not by the
 				// campaign authority. One key doing both would be the party
 				// judging a row also approving the inputs it judges.
-				if err := v.Sign("ewj2-campaign", testVerdictAuthority); err != nil {
+				if err := v.Sign(testVerdictIdentity, testVerdictAuthority); err != nil {
 					t.Fatal(err)
 				}
 				loader.verdicts[path] = v
@@ -509,7 +514,7 @@ func TestTheRightDeliveryPassesTheReleaseBinding(t *testing.T) {
 func resign(v *Verdict, key ed25519.PrivateKey, edit func(*Verdict)) {
 	edit(v)
 	v.Signature = nil
-	if err := v.Sign("ewj2-campaign", key); err != nil {
+	if err := v.Sign(testVerdictIdentity, key); err != nil {
 		panic(err)
 	}
 }

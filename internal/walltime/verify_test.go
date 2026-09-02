@@ -370,6 +370,12 @@ var testVerdictAuthority = mustSigningKey()
 
 func testVerdictSigners() []string { return []string{PublicKeyOf(testVerdictAuthority)} }
 
+// testVerdictIdentity is the delivery-bound verifier that judges a row. A
+// verdict must be signed UNDER it: the body names who judged, the signature
+// names who signed, and a verdict where those differ is a judgement
+// attributable to nobody.
+const testVerdictIdentity = "ewj2-verifier"
+
 // testBuildAttestation is a complete signed statement about one build: every
 // identity the contract asks to be retained, and a result that admits it.
 func testBuildAttestation(binary Digest, commit string) BuildAttestation {

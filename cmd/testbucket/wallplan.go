@@ -147,7 +147,12 @@ func runWallBundle(args []string) error {
 		StorePath: *store, StoreBytes: storeBytes, StoreAbsent: storeAbsent,
 		DiscoveryArgv: discoveryArgv(*vitestCommand, *vitestDiscovery, *vitestDiscoveryCommand),
 		Discovery:     discovery, Runnables: runnables, RunnableArgv: runnableArgv,
+		// The REAL invocation, as it was run. os.Args[0] is the program this
+		// process actually is, so the closure resolves the binary that took
+		// the snapshots rather than whatever `testbucket` resolves to on the
+		// next machine.
 		Env: planningEnv(), Resolve: closureResolver(*root),
+		BundleArgv: append([]string(nil), os.Args...),
 		Repository: *repository, Commit: *commit, Tree: *tree,
 		EventsDir: *eventsDir, FileParallelism: *fileParallelism, WallDir: *wallDir,
 	})
@@ -418,6 +423,7 @@ func runWallReplay(args []string) error {
 	expectStage2 := fs.String("expect-stage2", "", "the Stage-2 digest the measured records will carry")
 	expectRegistry := fs.String("expect-registry", "", "the Aeta component-registry digest the measured records will carry")
 	expectVerifier := fs.String("expect-verifier-id", "", "the verifier identity the measured records will carry; it must be non-empty for a scored row, because a record naming no verifier is attributable to none")
+	expectAttestation := fs.String("expect-attestation", "", "the SIGNED replay attestation the measured records will be verified against. Its signature is authenticated against the replay signers Stage 1 declares and its verifier identity is compared with --expect-verifier-id, BEFORE anything is measured: on its own --expect-verifier-id only proves a caller supplied SOME identity, so a different nonblank one opened the envelope, ran the tests, and was refused only by verification afterwards")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -439,6 +445,11 @@ func runWallReplay(args []string) error {
 
 	stage1 := issued.Stage1Digest
 	var lineage walltime.TrainingLineageID
+	// The keys Stage 1 declares for an INDEPENDENT replay. They are what makes
+	// the attestation compared below evidence rather than a file, so they are
+	// taken from the authority-signed manifest this replay just checked, never
+	// from the attestation itself.
+	var replaySigners []string
 	// The approval this replay independently observed on the Stage-1 manifest.
 	// An empty one means no manifest was supplied, and Matches then reports
 	// the receipt's claim as unre-derived rather than agreeing with it.
@@ -476,6 +487,7 @@ func runWallReplay(args []string) error {
 		}
 		stage1 = d
 		lineage = m.TrainingLineage
+		replaySigners = m.Instrumentation.ReplaySigners
 		if replayApproval, err = walltime.ApprovalOf(m); err != nil {
 			return err
 		}
@@ -540,6 +552,11 @@ func runWallReplay(args []string) error {
 	// eligible guard makes a scored request supply all four.
 	if *expectStage1 != "" || *expectStage2 != "" || *expectRegistry != "" || *expectVerifier != "" {
 		if err := checkRecordIdentities(issued, stage1, registryDigest, *expectStage1, *expectStage2, *expectRegistry, *expectVerifier); err != nil {
+			return err
+		}
+		// And the verifier identity is bound to a SIGNED replay, not merely
+		// found to be non-empty.
+		if err := checkAttestedVerifier(*expectAttestation, *expectVerifier, replaySigners, authorityKeys); err != nil {
 			return err
 		}
 	}
@@ -611,6 +628,68 @@ func checkRecordIdentities(issued walltime.Stage2Receipt, stage1, registry wallt
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("the identities the measured records will carry do not match the frozen plan, and no measured work may start:\n  %s", strings.Join(problems, "\n  "))
+	}
+	return nil
+}
+
+// checkAttestedVerifier binds the verifier identity the measured records will
+// carry to the SIGNED replay attestation the row will later be verified
+// against — before AT_start.
+//
+// --expect-verifier-id is a caller string like the other three, but unlike them
+// it has no document to be derived from, so the pre-flight could only say it
+// was non-blank. That is not the contract's resolved-value equivalence: a
+// caller supplying a different, perfectly non-blank identity passed the
+// pre-flight, opened the action envelope and ran the tests, and the genuine
+// signed replay disagreed with it only at verification. A refusal afterwards
+// can invalidate the row; it cannot un-measure it.
+//
+// The attestation is AUTHENTICATED here under exactly the rule the verifier
+// applies — signed by a replay signer the authority-signed Stage-1 manifest
+// declares, distinct from the authority key, under the identity it names.
+// Comparing against an unauthenticated file would prove nothing: the caller
+// could write one that agrees with whatever it passed.
+func checkAttestedVerifier(path, wantVerifier string, replaySigners, authorityKeys []string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("--expect-attestation was not supplied, so --expect-verifier-id is checked only for being non-blank; any other identity a caller resolves would open the envelope and be refused only after the bucket had run")
+	}
+	var a walltime.ReplayAttestation
+	if err := walltime.ReadJSONFile(path, &a); err != nil {
+		return fmt.Errorf("replay attestation: %w", err)
+	}
+	if len(replaySigners) == 0 {
+		return fmt.Errorf("no Stage-1 replay signer is available to this pre-flight, so the attestation it is about to compare against could have been signed by anyone, including the party that issued the plan; pass --stage1 with a manifest that declares one")
+	}
+	// The same independence rule the verifier enforces: an attestation the
+	// plan's own authority could have signed is the issuer re-checking itself.
+	for _, rk := range replaySigners {
+		for _, ak := range authorityKeys {
+			if rk == ak {
+				return fmt.Errorf("replay signer %s is also a predeclared authority key; a replay by the issuer of the plan is not an independent re-derivation", rk)
+			}
+		}
+	}
+	if a.Signature == nil {
+		return fmt.Errorf("the replay attestation is unsigned, so the verifier identity it names is an assertion by whoever wrote the file")
+	}
+	d, err := a.DigestOf()
+	if err != nil {
+		return fmt.Errorf("replay attestation: %w", err)
+	}
+	if err := walltime.VerifySigned(a.Signature, d, replaySigners); err != nil {
+		return fmt.Errorf("replay attestation signature: %w (only a replay signer Stage 1 declares may attest an independent re-derivation)", err)
+	}
+	if strings.TrimSpace(a.VerifierID) == "" {
+		return fmt.Errorf("the replay attestation names no verifier identity, so there is nothing for the records' identity to be equivalent to")
+	}
+	// Signed UNDER the identity it names. A signature made under some other
+	// label would let a declared replay key attest on behalf of an identity
+	// that never ran anything.
+	if a.Signature.Authority != a.VerifierID {
+		return fmt.Errorf("the replay attestation names verifier %q but was signed under authority %q; a valid key signing under another party's identity is not that party's attestation", a.VerifierID, a.Signature.Authority)
+	}
+	if strings.TrimSpace(wantVerifier) != a.VerifierID {
+		return fmt.Errorf("the measured records will be stamped --expect-verifier-id=%q, but the signed replay attestation this row is verified against was made by %q; the two must be the same resolved value BEFORE any measured work starts", strings.TrimSpace(wantVerifier), a.VerifierID)
 	}
 	return nil
 }

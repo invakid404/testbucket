@@ -716,7 +716,7 @@ func runWallVerify(args []string) error {
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable. Without one the verifier will not treat any signature as authority approval, because a self-generated key would otherwise pass")
 	var recordSigners stringList
-	fs.Var(&recordSigners, "record-signer", "a PREDECLARED run-key PUBLIC key (hex) allowed to sign this measurement's signer roster and closing seal; repeatable. The Stage-1 manifest normally declares these and is the authoritative source; this lets a caller state them independently, and the two sets are unioned")
+	fs.Var(&recordSigners, "record-signer", "a PREDECLARED run-key PUBLIC key (hex) allowed to sign this measurement's signer roster and closing seal; repeatable. The authority-signed Stage-1 manifest is the authoritative source and WINS OUTRIGHT: when it declares any signer, these are ignored entirely rather than added to it, because a caller who could add a key could authorise whoever attests its own measurement. They are used only when Stage 1 declares none")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

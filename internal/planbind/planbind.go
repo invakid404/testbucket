@@ -84,6 +84,18 @@ type AcquireOptions struct {
 	// independent verifier can say what it would take to reproduce the
 	// acquisition.
 	Env map[string]string
+	// BundleArgv is the ACTUAL command that produced this bundle — the real
+	// `wall bundle` invocation, with its real flags, as it was run.
+	//
+	// It is supplied by the caller that ran it rather than reconstructed here.
+	// The reconstruction used to be `{"testbucket","wall","bundle"}` with the
+	// separate Vitest DISCOVERY argv concatenated onto it, which is neither
+	// command: it omits every flag `wall bundle` was actually given and
+	// presents the discovery program's arguments as stray arguments to a
+	// different program. Running it would do something nobody did. A signed
+	// provenance record naming a command that was never run is worse than
+	// none, because it reads as evidence.
+	BundleArgv []string
 	// Resolve returns the resolved-executable and tool closure for ONE exact
 	// argv, and is called once per snapshot with the argv that snapshot was
 	// actually taken by.
@@ -208,7 +220,10 @@ func Acquire(opt AcquireOptions) (*walltime.PlanningInputBundle, error) {
 	b.Store = walltime.NewRawSnapshot(opt.StorePath, nil, opt.Root, opt.StoreBytes)
 
 	b.Source.Repository, b.Source.Commit, b.Source.Tree = opt.Repository, opt.Commit, opt.Tree
-	b.Acquisition.Argv = append([]string{"testbucket", "wall", "bundle"}, opt.DiscoveryArgv...)
+	if len(opt.BundleArgv) == 0 {
+		return nil, fmt.Errorf("planbind: no bundle argv was supplied; the acquisition closure would name a command nobody ran")
+	}
+	b.Acquisition.Argv = append([]string(nil), opt.BundleArgv...)
 	b.Acquisition.Cwd = opt.Root
 	b.Acquisition.Env = copyMap(opt.Env)
 	if b.Acquisition.Executables, b.Acquisition.Tools, err = resolveFor(opt, b.Acquisition.Argv, "the bundle acquisition closure"); err != nil {

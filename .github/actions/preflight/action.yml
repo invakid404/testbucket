@@ -71,6 +71,23 @@ inputs:
       that names no verifier is attributable to nobody, so a scored row needs
       one and this refuses a blank before any work starts.
     default: ""
+  replay-attestation:
+    description: >-
+      The SIGNED independent replay attestation this row will be verified
+      against.
+
+      `verifier-id` is a caller string with no document to derive it from, so
+      the pre-flight could previously only refuse a BLANK one. A caller that
+      resolved a different, perfectly non-blank identity passed here, opened the
+      action envelope and ran the tests; the genuine signed replay disagreed
+      with it only at post-action verification, which can invalidate the row but
+      cannot un-measure it.
+
+      Supplying it makes the pre-flight authenticate the attestation under the
+      replay signers Stage 1 declares and compare its verifier identity with
+      `verifier-id` BEFORE AT_start. Required whenever the record identities are
+      being bound at all.
+    default: ""
   version:
     description: >-
       testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
@@ -107,6 +124,7 @@ runs:
         TB_STAGE2_DIGEST: ${{ inputs.stage2-digest }}
         TB_REGISTRY_DIGEST: ${{ inputs.registry-digest }}
         TB_VERIFIER_ID: ${{ inputs.verifier-id }}
+        TB_REPLAY_ATTESTATION: ${{ inputs.replay-attestation }}
       run: |
         set -euo pipefail
         if [ -z "$TB_AUTHORITY_KEY" ]; then
@@ -130,6 +148,13 @@ runs:
         if [ -n "$TB_STAGE2_DIGEST" ]; then args+=(--expect-stage2 "$TB_STAGE2_DIGEST"); fi
         if [ -n "$TB_REGISTRY_DIGEST" ]; then args+=(--expect-registry "$TB_REGISTRY_DIGEST"); fi
         if [ -n "$TB_VERIFIER_ID" ]; then args+=(--expect-verifier-id "$TB_VERIFIER_ID"); fi
+
+        # The verifier identity is the one of the four with no document to
+        # derive it from, so a non-blank check is all a replay could do alone.
+        # Authenticating the SIGNED attestation here and comparing the identity
+        # it was made under is the contract's resolved-value equivalence, and
+        # it happens before the envelope rather than after the work.
+        if [ -n "$TB_REPLAY_ATTESTATION" ]; then args+=(--expect-attestation "$TB_REPLAY_ATTESTATION"); fi
 
         # No `|| true`. This step exists to stop the bucket, and a pre-flight
         # that reported a problem and continued would be a log line.

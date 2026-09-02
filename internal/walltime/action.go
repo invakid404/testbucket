@@ -23,7 +23,15 @@ type ActionState struct {
 	Containment  ContainmentIdentity `json:"containment"`
 	PeerControl  string              `json:"peer_control"`
 	TraceControl string              `json:"trace_control"`
-	Deadline     string              `json:"deadline"`
+	// PeerPID and TracePID are the detached observers' process ids.
+	//
+	// `wall begin` and `wall end` are two different steps, so the handles the
+	// closing step reconstructs have no cmd. Without these, a lifecycle that
+	// could not be completed there had nothing to kill: the observers would
+	// outlive the action they were bracketing.
+	PeerPID  int    `json:"peer_pid,omitempty"`
+	TracePID int    `json:"trace_pid,omitempty"`
+	Deadline string `json:"deadline"`
 	// StartedAt is the AT_start reading, repeated here only so a human reading
 	// the file can find the record; the RECORD is the evidence.
 	StartedAt Instant `json:"started_at"`
@@ -128,11 +136,18 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		peer.abandon()
 		return fail("start the trace collector", err)
 	}
+	// BOTH detached observers end when either admission fails. Abandoning only
+	// the other one left the one that failed running — and these are detached,
+	// so nothing downstream inherits a handle to it: it would watch the action
+	// containment for its whole timeout while the action reports that its
+	// lifecycle never opened.
 	if err := peer.admit(deadline); err != nil {
+		peer.abandon()
 		trace.abandon()
 		return fail("admit the containment peer", err)
 	}
 	if err := trace.admit(deadline); err != nil {
+		trace.abandon()
 		peer.abandon()
 		return fail("admit the trace collector", err)
 	}
@@ -159,6 +174,7 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	st := &ActionState{
 		Schema: SchemaVersion, Dir: dir, Run: run, Containment: cont.Identity(),
 		PeerControl: peer.ctl.base, TraceControl: trace.ctl.base,
+		PeerPID: peer.pid, TracePID: trace.pid,
 		Deadline: deadline.UTC().Format(time.RFC3339Nano), StartedAt: start,
 	}
 	b, err := json.MarshalIndent(st, "", "  ")
@@ -306,10 +322,13 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 			terminal, reason = TerminalCrashUnclosed, emptyErr.Error()
 		}
 	}
+	// Reconstructed WITH the process ids the opening step recorded, so a
+	// close that cannot be completed can still end the observer rather than
+	// leaving it to watch a containment that no longer exists.
 	trace := &observerProc{producer: ProducerTrace, ctl: control{base: st.TraceControl},
-		stream: filepath.Join(dir, streamName(ProducerTrace, LevelAction, 0))}
+		pid: st.TracePID, stream: filepath.Join(dir, streamName(ProducerTrace, LevelAction, 0))}
 	peer := &observerProc{producer: ProducerPeer, ctl: control{base: st.PeerControl},
-		stream: filepath.Join(dir, streamName(ProducerPeer, LevelAction, 0))}
+		pid: st.PeerPID, stream: filepath.Join(dir, streamName(ProducerPeer, LevelAction, 0))}
 	if err := trace.close(deadline); err != nil && terminal == TerminalPassed {
 		terminal, reason = TerminalWrapperError, err.Error()
 	}

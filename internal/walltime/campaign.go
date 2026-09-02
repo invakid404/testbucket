@@ -209,7 +209,15 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 			problems = append(problems, fmt.Sprintf("%s: %v", where, err))
 		} else if err := VerifySigned(m.Signature, d, authorityKeys); err != nil {
 			problems = append(problems, fmt.Sprintf("%s manifest authority: %v", where, err))
-		} else if authority != "" && m.Signature.Authority != authority {
+		} else if strings.TrimSpace(authority) == "" {
+			// The expected label is REQUIRED. Comparing it only when a caller
+			// supplied one made omitting it a wildcard: approved keys were
+			// still enforced, but a key signs under whatever label it is
+			// given, so correctly signed manifests carrying a different
+			// environment label were accepted whenever the caller said
+			// nothing.
+			problems = append(problems, where+" was loaded with no expected protected authority, so a manifest approved under any label would be accepted; the contract names exactly one environment that may approve Stage-1 inputs")
+		} else if m.Signature.Authority != authority {
 			// A key is WHO signed; the authority is WHICH protected
 			// environment approved. Checking only the key would accept a
 			// manifest approved by a different environment that happens to
@@ -255,6 +263,23 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 		}
 		if err := VerifySigned(v.Signature, vd, verdictKeys); err != nil {
 			problems = append(problems, fmt.Sprintf("%s verdict signature: %v", row, err))
+			continue
+		}
+		// WHO judged the row, bound to the row's own claim about who judged it.
+		//
+		// The signed body carries the delivery-bound Run.VerifierID, and the
+		// signature carries an authority label — and nothing related them. A
+		// verdict could therefore state one delivery verifier in its body and
+		// be signed under another identity by an admitted key, so the verifier
+		// string was signed but not attributable to the signer. That is the
+		// same substitution already closed for replay attestations.
+		if strings.TrimSpace(v.Run.VerifierID) == "" {
+			problems = append(problems, row+" names no delivery verifier identity, so its verdict is attributable to nobody")
+			continue
+		}
+		if v.Signature.Authority != v.Run.VerifierID {
+			problems = append(problems, fmt.Sprintf("%s was signed under authority %q but its body names delivery verifier %q; the identity that judged a row must be the identity that signed the verdict",
+				row, v.Signature.Authority, v.Run.VerifierID))
 			continue
 		}
 		if v.RecordsDigest == "" {

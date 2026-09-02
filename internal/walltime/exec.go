@@ -228,12 +228,22 @@ func Exec(opt ExecOptions) (int, error) {
 	// trace admits after the peer so that the peer brackets it. Both are
 	// verified by reading the observers' OWN records, not by trusting a return
 	// code.
+	// BOTH observers end when either admission fails. Abandoning only the
+	// other one left the observer whose admission failed running: it is
+	// already started, it is watching the containment, and the wrapper is
+	// about to return a terminal record saying the lifecycle never opened.
 	if err := peer.admit(deadline); err != nil {
+		peer.abandon()
 		trace.abandon()
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
 	}
 	if err := trace.admit(deadline); err != nil {
-		peer.close(deadline)
+		trace.abandon()
+		// The peer admitted, so it is given the chance to close cleanly and
+		// leave a closing record; abandon is the fallback when it will not.
+		if closeErr := peer.close(deadline); closeErr != nil {
+			peer.abandon()
+		}
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
 	}
 
@@ -346,7 +356,13 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time) (int, ProcI
 		return 1, ProcIdentity{}, TerminalSpawnError, err.Error()
 	}
 	if err := postSpawnAdmit(cont, cmd.Process.Pid); err != nil {
-		return 1, ProcIdentity{PID: cmd.Process.Pid}, TerminalSpawnError, "admit child: " + err.Error()
+		// The child is running but is not in the containment, so nothing
+		// downstream can account for it — and returning here abandoned it
+		// with no handle for anyone else to reap. A child that cannot be
+		// admitted is a child that must not run.
+		pid := cmd.Process.Pid
+		err = reapStarted(ProducerPhysical, cmd, fmt.Errorf("admit child: %w", err))
+		return 1, ProcIdentity{PID: pid}, TerminalSpawnError, err.Error()
 	}
 
 	done := make(chan error, 1)
@@ -596,8 +612,16 @@ var ObserverLauncher = func(args []string) (*exec.Cmd, error) {
 type observerProc struct {
 	producer Producer
 	cmd      *exec.Cmd
-	ctl      control
-	stream   string
+	// pid is the observer's process id, retained SEPARATELY from cmd.
+	//
+	// A detached action observer outlives the step that started it, so the
+	// later step reconstructs this handle from the action state and has no
+	// cmd. Without a pid there was then nothing to kill: a lifecycle that
+	// could not be completed left a live observer watching the containment,
+	// and the one process able to reach it had thrown away its address.
+	pid    int
+	ctl    control
+	stream string
 	// pub is the observer's signing identity, kept so the wrapper can declare
 	// it in the roster or register it in the key log. The PRIVATE half never
 	// comes back here — it goes down a pipe into the child and nowhere else.
@@ -715,7 +739,7 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 		}
 	}
 	return &observerProc{
-		producer: p, cmd: cmd, ctl: control{base: base}, pub: PublicKeyOf(key),
+		producer: p, cmd: cmd, pid: cmd.Process.Pid, ctl: control{base: base}, pub: PublicKeyOf(key),
 		stream: filepath.Join(opt.Dir, streamName(p, opt.Level, opt.Seq)),
 	}, nil
 }
@@ -839,6 +863,10 @@ func (o *observerProc) admit(deadline time.Time) error {
 // record, and reaps the process.
 func (o *observerProc) close(deadline time.Time) error {
 	if err := o.ctl.signal(phaseClose); err != nil {
+		// The observer never learned to stop. Returning here left it running
+		// for its whole timeout with the caller holding an error and no
+		// intention of trying again.
+		o.abandon()
 		return fmt.Errorf("signal %s close: %w", o.producer, err)
 	}
 	if err := o.awaitBoundary("end", deadline); err != nil {
@@ -860,6 +888,15 @@ func (o *observerProc) abandon() {
 	if o.cmd != nil && o.cmd.Process != nil {
 		_ = o.cmd.Process.Kill()
 		_ = o.cmd.Wait()
+		return
+	}
+	// A DETACHED observer reconstructed from the action state has no cmd, and
+	// a lifecycle that cannot be completed still has to end. It is not this
+	// process's child any more, so there is nothing to reap — but it is still
+	// killable, and leaving it watching the containment would let a refused
+	// lifecycle keep writing records over whatever runs next.
+	if o.pid > 0 {
+		_ = syscall.Kill(o.pid, syscall.SIGKILL)
 	}
 }
 

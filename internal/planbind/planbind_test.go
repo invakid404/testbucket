@@ -64,6 +64,7 @@ func baseAcquire(t *testing.T, root string, mutate func(*AcquireOptions)) Acquir
 		Token:         "vitest",
 		StorePath:     storePath,
 		DiscoveryArgv: []string{"npx", "vitest", "list", "--filesOnly", "--json"},
+		BundleArgv:    []string{"testbucket", "wall", "bundle", "--root", root, "--k", "2"},
 		Discovery:     []byte(discoveryJSON),
 		Runnables:     map[string][]byte{"tests/alpha.spec.ts": []byte(runnableJSON)},
 		// The argv that actually produced that listing, as the caller reports
@@ -214,6 +215,7 @@ func TestColdStartIsBoundAsAColdStart(t *testing.T) {
 		StorePath: filepath.Join(root, "absent.json"), StoreAbsent: true,
 		Discovery:     []byte(discoveryJSON),
 		DiscoveryArgv: []string{"npx", "vitest", "list", "--filesOnly", "--json"},
+		BundleArgv:    []string{"testbucket", "wall", "bundle", "--root", root, "--store-absent"},
 		Resolve:       testResolver,
 		Env:           map[string]string{},
 		Repository:    "example/mandel", Commit: testCommit, Tree: "sha256:tree",
@@ -418,5 +420,50 @@ func TestARunnableListingRecordsTheCommandThatProducedIt(t *testing.T) {
 		t.Errorf("a runnable listing with no acquisition argv was accepted")
 	} else if !strings.Contains(err.Error(), "provenance is invented") {
 		t.Errorf("error %q does not name the missing provenance", err)
+	}
+}
+
+// TestTheAcquisitionArgvIsTheCommandThatRan is the F7 regression. The bundle's
+// acquisition closure used to be reconstructed here as
+// {"testbucket","wall","bundle"} with the Vitest DISCOVERY argv appended, which
+// is a command nobody ran: it drops every flag `wall bundle` was given and
+// hands the discovery program's arguments to a different program. That string
+// is then resolved into a signed executable closure, so the receipt swore to
+// the provenance of an invocation that never happened.
+func TestTheAcquisitionArgvIsTheCommandThatRan(t *testing.T) {
+	root := t.TempDir()
+	real := []string{"testbucket", "wall", "bundle", "--root", root, "--k", "2"}
+	b := acquire(t, root, func(o *AcquireOptions) { o.BundleArgv = real })
+
+	if got := strings.Join(b.Acquisition.Argv, " "); got != strings.Join(real, " ") {
+		t.Errorf("acquisition argv = %q, want the invocation that ran, %q", got, strings.Join(real, " "))
+	}
+	// The specific fabrication that used to be recorded, named so a future
+	// reconstruction cannot quietly come back.
+	for _, forbidden := range []string{"vitest", "list", "--filesOnly"} {
+		for _, arg := range b.Acquisition.Argv {
+			if arg == forbidden {
+				t.Errorf("acquisition argv %q carries the discovery argument %q; it is describing a command nobody ran",
+					b.Acquisition.Argv, forbidden)
+			}
+		}
+	}
+	// And what it resolves is the real program's closure, not a synthesised one.
+	if _, ok := b.Acquisition.Executables["testbucket"]; !ok {
+		t.Errorf("acquisition closure %v does not resolve the program that ran", b.Acquisition.Executables)
+	}
+}
+
+// TestAnUnreportedAcquisitionInvocationIsRefused: with no argv from the caller
+// there is nothing truthful to record, and inventing one is what F7 was. The
+// refusal is the only remaining honest answer.
+func TestAnUnreportedAcquisitionInvocationIsRefused(t *testing.T) {
+	root := t.TempDir()
+	_, err := Acquire(baseAcquire(t, root, func(o *AcquireOptions) { o.BundleArgv = nil }))
+	if err == nil {
+		t.Fatal("a bundle acquired with no reported invocation")
+	}
+	if !strings.Contains(err.Error(), "nobody ran") {
+		t.Errorf("error %q does not say the recorded command would be fictional", err)
 	}
 }
