@@ -147,10 +147,10 @@ func Exec(opt ExecOptions) (int, error) {
 	// be fixed is that the set is CLOSED at AT_end: every key registers here,
 	// `wall end` seals the log, and a key that was never registered — or one
 	// appended afterwards — is not a signer this measurement admitted.
-	if err := RegisterKey(opt.Dir, KeyLogEntry{
+	if err := RegisterLowerKey(opt.Dir, KeyLogEntry{
 		Producer: ProducerPhysical, Level: opt.Level, Seq: opt.Seq,
 		PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
-	}); err != nil {
+	}, opt.Run); err != nil {
 		return 1, err
 	}
 
@@ -179,7 +179,7 @@ func Exec(opt ExecOptions) (int, error) {
 		}
 	}
 
-	cont, err := NewContainmentFor(containmentName(opt), opt.Parent, opt.Run)
+	cont, err := NewContainmentAt(opt.Level, containmentName(opt), opt.Parent)
 	if err != nil {
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "create containment: "+err.Error())
 	}
@@ -1026,7 +1026,7 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 	if opt.Level != LevelAction {
 		// Action-level observers are declared in the roster instead; anything
 		// below it registers, for the same reason the physical wrapper does.
-		if err := RegisterKeyFor(opt.Dir, KeyLogEntry{
+		if err := RegisterLowerKey(opt.Dir, KeyLogEntry{
 			Producer: p, Level: opt.Level, Seq: opt.Seq,
 			PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
 		}, opt.Run); err != nil {
@@ -1089,6 +1089,21 @@ const (
 	ReplayKeyEnv = "TB_WALL_REPLAY_KEY"
 	// BuilderKeyEnv signs a build attestation.
 	BuilderKeyEnv = "TB_WALL_BUILDER_KEY"
+	// SignerDelegateKeyEnv carries the SIGNER DELEGATION the action opened.
+	//
+	// The run key authorizes key-log registrations, and it is deliberately
+	// scoped to `wall begin` and `wall end` so the measured step cannot forge
+	// the signer set. That left the script and invocation producers — whose
+	// keys are minted during the measured step — with no authorization path at
+	// all, so every one of them was registered unauthorized and the verifier
+	// made every row ineligible for want of a capability nobody could hold.
+	//
+	// `wall begin` mints a delegate key, signs a delegation naming it with the
+	// run key, and leaves the delegate where the WRAPPER CHAIN can read it and
+	// the measured workload cannot. This is that channel. The delegation is
+	// bound to one run and may authorize only the lower levels, so holding it
+	// cannot register an action-level signer or vouch for another run.
+	SignerDelegateKeyEnv = "TB_WALL_SIGNER_DELEGATE_KEY"
 )
 
 // WallTimeSecretEnv is every environment variable this package treats as a
@@ -1101,12 +1116,25 @@ var WallTimeSecretEnv = []string{
 	VerifierKeyEnv,  // signs a verifier verdict
 	ReplayKeyEnv,    // signs an independent replay attestation
 	BuilderKeyEnv,   // signs a build attestation
-	// A CAPABILITY IS NOT ONLY A KEY. The workload account is the credential
-	// the measured work runs under, and an observer that inherits its name can
-	// be asked to drop to it — an observer must never be able to become the
-	// thing it observes. The list is "what confers a capability", not "what
-	// looks like a secret", and the earlier list was the second.
+	// A CAPABILITY IS NOT ONLY A KEY. The measured accounts are the credentials
+	// the measured work runs under, and an observer that inherits one of their
+	// names can be asked to drop to it — an observer must never be able to
+	// become the thing it observes. The list is "what confers a capability",
+	// not "what looks like a secret", and the earlier list was the second.
+	//
+	// BOTH drop selectors belong here. `workloadArgv` turns either name into
+	// `sudo -n -u <value>` at its own level, so they are the same capability at
+	// two levels; the script selector was introduced with the second measured
+	// party and was not added to this list, which left it inherited by all four
+	// production observers — the attached peer and trace and the detached
+	// action peer and trace.
 	WorkloadUserEnv,
+	ScriptUserEnv,
+	// The signer delegation is a capability too: whoever holds that private
+	// key can make a lower-level key-log registration admissible. The wrapper
+	// chain needs it; an observer does not, and an observer able to authorize
+	// its own signer would be vouching for itself.
+	SignerDelegateKeyEnv,
 }
 
 // scrubSecrets removes every wall-time secret from an environment.

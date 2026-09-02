@@ -104,11 +104,17 @@ func TestEveryPrivateKeyEnvironmentVariableIsScrubbed(t *testing.T) {
 }
 
 // nonKeyCapabilities are the capability-conferring variables that are not
-// signing keys. The workload account name is one: `sudo -u <it>` is the whole
-// of becoming the measured workload, and an observer must never be able to
-// become the thing it observes.
+// signing keys. An account name is one: `sudo -u <it>` is the whole of
+// becoming a measured party, and an observer must never be able to become the
+// thing it observes.
 var nonKeyCapabilities = map[string]bool{
 	WorkloadUserEnv: true,
+	// The SCRIPT account name is the same capability one level up: the script
+	// level drops with `sudo -u $TB_WALL_SCRIPT_USER` exactly as the
+	// invocation level drops with the workload name. It was introduced with
+	// the second measured party and left out of the scrub, so every observer
+	// inherited it.
+	ScriptUserEnv: true,
 }
 
 func dedupePaths(in []string) []string {

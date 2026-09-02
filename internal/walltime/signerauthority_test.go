@@ -51,7 +51,7 @@ func TestAnAuthorizedKeyLogEntryIsBoundToItsWholeClaim(t *testing.T) {
 	if err := authorized.Authorize(keyLogAuthority(base), key); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkKeyLogAuthorization(authorized, keys); err != nil {
+	if err := checkKeyLogAuthorization(authorized, keys, keys, nil); err != nil {
 		t.Fatalf("a genuinely authorized entry was refused: %v", err)
 	}
 	for _, tc := range []struct {
@@ -78,7 +78,7 @@ func TestAnAuthorizedKeyLogEntryIsBoundToItsWholeClaim(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e := authorized
 			tc.edit(&e)
-			err := checkKeyLogAuthorization(e, keys)
+			err := checkKeyLogAuthorization(e, keys, keys, nil)
 			if err == nil {
 				t.Fatalf("an entry with %s was admitted", tc.name)
 			}
@@ -88,10 +88,10 @@ func TestAnAuthorizedKeyLogEntryIsBoundToItsWholeClaim(t *testing.T) {
 		})
 	}
 	// And a key nobody predeclared cannot vouch for an entry.
-	if err := checkKeyLogAuthorization(authorized, []string{PublicKeyOf(mustSigningKey())}); err == nil {
+	if err := checkKeyLogAuthorization(authorized, []string{PublicKeyOf(mustSigningKey())}, []string{PublicKeyOf(mustSigningKey())}, nil); err == nil {
 		t.Error("an entry authorized by an undeclared key was admitted")
 	}
-	if err := checkKeyLogAuthorization(authorized, nil); err == nil {
+	if err := checkKeyLogAuthorization(authorized, nil, nil, nil); err == nil {
 		t.Error("an entry was admitted with no predeclared run signer to check it against")
 	}
 }
@@ -113,7 +113,7 @@ func TestRegisterKeyAuthorizesWhenItHoldsTheCapability(t *testing.T) {
 	if err != nil || len(logged) != 1 {
 		t.Fatalf("ReadKeyLog: %v (%d entries)", err, len(logged))
 	}
-	if err := checkKeyLogAuthorization(logged[0], []string{PublicKeyOf(key)}); err != nil {
+	if err := checkKeyLogAuthorization(logged[0], []string{PublicKeyOf(key)}, []string{PublicKeyOf(key)}, nil); err != nil {
 		t.Errorf("a key registered by a holder of the run key is not admissible: %v", err)
 	}
 
@@ -129,7 +129,7 @@ func TestRegisterKeyAuthorizesWhenItHoldsTheCapability(t *testing.T) {
 	if logged[0].Authorization != nil {
 		t.Error("a process with no run key produced an authorization anyway")
 	}
-	if err := checkKeyLogAuthorization(logged[0], []string{PublicKeyOf(key)}); err == nil {
+	if err := checkKeyLogAuthorization(logged[0], []string{PublicKeyOf(key)}, []string{PublicKeyOf(key)}, nil); err == nil {
 		t.Error("a key registered with no run key was admissible")
 	}
 }

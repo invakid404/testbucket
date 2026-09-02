@@ -472,11 +472,17 @@ func TestAnUnobservedCredentialDropIsNotReportedAsOne(t *testing.T) {
 // child and never declared that signer, so the one record proving such a child
 // existed was the one record the closed signer set could not attribute.
 func TestTheActionChildSignerIsRegistered(t *testing.T) {
-	body := productionFunc(t, "action.go", "func retainActionChild(")
+	body := productionFunc(t, "action.go", "func openActionChild(")
 	if !strings.Contains(body, "RegisterKeyFor(dir, KeyLogEntry{") {
 		t.Error("the action-child side stream still mints a signer nobody registered")
 	}
-	if !strings.Contains(body, "actionChildSeq(dir)") {
+	// AND ITS OWN STREAM IDENTITY. The side file used the main action ledger's
+	// producer, level and default sequence number while starting its own
+	// chain, so the reader merged two intact chains into one broken one.
+	if !strings.Contains(body, "streamName(ProducerPhysical, LevelAction, seq)") {
+		t.Error("the action-child ledger does not take its own stream name")
+	}
+	if !strings.Contains(body, "actionChildSeq(dir) + 1") {
 		t.Error("action-owned children share one producer role, so two of them claim the same signer")
 	}
 }

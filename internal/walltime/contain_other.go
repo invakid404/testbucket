@@ -2,6 +2,8 @@
 
 package walltime
 
+import "os"
+
 import (
 	"fmt"
 	"runtime"
@@ -26,7 +28,14 @@ func attachCgroup2(ident ContainmentIdentity) (Containment, error) {
 	return nil, fmt.Errorf("walltime: cgroup-v2 containment is Linux-only (host is %s)", runtime.GOOS)
 }
 
+// retainLevelMembershipFacts has no cgroup facts to re-read off Linux.
+func retainLevelMembershipFacts(Containment, Level) {}
+
 // delegateScriptSubtree has no cgroup subtree to delegate off Linux. The run
 // is unscorable for want of a containment primitive long before the script
 // account matters.
 func delegateScriptSubtree(Containment) error { return nil }
+
+// evidenceDirDelegation has no second account to resolve off Linux; the shared
+// decision lives in contain.go so it is exercised on every host.
+func evidenceDirDelegation() (int, os.FileMode) { return evidenceDirDelegationFor(nil) }

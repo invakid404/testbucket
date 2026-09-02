@@ -431,6 +431,15 @@ type streamKey struct {
 	Producer Producer
 	Level    Level
 	Ordinal  int
+	// File is the ledger the records were read from.
+	//
+	// A hash chain is a property of ONE WRITER'S FILE. Grouping by the
+	// identity a file claims merged two files that claimed the same
+	// producer/level/sequence into one group, and the second file's intact
+	// chain then "did not chain to its predecessor" — a terminal finding about
+	// the reader rather than about the evidence. Two files claiming one stream
+	// identity is a real problem, and it is reported as itself below.
+	File string
 }
 
 // boundaryCardinality is the rule that keeps a resumed stream honest.
@@ -469,7 +478,7 @@ func checkBoundaryCardinality(v *Verdict, key streamKey, recs []Record) {
 func groupStreams(recs []Record) map[streamKey][]Record {
 	out := map[streamKey][]Record{}
 	for _, r := range recs {
-		k := streamKey{r.Producer, r.Level, r.Seqno}
+		k := streamKey{r.Producer, r.Level, r.Seqno, r.streamFile()}
 		out[k] = append(out[k], r)
 	}
 	for k := range out {
@@ -479,10 +488,54 @@ func groupStreams(recs []Record) map[streamKey][]Record {
 	return out
 }
 
+// verifyStreamIdentitiesAreUnique reports two LEDGERS claiming one stream
+// identity.
+//
+// Chains are verified per file, because a chain is what one writer wrote. That
+// makes two files claiming the same producer/level/sequence a distinct
+// problem — the reader can no longer tell which of them is the stream that
+// identity names — and it is reported as itself rather than as a spurious
+// broken chain, which is what it used to surface as.
+func verifyStreamIdentitiesAreUnique(v *Verdict, streams map[streamKey][]Record) {
+	files := map[string]map[string]bool{}
+	for k := range streams {
+		if k.File == "" {
+			continue
+		}
+		id := fmt.Sprintf("%s/%s#%d", k.Producer, k.Level, k.Ordinal)
+		if files[id] == nil {
+			files[id] = map[string]bool{}
+		}
+		files[id][k.File] = true
+	}
+	for _, id := range sortedStringKeys(mapOfKeys(files)) {
+		if len(files[id]) < 2 {
+			continue
+		}
+		names := make([]string, 0, len(files[id]))
+		for n := range files[id] {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		v.add("WT-020", SeverityTerminal, fmt.Sprintf(
+			"two ledgers claim the stream identity %s (%v); each is internally intact, and nothing says which of them is that stream",
+			id, names))
+	}
+}
+
+func mapOfKeys(m map[string]map[string]bool) map[string]string {
+	out := map[string]string{}
+	for k := range m {
+		out[k] = k
+	}
+	return out
+}
+
 // verifyChains re-derives every record hash and follows the prev-hash links. A
 // record that was rewritten after the fact cannot survive this, which is the
 // point of writing the chain at all.
 func verifyChains(v *Verdict, streams map[streamKey][]Record) {
+	verifyStreamIdentitiesAreUnique(v, streams)
 	for _, key := range sortedKeys(streams) {
 		recs := streams[key]
 		checkBoundaryCardinality(v, key, recs)

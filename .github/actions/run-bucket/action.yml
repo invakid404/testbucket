@@ -432,6 +432,15 @@ runs:
             # it first so `tee` has somewhere to write (the script itself does
             # not mkdir, and each bucket runs on a fresh runner).
             mkdir -p "$TB_EVENTS_DIR"
+            # DELEGATED THE SAME WAY THE EVIDENCE DIRECTORY IS: the measured
+            # script runs as its own account and must create files here, so the
+            # script group gets create access — setgid so new files carry the
+            # group, sticky so only an owner may remove or rename anything.
+            # Without that the dropped script cannot write a single event file.
+            if [ -n "${TB_WALL_SCRIPT_USER:-}" ]; then
+              chgrp "$TB_WALL_SCRIPT_USER" "$TB_EVENTS_DIR"
+              chmod 3770 "$TB_EVENTS_DIR"
+            fi
             echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
             printf "%s\n" "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
             echo "--- invocations ---"

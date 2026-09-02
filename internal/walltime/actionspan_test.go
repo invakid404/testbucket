@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -56,7 +57,7 @@ func TestActionReadingsAreTakenByDifferentWrappers(t *testing.T) {
 	v := &Verdict{}
 	verifyProcessTree(v, []Envelope{e}, []Record{
 		actionReading(e, "start", 81000, 81000, 81500, 81600),
-		actionReading(e, "observed", 81001, 81001),
+		actionReading(e, "observed", 81001, 81500),
 		actionReading(e, "end", 81002),
 	})
 	for _, f := range v.Findings {
@@ -72,31 +73,66 @@ func TestActionReadingsAreTakenByDifferentWrappers(t *testing.T) {
 	}
 }
 
-// TestAnActionReadingTakenFromOutsideIsRefused: with no measured child, the
-// only thing tying an action record to a process is that the process was IN
-// the containment it reported on.
+// TestTheActionCloserStandsOutsideTheContainmentItDrains is the F1 regression.
 //
-// `wall end` took its closing reading without joining, so the record named a
-// process its own membership snapshot did not contain — an observation of a
-// containment the observer had never been inside.
-func TestAnActionReadingTakenFromOutsideIsRefused(t *testing.T) {
+// `wall end` joined the action containment and then called
+// enforceContainmentEmpty on it. That waits for the containment to become
+// empty and SIGKILLs every member at the deadline — so a closer that is itself
+// a member can never see it empty and kills itself, and the drained read, the
+// end boundary, the seal and the cleanup it claims to perform never happen.
+// The opening reading is the opposite case: `wall begin` created the
+// containment and joined it, so a reader that had not joined would be
+// reporting on a container it was never in.
+func TestTheActionCloserStandsOutsideTheContainmentItDrains(t *testing.T) {
 	e := actionEnvelope()
 	v := &Verdict{}
 	verifyProcessTree(v, []Envelope{e}, []Record{
 		actionReading(e, "start", 81000, 81000),
+		// The closer reads a containment that still holds action work, and is
+		// not among it.
 		actionReading(e, "observed", 81001, 81500),
 		actionReading(e, "end", 81002),
 	})
-	if len(findingsMentioning(v, "WT-033", "does not contain")) == 0 {
-		t.Errorf("a reading taken from outside the containment was accepted: %+v", v.Findings)
+	if len(v.Findings) != 0 {
+		t.Errorf("a closer standing outside its own drain produced findings: %+v", v.Findings)
 	}
-	// And the production step joins before it reads, so the shape above cannot
-	// be produced by the wrapper any more.
+
+	// A CLOSER INSIDE ITS OWN DRAIN is terminal.
+	inside := &Verdict{}
+	verifyProcessTree(inside, []Envelope{e}, []Record{
+		actionReading(e, "start", 81000, 81000),
+		actionReading(e, "observed", 81001, 81001, 81500),
+		actionReading(e, "end", 81002),
+	})
+	if len(findingsMentioning(inside, "WT-033", "inside its own drain")) == 0 {
+		t.Errorf("a closer that made itself a member of the containment it drains was accepted: %+v", inside.Findings)
+	}
+
+	// AND AN OPENING READING FROM OUTSIDE is still refused: `wall begin`
+	// creates the containment and joins it before it reads.
+	outside := &Verdict{}
+	verifyProcessTree(outside, []Envelope{e}, []Record{
+		actionReading(e, "start", 81000, 81500),
+		actionReading(e, "observed", 81001, 81500),
+		actionReading(e, "end", 81002),
+	})
+	if len(findingsMentioning(outside, "WT-033", "does not contain")) == 0 {
+		t.Errorf("an opening reading taken from outside the containment was accepted: %+v", outside.Findings)
+	}
+
+	// AND THE PRODUCTION CLOSER DOES NOT JOIN. The wrapper cannot produce the
+	// shape above any more, which is the half a verifier rule cannot state.
 	body := productionFunc(t, "action.go", "func EndAction(")
-	join := strings.Index(body, "joinContainment(st.Containment, os.Getpid())")
-	read := strings.Index(body, `retainActionProcessTree(w, st.Run, clock, cont, "observed")`)
-	if join < 0 || read < 0 || join > read {
-		t.Errorf("EndAction does not join the action containment before taking its closing reading: join=%d read=%d", join, read)
+	if strings.Contains(body, "joinContainment(st.Containment, os.Getpid())") {
+		t.Error("EndAction still joins the containment it is about to drain; it can only time out and cgroup.kill itself")
+	}
+	if !strings.Contains(body, "enforceContainmentEmpty(cont, deadline)") {
+		t.Error("EndAction no longer drains the containment")
+	}
+	// The OPENING step still joins, because its reading must come from inside.
+	begin := productionFunc(t, "action.go", "func BeginAction(")
+	if !strings.Contains(begin, "joinContainment(cont.Identity(), os.Getpid())") {
+		t.Error("BeginAction no longer joins the containment it reads")
 	}
 }
 
@@ -111,16 +147,25 @@ func TestActionOwnedChildrenAreVerified(t *testing.T) {
 	e := actionEnvelope()
 	child := func(edit func(*Record)) Record {
 		r := actionReading(e, "", 82000, 82000, 81000)
-		r.Kind, r.Boundary = "action_child", ""
+		r.Kind, r.Boundary = "action_child", "observed"
 		r.Note = "action-owned child: npm ci"
 		if edit != nil {
 			edit(&r)
 		}
 		return r
 	}
+	// The proof committed BEFORE the child existed: it names no process,
+	// because there was not one yet, and states what the containment held.
+	before := func() Record {
+		r := actionReading(e, "", 0, 81000)
+		r.Kind, r.Boundary = "action_child", "before"
+		r.Proc = ProcIdentity{}
+		r.Note = "action-owned child about to start: npm ci"
+		return r
+	}
 	base := []Record{
-		actionReading(e, "start", 81000, 81000),
-		actionReading(e, "observed", 81001, 81001),
+		actionReading(e, "start", 81000, 81000, 82000),
+		actionReading(e, "observed", 81001, 82000),
 		actionReading(e, "end", 81002),
 	}
 	for _, tc := range []struct {
@@ -146,7 +191,7 @@ func TestActionOwnedChildrenAreVerified(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := &Verdict{}
-			verifyProcessTree(v, []Envelope{e}, append(append([]Record{}, base...), tc.rec))
+			verifyProcessTree(v, []Envelope{e}, append(append([]Record{}, base...), before(), tc.rec))
 			if len(findingsMentioning(v, "WT-033", tc.want)) == 0 {
 				t.Errorf("%s was accepted: %+v", tc.name, v.Findings)
 			}
@@ -161,8 +206,9 @@ func TestActionOwnedChildrenAreVerified(t *testing.T) {
 	wc := child(func(r *Record) { r.Containment.Mode = 0o777 })
 	verifyProcessTree(wv, []Envelope{world}, []Record{
 		actionReading(world, "start", 81000, 81000),
-		actionReading(world, "observed", 81001, 81001),
+		actionReading(world, "observed", 81001, 81500),
 		actionReading(world, "end", 81002),
+		func() Record { r := before(); r.Containment.Mode = 0o777; return r }(),
 		wc,
 	})
 	if len(findingsMentioning(wv, "WT-033", "could write this containment's cgroup.procs")) == 0 {
@@ -172,9 +218,17 @@ func TestActionOwnedChildrenAreVerified(t *testing.T) {
 	// A complete one passes, so the control was added rather than the path
 	// broken.
 	v := &Verdict{}
-	verifyProcessTree(v, []Envelope{e}, append(append([]Record{}, base...), child(nil)))
+	verifyProcessTree(v, []Envelope{e}, append(append([]Record{}, base...), before(), child(nil)))
 	if len(v.Findings) != 0 {
 		t.Errorf("a complete action-owned child produced findings: %+v", v.Findings)
+	}
+
+	// AND A CHILD WITH NO PROOF BEFORE IT is refused, which is the shape the
+	// best-effort writer produced whenever anything failed.
+	unproved := &Verdict{}
+	verifyProcessTree(unproved, []Envelope{e}, append(append([]Record{}, base...), child(nil)))
+	if len(findingsMentioning(unproved, "WT-033", "containment proof BEFORE every action-owned child")) == 0 {
+		t.Errorf("an action-owned child that ran before anything was committed about it was accepted: %+v", unproved.Findings)
 	}
 }
 
@@ -208,7 +262,7 @@ func TestTheActionContainmentIsRederivedLikeEveryOther(t *testing.T) {
 			v := &Verdict{}
 			verifyProcessTree(v, []Envelope{e}, []Record{
 				actionReading(e, "start", 81000, 81000),
-				actionReading(e, "observed", 81001, 81001),
+				actionReading(e, "observed", 81001, 81500),
 				actionReading(e, "end", 81002),
 			})
 			if len(findingsMentioning(v, "WT-033", tc.want)) == 0 {
@@ -224,7 +278,7 @@ func TestTheActionContainmentIsRederivedLikeEveryOther(t *testing.T) {
 	v := &Verdict{}
 	verifyProcessTree(v, []Envelope{e}, []Record{
 		actionReading(e, "start", 81000, 81000),
-		actionReading(e, "observed", 81001, 81001),
+		actionReading(e, "observed", 81001, 81500),
 		actionReading(e, "end", 81002),
 	})
 	if len(findingsMentioning(v, "WT-033", "could write this containment's cgroup.procs")) == 0 {
@@ -235,9 +289,9 @@ func TestTheActionContainmentIsRederivedLikeEveryOther(t *testing.T) {
 // TestTheActionChildRecordCarriesItsOwnProof: the verifier can only consume
 // evidence the producer retains, and the record used to carry a pid and a note.
 func TestTheActionChildRecordCarriesItsOwnProof(t *testing.T) {
-	body := productionFunc(t, "action.go", "func retainActionChild(")
+	body := productionFunc(t, "action.go", "func (c *actionChild) append(")
 	for _, want := range []string{
-		"cont.Observe(string(ProducerPhysical))",
+		"c.cont.Observe(string(ProducerPhysical))",
 		"rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest",
 		"processGroupsOf(pid)",
 		"UID: processUIDOf(pid)",
@@ -245,5 +299,72 @@ func TestTheActionChildRecordCarriesItsOwnProof(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("the action-child record does not retain %q, so nothing downstream can rederive that the child was ever inside the action containment", want)
 		}
+	}
+	// AND NOTHING IS SWALLOWED. Every failure along the way used to be
+	// discarded, so a child could run with no retained proof and nothing said
+	// so.
+	if strings.Contains(body, "if err != nil {\n\t\treturn nil") {
+		t.Error("the action-child ledger still discards failures")
+	}
+	// THE PROOF PRECEDES THE CHILD. The record was written after the spawn,
+	// so nothing committed preceded the execution it is proof of.
+	run := productionFunc(t, "action.go", "func RunInAction(")
+	open := strings.Index(run, "openActionChild(dir, st, argv)")
+	start := strings.Index(run, "cmd.Start()")
+	if open < 0 || start < 0 {
+		t.Fatalf("the action-child production path is not recognizable: open=%d start=%d", open, start)
+	}
+	if open > start {
+		t.Errorf("the containment proof at %d is retained after the child starts at %d", open, start)
+	}
+}
+
+// TestTwoLedgersDoNotShareOneChain is the reader half of F5.
+//
+// A hash chain is a property of ONE WRITER'S FILE. The reader grouped records
+// by the producer/level/sequence identity they claim instead, so the
+// action-child side file — which defaulted to the main action ledger's
+// sequence number while starting its own chain — was merged with it and the
+// second half "did not chain to its predecessor". Two intact chains were
+// reported as one broken one.
+func TestTwoLedgersDoNotShareOneChain(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, kind string) {
+		w, err := NewWriter(filepath.Join(dir, name), ProducerPhysical, ProducerID(ProducerPhysical), mustSigningKey())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Append(Record{Kind: kind, Level: LevelAction, Seqno: 0}); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(streamName(ProducerPhysical, LevelAction, 0), "boundary")
+	write("physical_wrapper.action-child.jsonl", "action_child")
+
+	recs, err := ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &Verdict{}
+	verifyChains(v, groupStreams(recs))
+	for _, f := range v.Findings {
+		if f.Code == "WT-002" {
+			t.Errorf("two intact chains were reported as one broken chain: %s", f.Detail)
+		}
+	}
+	// The real problem — two ledgers claiming one stream identity — is
+	// reported as itself, so nothing is lost by grouping per file.
+	if len(findingsMentioning(v, "WT-020", "claim the stream identity")) == 0 {
+		t.Errorf("two ledgers claiming one stream identity went unreported: %+v", v.Findings)
+	}
+
+	// And production no longer produces that collision: each action-owned
+	// child takes the next sequence number, so it is its own stream.
+	body := productionFunc(t, "action.go", "func openActionChild(")
+	if !strings.Contains(body, "actionChildSeq(dir) + 1") {
+		t.Error("the action-child ledger does not take a sequence number distinct from the action envelope's")
 	}
 }

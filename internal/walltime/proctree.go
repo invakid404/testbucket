@@ -28,7 +28,11 @@ func verifyProcessTree(v *Verdict, envs []Envelope, recs []Record) {
 		case "process_tree":
 			trees[envelopeKey(r.Level, r.Seqno)] = append(trees[envelopeKey(r.Level, r.Seqno)], r)
 		case "action_child":
-			children[envelopeKey(r.Level, r.Seqno)] = append(children[envelopeKey(r.Level, r.Seqno)], r)
+			// KEYED BY LEVEL, NOT BY SEQNO. Each action-owned child writes its
+			// own stream with its own sequence number so its chain is not
+			// merged with the action ledger's; the envelope it belongs to is
+			// still the action envelope, which is the one this level has.
+			children[string(r.Level)] = append(children[string(r.Level)], r)
 		}
 	}
 	for _, e := range envs {
@@ -101,7 +105,7 @@ func verifyProcessTree(v *Verdict, envs []Envelope, recs []Record) {
 		// containment read from inside it, plus the children it owned.
 		if e.Level == LevelAction {
 			checkActionSpan(v, label, e, found)
-			checkActionChildren(v, label, e, children[envelopeKey(e.Level, e.Seq)])
+			checkActionChildren(v, label, e, children[string(e.Level)])
 			continue
 		}
 		for _, first := range admitted {
@@ -409,21 +413,25 @@ func membershipSubject(c ContainmentIdentity, p ProcIdentity, level Level) ([]in
 		uids, gids = append(uids, c.WorkloadUID), append(gids, c.WorkloadGIDs...)
 		described = fmt.Sprintf("the retained workload credential %d%v", c.WorkloadUID, c.WorkloadGIDs)
 	}
-	// The invocation child is the workload, so the credential the kernel
-	// reported for it is part of the subject rather than a second opinion
-	// about it. At the script level it is NOT: the script account owns the
-	// subtree delegated to it precisely so it can create the invocation
-	// containments, and asking whether it can write its own delegated subtree
-	// would refuse the only arrangement in which that level can run at all —
-	// what it cannot write is the enclosing action containment, which is what
-	// keeps it inside the lifecycle.
-	if level == LevelInvocation || len(uids) == 0 {
+	// AND THE CREDENTIAL THE KERNEL REPORTED FOR THE PROCESS THAT RAN.
+	//
+	// The retained declaration says which account the wrapper resolved; the
+	// process identity says which credential actually ran. Both belong in the
+	// subject at EVERY level where something was measured, and the script
+	// level was deliberately excluded — so a script containment made
+	// group-writable by the measured script's own group could be labelled
+	// supervisor-owned using an unrelated account's groups, which is the one
+	// arrangement the rule exists to refuse. A subject that omits the
+	// measured process is a rule about somebody who was not there.
+	if p.UID >= 0 && (level == LevelInvocation || level == LevelScript || len(uids) == 0) {
+		own := append(append([]int{}, p.Groups...), p.GID)
 		uids = append(uids, p.UID)
-		gids = append(gids, append(append([]int{}, p.Groups...), p.GID)...)
+		gids = append(gids, own...)
+		measured := fmt.Sprintf("the measured process's own credential %d%v", p.UID, own)
 		if described == "" {
-			described = fmt.Sprintf("the measured process's own credential %d%v", p.UID, append(append([]int{}, p.Groups...), p.GID))
+			described = measured
 		} else {
-			described += fmt.Sprintf(" together with the measured process's own %d%v", p.UID, append(append([]int{}, p.Groups...), p.GID))
+			described += " together with " + measured
 		}
 	}
 	return uids, gids, described
@@ -450,14 +458,21 @@ func checkActionSpan(v *Verdict, label string, e Envelope, found []Record) {
 				label, r.Containment.RootPID, r.Containment.RootStart, e.Containment.RootPID, e.Containment.RootStart))
 			continue
 		}
-		// THE OBSERVER WAS INSIDE WHAT IT READ.
+		// WHO TOOK THE READING, AND WHERE THEY STOOD.
 		//
-		// A wrapper that reads `cgroup.procs` from outside the containment
-		// reports on a container it was never in; the action level has no
-		// measured child, so this is the only thing that ties a reading to the
-		// process that took it. The drained read is exempt because it is taken
-		// after the containment empties — that is what it is for.
-		if r.Boundary == "end" || r.RawProcs == nil {
+		// With no measured child, this is the only thing tying an action
+		// record to a process. The two ends stand in OPPOSITE places, and both
+		// placements are required:
+		//
+		//   - the OPENING reading is taken by `wall begin`, which joins the
+		//     containment it created; a reader that had not joined would be
+		//     reporting on a container it was never in;
+		//   - the CLOSING readings are taken by `wall end`, which must NOT be
+		//     a member. It drains the containment and then SIGKILLs whatever
+		//     is left, so a closer inside its own drain can never see it empty
+		//     and kills itself at the deadline. A closing reading whose own
+		//     membership contains the reader is a drain that measured itself.
+		if r.RawProcs == nil {
 			continue
 		}
 		var inside bool
@@ -466,9 +481,14 @@ func checkActionSpan(v *Verdict, label string, e Envelope, found []Record) {
 				inside = true
 			}
 		}
-		if !inside {
+		switch {
+		case r.Boundary == "start" && !inside:
 			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
-				"%s: the %s action reading was taken by pid %d, which its own membership snapshot %v does not contain; a wrapper that had not joined the containment is reporting on one it was never in",
+				"%s: the opening action reading was taken by pid %d, which its own membership snapshot %v does not contain; a wrapper that had not joined the containment is reporting on one it was never in",
+				label, r.Proc.PID, r.RawProcs))
+		case r.Boundary != "start" && inside:
+			v.add("WT-033", SeverityTerminal, fmt.Sprintf(
+				"%s: the %s action reading was taken by pid %d, which is itself a member of the containment being drained (%v); a closer inside its own drain cannot observe it empty and kills itself at the deadline, so no drained read, end boundary or seal can follow",
 				label, r.Boundary, r.Proc.PID, r.RawProcs))
 		}
 	}
@@ -481,8 +501,24 @@ func checkActionSpan(v *Verdict, label string, e Envelope, found []Record) {
 // producer of exactly that proof was disconnected from eligibility: a setup
 // command that started, forked and vanished left a record no verdict consulted.
 func checkActionChildren(v *Verdict, label string, e Envelope, children []Record) {
+	var observed int
 	for _, r := range children {
 		where := fmt.Sprintf("%s action child", label)
+		if r.Boundary == "before" {
+			// The reading committed BEFORE the child existed. It states what
+			// the containment held at that moment and names no process,
+			// because there was not one yet; the containment proof the
+			// contract asks for precedes the execution rather than describing
+			// it afterwards.
+			if !r.Containment.Same(e.Containment) {
+				v.add("WT-033", SeverityTerminal, fmt.Sprintf(
+					"%s: a pre-spawn action-child record names a containment whose %s", where, r.Containment.Differs(e.Containment)))
+				continue
+			}
+			requireMembershipEvidence(v, where+" pre-spawn reading", r)
+			continue
+		}
+		observed++
 		if !r.Containment.Same(e.Containment) {
 			v.add("WT-033", SeverityTerminal, fmt.Sprintf(
 				"%s: an action-child record names a containment whose %s", where, r.Containment.Differs(e.Containment)))
@@ -515,6 +551,14 @@ func checkActionChildren(v *Verdict, label string, e Envelope, children []Record
 				where, p.PID, r.RawProcs))
 		}
 		rederiveMembership(v, where, e, r)
+	}
+	// EVERY OBSERVED CHILD HAS A PROOF THAT PRECEDED IT. A missing pre-spawn
+	// record is a child that ran before anything was committed about it, which
+	// is the shape the best-effort writer produced whenever anything failed.
+	if before := len(children) - observed; observed > before {
+		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+			"%s: %d action-owned child observation(s) but %d containment proof(s) committed before them; the contract asks for containment proof BEFORE every action-owned child",
+			label, observed, before))
 	}
 }
 

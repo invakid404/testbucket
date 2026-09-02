@@ -398,6 +398,12 @@ type Record struct {
 	Hash      Digest `json:"hash"`
 	SignerID  string `json:"signer_id,omitempty"`
 	Signature string `json:"signature,omitempty"`
+
+	// stream is the file this record was read from. It is stamped by the
+	// reader, is never serialized, and never enters a digest: a hash chain is
+	// a property of one writer's FILE, and grouping by the identity a file
+	// CLAIMS merged two intact chains into one broken one.
+	stream string
 }
 
 // SpecIdentity is the digest-bound identity of an invocation: what was run,
@@ -529,7 +535,25 @@ func ReadRecords(path string) ([]Record, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return decodeRecords(f)
+	recs, err := decodeRecords(f)
+	if err != nil {
+		return nil, err
+	}
+	// WHICH FILE EACH RECORD CAME FROM.
+	//
+	// A hash chain is a property of ONE WRITER'S FILE, and the reader grouped
+	// records by the producer/level/sequence identity they claim instead. Two
+	// files claiming one identity — which is what a side stream defaulting to
+	// the main stream's sequence number produced — were merged into a single
+	// group whose second half chained to nothing, and the reader reported a
+	// broken chain when what it had was two intact chains. The stream a record
+	// was read from is not part of the record it signs, so it is stamped here
+	// and never serialized.
+	name := filepath.Base(path)
+	for i := range recs {
+		recs[i].stream = name
+	}
+	return recs, nil
 }
 
 func decodeRecords(r io.Reader) ([]Record, error) {
@@ -552,6 +576,10 @@ func decodeRecords(r io.Reader) ([]Record, error) {
 
 // ReadDir loads every record stream in a directory, sorted by file name so the
 // result is deterministic.
+// streamFile is the ledger a record was read from. It is empty for a record a
+// caller built in memory, which groups such records together exactly as before.
+func (r Record) streamFile() string { return r.stream }
+
 func ReadDir(dir string) ([]Record, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

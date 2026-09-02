@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
@@ -280,6 +281,37 @@ func NewContainmentFor(name string, parent *ContainmentIdentity, run RunIdentity
 	return NewContainment(name, parent)
 }
 
+// NewContainmentAt creates a containment for one LEVEL, so the membership
+// facts retained on it describe the party that level measures.
+//
+// The level is not decoration. The membership rule asks whether the measured
+// party can write this containment's `cgroup.procs`, and there are two
+// measured parties: the script account at the script level and the workload
+// account at the invocation level. Resolving the invocation account for a
+// SCRIPT containment answered the question about a process that was never in
+// it — and did so immediately after delegating that containment to the script
+// account's group, which is exactly the credential the answer omitted.
+func NewContainmentAt(level Level, name string, parent *ContainmentIdentity) (Containment, error) {
+	c, err := newContainment(name, parent)
+	if err != nil {
+		return nil, err
+	}
+	retainLevelMembershipFacts(c, level)
+	return c, nil
+}
+
+// measuredAccountFor is the account the party measured at one level runs as.
+// The action level has no measured child, so the workload account — the
+// untrusted party whose containment this ultimately is — remains the subject.
+func measuredAccountFor(level Level) string {
+	if level == LevelScript {
+		if user := strings.TrimSpace(os.Getenv(ScriptUserEnv)); user != "" {
+			return user
+		}
+	}
+	return strings.TrimSpace(os.Getenv(WorkloadUserEnv))
+}
+
 func NewContainment(name string, parent *ContainmentIdentity) (Containment, error) {
 	return newContainment(name, parent)
 }
@@ -380,4 +412,20 @@ func AttachContainment(ident ContainmentIdentity) (Containment, error) {
 	default:
 		return nil, fmt.Errorf("walltime: unknown containment primitive %q", ident.Primitive)
 	}
+}
+
+// evidenceDirDelegationFor is the group and mode an evidence directory carries
+// once a script account is declared, separated from resolving that account so
+// the decision can be exercised on any host.
+//
+// rwxrws--T: the owner and the delegated group may CREATE; setgid makes new
+// files carry the directory's group; the sticky bit means only a file's owner
+// may remove or rename it. The wrapper's ledgers stay 0644 and wrapper-owned,
+// so the account that may add files beside them can neither modify nor replace
+// them — which is the difference between a delegation and a hole.
+func evidenceDirDelegationFor(gids []int) (int, os.FileMode) {
+	if len(gids) == 0 {
+		return -1, 0o755
+	}
+	return gids[0], os.FileMode(0o770) | os.ModeSetgid | os.ModeSticky
 }

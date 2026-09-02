@@ -183,6 +183,29 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		// saying so is more useful than a bare mkdir error.
 		return nil, fmt.Errorf("walltime: create the records directory (no terminal record can be retained without it): %w", err)
 	}
+	// THE EVIDENCE DIRECTORY IS DELEGATED, APPEND-ONLY, TO THE SCRIPT ACCOUNT.
+	//
+	// The measured bucket script runs as its own account and must create files
+	// here: one invocation spec per call, and the nested ledgers the
+	// invocation wrappers open beside them. The directory was 0755 and owned
+	// by the wrapper, so it could create none of them and the two-account path
+	// stopped before it could produce a row.
+	//
+	// General write access is not the answer — the measured script would then
+	// be able to rewrite the evidence being attested. This grants CREATE and
+	// nothing else: the group gets write and search, setgid makes new files
+	// carry the directory's group, and the STICKY BIT means a file may be
+	// removed or renamed only by its owner. The wrapper's ledgers and key log
+	// stay 0644 and wrapper-owned, so the script cannot modify them, cannot
+	// delete them, and cannot replace them with files of its own.
+	if gid, mode := evidenceDirDelegation(); gid >= 0 {
+		if err := os.Chown(dir, -1, gid); err != nil {
+			return nil, preWriter("give the evidence directory to the script account's group", err)
+		}
+		if err := os.Chmod(dir, mode); err != nil {
+			return nil, preWriter("make the evidence directory append-only for that group", err)
+		}
+	}
 	if err := probeErr(atRecordsDir, dir); err != nil {
 		return nil, preWriter("prepare the records directory", err)
 	}
@@ -240,7 +263,7 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		return nil, fmt.Errorf("walltime: %s: %w", reason, cause)
 	}
 
-	cont, err := NewContainmentFor(containmentName(ExecOptions{Level: LevelAction, Run: run}), nil, run)
+	cont, err := NewContainmentAt(LevelAction, containmentName(ExecOptions{Level: LevelAction, Run: run}), nil)
 	if err != nil {
 		return fail("create the action containment", err)
 	}
@@ -325,6 +348,19 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	if err := WriteRoster(dir, roster); err != nil {
 		return fail("write the signer roster", err)
 	}
+	// AND THE SIGNER DELEGATION, opened in the same step and with the same
+	// key, for the same reason the roster is sealed here.
+	//
+	// The script and invocation producers mint their keys during the MEASURED
+	// step, when no holder of the run key is left to vouch for them — so every
+	// lower key was registered unauthorized and the verifier reported every
+	// row ineligible for want of a capability nobody could hold. The delegate
+	// is that capability, bound to this run and to the lower levels only, so
+	// what it can do is exactly what the wrapper chain must do and nothing the
+	// roster reserves to this step.
+	if err := OpenSignerDelegation(dir, run, runKey); err != nil {
+		return fail("open the signer delegation", err)
+	}
 
 	st := &ActionState{
 		Schema: SchemaVersion, Dir: dir, Run: run, Containment: cont.Identity(),
@@ -400,10 +436,38 @@ func RunInAction(dir string, argv []string, cwd string, stdout, stderr *os.File)
 	// containment proof before every one of them and RunInAction may be called
 	// more than once. The record is appended to the action stream with the
 	// child's own identity, read while it is running.
+	// THE PROOF IS COMMITTED BEFORE THE CHILD EXISTS.
+	//
+	// The child used to be started first and its record written afterwards, so
+	// nothing committed preceded the execution the contract asks for
+	// containment proof BEFORE. Every failure along the way — key, writer,
+	// registration, observation, append — was also discarded, so an action
+	// child could run with no retained proof at all and nothing said so.
+	//
+	// This writes the pre-spawn reading, and refuses to start the child if it
+	// cannot: an action-owned child that cannot be accounted for is a child
+	// that must not run, which is the same rule the measured admission
+	// protocol applies one level down.
+	child, err := openActionChild(dir, st, argv)
+	if err != nil {
+		return 1, fmt.Errorf("walltime: retain the containment proof before an action-owned child: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
+		child.close()
 		return 1, err
 	}
-	retainActionChild(dir, st, cmd.Process.Pid, argv)
+	// AND THE IDENTITY, once the child exists. Two records, because they state
+	// two different things: what the containment held before the child, and
+	// which process the wrapper then started inside it.
+	if err := child.observe(cmd.Process.Pid, argv); err != nil {
+		child.close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return 1, fmt.Errorf("walltime: retain the identity of an action-owned child: %w", err)
+	}
+	if err := child.close(); err != nil {
+		return 1, fmt.Errorf("walltime: close the action-child ledger: %w", err)
+	}
 	if err := cmd.Wait(); err != nil {
 		if cmd.ProcessState != nil {
 			return cmd.ProcessState.ExitCode(), nil
@@ -413,62 +477,96 @@ func RunInAction(dir string, argv []string, cwd string, stdout, stderr *os.File)
 	return 0, nil
 }
 
-// retainActionChild records one action-owned child while it is alive.
+// actionChild is one action-owned child's ledger: its own stream, its own
+// registered signer and its own record chain.
+type actionChild struct {
+	w    *Writer
+	st   *ActionState
+	cont Containment
+	seq  int
+}
+
+// openActionChild opens that ledger and writes the containment proof that must
+// precede the child.
 //
-// It is best-effort and appended to a side stream rather than the sealed
-// action ledger, because RunInAction runs after `wall begin` has closed its
-// writer: what matters is that the child is not invisible. A setup command
-// that started, forked and vanished used to leave no trace of its identity at
-// all, and the contract asks for containment proof before every action-owned
-// child.
-func retainActionChild(dir string, st *ActionState, pid int, argv []string) {
+// THE SIDE STREAM IS ITS OWN CHAIN, AND MUST BE ITS OWN STREAM IDENTITY.
+//
+// It used to be written to `physical_wrapper.action-child.jsonl` with the same
+// producer, level and default Seqno 0 as the main action ledger, while
+// starting its own record sequence and previous-hash chain. `ReadDir` reads
+// every stream in the directory and groups records by producer/level/Seqno, so
+// the two files were merged into one group whose second half chained to
+// nothing — a terminal WT-002 on every action that ran a setup command. The
+// sequence number is what distinguishes them: the action envelope's own ledger
+// is 0 and each action-owned child takes the next, so the two are different
+// streams to the reader as well as to the writer.
+func openActionChild(dir string, st *ActionState, argv []string) (*actionChild, error) {
+	seq := actionChildSeq(dir) + 1
 	key, err := NewSigningKey()
 	if err != nil {
-		return
+		return nil, err
 	}
-	w, err := NewWriter(filepath.Join(dir, "physical_wrapper.action-child.jsonl"), ProducerPhysical, ProducerID(ProducerPhysical), key)
-	if err != nil {
-		return
-	}
-	defer w.Close()
 	// REGISTERED, or the record is signed by a key the closed signer set
-	// cannot attribute. A side stream minted its own key and never declared
-	// it, so the one record proving an action-owned child existed was the one
-	// record nobody could attribute.
-	_ = RegisterKeyFor(dir, KeyLogEntry{
-		Producer: ProducerPhysical, Level: LevelAction, Seq: actionChildSeq(dir),
+	// cannot attribute. A side stream that minted its own key and never
+	// declared it left the one record proving an action-owned child existed as
+	// the one record nobody could attribute.
+	if err := RegisterKeyFor(dir, KeyLogEntry{
+		Producer: ProducerPhysical, Level: LevelAction, Seq: seq,
 		PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
-	}, st.Run)
-	proc := ProcIdentity{
-		PID: pid, PGID: processGroupOf(pid), StartID: processStartID(pid),
-		SessionID: processSessionOf(pid), ParentPID: os.Getpid(),
-		UID: processUIDOf(pid),
+	}, st.Run); err != nil {
+		return nil, err
 	}
-	proc.GID, proc.Groups = processGroupsOf(pid)
+	w, err := NewWriter(filepath.Join(dir, streamName(ProducerPhysical, LevelAction, seq)), ProducerPhysical, ProducerID(ProducerPhysical), key)
+	if err != nil {
+		return nil, err
+	}
+	cont, err := AttachContainment(st.Containment)
+	if err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+	c := &actionChild{w: w, st: st, cont: cont, seq: seq}
+	if err := c.append("before", 0, "action-owned child about to start: "+strings.Join(argv, " ")); err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// observe records the child's identity while it is running.
+func (c *actionChild) observe(pid int, argv []string) error {
+	return c.append("observed", pid, "action-owned child: "+strings.Join(argv, " "))
+}
+
+func (c *actionChild) close() error { return c.w.Close() }
+
+// append writes one action-child record with the containment proof the
+// contract asks for: the exact kernel bytes, read while the claim is true.
+func (c *actionChild) append(boundary string, pid int, note string) error {
 	rec := Record{
-		Kind: "action_child", Role: RolePhysicalAction, Level: LevelAction,
-		Source: SourceProcessLifecycle, Run: st.Run, Containment: st.Containment,
-		Instant: NewSystemClock().Now(), Proc: proc,
-		Note: "action-owned child: " + strings.Join(argv, " "),
+		Kind: "action_child", Boundary: boundary,
+		Role: RolePhysicalAction, Level: LevelAction, Seqno: c.seq,
+		Source: SourceProcessLifecycle, Run: c.st.Run, Containment: c.st.Containment,
+		Instant: NewSystemClock().Now(), Note: note,
 	}
-	// THE CONTAINMENT PROOF, WITH THE CHILD STILL IN IT.
-	//
-	// The record used to carry a pid and a note. The contract asks for
-	// containment proof BEFORE every action-owned child, and a pid with no
-	// membership read beside it proves the wrapper knew a number: it does not
-	// show the child was ever inside the action containment, and it left
-	// nothing for the verifier to rederive. This read takes the same raw
-	// kernel bytes every other endpoint takes, while the child is running.
-	if cont, err := AttachContainment(st.Containment); err == nil {
-		if ev, _, err := cont.Observe(string(ProducerPhysical)); err == nil {
-			rec.RawEventID, rec.RawEventDigest, rec.RawEventBytes = ev.ID, ev.Digest, ev.Bytes
-			rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
-			rec.Note += fmt.Sprintf("; cgroup.procs members while it ran: %d", len(ev.Procs))
-		} else {
-			rec.Note += "; cgroup.procs unreadable: " + err.Error()
+	if pid > 0 {
+		proc := ProcIdentity{
+			PID: pid, PGID: processGroupOf(pid), StartID: processStartID(pid),
+			SessionID: processSessionOf(pid), ParentPID: os.Getpid(),
+			UID: processUIDOf(pid),
 		}
+		proc.GID, proc.Groups = processGroupsOf(pid)
+		rec.Proc = proc
 	}
-	_, _ = w.Append(rec)
+	ev, _, err := c.cont.Observe(string(ProducerPhysical))
+	if err != nil {
+		return fmt.Errorf("read the action containment: %w", err)
+	}
+	rec.RawEventID, rec.RawEventDigest, rec.RawEventBytes = ev.ID, ev.Digest, ev.Bytes
+	rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
+	rec.Note += fmt.Sprintf("; cgroup.procs members at this reading: %d", len(ev.Procs))
+	_, err = c.w.Append(rec)
+	return err
 }
 
 // actionChildSeq numbers each action-owned child, so two of them do not claim
@@ -568,24 +666,20 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	if terminal == "" {
 		terminal = TerminalPassed
 	}
-	// THIS STEP JOINS THE CONTAINMENT BEFORE IT READS IT.
+	// THE CLOSER STANDS OUTSIDE THE CONTAINMENT IT DRAINS.
 	//
-	// `wall end` is a different step process from `wall begin`, and it took
-	// its reading from outside the containment it was reporting on — so the
-	// record named a process its own membership snapshot did not contain, and
-	// the closing observation was made by a wrapper that had never been
-	// inside. Joining first makes the reading an observation from within the
-	// lifecycle it closes, which is the only thing tying an action record to
-	// the process that took it.
-	if err := joinContainment(st.Containment, os.Getpid()); err != nil {
-		return st, fmt.Errorf("walltime: join the action containment before the closing reading: %w", err)
-	}
-	// THE OBSERVED READ, TAKEN BEFORE THE DRAIN.
+	// This step used to join the action containment before reading it, so that
+	// its reading would be taken from inside the lifecycle it closes. That is
+	// a contradiction: `enforceContainmentEmpty` waits for the containment to
+	// become empty and then SIGKILLs every member, and a closer that has made
+	// itself a member can never see it empty — at the deadline it kills
+	// itself, and the drained read, the end boundary, the seal and the cleanup
+	// it claims to perform never happen.
 	//
-	// It used to follow enforceContainmentEmpty, so the "last observed" state
-	// was by construction the drained one: two records describing the same
-	// empty containment, and a descendant alive at the end of the action
-	// appeared in neither. This is the last moment anything was still in it.
+	// So the closer does not join, and the verifier requires exactly that: the
+	// closing readings must be taken by a process the membership does NOT
+	// contain, because a drain measured by one of its own members measures
+	// nothing.
 	retainActionProcessTree(w, st.Run, clock, cont, "observed")
 
 	if reaped, emptyErr := enforceContainmentEmpty(cont, deadline); emptyErr != nil {

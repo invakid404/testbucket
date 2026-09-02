@@ -414,6 +414,18 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 			// missing historical membership at all: their "good" evidence WAS
 			// the defect.
 			child := s.childProc(level, seq)
+			// THE ACTION'S CLOSING READINGS ARE TAKEN FROM OUTSIDE.
+			//
+			// `wall end` is a different step process from `wall begin`, and it
+			// drains the containment: a closer that had joined could never see
+			// it empty and would SIGKILL itself at the deadline. So at the
+			// action level the closing reading names the closer and its
+			// membership holds the action work, not the closer.
+			closer := child
+			if level == LevelAction {
+				closer.PID, closer.PGID, closer.SessionID = child.PID+7, child.PID+7, child.PID+7
+				closer.StartID = child.StartID + "7"
+			}
 			for _, tree := range []struct {
 				boundary string
 				ns       int64
@@ -432,12 +444,16 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 				if tree.boundary == s.dropProcessTree {
 					continue
 				}
+				proc := child
+				if level == LevelAction && tree.boundary != "start" {
+					proc = closer
+				}
 				rec := Record{
 					ProducerBinary: s.producerBinary,
 					Kind:           "process_tree", Boundary: tree.boundary,
 					Role: roleOrPanic(ProducerPhysical, level), Level: level,
 					Source: SourceProcessLifecycle, Seqno: seq, Run: run, Containment: ident,
-					Proc: child,
+					Proc: proc,
 					Instant: Instant{ClockID: s.clockID, Mono: Nanos(tree.ns), BootID: synthBoot,
 						Realtime: time.Unix(0, tree.ns).UTC().Format(time.RFC3339Nano) + "/" + time.Unix(0, tree.ns+1000).UTC().Format(time.RFC3339Nano)},
 					Note: fmt.Sprintf("cgroup.procs members at %s: %d", tree.boundary, len(tree.procs)),

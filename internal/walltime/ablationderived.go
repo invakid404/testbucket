@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -29,11 +30,28 @@ type AblationDerived struct {
 }
 
 // TopologyEntry renders one scheduled unit's kind and the files it covers, and
-// topologyUnit reads it back. One function writes the grammar and one reads
+// topologyUnitOf reads it back. One function writes the grammar and one reads
 // it, so the planner's projection and the gate's predicate cannot disagree
 // about what a topology entry says.
+//
+// THE FILE LIST IS JSON, NOT A DELIMITED STRING.
+//
+// It was `kind:a,b`, split on commas — and a comma is a legal character in a
+// path. `suite/a,b.spec.ts` is ONE file that was written as one entry and read
+// back as two, so a single-file schedule decoded as a multi-file topology and
+// realized a stratum it had not run. A delimiter chosen from the filename
+// domain cannot be injective over that domain; an encoding that escapes its
+// own separators can be. `encoding/json` is that encoding, it round-trips
+// every byte sequence a path may hold, and it is already how every other
+// projection in this package is digested.
 func TopologyEntry(kind string, files []string) string {
-	return kind + ":" + strings.Join(files, ",")
+	b, err := json.Marshal(append([]string(nil), files...))
+	if err != nil {
+		// A []string cannot fail to marshal; a panic here would be a bug in
+		// this function rather than a runtime condition.
+		panic(err)
+	}
+	return kind + ":" + string(b)
 }
 
 type topologyUnit struct {
@@ -42,11 +60,23 @@ type topologyUnit struct {
 }
 
 func topologyUnitOf(entry string) (topologyUnit, bool) {
+	// The kind never contains a colon, so the FIRST colon separates it from
+	// the encoded file list; a colon inside a path is inside the JSON string
+	// and cannot be mistaken for the separator.
 	kind, files, ok := strings.Cut(entry, ":")
-	if !ok || strings.TrimSpace(kind) == "" || strings.TrimSpace(files) == "" {
+	if !ok || strings.TrimSpace(kind) == "" {
 		return topologyUnit{}, false
 	}
-	return topologyUnit{kind: kind, files: strings.Split(files, ",")}, true
+	var list []string
+	if err := json.Unmarshal([]byte(files), &list); err != nil || len(list) == 0 {
+		return topologyUnit{}, false
+	}
+	for _, f := range list {
+		if strings.TrimSpace(f) == "" {
+			return topologyUnit{}, false
+		}
+	}
+	return topologyUnit{kind: kind, files: list}, true
 }
 
 // Digests recomputes the three projection digests exactly as the planner does,

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/invakid404/testbucket/internal/core"
@@ -246,6 +247,28 @@ func planningEnvArgs() []string {
 	return env
 }
 
+// planningSnapshot is THE ONE READ of the process environment.
+//
+// The comment used to claim a single snapshot while the code took two: the
+// runner was constructed from planningEnvArgs() and the bundle recorded
+// planningEnv() afterwards, and each called os.Environ() for itself. Anything
+// that changed a variable between those two calls — and Go makes that possible
+// and concurrency-safe — produced a bundle describing an environment the
+// subprocesses had not run under, which is exactly the equivalence the bundle
+// exists to establish.
+//
+// One memoized read makes the two call sites return the same environment by
+// construction rather than by ordering. It is memoized rather than threaded
+// through because both helpers are called from different layers of the command
+// and the property must hold however they are ordered.
+var planningSnapshot = sync.OnceValue(os.Environ)
+
+// resetPlanningSnapshot re-reads the environment. Only tests use it: a test
+// that sets a variable and then asks what the acquisition would record needs
+// the snapshot taken after its own setup, and nothing in production may
+// re-read it.
+func resetPlanningSnapshot() { planningSnapshot = sync.OnceValue(os.Environ) }
+
 func planningEnvironment() (map[string]string, []string) {
 	withheld := map[string]bool{}
 	for _, k := range walltime.WallTimeSecretEnv {
@@ -253,7 +276,7 @@ func planningEnvironment() (map[string]string, []string) {
 	}
 	record := map[string]string{}
 	var env []string
-	for _, kv := range os.Environ() {
+	for _, kv := range planningSnapshot() {
 		k, v, _ := strings.Cut(kv, "=")
 		if withheld[k] {
 			record["digest:"+k] = string(walltime.DigestBytes([]byte(v)))

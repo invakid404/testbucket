@@ -204,7 +204,42 @@ func RegisterKeyFor(dir string, e KeyLogEntry, run RunIdentity) error {
 	if err != nil {
 		return fmt.Errorf("walltime: key log: %w", err)
 	}
+	// THE DELEGATE, WHEN THE RUN KEY IS NOT HERE.
+	//
+	// The run key is scoped to `wall begin` and `wall end` precisely so the
+	// measured step cannot forge the signer set — which left the script and
+	// invocation producers, whose keys are minted during that step, with no
+	// authorizing party at all. `wall begin` opens a delegation for exactly
+	// those levels; this is where the wrapper chain uses it.
+	if runKey == nil {
+		delegate, err := delegateKeyFromEnvOrDir(dir)
+		if err != nil {
+			return fmt.Errorf("walltime: key log: signer delegate: %w", err)
+		}
+		runKey = delegate
+	}
 	return RegisterKeyWith(dir, e, runKey)
+}
+
+// RegisterLowerKey registers a SCRIPT or INVOCATION producer key, which is
+// minted during the measured step.
+//
+// It is a separate entry point because the authorization is a different one.
+// The run key is scoped to `wall begin` and `wall end` so the measured step
+// cannot forge the signer set — which left these producers with no authorizing
+// party at all, and the verifier correctly refused every one of them. What
+// vouches for them is the delegation `wall begin` opened with the run key: it
+// is bound to that run, it covers these levels and not the action level, and
+// the wrapper chain can read it while the measured workload cannot.
+//
+// The action level is refused here outright. Its signers are declared by the
+// roster that `wall begin` seals with the run key itself, and a path that
+// could register one from inside the measured step would be the run key.
+func RegisterLowerKey(dir string, e KeyLogEntry, run RunIdentity) error {
+	if e.Level == LevelAction {
+		return fmt.Errorf("walltime: key log: the action level's signers are declared by the roster, not registered from the measured step")
+	}
+	return RegisterKeyFor(dir, e, run)
 }
 
 // RegisterKeyWith is RegisterKey with the authorizing key supplied directly,
@@ -449,11 +484,26 @@ func verifySignerSet(v *Verdict, opt VerifyOptions, declared []string, recs []Re
 	// well-formed evidence nobody with the right capability vouched for, which
 	// is unscorable. Collapsing the two would report a developer run with no
 	// run key as a broken record chain.
+	// THE DELEGATE THE RUN KEY VOUCHED FOR, if one was opened. It authorizes
+	// the lower levels only; the action signers stay with the roster.
+	authorizers := append([]string(nil), keys...)
+	var delegation *SignerDelegation
+	if d, err := LoadSignerDelegation(opt.Dir); err != nil {
+		v.add("WT-032", SeverityIneligible, fmt.Sprintf("signer delegation: %v", err))
+	} else if d != nil {
+		delegate, err := d.Verify(roster.Run, keys)
+		if err != nil {
+			v.add("WT-032", SeverityIneligible, fmt.Sprintf(
+				"the evidence directory carries a signer delegation that does not hold: %v; a delegate nobody with the run key vouched for is the measured work choosing who attests it", err))
+		} else {
+			delegation, authorizers = d, append(authorizers, delegate)
+		}
+	}
 	registered := map[string]bool{}
 	unauthorized := map[string]bool{}
 	for _, e := range logged {
 		registered[e.PublicKey] = true
-		if err := checkKeyLogAuthorization(e, keys); err != nil {
+		if err := checkKeyLogAuthorization(e, keys, authorizers, delegation); err != nil {
 			if !unauthorized[e.PublicKey] {
 				unauthorized[e.PublicKey] = true
 				v.add("WT-032", SeverityIneligible, fmt.Sprintf(
@@ -543,22 +593,34 @@ func keyLogAuthority(e KeyLogEntry) string {
 }
 
 // checkKeyLogAuthorization decides whether one logged key may sign records.
-func checkKeyLogAuthorization(e KeyLogEntry, keys []string) error {
+func checkKeyLogAuthorization(e KeyLogEntry, keys, authorizers []string, delegation *SignerDelegation) error {
 	if e.Authorization == nil {
 		return fmt.Errorf("with no run-key authorization")
 	}
 	if want := keyLogAuthority(e); e.Authorization.Authority != want {
 		return fmt.Errorf("under authority %q, not the %q this entry claims", e.Authorization.Authority, want)
 	}
-	if len(keys) == 0 {
+	if len(authorizers) == 0 {
 		return fmt.Errorf("with no predeclared run signer to check it against")
 	}
 	d, err := e.DigestOf()
 	if err != nil {
 		return fmt.Errorf("whose entry cannot be digested: %v", err)
 	}
-	if err := VerifySigned(e.Authorization, d, keys); err != nil {
+	// A DELEGATE MAY VOUCH ONLY WHERE THE RUN KEY SAID IT MAY.
+	//
+	// The run key itself is unrestricted; a delegate is bound to the levels
+	// its delegation names, so an entry it signed at the action level is
+	// refused even though the signature verifies. That is what keeps `wall
+	// begin` and `wall end` the only parties who can declare an action signer.
+	if err := VerifySigned(e.Authorization, d, keys); err == nil {
+		return nil
+	}
+	if err := VerifySigned(e.Authorization, d, authorizers); err != nil {
 		return fmt.Errorf("whose authorization does not verify: %v", err)
+	}
+	if delegation == nil || !delegation.authorizes(e.Level) {
+		return fmt.Errorf("whose authorization is a delegate signature at the %s level, which no delegation covers", e.Level)
 	}
 	return nil
 }

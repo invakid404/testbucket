@@ -92,7 +92,21 @@ func newCgroupUnder(root, name string) (Containment, error) {
 // again — including at the action level, where there is no measured child
 // whose own uid could stand in for the workload's.
 func retainMembershipFacts(ident *ContainmentIdentity, dir string) {
-	w := resolveWorkloadCredential(os.Getenv(WorkloadUserEnv))
+	retainMembershipFactsFor(ident, dir, os.Getenv(WorkloadUserEnv))
+}
+
+// retainLevelMembershipFacts re-reads the facts for the party a LEVEL
+// measures, once the containment exists.
+func retainLevelMembershipFacts(c Containment, level Level) {
+	cg, ok := c.(*cgroup2)
+	if !ok {
+		return
+	}
+	retainMembershipFactsFor(&cg.ident, cg.dir, measuredAccountFor(level))
+}
+
+func retainMembershipFactsFor(ident *ContainmentIdentity, dir, account string) {
+	w := resolveWorkloadCredential(account)
 	ident.MembershipControl = membershipControl(dir, w)
 	ident.OwnerUID = containmentOwnerUID(dir)
 	ident.OwnerGID = containmentOwnerGID(dir)
@@ -344,4 +358,25 @@ func attachCgroup2(ident ContainmentIdentity) (Containment, error) {
 		return nil, fmt.Errorf("walltime: containment %s inode is %s, expected %s", ident.ID, got, ident.Inode)
 	}
 	return &cgroup2{dir: ident.ID, ident: ident}, nil
+}
+
+// evidenceDirDelegation is the group and mode the evidence directory must
+// carry so the script account can CREATE files in it and nothing more.
+//
+// setgid makes files created there carry the directory's group, and the sticky
+// bit means only a file's owner may remove or rename it — so the wrapper's own
+// ledgers, which stay 0644 and wrapper-owned, cannot be modified, deleted or
+// replaced by the account that is allowed to add files beside them. Granting
+// plain group write would have let the measured script rewrite the evidence
+// being attested, which is not a delegation but a hole.
+//
+// A gid of -1 means no delegation: without a declared script account the
+// wrapper chain and the measured script are one credential and there is
+// nothing to separate.
+func evidenceDirDelegation() (int, os.FileMode) {
+	user := strings.TrimSpace(os.Getenv(ScriptUserEnv))
+	if user == "" {
+		return -1, 0o755
+	}
+	return evidenceDirDelegationFor(resolveWorkloadCredential(user).GIDs)
 }

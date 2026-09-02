@@ -403,9 +403,9 @@ func TestTheGroupVectorComesFromTheProcessNotEtcGroup(t *testing.T) {
 // accounts database is not part of the evidence and the cgroup is gone — so
 // the facts are resolved once and retained on the identity the records carry.
 func TestTheRetainedWorkloadCredentialIsResolvedNotDeclared(t *testing.T) {
-	retain := productionFunc(t, "contain_linux.go", "func retainMembershipFacts(")
+	retain := productionFunc(t, "contain_linux.go", "func retainMembershipFactsFor(")
 	for _, want := range []string{
-		"resolveWorkloadCredential(os.Getenv(WorkloadUserEnv))",
+		"resolveWorkloadCredential(account)",
 		"ident.WorkloadUID = w.UID",
 		"ident.WorkloadGIDs = append",
 	} {
@@ -422,5 +422,60 @@ func TestTheRetainedWorkloadCredentialIsResolvedNotDeclared(t *testing.T) {
 	}
 	if !strings.Contains(decide, "w WorkloadCredential") {
 		t.Error("membershipControl does not take the resolved workload credential as retained facts")
+	}
+	// AND THE ACCOUNT IS THE ONE THAT LEVEL MEASURES. A script containment was
+	// labelled using the INVOCATION account's groups — an answer about a
+	// process that was never in it, given immediately after delegating that
+	// containment to the script account's group.
+	level := productionFunc(t, "contain.go", "func measuredAccountFor(")
+	if !strings.Contains(level, "level == LevelScript") || !strings.Contains(level, "ScriptUserEnv") {
+		t.Error("the retained membership account is not the account the level measures")
+	}
+}
+
+// TestTheScriptLevelIsJudgedOnTheScriptsOwnCredential is the F4 regression.
+//
+// The script cgroup is deliberately made group-writable by the script
+// account's group — that delegation is what lets the nested wrappers create
+// the invocation containments at all — and the membership rule was then rerun
+// against the INVOCATION account's groups, which is a different party that was
+// never in it. A containment the measured script can write was labelled
+// supervisor-owned using an unrelated account's credential.
+func TestTheScriptLevelIsJudgedOnTheScriptsOwnCredential(t *testing.T) {
+	base := ContainmentIdentity{
+		Primitive: PrimitiveCgroup2, ID: "/sys/fs/cgroup/testbucket/action/script",
+		Inode: "42", BootID: "boot", RootPID: 100, RootStart: "1000",
+		OwnerUID: 1000, OwnerGID: 2001, Mode: 0o770,
+		WorkloadUID: 2002, WorkloadGIDs: []int{2002},
+		MembershipControl: MembershipSupervisorOwned,
+	}
+	// The measured script is in the group that may write this containment.
+	script := ProcIdentity{UID: 2001, GID: 2001, Groups: []int{2001}}
+	v := &Verdict{}
+	rederiveMembership(v, "script[0]", Envelope{Level: LevelScript, Containment: base},
+		Record{Level: LevelScript, Containment: base, Proc: script})
+	if len(findingsMentioning(v, "WT-033", "could write this containment")) == 0 {
+		t.Errorf("a script containment its own measured process can write was accepted: %+v", v.Findings)
+	}
+
+	// A script that is NOT in the owning group is still scorable, so the rule
+	// was widened to the right party rather than made unsatisfiable.
+	clean := base
+	clean.OwnerGID = 3003
+	outsider := ProcIdentity{UID: 2001, GID: 2001, Groups: []int{2001}}
+	ok := &Verdict{}
+	rederiveMembership(ok, "script[0]", Envelope{Level: LevelScript, Containment: clean},
+		Record{Level: LevelScript, Containment: clean, Proc: outsider})
+	if len(ok.Findings) != 0 {
+		t.Errorf("a script containment the measured script cannot write was refused: %+v", ok.Findings)
+	}
+
+	// And the subject names both parties, so a finding says whose credential
+	// reached the file.
+	_, _, described := membershipSubject(base, script, LevelScript)
+	for _, want := range []string{"retained workload credential", "measured process's own credential"} {
+		if !strings.Contains(described, want) {
+			t.Errorf("the rederivation subject %q does not name the %s", described, want)
+		}
 	}
 }

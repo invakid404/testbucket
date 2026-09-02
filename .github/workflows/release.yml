@@ -149,20 +149,54 @@ jobs:
           echo "attested ${#assets[@]} released asset(s) from $TB_RELEASE_SHA"
           echo "NOT YET VERIFIED: the verify job must countersign these before publish runs"
 
+      # STAGE THE THREE INPUTS UNDER ONE ROOT.
+      #
+      # upload-artifact roots a multi-path upload at the LEAST COMMON ANCESTOR
+      # of its inputs, and these three did not share one: `dist` is in the
+      # workspace and the manifest and attestations are under RUNNER_TEMP, so
+      # the common ancestor was /home/runner/work and the download produced
+      # `testbucket/testbucket/dist` and `_temp/release-manifest.json` — while
+      # the verify and publish jobs both read a flat `$TB_BUILD/dist` and
+      # `$TB_BUILD/release-manifest.json`. The release stopped there, before
+      # any independent check or campaign gate ran.
+      #
+      # Copying them into one staging directory first makes that directory the
+      # artifact root, so what is downloaded is exactly the layout the two
+      # consumers address.
+      - name: Stage the built artifacts under one root
+        env:
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+          TB_ATTESTATION_DIR: ${{ runner.temp }}/attestations
+          TB_STAGING: ${{ runner.temp }}/release-staging
+        run: |
+          set -euo pipefail
+          rm -rf "$TB_STAGING"
+          mkdir -p "$TB_STAGING"
+          cp -R dist "$TB_STAGING/dist"
+          cp "$TB_RELEASE_MANIFEST" "$TB_STAGING/release-manifest.json"
+          cp -R "$TB_ATTESTATION_DIR" "$TB_STAGING/attestations"
+          # The manifest names asset paths relative to the workspace (dist/...)
+          # and every consumer resolves them against the staging root, so the
+          # two must agree. Fail here rather than half-way through publication.
+          for a in $(jq -r '.assets[].path' "$TB_STAGING/release-manifest.json"); do
+            if [ ! -f "$TB_STAGING/$a" ]; then
+              echo "REFUSED: the manifest names $a, which is not under the staged root." >&2
+              exit 1
+            fi
+          done
+          echo "staged $(jq -r '.assets | length' "$TB_STAGING/release-manifest.json") asset(s), the manifest and their attestations"
+
       # HAND THE EXACT BYTES TO THE NEXT JOB.
       #
       # The verifier must obtain the artifact for itself rather than be told
       # its digest, and the publisher must upload the bytes that were gated —
-      # so dist, the manifest and the builder attestations travel as one
-      # artifact and every later job works from what it downloaded.
+      # so dist, the manifest and the builder attestations travel as ONE PATH
+      # and every later job works from what it downloaded.
       - name: Upload the built artifacts for verification
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-build
-          path: |
-            dist
-            ${{ runner.temp }}/release-manifest.json
-            ${{ runner.temp }}/attestations
+          path: ${{ runner.temp }}/release-staging
           if-no-files-found: error
           retention-days: 7
 
@@ -186,16 +220,64 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27.0"
-
       - name: Download the built artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-build
           path: ${{ runner.temp }}/build
+
+      # THE TRUSTED VERIFIER, WHICH IS NOT THIS CANDIDATE.
+      #
+      # This job used to `go build ./cmd/testbucket` from the release
+      # candidate's own checkout and hand that binary the verifier private key.
+      # A candidate that decides whether it is acceptable, signs the answer,
+      # and reports its own hash as the "verifier binary" has verified nothing:
+      # the trust boundary was circular, and a defective or hostile candidate
+      # could countersign itself.
+      #
+      # The verifier is therefore a SEPARATELY PINNED, PREVIOUSLY PUBLISHED
+      # release, named by an exact tag and an exact SHA-256 that this workflow
+      # does not compute. Both come from repository variables a release cannot
+      # edit; the checksum is checked before the binary is executed, and an
+      # unset or mismatching pin fails closed. It is deliberately NOT the
+      # moving `v0` alias: an alias the release process can move is not a
+      # separate root of trust.
+      - name: Obtain the pinned trusted verifier
+        env:
+          TB_TRUSTED_VERIFIER_TAG: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_TAG }}
+          TB_TRUSTED_VERIFIER_SHA256: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_SHA256 }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TB_TRUSTED_VERIFIER_TAG:-}" ] || [ -z "${TB_TRUSTED_VERIFIER_SHA256:-}" ]; then
+            echo "REFUSED: no pinned trusted verifier." >&2
+            echo "Set TB_RELEASE_TRUSTED_VERIFIER_TAG to an exact previously published" >&2
+            echo "release tag (vX.Y.Z, never a moving alias) and TB_RELEASE_TRUSTED_VERIFIER_SHA256" >&2
+            echo "to that asset's exact digest. A verifier built from the candidate it judges" >&2
+            echo "is the candidate judging itself." >&2
+            exit 1
+          fi
+          case "$TB_TRUSTED_VERIFIER_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "REFUSED: the trusted verifier pin '$TB_TRUSTED_VERIFIER_TAG' is not an exact release tag." >&2
+              echo "A moving alias can be repointed by the very process being verified." >&2
+              exit 1
+              ;;
+          esac
+          if [ "$TB_TRUSTED_VERIFIER_TAG" = "${GITHUB_REF_NAME:-}" ]; then
+            echo "REFUSED: the trusted verifier pin is the tag being released." >&2
+            exit 1
+          fi
+          asset="testbucket_$(uname -s)_$(uname -m).tar.gz"
+          gh release download "$TB_TRUSTED_VERIFIER_TAG" \
+            --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/trusted"
+          echo "$TB_TRUSTED_VERIFIER_SHA256  $RUNNER_TEMP/trusted/$asset" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trusted/$asset" -C "$RUNNER_TEMP/trusted" testbucket
+          install -m 0755 "$RUNNER_TEMP/trusted/testbucket" "$RUNNER_TEMP/testbucket-verifier"
+          echo "trusted verifier: $TB_TRUSTED_VERIFIER_TAG ($TB_TRUSTED_VERIFIER_SHA256)"
+          "$RUNNER_TEMP/testbucket-verifier" version || true
 
       - name: Countersign every asset independently
         env:
@@ -223,7 +305,6 @@ jobs:
             echo "vouching for itself, which the frozen contract makes ineligible." >&2
             exit 1
           fi
-          go build -o "$RUNNER_TEMP/testbucket-verifier" ./cmd/testbucket
           mkdir -p "$TB_VERIFIED_DIR"
           now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           mapfile -t assets < <(jq -r '.assets[].path' "$TB_BUILD/release-manifest.json")
@@ -259,11 +340,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27.0"
-
       - name: Download the built artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -275,6 +351,51 @@ jobs:
         with:
           name: release-verified
           path: ${{ runner.temp }}/verified
+
+      # THE SAME PINNED TRUSTED IMPLEMENTATION ADJUDICATES THE RELEASE.
+      #
+      # This job built its gate from the candidate too, so the program deciding
+      # whether the candidate may be published was the candidate. Both
+      # decisions it makes — that every asset carries an independently
+      # countersigned attestation, and that a passing campaign authorises this
+      # exact delivery — are now taken by a previously published release named
+      # by an exact tag and an exact digest this workflow does not compute.
+      #
+      # The pin must be advanced deliberately when the evidence format changes:
+      # an older adjudicator cannot enforce a gate it does not know about, and
+      # that trade-off belongs to whoever moves the pin rather than to the
+      # release being judged.
+      - name: Obtain the pinned trusted verifier
+        env:
+          TB_TRUSTED_VERIFIER_TAG: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_TAG }}
+          TB_TRUSTED_VERIFIER_SHA256: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_SHA256 }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TB_TRUSTED_VERIFIER_TAG:-}" ] || [ -z "${TB_TRUSTED_VERIFIER_SHA256:-}" ]; then
+            echo "REFUSED: no pinned trusted verifier (TB_RELEASE_TRUSTED_VERIFIER_TAG/_SHA256)." >&2
+            echo "A gate built from the candidate is the candidate deciding about itself." >&2
+            exit 1
+          fi
+          case "$TB_TRUSTED_VERIFIER_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "REFUSED: the trusted verifier pin '$TB_TRUSTED_VERIFIER_TAG' is not an exact release tag." >&2
+              exit 1
+              ;;
+          esac
+          if [ "$TB_TRUSTED_VERIFIER_TAG" = "${GITHUB_REF_NAME:-}" ]; then
+            echo "REFUSED: the trusted verifier pin is the tag being released." >&2
+            exit 1
+          fi
+          asset="testbucket_$(uname -s)_$(uname -m).tar.gz"
+          gh release download "$TB_TRUSTED_VERIFIER_TAG" \
+            --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/trusted"
+          echo "$TB_TRUSTED_VERIFIER_SHA256  $RUNNER_TEMP/trusted/$asset" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trusted/$asset" -C "$RUNNER_TEMP/trusted" testbucket
+          install -m 0755 "$RUNNER_TEMP/trusted/testbucket" "$RUNNER_TEMP/testbucket-gate"
+          echo "trusted adjudicator: $TB_TRUSTED_VERIFIER_TAG ($TB_TRUSTED_VERIFIER_SHA256)"
 
       # THE ATTESTATION IS A RELEASE INPUT, not a file written beside one.
       #
@@ -302,7 +423,6 @@ jobs:
             echo "is not independent verification." >&2
             exit 1
           fi
-          go build -o "$RUNNER_TEMP/testbucket-gate" ./cmd/testbucket
           mapfile -t assets < <(jq -r '.assets[].path' "$TB_BUILD/release-manifest.json")
           for a in "${assets[@]}"; do
             name="$(basename "$a")"

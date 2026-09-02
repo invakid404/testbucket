@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +34,27 @@ type nodetool struct {
 	// same map it retains, and then the recorded environment IS the one the
 	// subprocess ran with.
 	env []string
+}
+
+// absoluteExecutable is the path the kernel will actually execute, made
+// absolute the same way the kernel resolves it: relative to the working
+// directory the child is given.
+func absoluteExecutable(path, dir string) string {
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	if dir == "" {
+		if abs, err := filepath.Abs(path); err == nil {
+			return abs
+		}
+		return path
+	}
+	if !filepath.IsAbs(dir) {
+		if abs, err := filepath.Abs(dir); err == nil {
+			dir = abs
+		}
+	}
+	return filepath.Join(dir, path)
 }
 
 // ExecProvenance is what one acquisition subprocess actually ran with: the
@@ -112,9 +134,18 @@ func (t nodetool) runWith(ctx context.Context, dir string, prov *ExecProvenance,
 		cmd.Env = os.Environ()
 	}
 	if prov != nil {
+		// THE ABSOLUTE EXECUTABLE, not the string the command line held.
+		//
+		// `exec.Command` resolves a bare name on PATH and leaves a head that
+		// CONTAINS A SLASH exactly as written — so `./tool` stayed "./tool",
+		// which the kernel then interprets against cmd.Dir at start. A replay
+		// from any other directory follows that name to different bytes or to
+		// nothing, and a closure hashed from it hashes the wrong file. The
+		// path is resolved against the directory the process actually runs in,
+		// which is the same interpretation the kernel makes.
 		*prov = ExecProvenance{
 			Argv: append([]string{t.command[0]}, full...),
-			Path: cmd.Path, Cwd: dir,
+			Path: absoluteExecutable(cmd.Path, dir), Cwd: dir,
 			Env: append([]string(nil), cmd.Env...),
 		}
 	}
