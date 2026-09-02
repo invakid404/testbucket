@@ -502,3 +502,92 @@ func TestRepetitionsWithinOneStratumAreNotADuplicate(t *testing.T) {
 		}
 	}
 }
+
+// TestAnAblationMustExhibitItsStratumInItsOwnPlan is the F5 regression.
+//
+// The gate held four digest STRINGS and compared them for inequality. Four
+// distinct opaque hashes prove inequality and nothing else, so four arbitrary
+// tuples standing for one generic topology satisfied the whole mandatory
+// prerequisite. Whether a collision atom or a legal slice was ever exercised
+// is a property of the derived plan, and the only way to know it is to read
+// the plan.
+func TestAnAblationMustExhibitItsStratumInItsOwnPlan(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stratum string
+		edit    func(*AblationDerived)
+		want    string
+	}{
+		{"a collision stratum with no colliding atom", StratumCollisionAtom, func(d *AblationDerived) {
+			d.Atoms = map[string][]string{"suite/a.spec.ts::solo": {"pkg-a"}}
+		}, "no atom holds more than one package"},
+
+		{"a slice stratum with no slice", StratumLegalNonAtomSlice, func(d *AblationDerived) {
+			d.Membership = map[string][]string{"bucket-0/inv-0": {"u1", "u2"}}
+		}, "no legal non-atom slice was exercised"},
+
+		{"a sequential stratum with one invocation", StratumSequentialInvocs, func(d *AblationDerived) {
+			d.Membership = map[string][]string{"bucket-0/inv-0": {"u1"}}
+		}, "no sequence of them was exercised"},
+
+		{"a multi-file stratum covering one unit", StratumWholeFileMultiFile, func(d *AblationDerived) {
+			d.Membership = map[string][]string{"bucket-0/inv-0": {"u1"}}
+		}, "no multi-file whole-file topology was exercised"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, loader, keys, _ := campaignFixture(t)
+			for i, a := range idx.Ablations {
+				if a.Stratum != tc.stratum {
+					continue
+				}
+				// Edited COHERENTLY: the receipt binds the digests of the
+				// edited documents, so the case exercises the stratum's shape
+				// rather than tripping the rederivation check on its way.
+				d := *loader.derived[a.DerivedPath]
+				tc.edit(&d)
+				loader.derived[a.DerivedPath] = &d
+				atoms, topo, membership, err := d.Digests()
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := *loader.stage2[a.Stage2Path]
+				r.AtomDigest, r.TopologyDigest, r.MembershipDigest = atoms, topo, membership
+				loader.stage2[a.Stage2Path] = &r
+				stage2, err := r.DigestOf()
+				if err != nil {
+					t.Fatal(err)
+				}
+				resign(loader.verdicts[idx.Ablations[i].VerdictPath], testVerdictAuthority, func(v *Verdict) {
+					v.Run.Stage2 = stage2
+				})
+			}
+			_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+			if !strings.Contains(strings.Join(problems, "\n"), tc.want) {
+				t.Errorf("problems %v do not report %q", problems, tc.want)
+			}
+		})
+	}
+}
+
+// TestTheDerivedProjectionsMustBeTheOnesTheReceiptBound: supplying documents
+// that are not the ones the Stage-2 receipt claims would let any plan stand in
+// for any other.
+func TestTheDerivedProjectionsMustBeTheOnesTheReceiptBound(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	a := idx.Ablations[0]
+	d := *loader.derived[a.DerivedPath]
+	d.Topology = map[string][]string{"bucket-0": {"substituted"}}
+	loader.derived[a.DerivedPath] = &d
+	_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+	if !strings.Contains(strings.Join(problems, "\n"), "but the Stage-2 receipt it ran binds") {
+		t.Errorf("substituted projections were accepted: %v", problems)
+	}
+
+	// And an ablation naming none at all is a label over opaque digests.
+	idx, loader, keys, _ = campaignFixture(t)
+	idx.Ablations[0].DerivedPath = ""
+	_, problems = LoadCampaign(idx, loader, keys, CampaignAuthority)
+	if !strings.Contains(strings.Join(problems, "\n"), "names no derived atom/topology/membership projections") {
+		t.Errorf("an ablation with no derived plan was accepted: %v", problems)
+	}
+}

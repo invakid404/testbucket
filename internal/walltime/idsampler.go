@@ -81,6 +81,7 @@ func (s *identitySampler) sample() {
 		ParentPID: processParentOf(s.pid),
 		UID:       processUIDOf(s.pid),
 	}
+	id.GID, id.Groups = processGroupsOf(s.pid)
 	// NO FALLBACK to the parent this sampler was told to expect. Substituting
 	// it would put the expected value in the field whose whole purpose is to
 	// show when the real one changed, which is how the copy survived the first

@@ -141,17 +141,30 @@ func runWallBundle(args []string) error {
 		}
 	}
 
+	// THE ROOT EVERY SUBPROCESS ACTUALLY RAN FROM, canonicalised by the runner
+	// itself. `--root .` defaults the caller's spelling into the bundle, and
+	// "." names a different directory from every other working directory in
+	// the world — so a replay could not know where discovery had run.
+	acquiredRoot := rnr.Root()
+	// THE DISCOVERY INVOCATION THAT RAN, taken from the operation that issued
+	// it rather than rebuilt here from the same flags. The two agreed, and
+	// were not one observed value.
+	observedDiscoveryArgv := discoveryArgv(*vitestCommand, *vitestDiscovery, *vitestDiscoveryCommand)
+	if seen := rnr.Discovered(); seen != nil {
+		observedDiscoveryArgv = seen.Argv
+		acquiredRoot = seen.Cwd
+	}
 	bundle, err := planbind.Acquire(planbind.AcquireOptions{
-		Root: *root, Runner: "vitest", Instant: now, StaleAfter: *staleAfter,
+		Root: acquiredRoot, Runner: "vitest", Instant: now, StaleAfter: *staleAfter,
 		K: *k, Count: 1, Token: rnr.CanonicalToken(),
 		StorePath: *store, StoreBytes: storeBytes, StoreAbsent: storeAbsent,
-		DiscoveryArgv: discoveryArgv(*vitestCommand, *vitestDiscovery, *vitestDiscoveryCommand),
+		DiscoveryArgv: observedDiscoveryArgv,
 		Discovery:     discovery, Runnables: runnables, RunnableArgv: runnableArgv,
 		// The REAL invocation, as it was run. os.Args[0] is the program this
 		// process actually is, so the closure resolves the binary that took
 		// the snapshots rather than whatever `testbucket` resolves to on the
 		// next machine.
-		Env: planningEnv(), Resolve: closureResolver(*root),
+		Env: planningEnv(), Resolve: closureResolver(acquiredRoot),
 		BundleArgv: append([]string(nil), os.Args...),
 		Repository: *repository, Commit: *commit, Tree: *tree,
 		EventsDir: *eventsDir, FileParallelism: *fileParallelism, WallDir: *wallDir,
@@ -197,8 +210,31 @@ func planningEnv() map[string]string {
 	for _, k := range []string{
 		"TB_DISCOVERY_EXCLUDE_PREFIXES", "TB_DISCOVERY_TIMEOUT",
 		"VITEST_MODE", "NODE_ENV", "CI",
+		// TOOL SELECTION AND EXECUTION. These were inherited by every
+		// discovery and runnable subprocess and recorded by none of them, so a
+		// bundle could not say which `npx`, which Node options or which
+		// registry the plan had been derived under — and a replay that
+		// resolved a different one would agree on every digest it checked.
+		"PATH", "NODE_OPTIONS", "NODE_PATH", "npm_config_registry",
+		"npm_config_userconfig", "npm_config_prefix", "COREPACK_ENABLE_STRICT",
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
 	} {
 		out[k] = os.Getenv(k)
+	}
+	// AND THE COMPLETE INHERITED SET, by name and by value digest.
+	//
+	// The subprocesses run with a nil Cmd.Env and therefore inherit
+	// everything, so an allow-list records what the author thought mattered
+	// rather than what the plan was actually derived under. Publishing every
+	// value would publish secrets, so each remaining variable is bound by the
+	// digest of its value: the SET is complete and any change to it is
+	// visible, and no secret is written into a bundle meant to be published.
+	for _, kv := range os.Environ() {
+		k, v, _ := strings.Cut(kv, "=")
+		if _, named := out[k]; named {
+			continue
+		}
+		out["digest:"+k] = string(walltime.DigestBytes([]byte(v)))
 	}
 	return out
 }
@@ -302,6 +338,12 @@ func delegatedProgram(root string, argv []string) (delegated, error) {
 	}
 	name := rest[0]
 	if p := filepath.Join(root, "node_modules", ".bin", name); fileExists(p) {
+		// ABSOLUTE. With a relative root this returned `node_modules/.bin/...`,
+		// which names a different program in every working directory — an
+		// executable identity that is not an identity.
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
 		return delegated{name: name, path: p}, nil
 	}
 	p, err := exec.LookPath(name)

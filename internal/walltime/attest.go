@@ -128,6 +128,21 @@ func (a BuildAttestation) Verify(binary Digest, reviewTip string, builderKeys []
 	if reviewTip != "" && a.SourceCommit != reviewTip {
 		problems = append(problems, fmt.Sprintf("the build attestation attests a build from %s, but the reviewed tip is %s", a.SourceCommit, reviewTip))
 	}
+	// SELF-ATTESTATION IS NOT ATTESTATION.
+	//
+	// The release workflow passed the builder identity as the verifier
+	// identity too, and `wall attest` then wrote `Result: verified`, named the
+	// current binary as its own verifier, signed with the builder key and
+	// checked only that same signature. A build vouching for itself is a
+	// claim, not a verification, and the frozen contract makes it ineligible.
+	//
+	// The two identities must differ. That is a property of the DOCUMENT, so
+	// it is checked here rather than left to whoever wires the workflow.
+	if strings.TrimSpace(a.BuilderID) == strings.TrimSpace(a.VerifierID) {
+		problems = append(problems, fmt.Sprintf(
+			"the build attestation names %q as both the builder and the verifier; a build that vouches for itself has been checked by nobody",
+			a.BuilderID))
+	}
 	if a.Signature == nil {
 		problems = append(problems, "the build attestation is unsigned; an unattributable claim about a build is prose")
 		return problems

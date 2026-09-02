@@ -14,6 +14,16 @@ type memoryLoader struct {
 	verdicts  map[string]*Verdict
 	manifests map[string]*Stage1Manifest
 	stage2    map[string]*Stage2Receipt
+	derived   map[string]*AblationDerived
+}
+
+func (m memoryLoader) Derived(path string) (*AblationDerived, error) {
+	d, ok := m.derived[path]
+	if !ok {
+		return nil, fmt.Errorf("no derived projections at %s", path)
+	}
+	c := *d
+	return &c, nil
 }
 
 func (m memoryLoader) Stage2(path string) (*Stage2Receipt, error) {
@@ -132,6 +142,7 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 		verdicts:  map[string]*Verdict{},
 		manifests: map[string]*Stage1Manifest{"baseline.json": baseline, "candidate.json": candidate},
 		stage2:    map[string]*Stage2Receipt{},
+		derived:   map[string]*AblationDerived{},
 	}
 	order, err := schedule.OrderDigest()
 	if err != nil {
@@ -208,6 +219,49 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 	return idx, loader, []string{PublicKeyOf(key)}, key
 }
 
+// derivedFor is the plan each stratum's experiment actually derives. The four
+// are materially different documents, because the four are different
+// experiments: a collision run holds an atom with two packages, a slice run
+// renders an invocation covering part of a file, a multi-file run schedules
+// several files, and a sequential run renders more than one invocation.
+func derivedFor(stratum string) AblationDerived {
+	switch stratum {
+	case StratumCollisionAtom:
+		return AblationDerived{
+			Atoms:      map[string][]string{"suite/a.spec.ts::collide": {"pkg-a", "pkg-b"}},
+			Topology:   map[string][]string{"bucket-0": {"file"}},
+			Membership: map[string][]string{"bucket-0/inv-0": {"u1", "u2"}},
+		}
+	case StratumLegalNonAtomSlice:
+		return AblationDerived{
+			Atoms:    map[string][]string{"suite/b.spec.ts::solo": {"pkg-c"}},
+			Topology: map[string][]string{"bucket-0": {"slice"}},
+			Membership: map[string][]string{
+				"bucket-0/inv-0": {"u1", "u2", "u3"},
+				"bucket-0/inv-1": {"u1"},
+			},
+		}
+	case StratumSequentialInvocs:
+		return AblationDerived{
+			Atoms:    map[string][]string{"suite/c.spec.ts::one": {"pkg-d"}},
+			Topology: map[string][]string{"bucket-0": {"file", "file", "file"}},
+			Membership: map[string][]string{
+				"bucket-0/inv-0": {"u1"},
+				"bucket-0/inv-1": {"u2"},
+				"bucket-0/inv-2": {"u3"},
+			},
+		}
+	default: // whole-file multi-file
+		return AblationDerived{
+			Atoms:    map[string][]string{"suite/d.spec.ts::one": {"pkg-e"}},
+			Topology: map[string][]string{"bucket-0": {"file", "file"}},
+			Membership: map[string][]string{
+				"bucket-0/inv-0": {"u1", "u2"},
+			},
+		}
+	}
+}
+
 // ablationInvocations is the realized invocation topology per stratum. The
 // sequential stratum runs more than one invocation; the others run one.
 func ablationInvocations(stratum string) []int64 {
@@ -260,9 +314,18 @@ func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, 
 		// the fixture says so rather than handing them one generic shape.
 		receipt.PlanDigest = Digest("sha256:plan-" + stratum)
 		receipt.TopologyDigest = Digest("sha256:topology-" + stratum)
-		receipt.AtomDigest = Digest("sha256:atoms-" + stratum)
-		receipt.MembershipDigest = Digest("sha256:membership-" + stratum)
 		receipt.InvocationDigest = Digest("sha256:invocations-" + stratum)
+		// THE PLAN THIS STRATUM ACTUALLY DERIVED. Four different experiments
+		// produce four materially different documents, and the receipt binds
+		// the digests OF THOSE DOCUMENTS rather than four arbitrary strings.
+		derived := derivedFor(stratum)
+		atoms, topo, membership, err := derived.Digests()
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt.AtomDigest, receipt.TopologyDigest, receipt.MembershipDigest = atoms, topo, membership
+		derivedPath := fmt.Sprintf("ablation-derived-%s.json", stratum)
+		loader.derived[derivedPath] = &derived
 		if err := receipt.Validate(); err != nil {
 			t.Fatalf("the fixture ablation Stage-2 for %s does not validate: %v", stratum, err)
 		}
@@ -299,7 +362,8 @@ func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, 
 			loader.verdicts[path] = v
 			idx.Ablations = append(idx.Ablations, CampaignAblationRef{
 				Stratum: stratum, RunID: v.Run.RunID,
-				Stage1Path: manifestPath, Stage2Path: receiptPath, VerdictPath: path,
+				Stage1Path: manifestPath, Stage2Path: receiptPath,
+				DerivedPath: derivedPath, VerdictPath: path,
 			})
 		}
 	}

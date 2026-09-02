@@ -453,9 +453,9 @@ func TestTheActionRootJoinsBeforeItsOwnSnapshot(t *testing.T) {
 // neither record.
 func TestTheActionObservedReadPrecedesTheDrain(t *testing.T) {
 	body := productionFunc(t, "action.go", "func EndAction(")
-	observed := strings.Index(body, `retainActionProcessTreeFor(w, st.Run, clock, cont, "observed", st.Root)`)
+	observed := strings.Index(body, `retainActionProcessTree(w, st.Run, clock, cont, "observed")`)
 	drain := strings.Index(body, "enforceContainmentEmpty(cont, deadline)")
-	end := strings.Index(body, `retainActionProcessTreeFor(w, st.Run, clock, cont, "end", st.Root)`)
+	end := strings.Index(body, `retainActionProcessTree(w, st.Run, clock, cont, "end")`)
 	if observed < 0 || drain < 0 || end < 0 {
 		t.Fatalf("the close ordering is no longer recognisable: observed=%d drain=%d end=%d", observed, drain, end)
 	}

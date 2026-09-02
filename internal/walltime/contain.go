@@ -85,8 +85,20 @@ func membershipModelFor(f MembershipFacts) string {
 		return MembershipWorkloadWritable
 	}
 	// THE WORKLOAD'S OWN CREDENTIAL. When the caller declares none, the
-	// workload is taken to share this process's — which is the single-credential
-	// runner, and the shape that cannot be scored.
+	// workload is taken to share this process's — the single-credential
+	// runner, and the shape that cannot be scored. When it DOES declare one,
+	// the declared set replaces this process's uid rather than widening it,
+	// because the whole point of a declared workload account is that the
+	// wrapper is no longer the workload.
+	//
+	// An earlier comment said self always widened the set while the code
+	// replaced it. Both cannot be true, and the code was right: a boundary
+	// where the wrapper owns the containment and the workload does not is
+	// exactly the arrangement a scored row needs, and counting the wrapper as
+	// the workload would refuse it. What keeps a declaration from minting that
+	// on its own is elsewhere — the verifier reruns this rule over the
+	// measured process's OWN uid and group vector, as the kernel reported
+	// them.
 	workload := f.WorkloadUIDs
 	if len(workload) == 0 {
 		workload = []int{f.SelfUID}

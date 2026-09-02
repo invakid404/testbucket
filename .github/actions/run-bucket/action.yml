@@ -351,19 +351,19 @@ runs:
         # The measured body is single-quoted, so the generated script is never
         # spliced into a command line; the inner shell reads it from the
         # environment, exactly as the unmeasured path does.
-        # THE CREDENTIAL DROP. When a supervisor was established the measured
-        # work runs as the distinct, non-sudo workload account: it may ask the
-        # supervisor for a containment or a producer registration and cannot
-        # perform either itself, and it cannot write the cgroup subtree root
-        # owns. Without a supervisor the command runs as this step's own user,
-        # which is the unscored path the verifier refuses to score.
-        as_workload=()
-        if [ -n "${TB_WALL_SUPERVISOR:-}" ] && [ -n "${TB_WORKLOAD_USER:-}" ]; then
-          as_workload=(sudo -n -u "$TB_WORKLOAD_USER" --preserve-env=TB_RUNNER,BUCKET_SCRIPT,BUCKET_NAME,BUCKET_EST,TB_EVENTS_DIR,TB_WALL_DIR,TB_WALL_CGROUP_ROOT,TB_WALL_WORKLOAD_UID,TB_WALL_SUPERVISOR,TB_SCORED,TB_VERSION,RUNNER_TEMP,GITHUB_WORKSPACE,PATH,HOME)
-        fi
+        # THE CREDENTIAL DROP HAPPENS INSIDE THE WRAPPER, and only at the
+        # invocation level. This shell must not wrap anything: the wrapper
+        # chain needs the credential that can create and admit containments and
+        # write the evidence directory, and only the one process tree that runs
+        # somebody else's test code drops to TB_WALL_WORKLOAD_USER.
+        #
+        # A guard here used to build a `sudo` prefix from two variables that no
+        # longer exist — one belonging to the removed supervisor, one never
+        # exported at all — so it was always empty and the drop never happened
+        # anywhere. Dead wiring that reads like a boundary is worse than none.
         if [ -n "$TB_WALL_DIR" ]; then
           set +e
-          "${as_workload[@]}" testbucket wall run --dir "$TB_WALL_DIR" -- bash -euo pipefail -c '
+          testbucket wall run --dir "$TB_WALL_DIR" -- bash -euo pipefail -c '
             # Delivery identity, checked INSIDE the envelope so a refusal is
             # retained as a terminal record. The installer resolves `local`, a
             # moving alias or an exact tag and nothing else; there is no

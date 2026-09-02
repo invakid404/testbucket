@@ -58,6 +58,14 @@ type CampaignAblationRef struct {
 	// was actually derived; the verdict's own invocation and reconciliation
 	// evidence is what it realized.
 	Stage2Path string `json:"stage2"`
+	// DerivedPath is the plan's own atom, topology and membership projections.
+	//
+	// The Stage-2 receipt binds their digests, and holding only those digests
+	// let four arbitrary opaque tuples stand for one generic topology. These
+	// are the documents themselves: rederived against the receipt that claimed
+	// them, and then READ, because whether a collision atom or a legal slice
+	// was exercised is a property of the plan and not of a hash.
+	DerivedPath string `json:"derived"`
 	// VerdictPath is the verifier verdict for the measured row.
 	VerdictPath string `json:"verdict"`
 }
@@ -336,6 +344,38 @@ func checkAblationTopology(where string, a CampaignAblationRef, m *Stage1Manifes
 		problems = append(problems, fmt.Sprintf(
 			"%s measured Stage-2 %s but the receipt it names digests to %s", where, v.Run.Stage2, stage2))
 	}
+	// THE DERIVED DOCUMENTS, REDERIVED AND READ.
+	if strings.TrimSpace(a.DerivedPath) == "" {
+		problems = append(problems, where+" names no derived atom/topology/membership projections, so its stratum is a label over four opaque digests")
+	} else if derived, err := loader.Derived(a.DerivedPath); err != nil {
+		problems = append(problems, fmt.Sprintf("%s derived projections: %v", where, err))
+	} else {
+		atoms, topo, membership, err := derived.Digests()
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("%s derived projections: %v", where, err))
+		default:
+			for _, cmp := range []struct {
+				what      string
+				got, want Digest
+			}{
+				{"atom", atoms, receipt.AtomDigest},
+				{"topology", topo, receipt.TopologyDigest},
+				{"membership", membership, receipt.MembershipDigest},
+			} {
+				if cmp.got != cmp.want {
+					problems = append(problems, fmt.Sprintf(
+						"%s supplies %s projections digesting to %s, but the Stage-2 receipt it ran binds %s",
+						where, cmp.what, cmp.got, cmp.want))
+				}
+			}
+			if missing := derived.realizes(a.Stratum); missing != "" {
+				problems = append(problems, fmt.Sprintf(
+					"%s is authorised into the %s stratum but its own derived plan shows %s", where, a.Stratum, missing))
+			}
+		}
+	}
+
 	// THE REALIZED OBSERVATION TOPOLOGY. A reconciliation entry exists only
 	// where a peer and a trace both bracketed the same lifecycle, so its
 	// absence means the row was not trace-qualified whatever its label says.

@@ -62,7 +62,11 @@ const (
 
 // Runner is the Vitest adapter.
 type Runner struct {
-	tool nodetool // the base vitest command; bounds discovery and Runnables
+	// observed is the discovery invocation this runner actually issued, kept
+	// so the bundle records the command that ran rather than one the caller
+	// reconstructs from the same flags a second time.
+	observed *DiscoveryProvenance
+	tool     nodetool // the base vitest command; bounds discovery and Runnables
 	// discoveryMode selects the built-in discovery invocation (glob | list). It
 	// is ignored when discoveryCmd is set.
 	discoveryMode string

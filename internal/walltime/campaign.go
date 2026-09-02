@@ -96,6 +96,12 @@ type CampaignLoader interface {
 	// and a Stage-1 manifest states an intent while the Stage-2 receipt is the
 	// plan that was derived from it.
 	Stage2(path string) (*Stage2Receipt, error)
+	// Derived loads the plan's own atom, topology and membership projections
+	// for one ablation, so the gate can rederive the digests the Stage-2
+	// receipt binds and then READ the documents. Four distinct opaque hashes
+	// prove inequality; they do not show that a collision atom or a legal
+	// slice was ever exercised.
+	Derived(path string) (*AblationDerived, error)
 }
 
 // FileCampaignLoader reads them from disk.
@@ -117,6 +123,15 @@ func (FileCampaignLoader) Stage2(path string) (*Stage2Receipt, error) {
 		return nil, err
 	}
 	return &r, nil
+}
+
+// Derived loads one ablation's derived projections.
+func (FileCampaignLoader) Derived(path string) (*AblationDerived, error) {
+	var d AblationDerived
+	if err := ReadJSONFile(path, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
 // Manifest loads one Stage-1 manifest.

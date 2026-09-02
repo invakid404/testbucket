@@ -78,6 +78,8 @@ func newCgroupUnder(root, name string) (Containment, error) {
 			// prove the nested history the envelope is built on.
 			MembershipControl: membershipControl(dir),
 			OwnerUID:          containmentOwnerUID(dir),
+			OwnerGID:          containmentOwnerGID(dir),
+			Mode:              containmentMode(dir),
 		},
 	}, nil
 }
@@ -95,6 +97,29 @@ func containmentOwnerUID(dir string) int {
 		return -1
 	}
 	return int(sys.Uid)
+}
+
+// containmentOwnerGID and containmentMode retain the remaining inputs to the
+// membership decision, so a verifier can rerun the rule instead of believing
+// the producer's summary of it.
+func containmentOwnerGID(dir string) int {
+	info, err := os.Stat(filepath.Join(dir, "cgroup.procs"))
+	if err != nil {
+		return -1
+	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1
+	}
+	return int(sys.Gid)
+}
+
+func containmentMode(dir string) uint32 {
+	info, err := os.Stat(filepath.Join(dir, "cgroup.procs"))
+	if err != nil {
+		return 0
+	}
+	return uint32(info.Mode().Perm())
 }
 
 func (c *cgroup2) Identity() ContainmentIdentity { return c.ident }

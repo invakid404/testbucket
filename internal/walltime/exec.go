@@ -316,7 +316,12 @@ func Exec(opt ExecOptions) (int, error) {
 // there is no window in which action-owned work exists outside the lifecycle
 // the peer and trace are bracketing.
 func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, clock Clock) (int, ProcIdentity, string, string) {
-	cmd := exec.Command(opt.Argv[0], opt.Argv[1:]...)
+	// THE MEASURED COMMAND, under the credential its level calls for. At the
+	// invocation level that is the workload account; above it the wrapper
+	// chain keeps its own, because it has containments to create and evidence
+	// to write that the workload must not be able to touch.
+	argv := workloadArgv(opt.Level, opt.Argv)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = opt.Cwd
 	// Assign the concrete *os.File values, not the struct fields directly: a
 	// nil *os.File stored in an io.Writer is a NON-nil interface holding a nil
@@ -398,6 +403,7 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 		ParentPID: os.Getpid(),
 		UID:       processUIDOf(cmd.Process.Pid),
 	}
+	proc.GID, proc.Groups = processGroupsOf(cmd.Process.Pid)
 	// THE MEMBERSHIP, WHILE THE CHILD IS IN IT.
 	//
 	// The only process-tree record this wrapper used to write was taken after
@@ -727,7 +733,27 @@ func retainProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment
 // Without a declared workload account the command runs as before: the run is
 // recorded in full and reported ineligible, because membershipControl then
 // reports a containment the workload could have written.
-func workloadArgv(argv []string) []string {
+// workloadArgv is LEVEL-AWARE, and that is what makes it a design rather than
+// a missing function call.
+//
+// Wiring the drop at every level would not run. The measured child of the
+// SCRIPT envelope is the generated bucket body, and that body writes evidence
+// into the wrapper-owned records directory and then invokes nested
+// `wall exec` wrappers that must create, admit into, freeze and destroy
+// containments in the delegated subtree. Dropping there would hand the
+// workload account either those capabilities — erasing the boundary — or
+// nothing, and the nested topology would simply fail.
+//
+// The untrusted thing is not the harness. It is the TEST CODE, and the test
+// code runs inside the INVOCATION envelope's child. So that is where the drop
+// belongs: the wrapper chain keeps the credential it needs to observe, and the
+// one process tree that executes somebody else's code runs as an account which
+// cannot write `cgroup.procs` — the process-migration control this whole
+// boundary exists to deny it.
+func workloadArgv(level Level, argv []string) []string {
+	if level != LevelInvocation {
+		return argv
+	}
 	user := strings.TrimSpace(os.Getenv(WorkloadUserEnv))
 	if user == "" || len(argv) == 0 {
 		return argv

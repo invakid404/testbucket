@@ -212,12 +212,36 @@ func (r *Runner) discover(ctx context.Context) ([]runner.LivePackage, error) {
 // a deadline hit into an actionable discovery error.
 func (r *Runner) runDiscovery(ctx context.Context) ([]byte, error) {
 	vt, args := r.discoveryInvocation()
+	// THE ARGV AND CWD THAT ACTUALLY RAN, retained here rather than
+	// reconstructed by the caller.
+	//
+	// The bundle used to rebuild its discovery argv from the same flags a
+	// second time and record that. The two agree today and are not one
+	// observed value: a change to how the invocation is assembled would make
+	// the bundle's provenance describe a command nobody issued, and nothing
+	// would notice.
+	r.observed = &DiscoveryProvenance{Argv: append(append([]string{}, vt.command...), args...), Cwd: r.root}
 	out, err := vt.run(ctx, r.root, args...)
 	if err != nil {
 		return nil, r.discoveryError(err)
 	}
 	return out, nil
 }
+
+// DiscoveryProvenance is the exact invocation a discovery run issued.
+type DiscoveryProvenance struct {
+	Argv []string
+	Cwd  string
+}
+
+// Discovered reports the argv and cwd of the discovery subprocess this runner
+// actually issued, or nil when discovery came from frozen bytes.
+func (r *Runner) Discovered() *DiscoveryProvenance { return r.observed }
+
+// Root is the canonical absolute root every subprocess was run from. The
+// bundle records THIS, not the caller's spelling of it: `--root .` names a
+// different directory from every other working directory in the world.
+func (r *Runner) Root() string { return r.root }
 
 // discoveryInvocation resolves the discovery subprocess: a verbatim
 // DiscoveryCommand (which owns its subcommand, so nothing is appended) when set,

@@ -244,6 +244,32 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
 			"%s: the process-tree record for pid %d names no process group, so a PGID change is undecidable", label, p.PID))
 	}
+	// THE ACTION LEVEL HAS NO MEASURED CHILD, and the two rules below are
+	// about one.
+	//
+	// A script or invocation envelope wraps a command: the wrapper creates the
+	// containment and admits a child into it, so the measured process must be
+	// neither the containment's own root nor running as the credential that
+	// owns it. The ACTION envelope wraps a GitHub job step sequence. Its
+	// containment is created by `wall begin`, which then joins it, and the
+	// setup and bucket steps are separate step processes that join it too —
+	// no single process is its child and none spans it.
+	//
+	// Applying the child rules there made the producer and the verifier
+	// contradict each other: `BeginAction` recorded the creating wrapper as
+	// the root, and this function then made that record terminal, so the
+	// production action path could never verify. The action record says which
+	// process TOOK the reading and what the containment held at that moment;
+	// what spans the action is the containment, and the membership reads are
+	// the evidence for it.
+	if r.Level == LevelAction {
+		if p.UID < 0 {
+			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+				"%s: the process-tree record does not state the credential the observing wrapper ran under", label))
+		}
+		return
+	}
+
 	// THE CREDENTIAL SEPARATION, OBSERVED.
 	//
 	// A containment whose `cgroup.procs` is owned by the credential the
@@ -261,6 +287,33 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
 				"%s: the measured process ran as uid %d, which is the credential owning this containment's cgroup.procs; on cgroup-v2 that file is the process-migration control, so the measured work could have rewritten the membership this envelope records",
 				label, p.UID))
+		}
+	}
+	// THE MEMBERSHIP DECISION, REDERIVED.
+	//
+	// The producer wrote MembershipControl as a string and the verifier
+	// believed it — a non-reproducible summary of the one property eligibility
+	// turns on, about a cgroup that no longer exists by the time anyone reads
+	// the records. The inputs are retained now, so the rule runs again here on
+	// the measured process's OWN group vector as the kernel reported it.
+	if e.Containment.Primitive == PrimitiveCgroup2 && e.Containment.Mode != 0 {
+		perm := e.Containment.Mode
+		rederived := membershipModelFor(MembershipFacts{
+			OwnerUID: uint32(e.Containment.OwnerUID), OwnerGID: uint32(e.Containment.OwnerGID),
+			GroupWritable: perm&0o020 != 0, OtherWritable: perm&0o002 != 0,
+			SelfUID:      p.UID,
+			WorkloadUIDs: []int{p.UID},
+			WorkloadGIDs: append(append([]int{}, p.Groups...), p.GID),
+		})
+		if rederived != e.Containment.MembershipControl {
+			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+				"%s: the containment records membership control %q, but rerunning the rule over its retained owner %d:%d, mode %04o and the measured process's own group vector %v derives %q; a producer's summary of the property eligibility turns on is not the property",
+				label, e.Containment.MembershipControl, e.Containment.OwnerUID, e.Containment.OwnerGID, perm,
+				append(append([]int{}, p.Groups...), p.GID), rederived))
+		}
+		if rederived != MembershipSupervisorOwned {
+			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+				"%s: rerun over the retained facts, the measured process could write this containment's cgroup.procs (%s)", label, rederived))
 		}
 	}
 	if p.SessionID <= 0 {

@@ -38,14 +38,14 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # goreleaser needs the full history and all tags for the version and
           # changelog.
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
 
@@ -113,12 +113,27 @@ jobs:
           TB_RELEASE_SHA: ${{ github.sha }}
           TB_WALL_BUILDER_KEY: ${{ secrets.TB_WALL_BUILDER_KEY }}
           TB_BUILDER_ID: ${{ github.repository }}/${{ github.workflow_ref }}
+          # The INDEPENDENT verifier identity. It is a separate input because a
+          # build that vouches for itself has been checked by nobody: this step
+          # passed the builder identity as the verifier too, `wall attest`
+          # wrote `Result: verified`, signed with the builder key and then
+          # checked only that same signature. The verifier now refuses an
+          # attestation whose builder and verifier are the same identity, so
+          # this must resolve to a party that is not the builder.
+          TB_VERIFIER_ID: ${{ vars.TB_RELEASE_VERIFIER_ID }}
           TB_ISSUER: https://token.actions.githubusercontent.com
           TB_RUN: ${{ github.run_id }}
           TB_ATTEMPT: ${{ github.run_attempt }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [ -z "${TB_VERIFIER_ID:-}" ] || [ "${TB_VERIFIER_ID:-}" = "$TB_BUILDER_ID" ]; then
+            echo "REFUSED: no INDEPENDENT verifier identity (repository variable TB_RELEASE_VERIFIER_ID)." >&2
+            echo "A build attestation whose builder and verifier are the same identity is a build" >&2
+            echo "vouching for itself, which the frozen contract makes ineligible. Set it to the" >&2
+            echo "party that actually checks the delivered artifact, and never to the builder." >&2
+            exit 1
+          fi
           if [ -z "${TB_WALL_BUILDER_KEY:-}" ]; then
             echo "REFUSED: no builder signing key (secret TB_WALL_BUILDER_KEY)." >&2
             echo "Stage 1 requires a SIGNED build attestation for the delivered binary," >&2
@@ -139,7 +154,7 @@ jobs:
               --issuer "$TB_ISSUER" \
               --build-run "$TB_RUN" \
               --build-attempt "$TB_ATTEMPT" \
-              --verifier-id "$TB_BUILDER_ID" \
+              --verifier-id "$TB_VERIFIER_ID" \
               --verified-at "$now" \
               --out "$TB_ATTESTATION_DIR/$name.attestation.json"
           done
@@ -298,7 +313,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 

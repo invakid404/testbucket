@@ -167,6 +167,16 @@ type ContainmentIdentity struct {
 	// must differ, or the thing being measured could have rewritten its own
 	// membership.
 	OwnerUID int `json:"owner_uid,omitempty"`
+	// OwnerGID and Mode are the rest of the facts the membership decision was
+	// made from, retained so a VERIFIER CAN REDERIVE IT.
+	//
+	// The producer's MembershipControl string is a summary, and the cgroup is
+	// gone by the time anyone reads the records — so a verifier that trusted
+	// the string was trusting a non-reproducible producer conclusion about the
+	// one property eligibility turns on. These are the inputs; the rule is
+	// membershipModelFor, and it can be run again.
+	OwnerGID int    `json:"owner_gid,omitempty"`
+	Mode     uint32 `json:"mode,omitempty"`
 	// MembershipControl is WHO may write this containment's `cgroup.procs` —
 	// the process-migration control on cgroup-v2 — established by reading the
 	// filesystem rather than asserted by Stage 1. See the Membership*
@@ -223,7 +233,15 @@ type ProcIdentity struct {
 	// from a caller's assertion into a fact: a containment owned by one
 	// credential and a measured process running under another is the boundary
 	// itself, observed.
-	UID       int    `json:"uid,omitempty"`
+	UID int `json:"uid,omitempty"`
+	// GID and Groups are the process's ACTUAL group vector, read from the
+	// launched process rather than resolved from /etc files. Account
+	// resolution may go through NSS, LDAP or SSSD, so parsing /etc/group
+	// establishes what those files say and not what the process received. The
+	// kernel's own answer is what decides whether a group-writable containment
+	// excluded this process.
+	GID       int    `json:"gid,omitempty"`
+	Groups    []int  `json:"groups,omitempty"`
 	ParentPID int    `json:"ppid,omitempty"`
 	ExitKind  string `json:"exit_kind,omitempty"`
 	ExitCode  int    `json:"exit_code,omitempty"`
