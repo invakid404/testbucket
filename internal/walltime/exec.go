@@ -183,6 +183,19 @@ func Exec(opt ExecOptions) (int, error) {
 	if err != nil {
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "create containment: "+err.Error())
 	}
+	// THE SCRIPT'S SUBTREE, DELEGATED BEFORE THE SCRIPT EXISTS.
+	//
+	// The measured bucket script runs as its own account and starts the
+	// nested invocation wrappers, and cgroup-v2 requires write access to the
+	// common ancestor's `cgroup.procs` to place a process into a sub-cgroup.
+	// Without this the dropped script could not create a single invocation
+	// containment; with it, it can rearrange only inside a subtree whose
+	// enclosing action containment it still cannot write.
+	if opt.Level == LevelScript {
+		if err := delegateScriptSubtree(cont); err != nil {
+			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "delegate the script subtree: "+err.Error())
+		}
+	}
 	// Cleanup is EXPLICIT rather than deferred, because a defer would run
 	// after the closing record and put real wrapper-owned work outside the
 	// envelope it belongs to. destroyed guards the error paths below, which
@@ -386,15 +399,45 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 		return 1, ProcIdentity{PID: pid}, TerminalSpawnError, err.Error()
 	}
 
-	// THE CHILD'S IDENTITY, SAMPLED WHILE IT IS ALIVE.
+	// THE MEMBERSHIP, READ WHILE THE CONTAINMENT IS STILL FROZEN.
 	//
-	// PGID and start id are read from /proc/<pid>, and this used to be done
-	// after awaitChild — which waits for cmd.Wait, and cmd.Wait reaps. On a
-	// normal Linux completion the entry is gone by then, so the start identity
-	// the schema says closes pid reuse came back EMPTY on exactly the runs
-	// that succeed, and the PGID lookup failed with it. The one moment the
-	// facts exist is between admission and the wait, and that is where they
-	// are taken now.
+	// The only process-tree record this wrapper used to write was taken after
+	// the containment had been drained and the child reaped, so its membership
+	// snapshot was empty by construction. An empty close snapshot is proof
+	// that nothing escaped; it is not proof that the measured process was ever
+	// inside, and those are different claims. This read happens at the one
+	// moment the containment provably holds exactly the admitted child —
+	// before the thaw, so nothing has run and nothing can have forked — and it
+	// retains the same raw evidence a peer or trace endpoint does: the exact
+	// kernel bytes and a digest binding them to this observer's own read.
+	admittedEvent, _, admittedErr := cont.Observe(string(ProducerPhysical))
+
+	// THAWED, and only now does the measured work begin.
+	if frozen {
+		if err := cont.Freeze(false); err != nil {
+			_ = reapStarted(ProducerPhysical, cmd, err)
+			return 1, ProcIdentity{PID: cmd.Process.Pid}, TerminalWrapperError, "thaw the containment after admission: " + err.Error()
+		}
+	}
+
+	// THE CREDENTIAL DROP, AWAITED — THEN the identity is sampled.
+	//
+	// This is the ordering the whole boundary turns on, and it used to run the
+	// other way round. The child is CREATED FROZEN so that the admission read
+	// is race-free, and a frozen child has not executed one instruction: it
+	// has not run `sudo`, has not changed credentials and has not exec'd the
+	// workload. Sampling its uid before the thaw therefore read the WRAPPER's
+	// credential every time, and the record then stated that the measured
+	// process ran as an account it never ran as — the one fact the credential
+	// separation is decided from.
+	//
+	// So the sample waits for the drop to be observable on the measured pid,
+	// and it never fabricates it: when the credential does not arrive — the
+	// drop failed, or `sudo` interposed a monitor process so the pid being
+	// watched is not the workload's — what is retained is whatever was
+	// actually read, plus a note saying so, and the verifier refuses to score
+	// a measured process whose uid is the credential owning its containment.
+	dropNote := awaitWorkloadCredential(cmd.Process.Pid, expectedWorkloadUID(opt.Level))
 	proc := ProcIdentity{
 		PID:       cmd.Process.Pid,
 		PGID:      processGroupOf(cmd.Process.Pid),
@@ -404,25 +447,8 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 		UID:       processUIDOf(cmd.Process.Pid),
 	}
 	proc.GID, proc.Groups = processGroupsOf(cmd.Process.Pid)
-	// THE MEMBERSHIP, WHILE THE CHILD IS IN IT.
-	//
-	// The only process-tree record this wrapper used to write was taken after
-	// the containment had been drained and the child reaped, so its membership
-	// snapshot was empty by construction. An empty close snapshot is proof
-	// that nothing escaped; it is not proof that the measured process was ever
-	// inside, and those are different claims. This read happens at the one
-	// moment the containment holds exactly the admitted child, and it retains
-	// the same raw evidence a peer or trace endpoint does: the exact kernel
-	// bytes and a digest binding them to this observer's own read.
-	retainProcessTree(w, opt, clock, cont, proc, "start")
-
-	// THAWED, and only now does the measured work begin.
-	if frozen {
-		if err := cont.Freeze(false); err != nil {
-			_ = reapStarted(ProducerPhysical, cmd, err)
-			return 1, proc, TerminalWrapperError, "thaw the containment after admission: " + err.Error()
-		}
-	}
+	appendProcessTree(w, opt, clock, cont, proc, "start", admittedEvent, admittedErr,
+		joinReason("membership read while the containment was frozen, before the child could run; identity read after the thaw, when the credential drop is observable", dropNote))
 
 	// An INDEPENDENT sampler runs beside the child: it re-reads the child's
 	// identity and the containment's membership while the process exists, and
@@ -699,13 +725,26 @@ func retainObservedTree(w *Writer, opt ExecOptions, clock Clock, cont Containmen
 }
 
 func retainProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment, proc ProcIdentity, boundary string) {
+	ev, _, err := cont.Observe(string(ProducerPhysical))
+	appendProcessTree(w, opt, clock, cont, proc, boundary, ev, err, "")
+}
+
+// appendProcessTree writes a process-tree record from a membership read that
+// was ALREADY TAKEN.
+//
+// The admission read and the identity read no longer happen at the same
+// instant, and they cannot: the membership must be read while the containment
+// is frozen, and the credential can only be read after the thaw lets the child
+// reach it. Splitting the write from the read is what lets one record carry
+// both, and the note says which instant each half came from rather than
+// leaving a reader to assume they were simultaneous.
+func appendProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment, proc ProcIdentity, boundary string, ev RawEvent, err error, note string) {
 	rec := Record{
 		Kind: "process_tree", Boundary: boundary,
 		Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
 		Source: SourceProcessLifecycle, Seqno: opt.Seq, Run: opt.Run,
 		Containment: cont.Identity(), Proc: proc, Instant: clock.Now(),
 	}
-	ev, _, err := cont.Observe(string(ProducerPhysical))
 	if err != nil {
 		rec.Note = "cgroup.procs unreadable: " + err.Error()
 	} else {
@@ -713,56 +752,123 @@ func retainProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment
 		rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
 		rec.Note = fmt.Sprintf("cgroup.procs members at %s: %d", boundary, len(ev.Procs))
 	}
+	if note != "" {
+		rec.Note = joinReason(rec.Note, note)
+	}
 	_, _ = w.Append(rec)
 }
 
-// workloadArgv wraps the measured command so it runs under the WORKLOAD'S OWN
-// CREDENTIAL rather than the wrapper's.
+// workloadArgv wraps the measured command so it runs under the MEASURED
+// PARTY'S OWN CREDENTIAL rather than the wrapper's.
 //
 // This is the privilege boundary, and it is the whole of it. The wrapper needs
 // to create containments, freeze them, admit into them and destroy them, so it
 // must be able to write the delegated subtree; the measured work must not,
 // because on cgroup-v2 `cgroup.procs` IS the process-migration control and a
-// workload that can write it can move itself between containments and rewrite
+// process that can write it can move itself between containments and rewrite
 // the membership history the envelope records.
 //
 // Both cannot be one credential, and no arrangement of files or environment
 // changes that — so the measured command is executed as a different account.
 // The wrapper stays where it is; only the thing being measured drops.
 //
-// Without a declared workload account the command runs as before: the run is
-// recorded in full and reported ineligible, because membershipControl then
-// reports a containment the workload could have written.
-// workloadArgv is LEVEL-AWARE, and that is what makes it a design rather than
-// a missing function call.
+// THERE ARE TWO MEASURED PARTIES, and they are not the same party.
 //
-// Wiring the drop at every level would not run. The measured child of the
-// SCRIPT envelope is the generated bucket body, and that body writes evidence
-// into the wrapper-owned records directory and then invokes nested
-// `wall exec` wrappers that must create, admit into, freeze and destroy
-// containments in the delegated subtree. Dropping there would hand the
-// workload account either those capabilities — erasing the boundary — or
-// nothing, and the nested topology would simply fail.
+// The invocation child runs somebody else's test code. The script child runs
+// the generated bucket body, which writes the invocation specs and starts the
+// nested wrappers — harness work, but work whose measured process was
+// nevertheless the credential OWNING its own containment when it did not drop,
+// which is exactly what the wrapper's own verifier refuses to score. Dropping
+// only the invocation therefore made an eligible script row unproducible: the
+// producer kept the wrapper credential at that level and the verifier made
+// that same credential unscorable there.
 //
-// The untrusted thing is not the harness. It is the TEST CODE, and the test
-// code runs inside the INVOCATION envelope's child. So that is where the drop
-// belongs: the wrapper chain keeps the credential it needs to observe, and the
-// one process tree that executes somebody else's code runs as an account which
-// cannot write `cgroup.procs` — the process-migration control this whole
-// boundary exists to deny it.
+// So both drop, to two accounts:
+//
+//   - the script to ScriptUserEnv, whose subtree is delegated to it before it
+//     starts, so it can create and admit the invocation containments and can
+//     still not touch the enclosing action containment;
+//   - the invocation to WorkloadUserEnv, which is delegated nothing at all.
+//
+// Without a declared account a level runs as before: the run is recorded in
+// full and reported ineligible, because the measured process is then the
+// credential that owns its own containment.
 func workloadArgv(level Level, argv []string) []string {
-	if level != LevelInvocation {
-		return argv
-	}
-	user := strings.TrimSpace(os.Getenv(WorkloadUserEnv))
+	user := workloadAccount(level)
 	if user == "" || len(argv) == 0 {
 		return argv
 	}
 	// `sudo -n` and never a password prompt: a measurement that stops to ask
 	// for one is a measurement that hangs. The runner grants the wrapper this;
-	// the workload account is deliberately granted no sudo at all, so it
-	// cannot travel back the other way.
+	// the measured accounts are deliberately granted no sudo back the other
+	// way.
 	return append([]string{"sudo", "-n", "-u", user, "--"}, argv...)
+}
+
+// workloadAccount is the account a level's measured process runs as. The
+// action level has no measured child — its containment is joined by the step
+// processes themselves — so it has no account and does not drop.
+func workloadAccount(level Level) string {
+	switch level {
+	case LevelInvocation:
+		return strings.TrimSpace(os.Getenv(WorkloadUserEnv))
+	case LevelScript:
+		return strings.TrimSpace(os.Getenv(ScriptUserEnv))
+	}
+	return ""
+}
+
+// expectedWorkloadUID is the uid the measured child must be running as once
+// its drop has happened, or -1 when this level declares no account.
+func expectedWorkloadUID(level Level) int {
+	user := workloadAccount(level)
+	if user == "" {
+		return -1
+	}
+	return resolveWorkloadCredential(user).UID
+}
+
+// credentialDropWait bounds how long the wrapper waits for the drop to become
+// observable. It is a spawn-and-exec of one program; a second is generous, and
+// the wait ends the moment the credential arrives.
+const credentialDropWait = time.Second
+
+// awaitWorkloadCredential waits until the measured pid is observably running
+// as want, and says what it saw.
+//
+// It exists because the drop is not instantaneous and is not guaranteed. The
+// child is thawed, and only then does it exec `sudo`, which sets the
+// credential and execs the workload — all on the same pid. Reading the uid
+// immediately after the thaw would race that, and reading it before the thaw
+// (which is what this wrapper did) could only ever return the wrapper's.
+//
+// It NEVER reports success it did not observe. A drop that never lands leaves
+// the note that says so, the record keeps the credential actually read, and
+// the verifier refuses the row: `sudo` configured with `use_pty` interposes a
+// monitor process, so the pid this wrapper holds would stay the wrapper's
+// credential forever — and a boundary that cannot be observed on the measured
+// process is not a boundary this contract admits.
+func awaitWorkloadCredential(pid, want int) string {
+	if want < 0 {
+		return "no workload uid could be established for this level — either no account is declared or this host cannot resolve one — so the measured process runs as the wrapper's own credential and the row is ineligible for want of the boundary"
+	}
+	deadline := time.Now().Add(credentialDropWait)
+	for {
+		got := processUIDOf(pid)
+		switch {
+		case got == want:
+			return fmt.Sprintf("the measured process was observed running as the declared account (uid %d) before its identity was read", want)
+		case got < 0:
+			// The process is gone, or its credential cannot be read at all.
+			// Waiting out the deadline would add a second to every short
+			// invocation and still establish nothing.
+			return fmt.Sprintf("the measured process's credential could not be read, so the drop to uid %d was not observed on the measured pid", want)
+		case !time.Now().Before(deadline):
+			return fmt.Sprintf("the measured process was still uid %d after %s, not the declared account's uid %d; the credential drop was not observed on the measured pid and the row cannot be scored on an unobserved boundary",
+				got, credentialDropWait, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func membershipSnapshot(cont Containment) ([]int, string) {

@@ -69,6 +69,11 @@ func runWallBundle(args []string) error {
 		DiscoveryMode:    *vitestDiscovery,
 		DiscoveryCommand: splitCommand(*vitestDiscoveryCommand),
 		DiscoveryTimeout: *discoveryTimeout,
+		// THE ENVIRONMENT IS FIXED BEFORE ANYTHING RUNS, and it is the same
+		// one the bundle retains. Collecting it afterwards recorded what the
+		// process happened to hold at the end of the acquisition, beside
+		// subprocesses that had inherited whatever was ambient at the start.
+		Env: planningEnvArgs(),
 	})
 	if err != nil {
 		return err
@@ -150,9 +155,17 @@ func runWallBundle(args []string) error {
 	// it rather than rebuilt here from the same flags. The two agreed, and
 	// were not one observed value.
 	observedDiscoveryArgv := discoveryArgv(*vitestCommand, *vitestDiscovery, *vitestDiscoveryCommand)
+	// THE EXECUTABLES THAT ACTUALLY RAN, keyed by the name that named them.
+	observedPaths := map[string]string{}
 	if seen := rnr.Discovered(); seen != nil {
 		observedDiscoveryArgv = seen.Argv
 		acquiredRoot = seen.Cwd
+		if len(seen.Argv) > 0 && seen.Path != "" {
+			observedPaths[seen.Argv[0]] = seen.Path
+		}
+	}
+	for _, p := range rnr.RunnablePaths() {
+		observedPaths[p.Name] = p.Path
 	}
 	bundle, err := planbind.Acquire(planbind.AcquireOptions{
 		Root: acquiredRoot, Runner: "vitest", Instant: now, StaleAfter: *staleAfter,
@@ -164,7 +177,7 @@ func runWallBundle(args []string) error {
 		// process actually is, so the closure resolves the binary that took
 		// the snapshots rather than whatever `testbucket` resolves to on the
 		// next machine.
-		Env: planningEnv(), Resolve: closureResolver(acquiredRoot),
+		Env: planningEnv(), Resolve: closureResolver(acquiredRoot, observedPaths),
 		BundleArgv: append([]string(nil), os.Args...),
 		Repository: *repository, Commit: *commit, Tree: *tree,
 		EventsDir: *eventsDir, FileParallelism: *fileParallelism, WallDir: *wallDir,
@@ -201,42 +214,56 @@ func discoveryArgv(command, mode, override string) []string {
 	return append(base, "list", "--filesOnly", "--json")
 }
 
-// planningEnv records the environment variables that can change a plan. It is
-// an allow-list, not the whole environment: a bundle that carried every
-// variable would carry secrets, and a bundle nobody can publish is a bundle
-// nobody can verify.
+// planningEnv is the environment the acquisition subprocesses ran with,
+// RETAINED EXACTLY so the run can be reproduced rather than described.
+//
+// It was an allow-list of exact values plus, for everything else inherited, a
+// digest of the value. The set was complete and the CONTENT was not: a digest
+// says that a variable had some value, and nobody can rerun `vitest list` from
+// a hash. The subprocesses inherited the whole ambient environment through a
+// nil Cmd.Env, so the plan was derived under an environment that could not be
+// reconstructed from the bundle that is supposed to bind its inputs.
+//
+// Now the map IS the environment: planningEnvironment builds both this record
+// and the exact KEY=VALUE set the subprocesses are given, from one read, so
+// the retained environment and the executed environment cannot differ.
+//
+// The wall-time secret and capability keys are the ONE exception. They are
+// withheld from the subprocess as well as from the record — the same six keys
+// the observer launcher scrubs — so nothing is claimed to have run with a
+// value that was not there. Their names and value digests are retained, which
+// makes their presence and any change to them visible without writing a
+// signing key into a bundle meant to be published.
 func planningEnv() map[string]string {
-	out := map[string]string{}
-	for _, k := range []string{
-		"TB_DISCOVERY_EXCLUDE_PREFIXES", "TB_DISCOVERY_TIMEOUT",
-		"VITEST_MODE", "NODE_ENV", "CI",
-		// TOOL SELECTION AND EXECUTION. These were inherited by every
-		// discovery and runnable subprocess and recorded by none of them, so a
-		// bundle could not say which `npx`, which Node options or which
-		// registry the plan had been derived under — and a replay that
-		// resolved a different one would agree on every digest it checked.
-		"PATH", "NODE_OPTIONS", "NODE_PATH", "npm_config_registry",
-		"npm_config_userconfig", "npm_config_prefix", "COREPACK_ENABLE_STRICT",
-		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
-	} {
-		out[k] = os.Getenv(k)
+	record, _ := planningEnvironment()
+	return record
+}
+
+// planningEnvArgs is the exact environment handed to every acquisition
+// subprocess, as KEY=VALUE.
+func planningEnvArgs() []string {
+	_, env := planningEnvironment()
+	return env
+}
+
+func planningEnvironment() (map[string]string, []string) {
+	withheld := map[string]bool{}
+	for _, k := range walltime.WallTimeSecretEnv {
+		withheld[k] = true
 	}
-	// AND THE COMPLETE INHERITED SET, by name and by value digest.
-	//
-	// The subprocesses run with a nil Cmd.Env and therefore inherit
-	// everything, so an allow-list records what the author thought mattered
-	// rather than what the plan was actually derived under. Publishing every
-	// value would publish secrets, so each remaining variable is bound by the
-	// digest of its value: the SET is complete and any change to it is
-	// visible, and no secret is written into a bundle meant to be published.
+	record := map[string]string{}
+	var env []string
 	for _, kv := range os.Environ() {
 		k, v, _ := strings.Cut(kv, "=")
-		if _, named := out[k]; named {
+		if withheld[k] {
+			record["digest:"+k] = string(walltime.DigestBytes([]byte(v)))
 			continue
 		}
-		out["digest:"+k] = string(walltime.DigestBytes([]byte(v)))
+		record[k] = v
+		env = append(env, kv)
 	}
-	return out
+	sort.Strings(env)
+	return record, env
 }
 
 // closureResolver resolves the executable and tool closure FOR ONE ARGV.
@@ -252,15 +279,25 @@ func planningEnv() map[string]string {
 // is an unbound input, and `wall bundle` is the one place that can still
 // refuse to freeze one; a bundle that carried it would be signed by Stage 1
 // before anybody noticed.
-func closureResolver(root string) func([]string) (map[string]string, map[string]walltime.ToolIdentity, error) {
+func closureResolver(root string, observed map[string]string) func([]string) (map[string]string, map[string]walltime.ToolIdentity, error) {
 	return func(argv []string) (map[string]string, map[string]walltime.ToolIdentity, error) {
 		if len(argv) == 0 {
 			return nil, nil, fmt.Errorf("no argv to resolve")
 		}
 		head := argv[0]
-		path, err := resolveProgram(head)
-		if err != nil {
-			return nil, nil, err
+		// THE PATH THAT ACTUALLY RAN, when the operation observed one.
+		//
+		// Resolving the head again here answers "what would this name resolve
+		// to now", which is a different question from "what executed", and on
+		// a changed PATH it is a different answer. The acquisition records the
+		// resolved executable `exec.Command` used; that is the binary the
+		// snapshot came from, so it is the binary the closure binds.
+		path, ok := observed[head]
+		if !ok {
+			var err error
+			if path, err = resolveProgram(head); err != nil {
+				return nil, nil, err
+			}
 		}
 		execs := map[string]string{head: path}
 		// The DELEGATED program, when the head is only a launcher.
@@ -1044,6 +1081,19 @@ func deriveDocuments(res *planbind.Result, registryPath, outDir string) error {
 		return walltime.WriteJSONFile(filepath.Join(outDir, fmt.Sprintf("%s-%d.json", kind, bucket)), doc)
 	}
 
+	// THE ABLATION'S DERIVED PLAN, WRITTEN BY THE PLANNER THAT DERIVED IT.
+	//
+	// The campaign's ablation gate loads this document, rederives its three
+	// digests against the Stage-2 receipt and then READS it to decide whether
+	// the stratum a row is authorised into is the topology the row actually
+	// ran. Nothing in production wrote it: the gate could only ever be handed
+	// a document somebody composed by hand, and a hand-composed document is
+	// the thing the gate exists to refuse.
+	if outDir != "" {
+		if err := walltime.WriteJSONFile(filepath.Join(outDir, "derived.json"), res.Derived); err != nil {
+			return err
+		}
+	}
 	if res.Allocator != nil && outDir != "" {
 		if err := walltime.WriteJSONFile(filepath.Join(outDir, "palloc.json"), res.Allocator.Values()); err != nil {
 			return err

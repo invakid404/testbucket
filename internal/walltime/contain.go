@@ -66,6 +66,34 @@ const WorkloadUserEnv = "TB_WALL_WORKLOAD_USER"
 // over.
 const WorkloadUIDEnv = "TB_WALL_WORKLOAD_UID"
 
+// ScriptUserEnv names the account the measured BUCKET SCRIPT runs as.
+//
+// It is a second account because the script and the test code are different
+// parties. The script body is harness-generated: it writes the invocation
+// specs and then starts the nested `wall exec` wrappers, which create and
+// admit the invocation containments — so it needs the delegated script subtree
+// and the test code must never have it. Running the script as the supervisor
+// instead made the level unscorable by the wrapper's own rule, because the
+// measured process was then the credential owning its own containment.
+//
+// Empty means the script level does not drop, is recorded in full and is
+// reported ineligible for want of the boundary — the same refusal an
+// undeclared workload account earns.
+const ScriptUserEnv = "TB_WALL_SCRIPT_USER"
+
+// WorkloadCredential is the DECLARED workload account, resolved to facts.
+//
+// UID is the account's own uid (-1 when none was declared or it could not be
+// resolved); UIDs is that uid together with any additional ones the caller
+// declared; GIDs is its primary group and every supplementary group it belongs
+// to. They are resolved once, retained on the containment identity, and the
+// membership rule is rerun by the verifier over the retained copy.
+type WorkloadCredential struct {
+	UID  int
+	UIDs []int
+	GIDs []int
+}
+
 // membershipModelFor decides who may write a containment's `cgroup.procs`,
 // from facts a caller has already read off the filesystem.
 //

@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -405,7 +406,7 @@ func TestTheAdmissionReadIsTakenUnderAFreeze(t *testing.T) {
 	body := productionFunc(t, "exec.go", "func runChild(")
 	freeze := strings.Index(body, "cont.Freeze(true)")
 	start := strings.Index(body, "cmd.Start()")
-	read := strings.Index(body, `retainProcessTree(w, opt, clock, cont, proc, "start")`)
+	read := strings.Index(body, `admittedEvent, _, admittedErr := cont.Observe(string(ProducerPhysical))`)
 	thaw := strings.Index(body, "cont.Freeze(false); err != nil")
 	if freeze < 0 || start < 0 || read < 0 || thaw < 0 {
 		t.Fatalf("the admission protocol is no longer recognisable: freeze=%d start=%d read=%d thaw=%d", freeze, start, read, thaw)
@@ -413,6 +414,55 @@ func TestTheAdmissionReadIsTakenUnderAFreeze(t *testing.T) {
 	if !(freeze < start && start < read && read < thaw) {
 		t.Errorf("the admission read is not taken under the freeze: freeze=%d start=%d read=%d thaw=%d; a child that is running when the read is taken may already have forked",
 			freeze, start, read, thaw)
+	}
+}
+
+// TestTheAdmittedIdentityIsSampledAfterTheDrop is the F1 regression.
+//
+// The two halves of the admission record are read at DIFFERENT instants, and
+// they have to be. The membership must be read while the containment is
+// frozen, or "exactly one member" is a race; the credential can only be read
+// after the thaw, because a frozen child has not executed one instruction — it
+// has not run `sudo`, has not changed credentials and has not exec'd the
+// workload. Sampling the uid before the thaw read the WRAPPER's credential on
+// every run, and that uid is the fact the whole credential separation is
+// decided from.
+func TestTheAdmittedIdentityIsSampledAfterTheDrop(t *testing.T) {
+	body := productionFunc(t, "exec.go", "func runChild(")
+	thaw := strings.Index(body, "// THAWED")
+	await := strings.Index(body, "awaitWorkloadCredential(cmd.Process.Pid, expectedWorkloadUID(opt.Level))")
+	uid := strings.Index(body, "UID:       processUIDOf(cmd.Process.Pid)")
+	if thaw < 0 || await < 0 || uid < 0 {
+		t.Fatalf("the credential sampling is no longer recognisable: thaw=%d await=%d uid=%d", thaw, await, uid)
+	}
+	if !(thaw < await && await < uid) {
+		t.Errorf("the identity is sampled at %d, before the thaw at %d lets the drop happen (await=%d); the retained admission identity would be the wrapper's, not the measured workload's",
+			uid, thaw, await)
+	}
+}
+
+// TestAnUnobservedCredentialDropIsNotReportedAsOne: the wait never invents the
+// boundary it is waiting for.
+//
+// `sudo` configured with `use_pty` interposes a monitor process, so the pid
+// this wrapper holds would keep the wrapper's credential forever. What must
+// happen then is that the record keeps the credential actually read and says
+// the drop was not observed — leaving the verifier to refuse a measured
+// process running as the credential owning its containment.
+func TestAnUnobservedCredentialDropIsNotReportedAsOne(t *testing.T) {
+	// This process is not running as uid 999999, and never becomes it. On a
+	// host that cannot read a process credential at all the answer is the
+	// same refusal for a different reason, and both say the drop was NOT
+	// observed rather than reporting one.
+	note := awaitWorkloadCredential(os.Getpid(), 999999)
+	if !strings.Contains(note, "not observed") {
+		t.Errorf("a drop that never happened was reported as %q", note)
+	}
+	if strings.Contains(note, "was observed running as the declared account") {
+		t.Errorf("an unobserved drop was reported as observed: %q", note)
+	}
+	if got := awaitWorkloadCredential(os.Getpid(), -1); !strings.Contains(got, "ineligible for want of the boundary") {
+		t.Errorf("an unresolvable account reported %q rather than saying the row is ineligible for want of the boundary", got)
 	}
 }
 

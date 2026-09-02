@@ -101,18 +101,58 @@ inputs:
       interval that claims to contain it. For example:
 
           sudo useradd --system --create-home --shell /bin/bash tb-workload
+          sudo useradd --system --create-home --shell /bin/bash tb-script
           sudo groupadd --system tb-wrapper
-          sudo usermod -aG tb-wrapper "$(id -un)"        # the WRAPPER, not the workload
+          sudo usermod -aG tb-wrapper "$(id -un)"        # the WRAPPER, not the measured accounts
           sudo mkdir -p /sys/fs/cgroup/testbucket
           sudo chown root:tb-wrapper /sys/fs/cgroup/testbucket
           sudo chmod 0770 /sys/fs/cgroup/testbucket
           sudo chown -R tb-workload "$GITHUB_WORKSPACE"
+          # The wrapper may become either measured account; neither may become
+          # anything. Two accounts because there are two measured parties —
+          # see script-user.
+          printf '%%s ALL=(tb-script,tb-workload) NOPASSWD: ALL\n' "$(id -un)" \
+            | sudo tee /etc/sudoers.d/testbucket-wall >/dev/null
+          printf 'tb-script ALL=(tb-workload) NOPASSWD: ALL\n' \
+            | sudo tee -a /etc/sudoers.d/testbucket-wall >/dev/null
+          # `sudo -n` must EXEC the command, not supervise it through a pty:
+          # a monitor process would leave the wrapper watching sudo's pid
+          # rather than the workload's, and the drop would not be observable
+          # on the measured process — which this wrapper refuses to score.
+          printf 'Defaults:%%s !use_pty\n' "$(id -un)" \
+            | sudo tee -a /etc/sudoers.d/testbucket-wall >/dev/null
+          printf 'Defaults:tb-script !use_pty\n' \
+            | sudo tee -a /etc/sudoers.d/testbucket-wall >/dev/null
 
       tb-workload must be in NO sudo group: a workload that could sudo would
       take every capability back. Left empty, the measured work runs as this
       action's own user, `membershipControl` reports the containment as
       workload-writable, and the row is recorded in full and reported
       INELIGIBLE rather than scored.
+    default: ""
+  script-user:
+    description: >-
+      The account the measured BUCKET SCRIPT runs under, distinct both from the
+      account this action runs as and from workload-user.
+
+      There are two measured parties, and one account cannot be both. The
+      bucket script is harness-generated: it writes the invocation specs and
+      starts the nested `wall exec` wrappers, which create and admit the
+      invocation containments — so it needs the delegated script subtree.
+      The test code the invocations run must have none of that.
+
+      Running the script as this action's own user instead made the script
+      level unscorable by the wrapper's own rule, because the measured process
+      was then the credential owning its own containment; that contradiction
+      is why this input exists. The script containment is delegated to this
+      account's group by the wrapper, immediately before the script starts,
+      and the enclosing ACTION containment is not — so the script can arrange
+      containments beneath it and cannot leave the lifecycle that brackets it.
+
+      Set up alongside workload-user in the same prior step (see the example
+      above). tb-script may sudo to tb-workload and to nothing else; left
+      empty, the script level is recorded in full and reported INELIGIBLE
+      rather than scored.
     default: ""
   workload-uid:
     description: >-
@@ -248,6 +288,9 @@ runs:
         # boundary was established, and the row is recorded in full and
         # reported INELIGIBLE rather than scored.
         TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
+        # The account the measured BUCKET SCRIPT runs under — the second
+        # measured party. See the script-user input.
+        TB_WALL_SCRIPT_USER: ${{ inputs.script-user }}
         # The run key, scoped to THIS step. `wall begin` seals the signer
         # roster with it before the measured script exists.
         TB_WALL_RUN_KEY: ${{ inputs.run-key }}
@@ -333,6 +376,10 @@ runs:
         # boundary was established, and the row is recorded in full and
         # reported INELIGIBLE rather than scored.
         TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
+        # The bucket script's own account. The wrapper delegates the script
+        # containment to it and drops to it before starting the script, so the
+        # measured script is not the credential owning what contains it.
+        TB_WALL_SCRIPT_USER: ${{ inputs.script-user }}
         TB_SCORED: ${{ inputs.scored }}
         TB_VERSION: ${{ inputs.version }}
       run: |
@@ -351,11 +398,12 @@ runs:
         # The measured body is single-quoted, so the generated script is never
         # spliced into a command line; the inner shell reads it from the
         # environment, exactly as the unmeasured path does.
-        # THE CREDENTIAL DROP HAPPENS INSIDE THE WRAPPER, and only at the
-        # invocation level. This shell must not wrap anything: the wrapper
-        # chain needs the credential that can create and admit containments and
-        # write the evidence directory, and only the one process tree that runs
-        # somebody else's test code drops to TB_WALL_WORKLOAD_USER.
+        # THE CREDENTIAL DROPS HAPPEN INSIDE THE WRAPPER, at both measured
+        # levels. This shell must not wrap anything: the wrapper chain needs
+        # the credential that can create and admit containments and write the
+        # evidence directory, and each measured process tree drops from it —
+        # the bucket script to TB_WALL_SCRIPT_USER, the test code inside each
+        # invocation to TB_WALL_WORKLOAD_USER.
         #
         # A guard here used to build a `sudo` prefix from two variables that no
         # longer exist — one belonging to the removed supervisor, one never

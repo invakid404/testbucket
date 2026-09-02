@@ -519,20 +519,65 @@ func TestAnAblationMustExhibitItsStratumInItsOwnPlan(t *testing.T) {
 		want    string
 	}{
 		{"a collision stratum with no colliding atom", StratumCollisionAtom, func(d *AblationDerived) {
-			d.Atoms = map[string][]string{"suite/a.spec.ts::solo": {"pkg-a"}}
+			d.Atoms = map[string][]string{"suite/a.spec.ts::solo": {"suite/a.spec.ts"}}
 		}, "no atom holds more than one package"},
 
+		// A COLLISION ATOM THE SCHEDULE NEVER PACKED. The inventory still
+		// holds one; no unit covers both members, so the experiment the
+		// stratum names did not happen — which the predicate could not see
+		// while it asked only whether an atom existed.
+		{"a collision atom nothing scheduled together", StratumCollisionAtom, func(d *AblationDerived) {
+			d.Topology = map[string][]string{
+				"bucket-0": {TopologyEntry("package", []string{"suite/a.spec.ts"})},
+			}
+		}, "no scheduled unit covers all the members"},
+
 		{"a slice stratum with no slice", StratumLegalNonAtomSlice, func(d *AblationDerived) {
-			d.Membership = map[string][]string{"bucket-0/inv-0": {"u1", "u2"}}
+			d.Membership = map[string][]string{"bucket-0/inv-0": {"suite/c.spec.ts"}}
+		}, "no invocation covers a name-slice unit"},
+
+		// THE SLICES GATHERED BACK INTO ONE CALL. Two name subsets run
+		// together are the whole file under another name, so nothing was
+		// sliced in the sense the stratum means.
+		{"slices that ran as one invocation", StratumLegalNonAtomSlice, func(d *AblationDerived) {
+			d.Membership = map[string][]string{
+				"bucket-0/inv-0": {"suite/c.spec.ts[first]", "suite/c.spec.ts[second]"},
+			}
 		}, "no legal non-atom slice was exercised"},
 
 		{"a sequential stratum with one invocation", StratumSequentialInvocs, func(d *AblationDerived) {
-			d.Membership = map[string][]string{"bucket-0/inv-0": {"u1"}}
+			d.Membership = map[string][]string{"bucket-0/inv-0": {"suite/d1.spec.ts"}}
 		}, "no sequence of them was exercised"},
 
-		{"a multi-file stratum covering one unit", StratumWholeFileMultiFile, func(d *AblationDerived) {
-			d.Membership = map[string][]string{"bucket-0/inv-0": {"u1"}}
-		}, "no multi-file whole-file topology was exercised"},
+		// ONE INVOCATION EACH IN THREE PARALLEL BUCKETS is not a sequence: the
+		// count of invocations across a plan says nothing about whether any
+		// lane ran them one after another.
+		{"invocations spread across parallel buckets", StratumSequentialInvocs, func(d *AblationDerived) {
+			d.Membership = map[string][]string{
+				"bucket-0/inv-0": {"suite/d1.spec.ts"},
+				"bucket-1/inv-0": {"suite/d2.spec.ts"},
+				"bucket-2/inv-0": {"suite/d3.spec.ts"},
+			}
+		}, "no bucket renders more than one invocation"},
+
+		// TWO UNITS OF ONE FILE. The predicate counted units and built a file
+		// set it never read, so a single file scheduled twice satisfied a
+		// multi-FILE topology.
+		{"a multi-file stratum covering one file", StratumWholeFileMultiFile, func(d *AblationDerived) {
+			d.Topology = map[string][]string{
+				"bucket-0": {
+					TopologyEntry("package", []string{"suite/e1.spec.ts"}),
+					TopologyEntry("package", []string{"suite/e1.spec.ts"}),
+				},
+			}
+		}, "covering 1 distinct file(s)"},
+
+		// AND A TOPOLOGY WITH NO FILES IN IT AT ALL, which is what the
+		// projection used to record: kinds, and nothing to say which files
+		// they were.
+		{"a topology naming no files", StratumWholeFileMultiFile, func(d *AblationDerived) {
+			d.Topology = map[string][]string{"bucket-0": {"package", "package"}}
+		}, "state no file identity"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			idx, loader, keys, _ := campaignFixture(t)

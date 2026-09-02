@@ -63,6 +63,7 @@ func TestScorableRequiresTheWholeIdentity(t *testing.T) {
 	full := ContainmentIdentity{
 		Primitive: PrimitiveCgroup2, ID: "/sys/fs/cgroup/testbucket/tb-action-0",
 		Inode: "900000", BootID: "boot-1", RootPID: 4242, RootStart: "778899",
+		OwnerUID: 1000, OwnerGID: 900, Mode: 0o770,
 		MembershipControl: MembershipSupervisorOwned,
 	}
 	if !full.Scorable() {
@@ -81,12 +82,42 @@ func TestScorableRequiresTheWholeIdentity(t *testing.T) {
 		{"no root start", func(c *ContainmentIdentity) { c.RootStart = "  " }},
 		{"a membership the workload can write", func(c *ContainmentIdentity) { c.MembershipControl = MembershipWorkloadWritable }},
 		{"an unestablished membership model", func(c *ContainmentIdentity) { c.MembershipControl = "" }},
+		// THE INPUTS TO THAT MODEL, which the verifier reruns the rule over.
+		// The mode was optional, so an identity could omit it, assert
+		// supervisor ownership, skip the rederivation that omission gates and
+		// stay scorable — a conclusion with no retained inputs behind it.
+		{"no retained mode", func(c *ContainmentIdentity) { c.Mode = 0 }},
+		{"no retained owner uid", func(c *ContainmentIdentity) { c.OwnerUID = -1 }},
+		{"no retained owner gid", func(c *ContainmentIdentity) { c.OwnerGID = -1 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := full
 			tc.edit(&c)
 			if c.Scorable() {
 				t.Errorf("a containment with %s is scorable", tc.name)
+			}
+		})
+	}
+	// SAME compares the membership facts too. Two records naming one path,
+	// inode and boot were treated as one containment however they described
+	// its ownership, so a producer could keep the identity and restate the
+	// owner, the mode or the conclusion and nothing noticed.
+	for _, tc := range []struct {
+		name string
+		edit func(*ContainmentIdentity)
+	}{
+		{"a different owner uid", func(c *ContainmentIdentity) { c.OwnerUID = 4242 }},
+		{"a different owner gid", func(c *ContainmentIdentity) { c.OwnerGID = 4242 }},
+		{"a different mode", func(c *ContainmentIdentity) { c.Mode = 0o777 }},
+		{"a different membership conclusion", func(c *ContainmentIdentity) { c.MembershipControl = MembershipWorkloadWritable }},
+		{"a different workload credential", func(c *ContainmentIdentity) { c.WorkloadUID = 31337 }},
+		{"a different workload group vector", func(c *ContainmentIdentity) { c.WorkloadGIDs = []int{31337} }},
+	} {
+		t.Run("Same with "+tc.name, func(t *testing.T) {
+			c := full
+			tc.edit(&c)
+			if full.Same(c) {
+				t.Errorf("two identities differing by %s compared as the same containment", tc.name)
 			}
 		})
 	}
@@ -127,7 +158,7 @@ func TestAWorkloadWritableContainmentIsNotScored(t *testing.T) {
 // and same-uid ownership — the shape the documented setup produces — is the
 // unscorable one.
 func TestTheMembershipModelIsReadNotAsserted(t *testing.T) {
-	if got := membershipControl(t.TempDir()); got != MembershipUnknown {
+	if got := membershipControl(t.TempDir(), resolveWorkloadCredential(os.Getenv(WorkloadUserEnv))); got != MembershipUnknown {
 		t.Errorf("a directory with no cgroup.procs established model %q, want %q", got, MembershipUnknown)
 	}
 	b, err := os.ReadFile(filepath.Join("..", "..", "cmd", "testbucket", "wallstage1.go"))
@@ -172,14 +203,14 @@ func TestADeclaredWorkloadUIDCannotMintTheBoundary(t *testing.T) {
 		// reads the owner and answers workload-writable, and a host with no
 		// cgroup-v2 to read answers unknown. Both are unscorable; what must
 		// never happen is a declaration producing the one answer that scores.
-		if got := membershipControl(dir); got == MembershipSupervisorOwned {
+		if got := membershipControl(dir, resolveWorkloadCredential(os.Getenv(WorkloadUserEnv))); got == MembershipSupervisorOwned {
 			t.Errorf("declaring workload uid %q made a file this process owns %q; a declaration cannot make the workload somebody else",
 				declared, got)
 		}
 	}
 	// The declaration may still WIDEN who lacks the boundary, never narrow it.
 	t.Setenv(WorkloadUIDEnv, strconv.Itoa(os.Getuid()))
-	if got := membershipControl(dir); got == MembershipSupervisorOwned {
+	if got := membershipControl(dir, resolveWorkloadCredential(os.Getenv(WorkloadUserEnv))); got == MembershipSupervisorOwned {
 		t.Errorf("membershipControl=%q for a file owned by a declared workload uid", got)
 	}
 }

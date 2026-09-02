@@ -22,9 +22,13 @@ import (
 // was measured in.
 func verifyProcessTree(v *Verdict, envs []Envelope, recs []Record) {
 	trees := map[string][]Record{}
+	children := map[string][]Record{}
 	for _, r := range recs {
-		if r.Kind == "process_tree" {
+		switch r.Kind {
+		case "process_tree":
 			trees[envelopeKey(r.Level, r.Seqno)] = append(trees[envelopeKey(r.Level, r.Seqno)], r)
+		case "action_child":
+			children[envelopeKey(r.Level, r.Seqno)] = append(children[envelopeKey(r.Level, r.Seqno)], r)
 		}
 	}
 	for _, e := range envs {
@@ -88,6 +92,18 @@ func verifyProcessTree(v *Verdict, envs []Envelope, recs []Record) {
 		// that changed parent, session, process group or start identity
 		// between admission and its last observation is not the process the
 		// envelope admitted.
+		//
+		// AT THE ACTION LEVEL IT IS THE CONTAINMENT THAT SPANS, and the
+		// records are readings taken by four different step processes. Running
+		// the transition check there compared two wrappers that were never
+		// meant to be the same process and made every production action row
+		// terminal; what that level must show instead is one unbroken
+		// containment read from inside it, plus the children it owned.
+		if e.Level == LevelAction {
+			checkActionSpan(v, label, e, found)
+			checkActionChildren(v, label, e, children[envelopeKey(e.Level, e.Seq)])
+			continue
+		}
 		for _, first := range admitted {
 			for _, later := range append(append([]Record{}, observed...), drained...) {
 				checkIdentityTransition(v, label, first.Proc, later.Proc, later.Boundary)
@@ -118,11 +134,20 @@ func checkAdmittedMembership(v *Verdict, label string, r Record) {
 		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
 			"%s lists members %v, none of which is the measured process %d", where, r.RawProcs, r.Proc.PID))
 	}
-	// EXACT CARDINALITY. At admission the containment holds the admitted child
-	// and nothing else: the wrapper does not join it, and the child has not run
-	// long enough to fork. More members than that is an unknown descendant
-	// already present, which the contract makes terminal.
-	if len(r.RawProcs) != 1 {
+	// EXACT CARDINALITY, WHERE THERE IS AN ADMITTED CHILD. At admission a
+	// script or invocation containment holds that child and nothing else: the
+	// wrapper does not join it, and the child has not run long enough to fork.
+	// More members than that is an unknown descendant already present, which
+	// the contract makes terminal.
+	//
+	// The ACTION containment is not that shape and never was. `wall begin`
+	// joins the containment it created and admits the containment peer and the
+	// trace collector into it before it reads — three members by construction,
+	// on every production action — so requiring one here made the level
+	// terminal for doing exactly what the contract tells it to do. What that
+	// level must show is that the reading was taken from inside, which
+	// checkActionSpan requires of every action record.
+	if r.Level != LevelAction && len(r.RawProcs) != 1 {
 		v.add("WT-033", SeverityTerminal, fmt.Sprintf(
 			"%s lists %d members (%v) at admission; the containment is created fresh and holds exactly the admitted child, so anything else is a process nobody accounted for",
 			where, len(r.RawProcs), r.RawProcs))
@@ -197,8 +222,7 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 	// envelope's process.
 	if !r.Containment.Same(e.Containment) {
 		v.add("WT-033", SeverityTerminal, fmt.Sprintf(
-			"%s: a process-tree record names containment %s/%s, not this envelope's %s/%s",
-			label, r.Containment.ID, r.Containment.Inode, e.Containment.ID, e.Containment.Inode))
+			"%s: a process-tree record names a containment whose %s", label, r.Containment.Differs(e.Containment)))
 		return
 	}
 	// WHO WROTE IT. The record is the PHYSICAL wrapper's account of the process
@@ -244,8 +268,20 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
 			"%s: the process-tree record for pid %d names no process group, so a PGID change is undecidable", label, p.PID))
 	}
-	// THE ACTION LEVEL HAS NO MEASURED CHILD, and the two rules below are
-	// about one.
+	// THE MEMBERSHIP DECISION, REDERIVED — AT EVERY LEVEL.
+	//
+	// The producer wrote MembershipControl as a string and the verifier
+	// believed it — a non-reproducible summary of the one property eligibility
+	// turns on, about a cgroup that no longer exists by the time anyone reads
+	// the records. The inputs are retained now, so the rule runs again here.
+	//
+	// It runs BEFORE the action level returns. It used to run after, so an
+	// action containment could be world-writable, assert supervisor ownership
+	// and never be rechecked — the level whose containment spans the whole
+	// envelope was the one level whose membership nobody rederived.
+	rederiveMembership(v, label, e, r)
+	// THE ACTION LEVEL HAS NO MEASURED CHILD, and the rules below are about
+	// one.
 	//
 	// A script or invocation envelope wraps a command: the wrapper creates the
 	// containment and admits a child into it, so the measured process must be
@@ -289,32 +325,18 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 				label, p.UID))
 		}
 	}
-	// THE MEMBERSHIP DECISION, REDERIVED.
+	// AND THE DECLARED WORKLOAD IS THE ONE THAT RAN.
 	//
-	// The producer wrote MembershipControl as a string and the verifier
-	// believed it — a non-reproducible summary of the one property eligibility
-	// turns on, about a cgroup that no longer exists by the time anyone reads
-	// the records. The inputs are retained now, so the rule runs again here on
-	// the measured process's OWN group vector as the kernel reported it.
-	if e.Containment.Primitive == PrimitiveCgroup2 && e.Containment.Mode != 0 {
-		perm := e.Containment.Mode
-		rederived := membershipModelFor(MembershipFacts{
-			OwnerUID: uint32(e.Containment.OwnerUID), OwnerGID: uint32(e.Containment.OwnerGID),
-			GroupWritable: perm&0o020 != 0, OtherWritable: perm&0o002 != 0,
-			SelfUID:      p.UID,
-			WorkloadUIDs: []int{p.UID},
-			WorkloadGIDs: append(append([]int{}, p.Groups...), p.GID),
-		})
-		if rederived != e.Containment.MembershipControl {
-			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
-				"%s: the containment records membership control %q, but rerunning the rule over its retained owner %d:%d, mode %04o and the measured process's own group vector %v derives %q; a producer's summary of the property eligibility turns on is not the property",
-				label, e.Containment.MembershipControl, e.Containment.OwnerUID, e.Containment.OwnerGID, perm,
-				append(append([]int{}, p.Groups...), p.GID), rederived))
-		}
-		if rederived != MembershipSupervisorOwned {
-			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
-				"%s: rerun over the retained facts, the measured process could write this containment's cgroup.procs (%s)", label, rederived))
-		}
+	// The invocation child is the process the workload account exists for. A
+	// containment retaining one workload credential while the process measured
+	// inside it ran as another means the rule above was rerun against a party
+	// that was not there — a declaration standing in for the boundary rather
+	// than describing it.
+	if r.Level == LevelInvocation && e.Containment.WorkloadUID > 0 && p.UID >= 0 &&
+		p.UID != e.Containment.WorkloadUID {
+		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+			"%s: the containment retains workload credential uid %d, but the process measured inside it ran as uid %d; the membership rule was rerun against a credential that did not run",
+			label, e.Containment.WorkloadUID, p.UID))
 	}
 	if p.SessionID <= 0 {
 		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
@@ -328,6 +350,171 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 		v.add("WT-033", SeverityTerminal, fmt.Sprintf(
 			"%s: the measured process %d/%s is the containment's own root process; the wrapper creates the containment and admits the child into it, so these cannot be the same process",
 			label, p.PID, p.StartID))
+	}
+}
+
+// rederiveMembership reruns the membership rule over the facts the record
+// retained, and reports when the producer's conclusion is not what the rule
+// derives — or when what it derives is a containment the workload could write.
+//
+// THE SUBJECT IS THE WORKLOAD, not whichever process took the reading.
+//
+// The question the contract asks is "could the measured workload rewrite the
+// membership history this envelope rests on", and at the action level there is
+// no measured child whose uid could stand in for the workload's — which is
+// why the rederivation used to be skipped there entirely. The workload
+// credential is retained on the containment now, so the same question has an
+// answer at every level, and it is the same question at every level.
+//
+// At the invocation level the measured process IS the workload, so its own
+// credential joins the subject: the retained declaration and the credential
+// the kernel reported must both fail to reach the file.
+func rederiveMembership(v *Verdict, label string, e Envelope, r Record) {
+	c := e.Containment
+	if c.Primitive != PrimitiveCgroup2 || c.Mode == 0 {
+		// A containment that retained no mode retained no inputs; Scorable
+		// refuses it outright rather than letting an omission skip the rule.
+		return
+	}
+	p := r.Proc
+	uids, gids, subject := membershipSubject(c, p, r.Level)
+	rederived := membershipModelFor(MembershipFacts{
+		OwnerUID: uint32(c.OwnerUID), OwnerGID: uint32(c.OwnerGID),
+		GroupWritable: c.Mode&0o020 != 0, OtherWritable: c.Mode&0o002 != 0,
+		SelfUID:      p.UID,
+		WorkloadUIDs: uids, WorkloadGIDs: gids,
+	})
+	if rederived != c.MembershipControl {
+		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+			"%s: the containment records membership control %q, but rerunning the rule over its retained owner %d:%d, mode %04o and %s derives %q; a producer's summary of the property eligibility turns on is not the property",
+			label, c.MembershipControl, c.OwnerUID, c.OwnerGID, c.Mode, subject, rederived))
+	}
+	if rederived != MembershipSupervisorOwned {
+		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+			"%s: rerun over the retained facts, %s could write this containment's cgroup.procs (%s)", label, subject, rederived))
+	}
+}
+
+// membershipSubject is the credential the rule is rerun against, and the words
+// that name it in a finding.
+func membershipSubject(c ContainmentIdentity, p ProcIdentity, level Level) ([]int, []int, string) {
+	var uids, gids []int
+	var described string
+	// A retained workload uid is a POSITIVE one. Zero is root, and a workload
+	// running as root holds every capability this boundary exists to deny, so
+	// it can never be the credential a scored row rests on; reading the zero
+	// value as a declaration would let an identity that retained nothing be
+	// rerun against uid 0 and pass.
+	if c.WorkloadUID > 0 {
+		uids, gids = append(uids, c.WorkloadUID), append(gids, c.WorkloadGIDs...)
+		described = fmt.Sprintf("the retained workload credential %d%v", c.WorkloadUID, c.WorkloadGIDs)
+	}
+	// The invocation child is the workload, so the credential the kernel
+	// reported for it is part of the subject rather than a second opinion
+	// about it. At the script level it is NOT: the script account owns the
+	// subtree delegated to it precisely so it can create the invocation
+	// containments, and asking whether it can write its own delegated subtree
+	// would refuse the only arrangement in which that level can run at all —
+	// what it cannot write is the enclosing action containment, which is what
+	// keeps it inside the lifecycle.
+	if level == LevelInvocation || len(uids) == 0 {
+		uids = append(uids, p.UID)
+		gids = append(gids, append(append([]int{}, p.Groups...), p.GID)...)
+		if described == "" {
+			described = fmt.Sprintf("the measured process's own credential %d%v", p.UID, append(append([]int{}, p.Groups...), p.GID))
+		} else {
+			described += fmt.Sprintf(" together with the measured process's own %d%v", p.UID, append(append([]int{}, p.Groups...), p.GID))
+		}
+	}
+	return uids, gids, described
+}
+
+// checkActionSpan adjudicates the action level's process-tree records, whose
+// subject is the CONTAINMENT rather than a process.
+//
+// The universal admitted-to-observed comparison could not hold here and was
+// never about this level: `wall begin`, the setup step, the bucket step and
+// `wall end` are separate step processes that each join the same containment,
+// so a different pid at the closing read is the DESIGN, and reporting it as
+// "a different pid is a different process" made every production action row
+// terminal by construction.
+//
+// What must hold instead is what the action actually claims: one containment,
+// unbroken across the interval, with every reading taken from inside it by a
+// process that says which process it was.
+func checkActionSpan(v *Verdict, label string, e Envelope, found []Record) {
+	for _, r := range found {
+		if !r.Containment.SameRoot(e.Containment) {
+			v.add("WT-033", SeverityTerminal, fmt.Sprintf(
+				"%s: an action process-tree record names a containment created for root %d/%s, not this envelope's %d/%s; what spans an action is its containment, so two readings of different containments cannot describe one action",
+				label, r.Containment.RootPID, r.Containment.RootStart, e.Containment.RootPID, e.Containment.RootStart))
+			continue
+		}
+		// THE OBSERVER WAS INSIDE WHAT IT READ.
+		//
+		// A wrapper that reads `cgroup.procs` from outside the containment
+		// reports on a container it was never in; the action level has no
+		// measured child, so this is the only thing that ties a reading to the
+		// process that took it. The drained read is exempt because it is taken
+		// after the containment empties — that is what it is for.
+		if r.Boundary == "end" || r.RawProcs == nil {
+			continue
+		}
+		var inside bool
+		for _, pid := range r.RawProcs {
+			if pid == r.Proc.PID {
+				inside = true
+			}
+		}
+		if !inside {
+			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+				"%s: the %s action reading was taken by pid %d, which its own membership snapshot %v does not contain; a wrapper that had not joined the containment is reporting on one it was never in",
+				label, r.Boundary, r.Proc.PID, r.RawProcs))
+		}
+	}
+}
+
+// checkActionChildren adjudicates the action-owned children.
+//
+// `RunInAction` retains one record per child, and NOTHING READ THEM. The
+// contract asks for containment proof before every action-owned child, and the
+// producer of exactly that proof was disconnected from eligibility: a setup
+// command that started, forked and vanished left a record no verdict consulted.
+func checkActionChildren(v *Verdict, label string, e Envelope, children []Record) {
+	for _, r := range children {
+		where := fmt.Sprintf("%s action child", label)
+		if !r.Containment.Same(e.Containment) {
+			v.add("WT-033", SeverityTerminal, fmt.Sprintf(
+				"%s: an action-child record names a containment whose %s", where, r.Containment.Differs(e.Containment)))
+			continue
+		}
+		if r.Producer != ProducerPhysical || r.Source != SourceProcessLifecycle {
+			v.add("WT-033", SeverityTerminal, fmt.Sprintf(
+				"%s: an action-child record was written by %s with source %q; only the wrapper that spawned the child, reporting an observed lifecycle, can state its identity",
+				where, r.Producer, r.Source))
+			continue
+		}
+		p := r.Proc
+		if p.PID <= 0 || strings.TrimSpace(p.StartID) == "" || p.PGID <= 0 || p.SessionID <= 0 || p.ParentPID <= 0 {
+			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+				"%s: pid %d is retained without the complete start/session/group/parent identity, so nothing states which process the action owned",
+				where, p.PID))
+		}
+		if !requireMembershipEvidence(v, where, r) {
+			continue
+		}
+		var inside bool
+		for _, pid := range r.RawProcs {
+			if pid == p.PID {
+				inside = true
+			}
+		}
+		if !inside {
+			v.add("WT-033", SeverityTerminal, fmt.Sprintf(
+				"%s: pid %d is not in the membership %v read while it was running; the contract asks for containment proof BEFORE every action-owned child, and a child outside the action containment is work the peer and the trace never bracketed",
+				where, p.PID, r.RawProcs))
+		}
+		rederiveMembership(v, where, e, r)
 	}
 }
 

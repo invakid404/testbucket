@@ -219,44 +219,76 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 	return idx, loader, []string{PublicKeyOf(key)}, key
 }
 
-// derivedFor is the plan each stratum's experiment actually derives. The four
-// are materially different documents, because the four are different
-// experiments: a collision run holds an atom with two packages, a slice run
-// renders an invocation covering part of a file, a multi-file run schedules
-// several files, and a sequential run renders more than one invocation.
+// derivedFor is the plan each stratum's experiment actually derives, in the
+// grammar the planner writes: unit ids as core renders them (`file`,
+// `file[name|name]`, `mod:<dir>`) and topology entries as
+// walltime.TopologyEntry writes them — the KIND together with the FILES that
+// unit covers.
+//
+// The four are materially different documents, because the four are different
+// experiments: a collision run schedules an atom's two files as ONE unit, a
+// slice run divides one file across separate invocations, a multi-file run
+// schedules whole files from more than one file, and a sequential run renders
+// several invocations in one bucket. They used to be four tuples of the word
+// "file", which is a shape no planner produces and which the gate could not
+// tell apart.
 func derivedFor(stratum string) AblationDerived {
 	switch stratum {
 	case StratumCollisionAtom:
+		// The two files of one suffix-collision atom, packed into the single
+		// module-atom unit that is the whole reason an atom cannot be split.
 		return AblationDerived{
-			Atoms:      map[string][]string{"suite/a.spec.ts::collide": {"pkg-a", "pkg-b"}},
-			Topology:   map[string][]string{"bucket-0": {"file"}},
-			Membership: map[string][]string{"bucket-0/inv-0": {"u1", "u2"}},
+			Atoms: map[string][]string{"suite/collide": {"suite/a.spec.ts", "suite/b.spec.ts"}},
+			Topology: map[string][]string{
+				"bucket-0": {TopologyEntry("module-atom", []string{"suite/a.spec.ts", "suite/b.spec.ts"})},
+			},
+			Membership: map[string][]string{"bucket-0/inv-0": {"mod:suite"}},
 		}
 	case StratumLegalNonAtomSlice:
+		// One file divided into two name slices, run as separate invocations.
+		// Its atom holds only itself, which is what makes the slice legal.
 		return AblationDerived{
-			Atoms:    map[string][]string{"suite/b.spec.ts::solo": {"pkg-c"}},
-			Topology: map[string][]string{"bucket-0": {"slice"}},
+			Atoms: map[string][]string{"suite/c.spec.ts::solo": {"suite/c.spec.ts"}},
+			Topology: map[string][]string{
+				"bucket-0": {
+					TopologyEntry("run-slice", []string{"suite/c.spec.ts"}),
+					TopologyEntry("run-slice", []string{"suite/c.spec.ts"}),
+				},
+			},
 			Membership: map[string][]string{
-				"bucket-0/inv-0": {"u1", "u2", "u3"},
-				"bucket-0/inv-1": {"u1"},
+				"bucket-0/inv-0": {"suite/c.spec.ts[first]"},
+				"bucket-0/inv-1": {"suite/c.spec.ts[second]"},
 			},
 		}
 	case StratumSequentialInvocs:
+		// Three invocations, one after another, in ONE bucket: a sequence is a
+		// property of a lane, not of a plan that happens to have three lanes.
 		return AblationDerived{
-			Atoms:    map[string][]string{"suite/c.spec.ts::one": {"pkg-d"}},
-			Topology: map[string][]string{"bucket-0": {"file", "file", "file"}},
+			Atoms: map[string][]string{"suite/d.spec.ts::one": {"suite/d.spec.ts"}},
+			Topology: map[string][]string{
+				"bucket-0": {
+					TopologyEntry("package", []string{"suite/d1.spec.ts"}),
+					TopologyEntry("package", []string{"suite/d2.spec.ts"}),
+					TopologyEntry("package", []string{"suite/d3.spec.ts"}),
+				},
+			},
 			Membership: map[string][]string{
-				"bucket-0/inv-0": {"u1"},
-				"bucket-0/inv-1": {"u2"},
-				"bucket-0/inv-2": {"u3"},
+				"bucket-0/inv-0": {"suite/d1.spec.ts"},
+				"bucket-0/inv-1": {"suite/d2.spec.ts"},
+				"bucket-0/inv-2": {"suite/d3.spec.ts"},
 			},
 		}
 	default: // whole-file multi-file
 		return AblationDerived{
-			Atoms:    map[string][]string{"suite/d.spec.ts::one": {"pkg-e"}},
-			Topology: map[string][]string{"bucket-0": {"file", "file"}},
+			Atoms: map[string][]string{"suite/e.spec.ts::one": {"suite/e1.spec.ts"}},
+			Topology: map[string][]string{
+				"bucket-0": {
+					TopologyEntry("package", []string{"suite/e1.spec.ts"}),
+					TopologyEntry("package", []string{"suite/e2.spec.ts"}),
+				},
+			},
 			Membership: map[string][]string{
-				"bucket-0/inv-0": {"u1", "u2"},
+				"bucket-0/inv-0": {"suite/e1.spec.ts", "suite/e2.spec.ts"},
 			},
 		}
 	}

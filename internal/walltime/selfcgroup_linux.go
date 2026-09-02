@@ -41,15 +41,16 @@ func SelfContainment() (*ContainmentIdentity, bool) {
 		return nil, false
 	}
 	self := os.Getpid()
-	return &ContainmentIdentity{
-		Primitive:         PrimitiveCgroup2,
-		ID:                dir,
-		Inode:             strconv.FormatUint(sys.Ino, 10),
-		BootID:            bootIdentity(),
-		RootPID:           self,
-		RootStart:         processStartID(self),
-		MembershipControl: membershipControl(dir),
-	}, true
+	ident := &ContainmentIdentity{
+		Primitive: PrimitiveCgroup2,
+		ID:        dir,
+		Inode:     strconv.FormatUint(sys.Ino, 10),
+		BootID:    bootIdentity(),
+		RootPID:   self,
+		RootStart: processStartID(self),
+	}
+	retainMembershipFacts(ident, dir)
+	return ident, true
 }
 
 // selfCgroupPath reads the unified-hierarchy line of /proc/self/cgroup, which

@@ -220,18 +220,31 @@ func (r *Runner) runDiscovery(ctx context.Context) ([]byte, error) {
 	// observed value: a change to how the invocation is assembled would make
 	// the bundle's provenance describe a command nobody issued, and nothing
 	// would notice.
-	r.observed = &DiscoveryProvenance{Argv: append(append([]string{}, vt.command...), args...), Cwd: r.root}
-	out, err := vt.run(ctx, r.root, args...)
+	var prov ExecProvenance
+	out, err := vt.runWith(ctx, r.root, &prov, args...)
+	r.observed = &DiscoveryProvenance{
+		Argv: prov.Argv, Cwd: prov.Cwd, Path: prov.Path, Env: prov.Env,
+	}
 	if err != nil {
 		return nil, r.discoveryError(err)
 	}
 	return out, nil
 }
 
-// DiscoveryProvenance is the exact invocation a discovery run issued.
+// DiscoveryProvenance is the exact invocation a discovery run issued: its
+// argv, the RESOLVED executable that ran, the directory it ran from and the
+// complete environment it ran with.
+//
+// Path and Env are what make it replayable rather than descriptive. The bundle
+// used to carry the intended argv beside a closure resolved afterwards from
+// whatever PATH the resolver saw, and an environment recorded as an allow-list
+// of values plus digests of everything else — from which nobody can reconstruct
+// the process that took the snapshot.
 type DiscoveryProvenance struct {
 	Argv []string
 	Cwd  string
+	Path string
+	Env  []string
 }
 
 // Discovered reports the argv and cwd of the discovery subprocess this runner
@@ -251,7 +264,11 @@ func (r *Runner) Root() string { return r.root }
 // so the selection is unit-tested without spawning a process.
 func (r *Runner) discoveryInvocation() (nodetool, []string) {
 	if len(r.discoveryCmd) > 0 {
-		return nodetool{command: r.discoveryCmd, timeout: r.tool.timeout}, nil
+		// The same environment the base tool runs with. Dropping it here would
+		// have let a verbatim discovery command inherit the ambient
+		// environment while the bundle recorded the one everything else ran
+		// under.
+		return nodetool{command: r.discoveryCmd, timeout: r.tool.timeout, env: r.tool.env}, nil
 	}
 	if r.discoveryMode == discoveryList {
 		return r.tool, []string{"list", "--json"}

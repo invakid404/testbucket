@@ -34,8 +34,11 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # READ ONLY. This job builds and attests; nothing it produces reaches
+    # GitHub until an independent verifier has countersigned it and the
+    # publish job has re-checked both signatures.
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,38 +105,26 @@ jobs:
       # the exact goreleaser output was never attested on the path that
       # actually ships it.
       #
-      # It attests every asset in the canonical publish set, so the statement
-      # covers what is published rather than a binary built beside it. The
-      # builder key is a secret; without it this fails closed, which is correct
-      # — an unattested delivery is not a delivery this contract admits.
-      - name: Attest the release artifacts
+      # This is the BUILDER'S HALF ONLY. It states the subject, the source and
+      # the builder's own identity, signed with the builder key. It does NOT
+      # state that anything was verified: the verifier id, the verifier binary,
+      # the instant and the result used to be written here too, all chosen by
+      # the builder and signed with the builder's key, which is a build
+      # vouching for itself. The `verify` job below is the second party, and
+      # `publish` will not run without its countersignature.
+      - name: Attest the release artifacts (builder half)
         env:
           TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
           TB_ATTESTATION_DIR: ${{ runner.temp }}/attestations
           TB_RELEASE_SHA: ${{ github.sha }}
           TB_WALL_BUILDER_KEY: ${{ secrets.TB_WALL_BUILDER_KEY }}
           TB_BUILDER_ID: ${{ github.repository }}/${{ github.workflow_ref }}
-          # The INDEPENDENT verifier identity. It is a separate input because a
-          # build that vouches for itself has been checked by nobody: this step
-          # passed the builder identity as the verifier too, `wall attest`
-          # wrote `Result: verified`, signed with the builder key and then
-          # checked only that same signature. The verifier now refuses an
-          # attestation whose builder and verifier are the same identity, so
-          # this must resolve to a party that is not the builder.
-          TB_VERIFIER_ID: ${{ vars.TB_RELEASE_VERIFIER_ID }}
           TB_ISSUER: https://token.actions.githubusercontent.com
           TB_RUN: ${{ github.run_id }}
           TB_ATTEMPT: ${{ github.run_attempt }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ -z "${TB_VERIFIER_ID:-}" ] || [ "${TB_VERIFIER_ID:-}" = "$TB_BUILDER_ID" ]; then
-            echo "REFUSED: no INDEPENDENT verifier identity (repository variable TB_RELEASE_VERIFIER_ID)." >&2
-            echo "A build attestation whose builder and verifier are the same identity is a build" >&2
-            echo "vouching for itself, which the frozen contract makes ineligible. Set it to the" >&2
-            echo "party that actually checks the delivered artifact, and never to the builder." >&2
-            exit 1
-          fi
           if [ -z "${TB_WALL_BUILDER_KEY:-}" ]; then
             echo "REFUSED: no builder signing key (secret TB_WALL_BUILDER_KEY)." >&2
             echo "Stage 1 requires a SIGNED build attestation for the delivered binary," >&2
@@ -141,7 +132,6 @@ jobs:
             exit 1
           fi
           mkdir -p "$TB_ATTESTATION_DIR"
-          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           mapfile -t assets < <(jq -r '.assets[].path' "$TB_RELEASE_MANIFEST")
           for a in "${assets[@]}"; do
             name="$(basename "$a")"
@@ -154,11 +144,176 @@ jobs:
               --issuer "$TB_ISSUER" \
               --build-run "$TB_RUN" \
               --build-attempt "$TB_ATTEMPT" \
-              --verifier-id "$TB_VERIFIER_ID" \
-              --verified-at "$now" \
               --out "$TB_ATTESTATION_DIR/$name.attestation.json"
           done
           echo "attested ${#assets[@]} released asset(s) from $TB_RELEASE_SHA"
+          echo "NOT YET VERIFIED: the verify job must countersign these before publish runs"
+
+      # HAND THE EXACT BYTES TO THE NEXT JOB.
+      #
+      # The verifier must obtain the artifact for itself rather than be told
+      # its digest, and the publisher must upload the bytes that were gated —
+      # so dist, the manifest and the builder attestations travel as one
+      # artifact and every later job works from what it downloaded.
+      - name: Upload the built artifacts for verification
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-build
+          path: |
+            dist
+            ${{ runner.temp }}/release-manifest.json
+            ${{ runner.temp }}/attestations
+          if-no-files-found: error
+          retention-days: 7
+
+  # THE INDEPENDENT VERIFIER.
+  #
+  # A separate job, a separate key and a separate copy of the artifact. It
+  # downloads what the builder produced, RE-DERIVES each asset's digest for
+  # itself, and signs what it concluded under TB_WALL_VERIFIER_KEY — which the
+  # builder job is never given. `wall countersign` refuses a verifier identity
+  # equal to the builder's, refuses a verifier key equal to the builder's, and
+  # refuses bytes whose digest is not the one the builder attested.
+  #
+  # This is what "verified" now means. It used to mean a string in a repository
+  # variable that the builder wrote into its own document.
+  verify:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+
+      - name: Download the built artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/build
+
+      - name: Countersign every asset independently
+        env:
+          TB_WALL_VERIFIER_KEY: ${{ secrets.TB_WALL_VERIFIER_KEY }}
+          TB_BUILDER_PUBLIC_KEY: ${{ vars.TB_RELEASE_BUILDER_PUBLIC_KEY }}
+          TB_VERIFIER_ID: ${{ vars.TB_RELEASE_VERIFIER_ID }}
+          TB_BUILDER_ID: ${{ github.repository }}/${{ github.workflow_ref }}
+          TB_BUILD: ${{ runner.temp }}/build
+          TB_VERIFIED_DIR: ${{ runner.temp }}/verified
+        run: |
+          set -euo pipefail
+          if [ -z "${TB_WALL_VERIFIER_KEY:-}" ]; then
+            echo "REFUSED: no verifier signing key (secret TB_WALL_VERIFIER_KEY)." >&2
+            echo "The verifier signs under its own key, or it is not a second party." >&2
+            exit 1
+          fi
+          if [ -z "${TB_BUILDER_PUBLIC_KEY:-}" ]; then
+            echo "REFUSED: no predeclared builder public key (variable TB_RELEASE_BUILDER_PUBLIC_KEY)." >&2
+            echo "An attestation authenticated against whatever signed it is one anybody can mint." >&2
+            exit 1
+          fi
+          if [ -z "${TB_VERIFIER_ID:-}" ] || [ "${TB_VERIFIER_ID:-}" = "$TB_BUILDER_ID" ]; then
+            echo "REFUSED: no INDEPENDENT verifier identity (variable TB_RELEASE_VERIFIER_ID)." >&2
+            echo "A build attestation whose builder and verifier are the same identity is a build" >&2
+            echo "vouching for itself, which the frozen contract makes ineligible." >&2
+            exit 1
+          fi
+          go build -o "$RUNNER_TEMP/testbucket-verifier" ./cmd/testbucket
+          mkdir -p "$TB_VERIFIED_DIR"
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_BUILD/release-manifest.json")
+          for a in "${assets[@]}"; do
+            name="$(basename "$a")"
+            "$RUNNER_TEMP/testbucket-verifier" wall countersign \
+              --attestation "$TB_BUILD/attestations/$name.attestation.json" \
+              --subject "$TB_BUILD/$a" \
+              --verifier-id "$TB_VERIFIER_ID" \
+              --verified-at "$now" \
+              --builder-key "$TB_BUILDER_PUBLIC_KEY" \
+              --out "$TB_VERIFIED_DIR/$name.attestation.json"
+          done
+          echo "countersigned ${#assets[@]} asset(s) as $TB_VERIFIER_ID"
+
+      - name: Upload the countersigned attestations
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-verified
+          path: ${{ runner.temp }}/verified
+          if-no-files-found: error
+          retention-days: 7
+
+  # THE PUBLISHER, which runs only after an independent party has signed.
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+
+      - name: Download the built artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/build
+
+      - name: Download the countersigned attestations
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-verified
+          path: ${{ runner.temp }}/verified
+
+      # THE ATTESTATION IS A RELEASE INPUT, not a file written beside one.
+      #
+      # Every asset about to be uploaded must carry an attestation that
+      # authenticates against BOTH predeclared keys and names the exact bytes
+      # on disk. Without this step the attestations were produced and then
+      # never consulted by anything downstream, so they gated nothing even on
+      # their own terms.
+      - name: Refuse an asset with no independently verified attestation
+        env:
+          TB_BUILD: ${{ runner.temp }}/build
+          TB_VERIFIED: ${{ runner.temp }}/verified
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_BUILDER_PUBLIC_KEY: ${{ vars.TB_RELEASE_BUILDER_PUBLIC_KEY }}
+          TB_VERIFIER_PUBLIC_KEY: ${{ vars.TB_RELEASE_VERIFIER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TB_BUILDER_PUBLIC_KEY:-}" ] || [ -z "${TB_VERIFIER_PUBLIC_KEY:-}" ]; then
+            echo "REFUSED: both predeclared public keys are required" >&2
+            echo "(variables TB_RELEASE_BUILDER_PUBLIC_KEY and TB_RELEASE_VERIFIER_PUBLIC_KEY)." >&2
+            exit 1
+          fi
+          if [ "$TB_BUILDER_PUBLIC_KEY" = "$TB_VERIFIER_PUBLIC_KEY" ]; then
+            echo "REFUSED: the builder and verifier keys are the same key; one party with two labels" >&2
+            echo "is not independent verification." >&2
+            exit 1
+          fi
+          go build -o "$RUNNER_TEMP/testbucket-gate" ./cmd/testbucket
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_BUILD/release-manifest.json")
+          for a in "${assets[@]}"; do
+            name="$(basename "$a")"
+            "$RUNNER_TEMP/testbucket-gate" wall verify-attestation \
+              --attestation "$TB_VERIFIED/$name.attestation.json" \
+              --subject "$TB_BUILD/$a" \
+              --source-commit "$TB_RELEASE_SHA" \
+              --key "$TB_BUILDER_PUBLIC_KEY" \
+              --key "$TB_VERIFIER_PUBLIC_KEY"
+          done
+          echo "every one of ${#assets[@]} asset(s) carries an independently countersigned attestation"
 
       # THE CAMPAIGN GATE. The frozen acceptance contract prohibits release
       # until an authenticated five-pair / ten-run / eighty-action-row campaign
@@ -191,7 +346,12 @@ jobs:
           # the tag NAME: a tag is descriptive metadata that can be moved, and
           # a moved tag must not inherit another commit's evidence.
           TB_RELEASE_SHA: ${{ github.sha }}
-          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+          # The manifest and the assets are the ones this job DOWNLOADED, which
+          # are the bytes the verifier countersigned and the bytes about to be
+          # uploaded. Gating a copy the publisher does not hold would gate a
+          # different set.
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/build/release-manifest.json
+          TB_BUILD: ${{ runner.temp }}/build
         run: |
           set -euo pipefail
           if [ ! -f "$TB_CAMPAIGN_INDEX" ]; then
@@ -215,7 +375,7 @@ jobs:
             --authority-key "$TB_CAMPAIGN_AUTHORITY_KEY" \
             --release-sha "$TB_RELEASE_SHA" \
             --release-manifest "$TB_RELEASE_MANIFEST" \
-            --release-dist .
+            --release-dist "$TB_BUILD"
           echo "campaign gate: the frozen decision rule passes over the retained population,"
           echo "and that population authorises exactly $TB_RELEASE_SHA and these exact assets"
 
@@ -232,12 +392,13 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
           TB_RELEASE_SHA: ${{ github.sha }}
-          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/build/release-manifest.json
+          TB_BUILD: ${{ runner.temp }}/build
           GITHUB_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mapfile -t assets < <(jq -r '.assets[].path' "$TB_RELEASE_MANIFEST")
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_RELEASE_MANIFEST" | sed "s|^|$TB_BUILD/|")
           if [ "${#assets[@]}" -eq 0 ]; then
             echo "REFUSED: the verified publish set names no asset." >&2
             exit 1
@@ -307,7 +468,7 @@ jobs:
   # release published but this failed transiently, rerunning just recomputes and
   # re-points — it never rebuilds or re-uploads.
   alias:
-    needs: release
+    needs: publish
     runs-on: ubuntu-latest
     permissions:
       contents: write

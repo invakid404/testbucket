@@ -361,7 +361,15 @@ const testViteConfig = "export default { test: { fileParallelism: false } }\n"
 // doing two jobs.
 var testBuilderAuthority = mustSigningKey()
 
-func testBuilderKeys() []string { return []string{PublicKeyOf(testBuilderAuthority)} }
+// testDeliveryVerifierAuthority is the INDEPENDENT verifier that countersigns
+// a build. It is a separate key held by a separate party: the builder signs
+// what it built, and somebody else obtains the artifact, re-derives its digest
+// and signs what they concluded. Two labels over one key would be one party.
+var testDeliveryVerifierAuthority = mustSigningKey()
+
+func testBuilderKeys() []string {
+	return []string{PublicKeyOf(testBuilderAuthority), PublicKeyOf(testDeliveryVerifierAuthority)}
+}
 
 // testVerdictAuthority signs verifier verdicts. It is a THIRD party: the
 // campaign authority approves the inputs, this one judges the rows, and one
@@ -393,6 +401,12 @@ func testBuildAttestation(binary Digest, commit string) BuildAttestation {
 	// disagreed with it would be an unchecked string beside an authenticated
 	// one.
 	if err := a.Sign(a.BuilderID, testBuilderAuthority); err != nil {
+		panic(err)
+	}
+	// AND COUNTERSIGNED by the verifier it names, under the verifier's own
+	// key. Without this the verifier is a string the builder wrote beside a
+	// result the builder also wrote.
+	if err := a.Countersign(a.VerifierID, testDeliveryVerifierAuthority); err != nil {
 		panic(err)
 	}
 	return a
@@ -512,7 +526,11 @@ func evidenceLabel(id string, ns int64, features ...Feature) TrainingLabel {
 				// a pid alone is a number the kernel reuses.
 				RootPID: 4242, RootStart: "778899",
 				// Owned by a credential the measured workload does not have:
-				// on cgroup-v2 `cgroup.procs` is the migration control.
+				// on cgroup-v2 `cgroup.procs` is the migration control. The
+				// INPUTS to that decision are retained beside it, because a
+				// conclusion whose inputs nobody kept cannot be rederived.
+				OwnerUID: 1000, OwnerGID: 900, Mode: 0o770,
+				WorkloadUID: 1001, WorkloadGIDs: []int{1001},
 				MembershipControl: MembershipSupervisorOwned,
 			},
 			Terminal: TerminalPassed, ObservedAt: at, DurationNs: ns,

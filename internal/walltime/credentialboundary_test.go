@@ -250,26 +250,74 @@ func TestTheProductionLaunchPathAppliesTheCredentialDrop(t *testing.T) {
 	}
 }
 
-// TestTheNestedScoredPathStaysRunnable is the F2 regression.
+// TestBothMeasuredLevelsDropToTheirOwnAccount is the F2 regression.
 //
-// Dropping at every level is not a stricter version of dropping at one: the
-// script body writes evidence into the wrapper-owned records directory and
-// starts nested wrappers that create, admit into, freeze and destroy
-// containments in the delegated subtree. A workload account able to do that
-// has the boundary back; one unable to do it cannot run the nested topology at
-// all. The composition has to be level-aware, and this pins which level.
-func TestTheNestedScoredPathStaysRunnable(t *testing.T) {
-	body := productionFunc(t, "exec.go", "func workloadArgv(")
-	if !strings.Contains(body, "if level != LevelInvocation") {
-		t.Error("the drop is not level-aware; at script level it would hand the workload the evidence directory and the nested containment operations, or break them")
-	}
+// Dropping only the invocation could not produce an eligible SCRIPT row. The
+// script's measured child kept the wrapper's credential, and the wrapper's own
+// verifier makes a measured process running as the credential that owns its
+// containment unscorable — so the producer and the verifier were asking for
+// opposite things at that level and no passing script row could exist.
+//
+// The resolution is a second account, not a relaxed rule. There are two
+// measured parties: the harness-generated bucket script, which starts the
+// nested wrappers and is therefore handed the delegated script subtree, and
+// the test code, which is handed nothing. The ACTION level still does not
+// drop, because it has no measured child at all — its containment is joined by
+// the step processes themselves.
+func TestBothMeasuredLevelsDropToTheirOwnAccount(t *testing.T) {
 	t.Setenv(WorkloadUserEnv, "tb-workload")
+	t.Setenv(ScriptUserEnv, "tb-script")
 	argv := []string{"bash", "-c", "generated bucket body"}
-	if got := workloadArgv(LevelScript, argv); len(got) != len(argv) {
-		t.Errorf("the script body was dropped to the workload account: %v", got)
+	script := workloadArgv(LevelScript, argv)
+	if len(script) == len(argv) {
+		t.Error("the bucket script was NOT dropped; it would run as the credential owning its own containment, which this wrapper's verifier refuses to score")
 	}
-	if got := workloadArgv(LevelInvocation, argv); len(got) == len(argv) {
+	if len(script) > 3 && script[3] != "tb-script" {
+		t.Errorf("the script dropped to %q, not the script account", script[3])
+	}
+	invocation := workloadArgv(LevelInvocation, argv)
+	if len(invocation) == len(argv) {
 		t.Error("the invocation child was NOT dropped; that is the one process tree running somebody else's code")
+	}
+	if len(invocation) > 3 && invocation[3] != "tb-workload" {
+		t.Errorf("the invocation dropped to %q, not the workload account", invocation[3])
+	}
+	// TWO ACCOUNTS, NOT ONE. A single account for both would give the test
+	// code the script's delegated subtree back.
+	if len(script) > 3 && len(invocation) > 3 && script[3] == invocation[3] {
+		t.Error("the script and the invocation dropped to the same account; the delegated subtree the script needs is exactly what the test code must not have")
+	}
+	if got := workloadArgv(LevelAction, argv); len(got) != len(argv) {
+		t.Errorf("the action level dropped: %v; it wraps a sequence of job steps and has no measured child to drop", got)
+	}
+	// And an undeclared account still runs, unwrapped and ineligible, rather
+	// than failing closed on a host that has not been set up.
+	t.Setenv(ScriptUserEnv, "")
+	if got := workloadArgv(LevelScript, argv); len(got) != len(argv) {
+		t.Errorf("an undeclared script account still wrapped the command: %v", got)
+	}
+}
+
+// TestTheScriptSubtreeIsDelegatedBeforeTheScriptStarts is the other half of
+// F2: the drop is only executable if the dropped account can still do the work
+// that level owns.
+//
+// cgroup-v2 requires write access to the COMMON ANCESTOR's `cgroup.procs` to
+// place a process into a sub-cgroup, so a script account with no delegated
+// subtree could not create a single invocation containment — the drop would
+// compile, ship, and break the nested topology on the first bucket.
+func TestTheScriptSubtreeIsDelegatedBeforeTheScriptStarts(t *testing.T) {
+	body := productionFunc(t, "exec.go", "func Exec(")
+	delegate := strings.Index(body, "delegateScriptSubtree(cont)")
+	child := strings.Index(body, "runChild(")
+	if delegate < 0 {
+		t.Fatal("Exec never delegates the script subtree; the dropped script cannot create the invocation containments it is supposed to start")
+	}
+	if child >= 0 && delegate > child {
+		t.Errorf("the delegation at %d happens after the child at %d; the script would already be running", delegate, child)
+	}
+	if !strings.Contains(body, "if opt.Level == LevelScript {") {
+		t.Error("the delegation is not scoped to the script level; delegating an invocation containment would hand the test code the migration control")
 	}
 }
 
@@ -334,8 +382,45 @@ func TestTheGroupVectorComesFromTheProcessNotEtcGroup(t *testing.T) {
 	if !strings.Contains(run, "processGroupsOf(cmd.Process.Pid)") {
 		t.Error("the measured child's group vector is not read from the process")
 	}
-	rederive := productionFunc(t, "proctree.go", "func checkProcessTree(")
-	if !strings.Contains(rederive, "WorkloadGIDs: append(append([]int{}, p.Groups...), p.GID)") {
+	// The verifier reruns the rule over the RETAINED workload credential, and
+	// at the invocation level over the measured process's own vector as well —
+	// the level where the measured process is the workload.
+	subject := productionFunc(t, "proctree.go", "func membershipSubject(")
+	if !strings.Contains(subject, "append(append([]int{}, p.Groups...), p.GID)") {
 		t.Error("the verifier does not rederive over the process's own group vector")
+	}
+	if !strings.Contains(subject, "level == LevelInvocation") {
+		t.Error("the subject of the rederivation is not level-aware")
+	}
+	if !strings.Contains(subject, "c.WorkloadUID > 0") {
+		t.Error("the verifier does not use the retained workload credential, so the action level has no workload to rerun the rule about")
+	}
+}
+
+// TestTheRetainedWorkloadCredentialIsResolvedNotDeclared: the producer used to
+// answer the membership question by reading /etc/passwd and /etc/group at
+// decision time and writing down its conclusion. Nobody could rerun that — the
+// accounts database is not part of the evidence and the cgroup is gone — so
+// the facts are resolved once and retained on the identity the records carry.
+func TestTheRetainedWorkloadCredentialIsResolvedNotDeclared(t *testing.T) {
+	retain := productionFunc(t, "contain_linux.go", "func retainMembershipFacts(")
+	for _, want := range []string{
+		"resolveWorkloadCredential(os.Getenv(WorkloadUserEnv))",
+		"ident.WorkloadUID = w.UID",
+		"ident.WorkloadGIDs = append",
+	} {
+		if !strings.Contains(retain, want) {
+			t.Errorf("the containment identity does not retain %q, so the rule cannot be rerun from the record", want)
+		}
+	}
+	// And the decision function takes those facts as an ARGUMENT rather than
+	// reading the accounts files itself, which is what makes the producer's
+	// answer and the verifier's rerun the same computation.
+	decide := productionFunc(t, "membership_linux.go", "func membershipControl(")
+	if strings.Contains(decide, "/etc/group") || strings.Contains(decide, "/etc/passwd") {
+		t.Error("membershipControl still reads the accounts database at decision time")
+	}
+	if !strings.Contains(decide, "w WorkloadCredential") {
+		t.Error("membershipControl does not take the resolved workload credential as retained facts")
 	}
 }

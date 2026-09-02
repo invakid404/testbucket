@@ -5,44 +5,97 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
-// TestPlanningEnvBindsTheWholeInheritedEnvironment is part of F6.
+// TestPlanningEnvIsTheEnvironmentTheAcquisitionRanWith is the F6 regression.
 //
-// Discovery and runnable subprocesses run with a nil `Cmd.Env` and therefore
-// inherit everything. The bundle recorded five allow-listed variables, so
-// `PATH`, `NODE_OPTIONS`, package-manager configuration and proxy settings —
-// every one of which can change which tool runs and how — were neither frozen
-// nor eliminated. An allow-list records what the author thought mattered
-// rather than what the plan was derived under.
+// Two defects, one cause. The subprocesses ran with a nil `Cmd.Env` and
+// inherited everything, and the bundle recorded exact values only for an
+// allow-list — binding every other inherited variable by the DIGEST of its
+// value. A digest says that a variable had some value; nobody can rerun
+// `vitest list` from a hash, so the plan was derived under an environment the
+// bundle could not reconstruct, and this test used to assert that a digest was
+// sufficient.
 //
-// Publishing every value would publish secrets, so the remainder is bound by
-// the digest of its value: the SET is complete, a change to any of it is
-// visible, and nothing secret is written into a document meant to be
-// published.
-func TestPlanningEnvBindsTheWholeInheritedEnvironment(t *testing.T) {
+// The record and the executed environment are now built from one read, so they
+// cannot differ, and the only values withheld are the wall-time secret and
+// capability keys — withheld from the SUBPROCESS as well, so nothing is
+// claimed to have run with a value that was not there.
+func TestPlanningEnvIsTheEnvironmentTheAcquisitionRanWith(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/bin")
 	t.Setenv("NODE_OPTIONS", "--max-old-space-size=4096")
-	t.Setenv("TB_TEST_SECRET_TOKEN", "hunter2")
+	t.Setenv("TB_ARBITRARY_PLANNING_INPUT", "exact-value-needed-for-replay")
+	t.Setenv(walltime.RunKeyEnv, "a-signing-key")
 
-	env := planningEnv()
-	for _, name := range []string{"PATH", "NODE_OPTIONS"} {
-		if env[name] == "" {
-			t.Errorf("planningEnv does not record %s, which selects which tool runs", name)
+	record, env := planningEnvironment()
+	for _, name := range []string{"PATH", "NODE_OPTIONS", "TB_ARBITRARY_PLANNING_INPUT"} {
+		if record[name] != os.Getenv(name) {
+			t.Errorf("the retained environment records %s as %q, not the exact value %q the acquisition ran under; a replay cannot reconstruct a subprocess from a description of it",
+				name, record[name], os.Getenv(name))
 		}
 	}
-	// Everything else is present by name, bound by digest, and never by value.
-	digested, ok := env["digest:TB_TEST_SECRET_TOKEN"]
-	if !ok {
-		t.Error("planningEnv omits an inherited variable entirely; the recorded set is not the set the subprocess inherited")
+	// THE RECORD IS THE ENVIRONMENT. Every KEY=VALUE handed to the subprocess
+	// is in the record with the same value, and nothing in the record claims a
+	// variable the subprocess did not get.
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
 	}
-	if digested == "hunter2" {
-		t.Error("planningEnv wrote a secret's value into a bundle meant to be published")
-	}
-	for k, v := range env {
-		if v == "hunter2" {
-			t.Errorf("planningEnv leaked a secret value under %q", k)
+	for k, v := range record {
+		if strings.HasPrefix(k, "digest:") {
+			continue
 		}
+		if have, ok := got[k]; !ok || have != v {
+			t.Errorf("the record binds %s=%q but the subprocess environment has %q (present=%v)", k, v, have, ok)
+		}
+	}
+	for k, v := range got {
+		if record[k] != v {
+			t.Errorf("the subprocess ran with %s=%q, which the record does not bind", k, v)
+		}
+	}
+	// THE SECRET AND CAPABILITY KEYS are withheld from both, and named by
+	// digest so their presence and any change to them is still visible.
+	for _, secret := range walltime.WallTimeSecretEnv {
+		if _, leaked := got[secret]; leaked && os.Getenv(secret) != "" {
+			t.Errorf("the acquisition subprocess was handed %s", secret)
+		}
+	}
+	if record[walltime.RunKeyEnv] == "a-signing-key" {
+		t.Error("planningEnv wrote a signing key into a bundle meant to be published")
+	}
+	if record["digest:"+walltime.RunKeyEnv] == "" {
+		t.Errorf("planningEnv omits %s entirely; the recorded set is not the set the process held", walltime.RunKeyEnv)
+	}
+	for k, v := range record {
+		if v == "a-signing-key" {
+			t.Errorf("planningEnv leaked a signing key under %q", k)
+		}
+	}
+}
+
+// TestTheAcquisitionSubprocessRunsWithTheRetainedEnvironment: the record is
+// only replayable if the subprocess was actually given it.
+func TestTheAcquisitionSubprocessRunsWithTheRetainedEnvironment(t *testing.T) {
+	b, err := os.ReadFile("wallplan.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "Env: planningEnvArgs(),") {
+		t.Error("the runner is not given the retained environment, so the acquisition inherits whatever is ambient and the bundle describes something else")
+	}
+	exec, err := os.ReadFile(filepath.Join("..", "..", "internal", "runner", "vitestrunner", "exec.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(exec), "cmd.Env = t.env") {
+		t.Error("the acquisition subprocess still runs with a nil Cmd.Env")
+	}
+	if !strings.Contains(string(exec), "cmd.Path") {
+		t.Error("the acquisition does not retain the executable exec.Command actually resolved")
 	}
 }
 
@@ -64,7 +117,7 @@ func TestTheAcquisitionRootIsTheCanonicalAbsolutePath(t *testing.T) {
 	if strings.Contains(source, "Root: *root, Runner: \"vitest\"") {
 		t.Error("the bundle still records the caller's spelling of --root as the acquisition cwd")
 	}
-	if !strings.Contains(source, "Resolve: closureResolver(acquiredRoot)") {
+	if !strings.Contains(source, "Resolve: closureResolver(acquiredRoot, observedPaths)") {
 		t.Error("the executable closure is resolved against a root other than the one that ran")
 	}
 }

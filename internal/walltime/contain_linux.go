@@ -64,7 +64,7 @@ func newCgroupUnder(root, name string) (Containment, error) {
 		return newProcessGroupContainment(name, "cannot read containment inode")
 	}
 	self := os.Getpid()
-	return &cgroup2{
+	c := &cgroup2{
 		dir: dir,
 		ident: ContainmentIdentity{
 			Primitive: PrimitiveCgroup2,
@@ -73,15 +73,100 @@ func newCgroupUnder(root, name string) (Containment, error) {
 			BootID:    bootIdentity(),
 			RootPID:   self,
 			RootStart: processStartID(self),
-			// Established by reading the filesystem, not asserted. A
-			// containment whose membership the workload can rewrite cannot
-			// prove the nested history the envelope is built on.
-			MembershipControl: membershipControl(dir),
-			OwnerUID:          containmentOwnerUID(dir),
-			OwnerGID:          containmentOwnerGID(dir),
-			Mode:              containmentMode(dir),
 		},
-	}, nil
+	}
+	// Established by reading the filesystem, not asserted. A containment whose
+	// membership the workload can rewrite cannot prove the nested history the
+	// envelope is built on.
+	retainMembershipFacts(&c.ident, dir)
+	return c, nil
+}
+
+// retainMembershipFacts reads the owner, mode and declared workload credential
+// a containment's membership decision is made from, and retains ALL of them
+// beside the conclusion.
+//
+// The conclusion alone is a producer's summary of the one property eligibility
+// turns on, about a cgroup that no longer exists when anyone reads the
+// records. Retaining the inputs is what lets the verifier run the same rule
+// again — including at the action level, where there is no measured child
+// whose own uid could stand in for the workload's.
+func retainMembershipFacts(ident *ContainmentIdentity, dir string) {
+	w := resolveWorkloadCredential(os.Getenv(WorkloadUserEnv))
+	ident.MembershipControl = membershipControl(dir, w)
+	ident.OwnerUID = containmentOwnerUID(dir)
+	ident.OwnerGID = containmentOwnerGID(dir)
+	ident.Mode = containmentMode(dir)
+	ident.WorkloadUID = w.UID
+	ident.WorkloadGIDs = append([]int(nil), w.GIDs...)
+}
+
+// delegateScriptSubtree delegates a script containment to the declared script
+// account and RE-READS the facts, because delegating changed them.
+//
+// Retaining the pre-delegation owner and mode would have described a
+// containment that no longer existed by the time the script started, and the
+// verifier reruns the membership rule over exactly these retained values.
+func delegateScriptSubtree(cont Containment) error {
+	c, ok := cont.(*cgroup2)
+	if !ok {
+		return nil
+	}
+	user := strings.TrimSpace(os.Getenv(ScriptUserEnv))
+	if user == "" {
+		return nil
+	}
+	if err := delegateSubtree(c.dir, user); err != nil {
+		return err
+	}
+	retainMembershipFacts(&c.ident, c.dir)
+	return nil
+}
+
+// delegateSubtree hands a containment's SUBTREE to a named account's group,
+// so that account can create containments inside it and admit its own
+// processes into them — and cannot do either anywhere else.
+//
+// This is what makes the script level's credential drop executable rather than
+// decorative. The measured bucket script starts nested `wall exec` wrappers,
+// and cgroup-v2 requires write access to the COMMON ANCESTOR's `cgroup.procs`
+// to place a process into a sub-cgroup: without the delegated subtree the
+// dropped script simply could not create the invocation containments, and with
+// it the script can rearrange only inside a subtree it cannot leave, because
+// the enclosing action containment stays supervisor-owned.
+//
+// The workload account is deliberately NOT delegated anything. The membership
+// rule is rerun against the workload's own credential, so this delegation is
+// visible in the retained owner/mode facts rather than asserted here.
+func delegateSubtree(dir, user string) error {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		return nil
+	}
+	w := resolveWorkloadCredential(user)
+	if len(w.GIDs) == 0 {
+		return fmt.Errorf("resolve the primary group of %q", user)
+	}
+	gid := w.GIDs[0]
+	for _, path := range []string{dir, filepath.Join(dir, "cgroup.procs"), filepath.Join(dir, "cgroup.subtree_control")} {
+		info, err := os.Stat(path)
+		if err != nil {
+			// cgroup.subtree_control is absent on a leaf without enabled
+			// controllers; the two that matter are the directory and
+			// cgroup.procs, and their absence is a real failure below.
+			if os.IsNotExist(err) && strings.HasSuffix(path, "cgroup.subtree_control") {
+				continue
+			}
+			return err
+		}
+		if err := os.Chown(path, -1, gid); err != nil {
+			return fmt.Errorf("chgrp %s to %s: %w", path, user, err)
+		}
+		if err := os.Chmod(path, info.Mode().Perm()|0o070); err != nil {
+			return fmt.Errorf("chmod %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // containmentOwnerUID is the credential owning this containment's

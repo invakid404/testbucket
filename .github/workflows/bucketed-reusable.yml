@@ -150,6 +150,19 @@ on:
           reported INELIGIBLE rather than scored.
         type: string
         default: ""
+      script-user:
+        description: >-
+          The account the measured BUCKET SCRIPT runs under, distinct both from
+          the wrapper's account and from workload-user. There are two measured
+          parties: the harness-generated bucket script, which starts the nested
+          invocation wrappers and therefore needs the delegated script subtree,
+          and the test code, which must have none of it. Running the script as
+          the wrapper made that level unscorable by the wrapper's own rule.
+          Establish the account alongside workload-user in a PRIOR step of the
+          calling job; left empty the script level is recorded in full and
+          reported INELIGIBLE rather than scored.
+        type: string
+        default: ""
       workload-uid:
         description: >-
           ADDITIONAL uids the measured workload may run as, comma-separated,
@@ -720,6 +733,7 @@ jobs:
           cgroup-root: ${{ inputs.cgroup-root }}
           workload-uid: ${{ inputs.workload-uid }}
           workload-user: ${{ inputs.workload-user }}
+          script-user: ${{ inputs.script-user }}
           campaign-id: ${{ inputs.campaign-id }}
           stage1-digest: ${{ inputs.stage1-digest }}
           stage2-digest: ${{ inputs.stage2-digest }}

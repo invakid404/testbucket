@@ -38,7 +38,7 @@ func TestTheClosureBindsTheProgramThatActuallyLaunchesTheFacade(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	execs, tools, err := closureResolver(root)([]string{"pnpm", "exec", "tsx", "scripts/tb-vitest.ts"})
+	execs, tools, err := closureResolver(root, nil)([]string{"pnpm", "exec", "tsx", "scripts/tb-vitest.ts"})
 	if err != nil {
 		t.Fatalf("closureResolver: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestAnUnresolvableDelegatedProgramFailsClosed(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	_, _, err := closureResolver(root)([]string{"pnpm", "exec", "definitely-not-installed", "x.ts"})
+	_, _, err := closureResolver(root, nil)([]string{"pnpm", "exec", "definitely-not-installed", "x.ts"})
 	if err == nil {
 		t.Fatal("a closure was returned for a launcher whose selected executable does not resolve")
 	}
@@ -104,7 +104,7 @@ func TestAnOrdinaryCommandDelegatesToNothing(t *testing.T) {
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	// `vitest list --json` is not a launcher; nothing is delegated.
-	execs, _, err := closureResolver(root)([]string{"vitest", "list", "--filesOnly", "--json"})
+	execs, _, err := closureResolver(root, nil)([]string{"vitest", "list", "--filesOnly", "--json"})
 	if err != nil {
 		t.Fatalf("closureResolver: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestAnOrdinaryCommandDelegatesToNothing(t *testing.T) {
 		t.Errorf("an ordinary command resolved %d executables: %v", len(execs), execs)
 	}
 	// `npx vitest` IS a launcher, and delegates to vitest.
-	execs, tools, err := closureResolver(root)([]string{"npx", "vitest", "list", "--json"})
+	execs, tools, err := closureResolver(root, nil)([]string{"npx", "vitest", "list", "--json"})
 	if err != nil {
 		t.Fatalf("closureResolver: %v", err)
 	}

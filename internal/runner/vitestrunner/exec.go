@@ -24,6 +24,26 @@ type nodetool struct {
 	command []string
 	// timeout bounds each subprocess. Zero disables the per-command deadline.
 	timeout time.Duration
+	// env is the EXACT environment every subprocess runs with, as KEY=VALUE.
+	//
+	// It used to be nil, which makes Go pass the whole ambient environment
+	// through unread — so the acquisition ran under an environment nobody
+	// recorded and a replay had nothing to reproduce. Nil still means inherit,
+	// but the caller that intends the bundle to be replayable supplies the
+	// same map it retains, and then the recorded environment IS the one the
+	// subprocess ran with.
+	env []string
+}
+
+// ExecProvenance is what one acquisition subprocess actually ran with: the
+// argv, the RESOLVED executable path, the working directory and the complete
+// environment. It is filled in before the process starts, so a run that fails
+// still says what was attempted.
+type ExecProvenance struct {
+	Argv []string
+	Path string
+	Cwd  string
+	Env  []string
 }
 
 // timeoutError is returned when a subprocess hit ITS OWN deadline (not the
@@ -63,6 +83,17 @@ func (t nodetool) context(ctx context.Context) (context.Context, context.CancelF
 // returns its stdout. A deadline hit is reported as such so a timeout never
 // reads as a broken project.
 func (t nodetool) run(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return t.runWith(ctx, dir, nil, args...)
+}
+
+// runWith is run(), recording WHAT IT ACTUALLY RAN into prov before it runs it.
+//
+// The resolved executable is the point. `exec.Command` resolves argv[0] on
+// PATH when it builds the command, and that resolution — not a second
+// exec.LookPath taken afterwards, from a possibly different PATH — is the
+// program that ran. A provenance record that resolves the head again later
+// describes a binary that may never have executed.
+func (t nodetool) runWith(ctx context.Context, dir string, prov *ExecProvenance, args ...string) ([]byte, error) {
 	if len(t.command) == 0 {
 		return nil, fmt.Errorf("vitestrunner: no vitest command configured")
 	}
@@ -72,6 +103,21 @@ func (t nodetool) run(ctx context.Context, dir string, args ...string) ([]byte, 
 	full := append(append([]string(nil), t.command[1:]...), args...)
 	cmd := exec.CommandContext(cctx, t.command[0], full...)
 	cmd.Dir = dir
+	// THE ENVIRONMENT, EXPANDED RATHER THAN INHERITED IMPLICITLY.
+	//
+	// A nil Cmd.Env inherits everything and states nothing; the acquisition
+	// bundle is supposed to let somebody rerun this exact subprocess.
+	cmd.Env = t.env
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	if prov != nil {
+		*prov = ExecProvenance{
+			Argv: append([]string{t.command[0]}, full...),
+			Path: cmd.Path, Cwd: dir,
+			Env: append([]string(nil), cmd.Env...),
+		}
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

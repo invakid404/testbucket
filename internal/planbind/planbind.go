@@ -264,6 +264,9 @@ type Result struct {
 	// rather than recomputed, so a scorer that moved afterwards cannot make a
 	// prediction look better than it was.
 	Allocator *Allocator
+	// Derived is the atom/topology/membership projections whose digests the
+	// receipt binds — the document the campaign's ablation gate reads.
+	Derived walltime.AblationDerived
 }
 
 // PlanOptions configures the replay.
@@ -369,7 +372,8 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 	if opt.Scorer != nil {
 		receipt.PlannerResult += fmt.Sprintf(" allocation=palloc scorer=%s", opt.Scorer.ID)
 	}
-	return &Result{Doc: doc, Receipt: *receipt, Bundle: b, Allocator: allocator}, nil
+	return &Result{Doc: doc, Receipt: *receipt, Bundle: b, Allocator: allocator,
+		Derived: DerivedProjections(doc, live)}, nil
 }
 
 // deriveReceipt computes every digest the Stage-2 receipt carries, plus the
@@ -387,15 +391,16 @@ func deriveReceipt(stage1 walltime.Digest, b *walltime.PlanningInputBundle, doc 
 	if err != nil {
 		return nil, err
 	}
-	atoms, err := walltime.DigestJSON(atomProjection(live))
+	derived := DerivedProjections(doc, live)
+	atoms, err := walltime.DigestJSON(derived.Atoms)
 	if err != nil {
 		return nil, err
 	}
-	topology, err := walltime.DigestJSON(topologyProjection(doc))
+	topology, err := walltime.DigestJSON(derived.Topology)
 	if err != nil {
 		return nil, err
 	}
-	membership, err := walltime.DigestJSON(membershipProjection(doc))
+	membership, err := walltime.DigestJSON(derived.Membership)
 	if err != nil {
 		return nil, err
 	}
@@ -492,6 +497,23 @@ func SemanticProjection(doc *core.PlanDocument) SemanticPlan {
 	return out
 }
 
+// DerivedProjections is the plan's own atom, topology and membership
+// projections, as ONE document.
+//
+// The campaign gate reads exactly these three maps and asks what the schedule
+// realized; the Stage-2 receipt binds their digests. They are built here, by
+// the same call that computes those digests, so the document a run publishes
+// and the digests its receipt carries cannot be derived from different plans.
+// Nothing in production produced this document before: the gate could only
+// ever be handed one somebody wrote by hand.
+func DerivedProjections(doc *core.PlanDocument, live []runner.LivePackage) walltime.AblationDerived {
+	return walltime.AblationDerived{
+		Atoms:      atomProjection(live),
+		Topology:   topologyProjection(doc),
+		Membership: membershipProjection(doc),
+	}
+}
+
 // atomProjection is the suffix-collision atom closure: which targets must ride
 // together. It is digested separately because an atom split is terminal, and a
 // terminal condition deserves its own identity.
@@ -511,13 +533,23 @@ func atomProjection(live []runner.LivePackage) map[string][]string {
 }
 
 // topologyProjection is the shape of the schedule: which unit kinds landed in
-// which bucket, in order.
+// which bucket, in order — AND WHICH FILES each of those units covers.
+//
+// The kind alone could not establish the topology the contract's strata are
+// about. "Two whole-file units" says nothing about how many files were
+// scheduled, so a plan running one file twice and a plan running two files
+// projected identically, and a multi-file condition could not be proved from
+// the document that is supposed to prove it. The files a unit covers are the
+// unit's own Packages, spelled out rather than parsed back out of an id whose
+// slice form embeds arbitrary runnable names.
 func topologyProjection(doc *core.PlanDocument) map[string][]string {
 	out := map[string][]string{}
 	for _, b := range doc.Buckets {
 		key := fmt.Sprintf("bucket-%d", b.Index)
 		for _, u := range b.Units {
-			out[key] = append(out[key], string(u.Kind))
+			files := append([]string(nil), u.Packages...)
+			sort.Strings(files)
+			out[key] = append(out[key], walltime.TopologyEntry(string(u.Kind), files))
 		}
 	}
 	return out

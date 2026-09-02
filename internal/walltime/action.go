@@ -439,16 +439,36 @@ func retainActionChild(dir string, st *ActionState, pid int, argv []string) {
 		Producer: ProducerPhysical, Level: LevelAction, Seq: actionChildSeq(dir),
 		PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
 	}, st.Run)
-	_, _ = w.Append(Record{
+	proc := ProcIdentity{
+		PID: pid, PGID: processGroupOf(pid), StartID: processStartID(pid),
+		SessionID: processSessionOf(pid), ParentPID: os.Getpid(),
+		UID: processUIDOf(pid),
+	}
+	proc.GID, proc.Groups = processGroupsOf(pid)
+	rec := Record{
 		Kind: "action_child", Role: RolePhysicalAction, Level: LevelAction,
 		Source: SourceProcessLifecycle, Run: st.Run, Containment: st.Containment,
-		Instant: NewSystemClock().Now(),
-		Proc: ProcIdentity{
-			PID: pid, PGID: processGroupOf(pid), StartID: processStartID(pid),
-			SessionID: processSessionOf(pid), ParentPID: os.Getpid(),
-		},
+		Instant: NewSystemClock().Now(), Proc: proc,
 		Note: "action-owned child: " + strings.Join(argv, " "),
-	})
+	}
+	// THE CONTAINMENT PROOF, WITH THE CHILD STILL IN IT.
+	//
+	// The record used to carry a pid and a note. The contract asks for
+	// containment proof BEFORE every action-owned child, and a pid with no
+	// membership read beside it proves the wrapper knew a number: it does not
+	// show the child was ever inside the action containment, and it left
+	// nothing for the verifier to rederive. This read takes the same raw
+	// kernel bytes every other endpoint takes, while the child is running.
+	if cont, err := AttachContainment(st.Containment); err == nil {
+		if ev, _, err := cont.Observe(string(ProducerPhysical)); err == nil {
+			rec.RawEventID, rec.RawEventDigest, rec.RawEventBytes = ev.ID, ev.Digest, ev.Bytes
+			rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
+			rec.Note += fmt.Sprintf("; cgroup.procs members while it ran: %d", len(ev.Procs))
+		} else {
+			rec.Note += "; cgroup.procs unreadable: " + err.Error()
+		}
+	}
+	_, _ = w.Append(rec)
 }
 
 // actionChildSeq numbers each action-owned child, so two of them do not claim
@@ -547,6 +567,18 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	}
 	if terminal == "" {
 		terminal = TerminalPassed
+	}
+	// THIS STEP JOINS THE CONTAINMENT BEFORE IT READS IT.
+	//
+	// `wall end` is a different step process from `wall begin`, and it took
+	// its reading from outside the containment it was reporting on — so the
+	// record named a process its own membership snapshot did not contain, and
+	// the closing observation was made by a wrapper that had never been
+	// inside. Joining first makes the reading an observation from within the
+	// lifecycle it closes, which is the only thing tying an action record to
+	// the process that took it.
+	if err := joinContainment(st.Containment, os.Getpid()); err != nil {
+		return st, fmt.Errorf("walltime: join the action containment before the closing reading: %w", err)
 	}
 	// THE OBSERVED READ, TAKEN BEFORE THE DRAIN.
 	//

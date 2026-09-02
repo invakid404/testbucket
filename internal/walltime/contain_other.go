@@ -25,3 +25,8 @@ func processStartID(int) string { return "" }
 func attachCgroup2(ident ContainmentIdentity) (Containment, error) {
 	return nil, fmt.Errorf("walltime: cgroup-v2 containment is Linux-only (host is %s)", runtime.GOOS)
 }
+
+// delegateScriptSubtree has no cgroup subtree to delegate off Linux. The run
+// is unscorable for want of a containment primitive long before the script
+// account matters.
+func delegateScriptSubtree(Containment) error { return nil }

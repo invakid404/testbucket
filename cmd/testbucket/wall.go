@@ -60,6 +60,12 @@ usage:
   testbucket wall train   [flags]  fit the frozen scorer from a sealed training
                                    receipt set of historical wrapper-qualified
                                    physical V labels
+  testbucket wall verify-attestation [flags]  refuse an asset whose
+                                    attestation does not authenticate against
+                                    BOTH predeclared keys
+  testbucket wall countersign [flags]  the VERIFIER'S independent signature
+                                    over a builder attestation, after
+                                    re-deriving the artifact's digest
   testbucket wall attest   [flags]  produce the builder's SIGNED build
                                    attestation for one exact artifact: its
                                    subject digest, source, builder, issuer,
@@ -112,6 +118,10 @@ func runWall(args []string) error {
 		return runWallCampaign(args[1:])
 	case "release-manifest":
 		return runWallReleaseManifest(args[1:])
+	case "verify-attestation":
+		return runWallVerifyAttestation(args[1:])
+	case "countersign":
+		return runWallCountersign(args[1:])
 	case "attest":
 		return runWallAttest(args[1:])
 	case "-h", "--help", "help":
@@ -506,16 +516,13 @@ func runWallAttest(args []string) error {
 	issuer := fs.String("issuer", "", "the identity vouching for that workload, e.g. the OIDC issuer (required)")
 	run := fs.String("build-run", "", "the run that produced it (required): the retained verification result is bound to it")
 	attempt := fs.String("build-attempt", "", "that run's attempt (required)")
-	verifierID := fs.String("verifier-id", "", "who checked the build (required)")
-	at := fs.String("verified-at", "", "RFC3339 instant the check was made (required)")
 	out := fs.String("out", "", "write the signed attestation here (required)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	required := map[string]string{
 		"--subject": *subject, "--source-repository": *repository, "--source-commit": *commit,
-		"--builder-id": *builderID, "--issuer": *issuer, "--verifier-id": *verifierID,
-		"--verified-at": *at, "--out": *out,
+		"--builder-id": *builderID, "--issuer": *issuer, "--out": *out,
 		// The run and attempt are what bind the retained verification result
 		// to a run a reader can go and look at.
 		"--build-run": *run, "--build-attempt": *attempt,
@@ -542,20 +549,19 @@ func runWallAttest(args []string) error {
 	if strings.TrimSpace(name) == "" {
 		name = filepath.Base(*subject)
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	selfDigest, err := walltime.FileDigest(self)
-	if err != nil {
-		return err
-	}
+	// THE BUILDER STATES ONLY THE BUILDER'S HALF.
+	//
+	// This command used to write the verifier id, the verifier's binary
+	// digest, the version, the instant of the verification and
+	// `Result: verified` as well — every one of them chosen by the builder and
+	// then signed with the builder's key. That document said a build had been
+	// checked, and the only party in it was the party that made it. The
+	// verifier fields are filled in by `wall countersign`, run by the verifier,
+	// from the artifact the verifier obtained for itself.
 	a := walltime.BuildAttestation{
 		Kind: walltime.BuildAttestationKind, SubjectName: name, SubjectDigest: digest,
 		SourceRepository: *repository, SourceCommit: *commit,
 		BuilderID: *builderID, Issuer: *issuer, BuildRun: *run, BuildAttempt: *attempt,
-		VerifierID: *verifierID, VerifierBinary: selfDigest, VerifierVersion: version,
-		VerifiedAt: *at, Result: walltime.AttestationVerified,
 	}
 	key, err := walltime.DecodeKey(strings.TrimSpace(os.Getenv(builderKeyEnv)))
 	if err != nil {
@@ -564,17 +570,139 @@ func runWallAttest(args []string) error {
 	if err := a.Sign(*builderID, key); err != nil {
 		return err
 	}
-	// Checked before it is written. An attestation that could not verify
-	// against its own subject would be discovered by Stage 1 instead.
-	if problems := a.Verify(digest, *commit, []string{walltime.PublicKeyOf(key)}); len(problems) > 0 {
-		return fmt.Errorf("the attestation this produced does not verify:\n  %s", strings.Join(problems, "\n  "))
+	if err := walltime.WriteJSONFile(*out, a); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "testbucket wall: attested %s\n  subject: %s\n  source:  %s@%s\n  builder: %s (%s)\n  key:     %s\n  NOT YET VERIFIED: an independent verifier must countersign this before it can admit a delivery\n",
+		name, digest, *repository, *commit, *builderID, *issuer, a.Signature.KeyID)
+	fmt.Println(a.Signature.KeyID)
+	return nil
+}
+
+// runWallCountersign is the VERIFIER'S half: obtain the artifact, re-derive
+// its digest, and sign what was concluded under the verifier's own key.
+//
+// It exists because "verified" was a word the builder wrote. The builder
+// cannot run this: the key it needs is a different secret, and the artifact it
+// checks is the one this job downloaded rather than the one the build step
+// still had on disk. What it produces is the second signature Verify requires,
+// and the release cannot publish without it.
+func runWallCountersign(args []string) error {
+	fs := flag.NewFlagSet("wall countersign", flag.ExitOnError)
+	in := fs.String("attestation", "", "the builder's signed attestation (required)")
+	subject := fs.String("subject", "", "path to the artifact the VERIFIER obtained, whose digest is recomputed here (required)")
+	verifierID := fs.String("verifier-id", "", "the identity doing the checking (required); it must not be the builder")
+	at := fs.String("verified-at", "", "RFC3339 instant this check was made (required)")
+	builderKey := fs.String("builder-key", "", "the builder's PUBLIC key, predeclared, so the builder half is authenticated before it is countersigned (required)")
+	out := fs.String("out", "", "write the countersigned attestation here (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	for name, value := range map[string]string{
+		"--attestation": *in, "--subject": *subject, "--verifier-id": *verifierID,
+		"--verified-at": *at, "--builder-key": *builderKey, "--out": *out,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s is required", name)
+		}
+	}
+	var a walltime.BuildAttestation
+	if err := walltime.ReadJSONFile(*in, &a); err != nil {
+		return err
+	}
+	// THE VERIFIER RE-DERIVES THE SUBJECT ITSELF. Countersigning a digest the
+	// builder computed would add a signature and no verification.
+	digest, err := walltime.FileDigest(*subject)
+	if err != nil {
+		return fmt.Errorf("digest the artifact this verifier obtained: %w", err)
+	}
+	if digest != a.SubjectDigest {
+		return fmt.Errorf("REFUSED: the artifact this verifier obtained digests to %s, but the builder attested %s; these are different bytes and no signature can reconcile them", digest, a.SubjectDigest)
+	}
+	if strings.TrimSpace(*verifierID) == strings.TrimSpace(a.BuilderID) {
+		return fmt.Errorf("REFUSED: the verifier identity %q is the builder's; a build that vouches for itself has been checked by nobody", *verifierID)
+	}
+	// The builder half is AUTHENTICATED before it is adopted. A
+	// countersignature over an unauthenticated statement says the verifier
+	// checked the bytes and believed whatever was written beside them.
+	builderDigest, err := a.BuilderDigestOf()
+	if err != nil {
+		return err
+	}
+	if err := walltime.VerifySigned(a.Signature, builderDigest, []string{strings.TrimSpace(*builderKey)}); err != nil {
+		return fmt.Errorf("the builder half does not authenticate against the predeclared builder key: %w", err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	selfDigest, err := walltime.FileDigest(self)
+	if err != nil {
+		return err
+	}
+	a.VerifierID, a.VerifierBinary, a.VerifierVersion = *verifierID, selfDigest, version
+	a.VerifiedAt, a.Result = *at, walltime.AttestationVerified
+	key, err := walltime.DecodeKey(strings.TrimSpace(os.Getenv(verifierKeyEnv)))
+	if err != nil {
+		return fmt.Errorf("%s: %w (the verifier signs under its own key, or it is not a second party)", verifierKeyEnv, err)
+	}
+	if walltime.PublicKeyOf(key) == strings.TrimSpace(*builderKey) {
+		return fmt.Errorf("REFUSED: the verifier key is the builder key; two identities holding one key are one party")
+	}
+	if err := a.Countersign(*verifierID, key); err != nil {
+		return err
+	}
+	// Checked before it is written, against both predeclared keys.
+	if problems := a.Verify(digest, a.SourceCommit, []string{strings.TrimSpace(*builderKey), walltime.PublicKeyOf(key)}); len(problems) > 0 {
+		return fmt.Errorf("the countersigned attestation does not verify:\n  %s", strings.Join(problems, "\n  "))
 	}
 	if err := walltime.WriteJSONFile(*out, a); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "testbucket wall: attested %s\n  subject: %s\n  source:  %s@%s\n  builder: %s (%s)\n  key:     %s\n",
-		name, digest, *repository, *commit, *builderID, *issuer, a.Signature.KeyID)
-	fmt.Println(a.Signature.KeyID)
+	fmt.Fprintf(os.Stderr, "testbucket wall: countersigned %s\n  subject:  %s\n  builder:  %s\n  verifier: %s\n  key:      %s\n",
+		a.SubjectName, digest, a.BuilderID, *verifierID, a.VerifierSignature.KeyID)
+	fmt.Println(a.VerifierSignature.KeyID)
+	return nil
+}
+
+// runWallVerifyAttestation is what makes an attestation a RELEASE INPUT.
+//
+// The attestations were produced and then consulted by nothing: no publish
+// step read them, so a delivery could ship with an attestation that did not
+// verify, or with none at all, and the files sat in a temp directory gating
+// nothing on their own terms. This refuses the asset unless the document
+// authenticates against both predeclared keys and describes the exact bytes
+// about to be uploaded.
+func runWallVerifyAttestation(args []string) error {
+	fs := flag.NewFlagSet("wall verify-attestation", flag.ExitOnError)
+	in := fs.String("attestation", "", "the countersigned attestation to check (required)")
+	subject := fs.String("subject", "", "path to the artifact about to be published (required); its digest is recomputed here")
+	commit := fs.String("source-commit", "", "the commit being released (required)")
+	var keys stringList
+	fs.Var(&keys, "key", "a PREDECLARED public key; repeat for the builder's and the verifier's (both required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*in) == "" || strings.TrimSpace(*subject) == "" || strings.TrimSpace(*commit) == "" {
+		return fmt.Errorf("--attestation, --subject and --source-commit are required")
+	}
+	if len(keys) < 2 {
+		return fmt.Errorf("two predeclared keys are required — the builder's and the independent verifier's; a delivery authenticated against one party is a delivery one party can mint")
+	}
+	var a walltime.BuildAttestation
+	if err := walltime.ReadJSONFile(*in, &a); err != nil {
+		return err
+	}
+	digest, err := walltime.FileDigest(*subject)
+	if err != nil {
+		return err
+	}
+	if problems := a.Verify(digest, *commit, keys); len(problems) > 0 {
+		return fmt.Errorf("REFUSED: %s is not covered by an independently verified attestation:\n  %s",
+			filepath.Base(*subject), strings.Join(problems, "\n  "))
+	}
+	fmt.Fprintf(os.Stderr, "testbucket wall: %s is attested by %s and independently verified by %s\n",
+		a.SubjectName, a.BuilderID, a.VerifierID)
 	return nil
 }
 

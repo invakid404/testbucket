@@ -57,6 +57,20 @@ type BuildAttestation struct {
 	VerifiedAt      string     `json:"verified_at"`
 	Result          string     `json:"result"`
 	Signature       *Signature `json:"signature,omitempty"`
+	// VerifierSignature is the VERIFIER'S OWN signature over the same
+	// attestation, and it is what makes the verifier a party rather than a
+	// label.
+	//
+	// The document carried one signature — the builder's — beside a verifier
+	// id, a verifier binary digest and `Result: verified`, all of them chosen
+	// and signed by the builder. Requiring the two identity STRINGS to differ
+	// only obliged a builder to pick two labels; nothing else in the document
+	// came from anywhere but the builder, so the retained verification result
+	// was the builder's statement that it had checked itself.
+	//
+	// A verification is somebody else re-deriving the subject and saying so
+	// under their own key. That is this field, and Verify requires it.
+	VerifierSignature *Signature `json:"verifier_signature,omitempty"`
 }
 
 // AttestationVerified is the only result that admits a delivery. Anything else
@@ -66,13 +80,40 @@ const AttestationVerified = "verified"
 // DigestOf is the attestation's canonical identity, excluding its signature.
 func (a BuildAttestation) DigestOf() (Digest, error) {
 	c := a
-	c.Signature = nil
+	c.Signature, c.VerifierSignature = nil, nil
 	return DigestJSON(c)
 }
 
-// Sign attaches the builder's detached signature.
+// BuilderDigestOf is what the BUILDER signs: the half of the document the
+// builder can honestly state — the subject, the source, and its own identity.
+//
+// It excludes the verifier's fields because the builder does not know them and
+// must not author them. The builder used to sign a complete document in which
+// the verifier id, the verifier's binary digest, the instant of the
+// verification and its RESULT were all values the builder had chosen; the
+// verifier is a separate party that fills those in afterwards, and a digest
+// covering them could not have been signed before they existed.
+func (a BuildAttestation) BuilderDigestOf() (Digest, error) {
+	c := a
+	c.Signature, c.VerifierSignature = nil, nil
+	c.VerifierID, c.VerifierBinary, c.VerifierVersion = "", "", ""
+	c.VerifiedAt, c.Result = "", ""
+	return DigestJSON(c)
+}
+
+// VerifierDigestOf is what the VERIFIER signs: the whole document, INCLUDING
+// the builder's signature. Countersigning the builder's signature is what ties
+// the two statements together — the verifier says which builder statement it
+// checked, not merely that it checked something with these fields.
+func (a BuildAttestation) VerifierDigestOf() (Digest, error) {
+	c := a
+	c.VerifierSignature = nil
+	return DigestJSON(c)
+}
+
+// Sign attaches the builder's detached signature over the builder half.
 func (a *BuildAttestation) Sign(builder string, key ed25519.PrivateKey) error {
-	d, err := a.DigestOf()
+	d, err := a.BuilderDigestOf()
 	if err != nil {
 		return err
 	}
@@ -80,13 +121,29 @@ func (a *BuildAttestation) Sign(builder string, key ed25519.PrivateKey) error {
 	return nil
 }
 
+// Countersign attaches the VERIFIER'S signature.
+//
+// It is a separate call because it is a separate party, holding a separate
+// key, in a separate job that obtained the artifact for itself and re-derived
+// its digest. It signs the whole document including the builder's signature,
+// so a countersignature cannot be lifted onto a different build statement.
+func (a *BuildAttestation) Countersign(verifier string, key ed25519.PrivateKey) error {
+	d, err := a.VerifierDigestOf()
+	if err != nil {
+		return err
+	}
+	a.VerifierSignature = &Signature{Authority: verifier, KeyID: PublicKeyOf(key), Digest: d, Value: SignApproval(verifier, key, d)}
+	return nil
+}
+
 // Verify checks the attestation against the delivery it claims to be about.
 //
 // binary and reviewTip are the manifest's own values, so what this answers is
 // "does this attestation describe THIS delivery", not merely "is this
-// attestation well formed". builderKeys are PREDECLARED: an attestation
-// verified against whatever signed it is one anybody can mint.
-func (a BuildAttestation) Verify(binary Digest, reviewTip string, builderKeys []string) []string {
+// attestation well formed". keys are the PREDECLARED public keys of both
+// parties — the builder and the independent verifier: an attestation verified
+// against whatever signed it is one anybody can mint.
+func (a BuildAttestation) Verify(binary Digest, reviewTip string, keys []string) []string {
 	var problems []string
 	if a.Kind != BuildAttestationKind {
 		problems = append(problems, fmt.Sprintf("build attestation kind %q, want %q", a.Kind, BuildAttestationKind))
@@ -145,10 +202,24 @@ func (a BuildAttestation) Verify(binary Digest, reviewTip string, builderKeys []
 	}
 	if a.Signature == nil {
 		problems = append(problems, "the build attestation is unsigned; an unattributable claim about a build is prose")
+	}
+	// AND THE VERIFIER SIGNED IT TOO.
+	//
+	// Without this the verifier existed only as a string the builder wrote
+	// down, next to a result the builder also wrote down. A build is verified
+	// when a second party obtains the artifact, checks it and signs what it
+	// concluded; that signature is the evidence, and its absence means nobody
+	// checked this build but the party that made it.
+	if a.VerifierSignature == nil {
+		problems = append(problems, fmt.Sprintf(
+			"the build attestation carries no signature from verifier %q; the verifier id, the verifier binary and the retained result were all written and signed by the builder, so nothing independent has checked this build",
+			a.VerifierID))
+	}
+	if len(problems) > 0 {
 		return problems
 	}
-	if len(builderKeys) == 0 {
-		problems = append(problems, "no builder key was predeclared, so the attestation's own signature would authenticate it and any self-generated key would vouch for any build")
+	if len(keys) == 0 {
+		problems = append(problems, "no builder or verifier key was predeclared, so the attestation's own signatures would authenticate it and any self-generated key would vouch for any build")
 		return problems
 	}
 	// The SIGNER must be the builder it names. Signature.Authority is the only
@@ -160,12 +231,33 @@ func (a BuildAttestation) Verify(binary Digest, reviewTip string, builderKeys []
 			"the build attestation is signed by authority %q but names builder %q; the retained builder identity must be the identity that signed",
 			a.Signature.Authority, a.BuilderID))
 	}
-	d, err := a.DigestOf()
+	if a.VerifierSignature.Authority != a.VerifierID {
+		problems = append(problems, fmt.Sprintf(
+			"the build attestation's second signature is by authority %q but names verifier %q; a countersignature attributed to somebody who is not the verifier verifies nothing",
+			a.VerifierSignature.Authority, a.VerifierID))
+	}
+	// TWO LABELS AND ONE KEY IS ONE PARTY. The identities differing is a
+	// property of the text; the KEYS differing is the property that makes the
+	// second signature independent evidence rather than the builder signing
+	// twice.
+	if a.Signature.KeyID == a.VerifierSignature.KeyID {
+		problems = append(problems, fmt.Sprintf(
+			"the builder and the verifier signed with the same key %s; two identities holding one key are one party, and a build checked by the party that built it has been checked by nobody",
+			a.Signature.KeyID))
+	}
+	builderDigest, err := a.BuilderDigestOf()
 	if err != nil {
 		return append(problems, err.Error())
 	}
-	if err := VerifySigned(a.Signature, d, builderKeys); err != nil {
+	verifierDigest, err := a.VerifierDigestOf()
+	if err != nil {
+		return append(problems, err.Error())
+	}
+	if err := VerifySigned(a.Signature, builderDigest, keys); err != nil {
 		problems = append(problems, fmt.Sprintf("build attestation signature: %v", err))
+	}
+	if err := VerifySigned(a.VerifierSignature, verifierDigest, keys); err != nil {
+		problems = append(problems, fmt.Sprintf("build attestation verifier signature: %v", err))
 	}
 	return problems
 }

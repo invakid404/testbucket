@@ -86,6 +86,29 @@ type Runner struct {
 	// in a single-project config (no --project scoping needed). Runnables is
 	// called sequentially by the core, so no lock guards this.
 	projectByFile map[string]string
+	// runnablePaths is the resolved executable each runnable listing actually
+	// ran, kept so the bundle's closure binds the binary that took the
+	// snapshot rather than whatever the name resolves to afterwards.
+	runnablePaths []ResolvedProgram
+}
+
+// ResolvedProgram is a program name and the executable path it resolved to
+// when it ran.
+type ResolvedProgram struct {
+	Name string
+	Path string
+}
+
+// RunnablePaths reports the executables the runnable listings ran.
+func (r *Runner) RunnablePaths() []ResolvedProgram { return r.runnablePaths }
+
+func appendPath(list []ResolvedProgram, p ResolvedProgram) []ResolvedProgram {
+	for _, e := range list {
+		if e.Name == p.Name && e.Path == p.Path {
+			return list
+		}
+	}
+	return append(list, p)
 }
 
 // Options configures the Vitest adapter.
@@ -126,6 +149,11 @@ type Options struct {
 	// with that records directory. Empty — the default — renders the v0.2.2
 	// bytes unchanged.
 	WallDir string
+	// Env is the exact environment every subprocess this runner spawns is
+	// given, as KEY=VALUE. nil inherits the ambient environment, which is what
+	// a caller that is not binding a plan wants; `wall bundle` supplies the
+	// same set it retains, so the recorded environment is the one that ran.
+	Env []string
 	// Frozen, when set, makes discovery and runnable listing read BOUND BYTES
 	// instead of running Vitest. It is how a plan is replayed from a frozen
 	// input bundle: the same parsers run over the same bytes, so the plan is a
@@ -185,7 +213,7 @@ func New(opt Options) (*Runner, error) {
 		discTimeout = opt.Timeout
 	}
 	return &Runner{
-		tool:          nodetool{command: cmd, timeout: discTimeout},
+		tool:          nodetool{command: cmd, timeout: discTimeout, env: opt.Env},
 		discoveryMode: mode,
 		discoveryCmd:  append([]string(nil), opt.DiscoveryCommand...),
 		frozen:        opt.Frozen,
@@ -322,11 +350,15 @@ func (r *Runner) CaptureRunnables(ctx context.Context, fileID string, discovery 
 		return nil, nil, err
 	}
 	args := runnablesArgs(project, fileID)
-	out, err := r.tool.run(ctx, r.root, args...)
+	var prov ExecProvenance
+	out, err := r.tool.runWith(ctx, r.root, &prov, args...)
+	if prov.Path != "" && len(prov.Argv) > 0 {
+		r.runnablePaths = appendPath(r.runnablePaths, ResolvedProgram{Name: prov.Argv[0], Path: prov.Path})
+	}
 	if err != nil {
 		return nil, nil, r.runnablesError(fileID, project, err)
 	}
-	return out, r.tool.argv(args...), nil
+	return out, prov.Argv, nil
 }
 
 // runnablesArgs builds the `vitest list` invocation for one file's names:

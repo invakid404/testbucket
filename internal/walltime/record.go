@@ -177,6 +177,24 @@ type ContainmentIdentity struct {
 	// membershipModelFor, and it can be run again.
 	OwnerGID int    `json:"owner_gid,omitempty"`
 	Mode     uint32 `json:"mode,omitempty"`
+	// WorkloadUID and WorkloadGIDs are the credential the MEASURED WORKLOAD
+	// runs as, resolved once when the containment was created and retained
+	// here.
+	//
+	// The membership decision asks one question — can the workload rewrite
+	// this containment's `cgroup.procs`? — and the producer used to answer it
+	// by reading `/etc/passwd` and `/etc/group` at decision time and writing
+	// down the conclusion. Nobody could rerun that: the accounts file is not
+	// part of the evidence, the cgroup is gone, and at the action level there
+	// is no measured child whose own uid could stand in for the workload's.
+	// These are the inputs, retained beside the owner and the mode, so the
+	// rule runs again over the same facts the producer used.
+	//
+	// WorkloadUID is -1 when no workload account was declared, which is the
+	// single-credential host: the wrapper and the measured work share a
+	// credential, and no boundary exists to rederive.
+	WorkloadUID  int   `json:"workload_uid,omitempty"`
+	WorkloadGIDs []int `json:"workload_gids,omitempty"`
 	// MembershipControl is WHO may write this containment's `cgroup.procs` —
 	// the process-migration control on cgroup-v2 — established by reading the
 	// filesystem rather than asserted by Stage 1. See the Membership*
@@ -197,7 +215,17 @@ type ContainmentIdentity struct {
 func (c ContainmentIdentity) Scorable() bool {
 	return c.Primitive == PrimitiveCgroup2 && c.ID != "" && c.Inode != "" && c.BootID != "" &&
 		c.RootPID > 0 && strings.TrimSpace(c.RootStart) != "" &&
-		c.MembershipControl == MembershipSupervisorOwned
+		c.MembershipControl == MembershipSupervisorOwned &&
+		// AND THE FACTS THE MEMBERSHIP DECISION WAS MADE FROM.
+		//
+		// MembershipControl is a producer's summary of the one property
+		// eligibility turns on. The verifier reruns the rule — but only over
+		// records that retained its inputs, and the mode was optional: a
+		// signed identity could omit it, assert supervisor ownership, skip
+		// the rederivation it gates and stay scorable. A conclusion whose
+		// inputs were not retained is not rederivable, and a property nobody
+		// can recheck is a claim.
+		c.OwnerUID >= 0 && c.OwnerGID >= 0 && c.Mode != 0
 }
 
 // SameRoot reports whether two identities name the same root process.
@@ -216,7 +244,49 @@ func (c ContainmentIdentity) SameRoot(o ContainmentIdentity) bool {
 // is the pair (id, inode) plus boot: a path that was destroyed and re-created
 // is a DIFFERENT containment even though its name is unchanged.
 func (c ContainmentIdentity) Same(o ContainmentIdentity) bool {
-	return c.Primitive == o.Primitive && c.ID == o.ID && c.Inode == o.Inode && c.BootID == o.BootID
+	return c.Primitive == o.Primitive && c.ID == o.ID && c.Inode == o.Inode && c.BootID == o.BootID &&
+		// AND THE SAME MEMBERSHIP FACTS.
+		//
+		// Two records naming one path, inode and boot were treated as the same
+		// containment however they described its ownership — so a record could
+		// keep the identity and restate the owner, the mode or the conclusion,
+		// and the disagreement was invisible. These fields are what the
+		// membership rule is rerun over; producers that disagree about them
+		// did not observe the same containment.
+		c.OwnerUID == o.OwnerUID && c.OwnerGID == o.OwnerGID && c.Mode == o.Mode &&
+		c.MembershipControl == o.MembershipControl &&
+		c.WorkloadUID == o.WorkloadUID && sameInts(c.WorkloadGIDs, o.WorkloadGIDs)
+}
+
+// Differs names the first field on which two identities disagree, in words a
+// reader can act on.
+//
+// The mismatch message used to print the path and the inode, which are exactly
+// the fields that are equal when the disagreement is about the owner, the mode
+// or the membership conclusion — so a record that restated the ownership of a
+// containment produced a finding saying it named "X, not this envelope's X".
+func (c ContainmentIdentity) Differs(o ContainmentIdentity) string {
+	for _, f := range []struct {
+		what    string
+		a, b    any
+		differs bool
+	}{
+		{"primitive", c.Primitive, o.Primitive, c.Primitive != o.Primitive},
+		{"path", c.ID, o.ID, c.ID != o.ID},
+		{"inode", c.Inode, o.Inode, c.Inode != o.Inode},
+		{"boot", c.BootID, o.BootID, c.BootID != o.BootID},
+		{"cgroup.procs owner uid", c.OwnerUID, o.OwnerUID, c.OwnerUID != o.OwnerUID},
+		{"cgroup.procs owner gid", c.OwnerGID, o.OwnerGID, c.OwnerGID != o.OwnerGID},
+		{"cgroup.procs mode", c.Mode, o.Mode, c.Mode != o.Mode},
+		{"membership control", c.MembershipControl, o.MembershipControl, c.MembershipControl != o.MembershipControl},
+		{"retained workload uid", c.WorkloadUID, o.WorkloadUID, c.WorkloadUID != o.WorkloadUID},
+		{"retained workload groups", c.WorkloadGIDs, o.WorkloadGIDs, !sameInts(c.WorkloadGIDs, o.WorkloadGIDs)},
+	} {
+		if f.differs {
+			return fmt.Sprintf("%s %v, not this envelope's %v", f.what, f.a, f.b)
+		}
+	}
+	return ""
 }
 
 // ProcIdentity is the process-tree fact a record carries.

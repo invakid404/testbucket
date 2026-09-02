@@ -275,6 +275,11 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 		// process below runs under the workload's. They differ, which is the
 		// boundary the verifier checks rather than assumes.
 		OwnerUID: 1000, OwnerGID: 900, Mode: 0o770,
+		// The workload credential the wrapper resolved when it created the
+		// containment, RETAINED so the verifier can rerun the membership rule
+		// over the same facts instead of believing the conclusion — and, at
+		// the action level, so the rule has a workload to be about at all.
+		WorkloadUID: 1001, WorkloadGIDs: []int{1001},
 		// The membership-control model production establishes by reading the
 		// filesystem. A scored containment is one whose `cgroup.procs` the
 		// measured workload cannot write.
