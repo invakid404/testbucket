@@ -249,3 +249,92 @@ func TestAnAblationIsBoundToItsOwnDelivery(t *testing.T) {
 		})
 	}
 }
+
+// TestAnAblationManifestIsValidatedNotJustSigned is the F5 regression.
+//
+// checkAblationRow verified the authority signature and nothing else, while
+// loadArm validates an arm's manifest first. So a document the campaign
+// authority genuinely signed but which is not a well-formed Stage-1 manifest
+// at all — the wrong kind, no reviewed actions — satisfied the mandatory
+// pre-campaign prerequisite. A signature says who wrote a document; it does
+// not make the document mean anything.
+func TestAnAblationManifestIsValidatedNotJustSigned(t *testing.T) {
+	idx, loader, keys, authorityKey := campaignFixture(t)
+	genuine := loader.manifests[idx.Ablations[0].Stage1Path]
+	bad := *genuine
+	bad.Kind = "not-a-stage1-manifest"
+	bad.Actions = nil
+	bad.Signature = nil
+	if err := bad.Sign(CampaignAuthority, authorityKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("the control needs a manifest Validate rejects")
+	}
+	// Genuinely signed by the campaign authority: the signature is not the
+	// thing that is wrong.
+	badDigest, err := bad.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bad.RequireApproval(keys, CampaignAuthority); err != nil {
+		t.Fatalf("the control needs the authority approval to pass: %v", err)
+	}
+	loader.manifests["invalid-ablation-stage1.json"] = &bad
+	idx.Ablations[0].Stage1Path = "invalid-ablation-stage1.json"
+	resign(loader.verdicts[idx.Ablations[0].VerdictPath], testVerdictAuthority, func(v *Verdict) {
+		v.Run.Stage1 = badDigest
+		v.VerifierBinary = bad.Instrumentation.VerifierBinary
+	})
+	_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+	if len(problems) == 0 {
+		t.Fatal("a signed but structurally invalid Stage-1 satisfied the ablation prerequisite")
+	}
+	if !strings.Contains(strings.Join(problems, "\n"), "ablation 0") {
+		t.Errorf("problems %v do not attribute the failure to the ablation", problems)
+	}
+}
+
+// TestTheAblationStratumComesFromTheSignedManifest is the other half of F5.
+//
+// The stratum lived only in the unsigned campaign index, so swapping two
+// labels changed no manifest, verdict, records digest or signature — and the
+// rule requiring three in each of four strata counted the relabelled pair
+// exactly as before. The authority decides which experiment a run belongs to,
+// before the run.
+func TestTheAblationStratumComesFromTheSignedManifest(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	if idx.Ablations[0].Stratum == idx.Ablations[3].Stratum {
+		t.Fatal("the fixture's selected ablations are in the same stratum")
+	}
+	idx.Ablations[0].Stratum, idx.Ablations[3].Stratum = idx.Ablations[3].Stratum, idx.Ablations[0].Stratum
+	_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+	joined := strings.Join(problems, "\n")
+	if !strings.Contains(joined, "its authority-signed manifest authorises stratum") {
+		t.Errorf("an unsigned stratum relabel was accepted: %v", problems)
+	}
+
+	// And a manifest that declares no stratum at all cannot authorise one.
+	// It is re-signed and the verdict rebound to its new digest, so what this
+	// case isolates is the silent stratum rather than a broken signature or an
+	// unbound Stage-1, both of which have their own cases.
+	idx, loader, keys, authorityKey := campaignFixture(t)
+	silent := *loader.manifests[idx.Ablations[0].Stage1Path]
+	silent.AblationStratum = ""
+	silent.Signature = nil
+	if err := silent.Sign(CampaignAuthority, authorityKey); err != nil {
+		t.Fatal(err)
+	}
+	silentDigest, err := silent.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader.manifests[idx.Ablations[0].Stage1Path] = &silent
+	resign(loader.verdicts[idx.Ablations[0].VerdictPath], testVerdictAuthority, func(v *Verdict) {
+		v.Run.Stage1 = silentDigest
+	})
+	_, problems = LoadCampaign(idx, loader, keys, CampaignAuthority)
+	if !strings.Contains(strings.Join(problems, "\n"), "declares no ablation stratum") {
+		t.Errorf("an ablation whose manifest names no stratum was accepted: %v", problems)
+	}
+}

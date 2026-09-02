@@ -247,7 +247,7 @@ func Exec(opt ExecOptions) (int, error) {
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
 	}
 
-	code, proc, termState, reason := runChild(opt, cont, deadline)
+	code, proc, termState, reason := runChild(opt, cont, deadline, w, clock)
 
 	// The wrapper's own view of emptiness is physical suffix work; the
 	// observers still take their own reads, and the VERIFIER decides closure.
@@ -261,15 +261,10 @@ func Exec(opt ExecOptions) (int, error) {
 	traceErr := trace.close(deadline)
 	peerErr := peer.close(deadline)
 
-	members, note := membershipSnapshot(cont)
-	if _, err := w.Append(Record{
-		Kind: "process_tree", Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
-		Source: SourceProcessLifecycle, Seqno: opt.Seq, Run: opt.Run,
-		Containment: cont.Identity(), Proc: proc, Instant: clock.Now(),
-		RawProcs: members, Note: note,
-	}); err != nil {
-		return code, err
-	}
+	// And the CLOSING membership: the drained containment, retained with the
+	// same raw evidence, so "nothing was left" is as checkable as "the child
+	// was in it".
+	retainProcessTree(w, opt, clock, cont, proc, "end")
 
 	if emptyErr != nil {
 		// An ESCAPE is a descendant that outlived a run which ended on its own
@@ -320,7 +315,7 @@ func Exec(opt ExecOptions) (int, error) {
 // child is created in the containment (never moved into it afterwards), so
 // there is no window in which action-owned work exists outside the lifecycle
 // the peer and trace are bracketing.
-func runChild(opt ExecOptions, cont Containment, deadline time.Time) (int, ProcIdentity, string, string) {
+func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, clock Clock) (int, ProcIdentity, string, string) {
 	cmd := exec.Command(opt.Argv[0], opt.Argv[1:]...)
 	cmd.Dir = opt.Cwd
 	// Assign the concrete *os.File values, not the struct fields directly: a
@@ -378,8 +373,20 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time) (int, ProcI
 		PID:       cmd.Process.Pid,
 		PGID:      processGroupOf(cmd.Process.Pid),
 		StartID:   processStartID(cmd.Process.Pid),
+		SessionID: processSessionOf(cmd.Process.Pid),
 		ParentPID: os.Getpid(),
 	}
+	// THE MEMBERSHIP, WHILE THE CHILD IS IN IT.
+	//
+	// The only process-tree record this wrapper used to write was taken after
+	// the containment had been drained and the child reaped, so its membership
+	// snapshot was empty by construction. An empty close snapshot is proof
+	// that nothing escaped; it is not proof that the measured process was ever
+	// inside, and those are different claims. This read happens at the one
+	// moment the containment holds exactly the admitted child, and it retains
+	// the same raw evidence a peer or trace endpoint does: the exact kernel
+	// bytes and a digest binding them to this observer's own read.
+	retainProcessTree(w, opt, clock, cont, proc, "start")
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -606,6 +613,31 @@ func waitContainmentEmpty(cont Containment, deadline time.Time) error {
 // membershipSnapshot returns the containment membership at close. The LIST is
 // retained, not a count: "0 members" and "these are the members" answer
 // different questions, and only the second one lets a reader check the first.
+// retainProcessTree writes one physical process-tree record with the
+// containment membership read AT THIS MOMENT.
+//
+// It is a best-effort retention: a read that fails still produces a record
+// saying so, because "the membership could not be read" is a fact about the
+// run and the verifier decides what it means. What it never does is present an
+// unread or absent snapshot as an observed one.
+func retainProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment, proc ProcIdentity, boundary string) {
+	rec := Record{
+		Kind: "process_tree", Boundary: boundary,
+		Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
+		Source: SourceProcessLifecycle, Seqno: opt.Seq, Run: opt.Run,
+		Containment: cont.Identity(), Proc: proc, Instant: clock.Now(),
+	}
+	ev, _, err := cont.Observe(string(ProducerPhysical))
+	if err != nil {
+		rec.Note = "cgroup.procs unreadable: " + err.Error()
+	} else {
+		rec.RawEventID, rec.RawEventDigest, rec.RawEventBytes = ev.ID, ev.Digest, ev.Bytes
+		rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
+		rec.Note = fmt.Sprintf("cgroup.procs members at %s: %d", boundary, len(ev.Procs))
+	}
+	_, _ = w.Append(rec)
+}
+
 func membershipSnapshot(cont Containment) ([]int, string) {
 	pids, err := cont.Procs()
 	if err != nil {

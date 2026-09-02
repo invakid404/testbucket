@@ -206,9 +206,13 @@ func (c ContainmentIdentity) Same(o ContainmentIdentity) bool {
 
 // ProcIdentity is the process-tree fact a record carries.
 type ProcIdentity struct {
-	PID       int    `json:"pid,omitempty"`
-	PGID      int    `json:"pgid,omitempty"`
-	StartID   string `json:"start_id,omitempty"`
+	PID     int    `json:"pid,omitempty"`
+	PGID    int    `json:"pgid,omitempty"`
+	StartID string `json:"start_id,omitempty"`
+	// SessionID is the child's session, read while it is alive. The contract
+	// makes a session or PGID change terminal, and neither is decidable from a
+	// record that never carried the session.
+	SessionID int    `json:"sid,omitempty"`
 	ParentPID int    `json:"ppid,omitempty"`
 	ExitKind  string `json:"exit_kind,omitempty"`
 	ExitCode  int    `json:"exit_code,omitempty"`

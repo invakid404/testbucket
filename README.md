@@ -347,6 +347,47 @@ own peer, both bracketing the same admission-to-verified-empty lifecycle —
 never a trace against the longer physical envelope, which would fail a
 correctly instrumented run for the crime of accounting for its own bootstrap.
 
+### Two blockers to an eligible scored row on a single-uid runner
+
+These are known, unresolved architectural gaps, not bugs in the checks below.
+Both are refusals working correctly; what is missing is a deployment shape in
+which a genuine run can satisfy them. On a runner where the wrapper and the
+measured workload run as the **same uid** — which is every GitHub-hosted runner
+as this action ships — no scored row can be produced, and the verifier says so
+rather than pretending otherwise.
+
+1. **No party can authorize a lower-level signer.** Script- and
+   invocation-level physical, peer and trace keys are minted at runtime by
+   wrappers the measured script starts. A key-log entry is admissible only if
+   the run key countersigned it (WT-032), and the run key is deliberately
+   scoped to `wall begin` and `wall end` — it is absent from the measured step.
+   Placing it there would hand it to the workload, which runs as the same uid
+   in the same process tree and can read the environment, argv and descriptors
+   of the wrappers it spawns. So there is no capability an inner wrapper can
+   hold that the workload cannot, and every genuine lower-level key is
+   unauthorized.
+
+2. **No party can own the containment the workload cannot write.** On cgroup-v2
+   `cgroup.procs` is the process-migration control. `newCgroupUnder` creates
+   each level's containment as the wrapper's own uid, so the resulting
+   `cgroup.procs` is owned by the uid the workload also runs as, and the
+   membership model is `workload-writable` (WT-031). A pre-created
+   supervisor-owned directory is refused as non-fresh, and the same-uid inner
+   wrappers could not create children under it in any case.
+
+Closing either one requires a privilege boundary this action does not have:
+running the measured workload under a **different uid** from the wrapper (which
+changes the measured environment — `HOME`, checkout ownership, package caches —
+and is therefore a consumer-visible decision), or a **root-privileged
+supervisor** that creates containments and authorizes producer keys on the
+wrapper's behalf. A supervisor alone does not close (1): it cannot distinguish
+a legitimate inner wrapper from the workload executing the same binary at the
+same uid.
+
+Until one ships, `--require eligible` fails closed and the campaign gate has
+nothing to count. That is the intended behaviour of a system that refuses to
+assert a boundary it does not have.
+
 ### It fails closed
 
 - No delegated cgroup-v2 subtree (`TB_WALL_CGROUP_ROOT`)? The run is recorded

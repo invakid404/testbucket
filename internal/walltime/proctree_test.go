@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -31,7 +32,7 @@ func TestTheMeasuredProcessIdentityIsRequired(t *testing.T) {
 func TestTheProcessTreeRecordMustBeComplete(t *testing.T) {
 	tree := func(edit func(*ProcIdentity)) mutation {
 		return func(_ Level, _ int, p Producer, boundary string, r *Record) {
-			if p == ProducerPhysical && boundary == "process_tree" {
+			if p == ProducerPhysical && strings.HasPrefix(boundary, "process_tree") {
 				edit(&r.Proc)
 			}
 		}
@@ -66,7 +67,7 @@ func TestTheProcessTreeRecordMustBeComplete(t *testing.T) {
 // process is the wrapper describing itself as the measured work.
 func TestTheMeasuredProcessIsNotTheContainmentRoot(t *testing.T) {
 	v := verifySynth(t, func(_ Level, _ int, p Producer, boundary string, r *Record) {
-		if p == ProducerPhysical && boundary == "process_tree" {
+		if p == ProducerPhysical && strings.HasPrefix(boundary, "process_tree") {
 			r.Proc.PID = r.Containment.RootPID
 			r.Proc.StartID = r.Containment.RootStart
 		}
@@ -93,8 +94,9 @@ func TestAProcessTreeRecordIsBoundToItsEnvelope(t *testing.T) {
 	other.Inode = "999999"
 	v := &Verdict{}
 	checkProcessTree(v, "script[0]", e, Record{
-		Kind: "process_tree", Containment: other,
-		Proc: ProcIdentity{PID: 70001, PGID: 70001, StartID: "8810", ParentPID: 4242},
+		Kind: "process_tree", Boundary: "start", Producer: ProducerPhysical,
+		Source: SourceProcessLifecycle, Containment: other,
+		Proc: ProcIdentity{PID: 70001, PGID: 70001, SessionID: 70001, StartID: "8810", ParentPID: 4242},
 	})
 	if len(findingsMentioning(v, "WT-033", "not this envelope's")) == 0 {
 		t.Errorf("a process-tree record for another containment was accepted: %+v", v.Findings)
@@ -102,8 +104,9 @@ func TestAProcessTreeRecordIsBoundToItsEnvelope(t *testing.T) {
 	// And the matching one is accepted.
 	ok := &Verdict{}
 	checkProcessTree(ok, "script[0]", e, Record{
-		Kind: "process_tree", Containment: e.Containment,
-		Proc: ProcIdentity{PID: 70001, PGID: 70001, StartID: "8810", ParentPID: 4242},
+		Kind: "process_tree", Boundary: "start", Producer: ProducerPhysical,
+		Source: SourceProcessLifecycle, Containment: e.Containment,
+		Proc: ProcIdentity{PID: 70001, PGID: 70001, SessionID: 70001, StartID: "8810", ParentPID: 4242},
 	})
 	if len(ok.Findings) > 0 {
 		t.Errorf("a well-formed process-tree record was refused: %+v", ok.Findings)
@@ -115,8 +118,8 @@ func TestAProcessTreeRecordIsBoundToItsEnvelope(t *testing.T) {
 // somebody else's containment.
 func TestTheMembershipBesideTheTreeNamesTheMeasuredProcess(t *testing.T) {
 	v := verifySynth(t, func(_ Level, _ int, p Producer, boundary string, r *Record) {
-		if p == ProducerPhysical && boundary == "process_tree" {
-			r.RawProcs = []int{999999}
+		if p == ProducerPhysical && boundary == "process_tree:start" {
+			setMembership(r, "999999\n")
 		}
 	}, nil)
 	if len(findingsMentioning(v, "WT-033", "none of which is the measured process")) == 0 {
@@ -167,5 +170,158 @@ func indexOfAll(hay, needle string) []int {
 		}
 		out = append(out, off+at)
 		off += at + len(needle)
+	}
+}
+
+// TestAnEmptyCloseSnapshotIsNotMembershipProof is the F2 regression.
+//
+// The wrapper wrote ONE process-tree record, after enforceContainmentEmpty had
+// drained the containment and the child had been reaped — so its membership
+// was empty by construction, and the verifier only looked at membership when
+// the list was non-empty. An empty close snapshot is proof that nothing
+// escaped; it is not proof that the measured process was ever inside, and the
+// fixture emitted exactly that shape, which is why the committed positive
+// tests could not see the gap.
+func TestAnEmptyCloseSnapshotIsNotMembershipProof(t *testing.T) {
+	// The defect shape: only the drained read survives.
+	v := verifySynth(t, func(_ Level, _ int, p Producer, boundary string, r *Record) {
+		if p == ProducerPhysical && boundary == "process_tree:start" {
+			setMembership(r, "")
+			r.RawEventBytes = []byte("populated 0\nfrozen 0\n")
+			r.RawEventDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawEventBytes...))
+		}
+	}, nil)
+	if len(findingsMentioning(v, "WT-033", "reports an EMPTY containment at the moment")) == 0 {
+		t.Errorf("an empty admission snapshot was accepted as membership proof: %+v", v.Findings)
+	}
+	if v.Eligible {
+		t.Error("a run that never showed the measured process inside its containment scored")
+	}
+}
+
+// TestBothProcessTreeReadsAreRequired: the admission read and the drained read
+// answer different questions, and neither substitutes for the other.
+func TestBothProcessTreeReadsAreRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		drop string
+		want string
+	}{
+		{"no admission read", "start", "taken while the measured process was in the containment"},
+		{"no drained read", "end", "taken after the containment drained"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := verifySynth(t, nil, func(s *synthRun) { s.dropProcessTree = tc.drop })
+			if len(findingsMentioning(v, "WT-033", tc.want)) == 0 {
+				t.Errorf("dropping the %q read raised no WT-033: %+v", tc.drop, v.Findings)
+			}
+			if v.Eligible {
+				t.Errorf("a run with %s scored", tc.name)
+			}
+		})
+	}
+}
+
+// TestAProcessTreeRecordMustComeFromThePhysicalProducer: the record is the
+// physical wrapper's account of the process it spawned, delimited by an
+// independently observed lifecycle event. A trace collector's record, or one
+// sourced from a wrapper annotation, is not that account — and both were
+// accepted without comment.
+func TestAProcessTreeRecordMustComeFromThePhysicalProducer(t *testing.T) {
+	e := Envelope{Level: LevelScript, Seq: 0, Containment: ContainmentIdentity{
+		Primitive: PrimitiveCgroup2, ID: "/sys/fs/cgroup/tb/script", Inode: "42",
+		BootID: "boot", RootPID: 100, RootStart: "1000", MembershipControl: MembershipSupervisorOwned,
+	}}
+	base := Record{
+		Kind: "process_tree", Boundary: "start", Producer: ProducerPhysical, Role: RolePhysicalScript,
+		Source: SourceProcessLifecycle, Level: LevelScript, Seqno: 0, Containment: e.Containment,
+		Proc:     ProcIdentity{PID: 200, PGID: 200, SessionID: 200, StartID: "2000", ParentPID: 100},
+		RawProcs: []int{},
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*Record)
+		want string
+	}{
+		{"a trace collector's record", func(r *Record) { r.Producer = ProducerTrace; r.Role = RoleTraceScript }, "written by"},
+		{"a wrapper annotation", func(r *Record) { r.Source = SourceWrapper }, "declares source"},
+		{"a reporter annotation", func(r *Record) { r.Source = SourceReporter }, "declares source"},
+		{"an unlabelled boundary", func(r *Record) { r.Boundary = "" }, "belongs to neither"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := base
+			tc.edit(&r)
+			v := &Verdict{}
+			checkProcessTree(v, "script[0]", e, r)
+			if len(findingsMentioning(v, "WT-033", tc.want)) == 0 {
+				t.Errorf("%s was accepted: %+v", tc.name, v.Findings)
+			}
+		})
+	}
+}
+
+// TestTheProcessTreeMembershipIsRetainedEvidence: the physical record carries
+// the same raw kernel evidence a peer or trace endpoint does. It used to carry
+// a bare list with nothing behind it.
+func TestTheProcessTreeMembershipIsRetainedEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit mutation
+		want string
+	}{
+		{"no retained bytes or digest", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p == ProducerPhysical && strings.HasPrefix(b, "process_tree") {
+				r.RawProcsDigest, r.RawProcsBytes = "", nil
+			}
+		}, "no raw event id or digest"},
+
+		{"a digest over other bytes", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p == ProducerPhysical && b == "process_tree:start" {
+				r.RawProcsDigest = DigestBytes(append([]byte("someone-else\x00"), r.RawProcsBytes...))
+			}
+		}, "derive"},
+
+		{"bytes outside the kernel grammar", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p == ProducerPhysical && b == "process_tree:start" {
+				r.RawProcsBytes = []byte("not-a-pid\n")
+				r.RawProcsDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawProcsBytes...))
+			}
+		}, "not the kernel's grammar"},
+
+		{"a list its own bytes do not name", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p == ProducerPhysical && b == "process_tree:start" {
+				r.RawProcs = append(r.RawProcs, 999999)
+			}
+		}, "retained cgroup.procs bytes name"},
+
+		// More than the admitted child at admission is a process nobody
+		// accounted for, which the contract makes terminal.
+		{"an unknown descendant already present at admission", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p == ProducerPhysical && b == "process_tree:start" {
+				setMembership(r, fmt.Sprintf("%d\n999999\n", r.Proc.PID))
+			}
+		}, "anything else is a process nobody accounted for"},
+
+		{"a descendant still alive after the drain", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p == ProducerPhysical && b == "process_tree:end" {
+				setMembership(r, "999999\n")
+			}
+		}, "outlived the measured root"},
+
+		{"no session identity", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p == ProducerPhysical && strings.HasPrefix(b, "process_tree") {
+				r.Proc.SessionID = 0
+			}
+		}, "names no session"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := verifySynth(t, tc.edit, nil)
+			if len(findingsMentioning(v, "WT-033", tc.want)) == 0 {
+				t.Errorf("no WT-033 finding mentions %q: %+v", tc.want, v.Findings)
+			}
+			if v.Eligible {
+				t.Errorf("a run with %s scored", tc.name)
+			}
+		})
 	}
 }

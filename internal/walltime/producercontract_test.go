@@ -33,7 +33,7 @@ func TestTheVerifierAcceptsWhatTheProducerCanActuallyObserve(t *testing.T) {
 	body := productionFunc(t, "exec.go", "func Exec(")
 	peer := strings.Index(body, "peer.admit(deadline)")
 	trace := strings.Index(body, "trace.admit(deadline)")
-	child := strings.Index(body, "runChild(opt, cont, deadline)")
+	child := strings.Index(body, "runChild(opt, cont, deadline, w, clock)")
 	if peer < 0 || trace < 0 || child < 0 {
 		t.Fatalf("production ordering is no longer recognisable: peer=%d trace=%d child=%d", peer, trace, child)
 	}

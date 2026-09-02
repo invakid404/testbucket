@@ -1,6 +1,8 @@
 package walltime
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -129,5 +131,43 @@ func TestRegisterKeyAuthorizesWhenItHoldsTheCapability(t *testing.T) {
 	}
 	if err := checkKeyLogAuthorization(logged[0], []string{PublicKeyOf(key)}); err == nil {
 		t.Error("a key registered with no run key was admissible")
+	}
+}
+
+// TestTheUnresolvedProducerBlockersAreStatedNotHidden pins the two
+// architectural gaps F1 and F4 name, as documentation rather than as code.
+//
+// Neither is repairable inside this wrapper: an inner wrapper runs at the same
+// uid as the workload that spawned it, so there is no capability it can hold
+// that the workload cannot, and `newCgroupUnder` creates each containment as
+// that same uid. Both refusals are correct; what is missing is a deployment in
+// which a genuine run could satisfy them.
+//
+// The risk this test guards against is not that the refusals get removed —
+// their own regressions cover that — but that the LIMITATION stops being
+// stated, so a reader assumes an eligible row is reachable as shipped. A
+// refusal nobody documents reads as a bug.
+func TestTheUnresolvedProducerBlockersAreStatedNotHidden(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(b)
+	for _, want := range []string{
+		"blockers to an eligible scored row",
+		"No party can authorize a lower-level signer",
+		"No party can own the containment the workload cannot write",
+		"different uid",
+		"root-privileged\nsupervisor",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("the README no longer states %q; the two refusals are unresolved architectural gaps, and a reader who cannot find that will read them as defects in the checks", want)
+		}
+	}
+	// And the diagnostic itself points at the requirement, so an operator
+	// reading a verdict is not left to infer it.
+	v := verifySynth(t, nil, func(s *synthRun) { s.unauthorizedLowerKeys = true })
+	if len(findingsMentioning(v, "WT-032", "a different workload uid, or a privileged supervisor")) == 0 {
+		t.Errorf("WT-032 does not say what would make a lower-level signer admissible: %+v", v.Findings)
 	}
 }

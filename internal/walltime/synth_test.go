@@ -70,6 +70,9 @@ type synthRun struct {
 	// context with one key — the shape a single-process implementation
 	// produces, and the one the independence check exists to catch.
 	sharedObserverContext bool
+	// dropProcessTree omits one of the two physical process-tree reads, so a
+	// test can show that neither substitutes for the other.
+	dropProcessTree string
 	// processTree emits the physical wrapper's process-tree record. A test can
 	// clear it to model a run that retains no evidence of what it measured.
 	processTree bool
@@ -390,20 +393,60 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 		// it. The fixture emitted none, so a verifier that never read one
 		// passed its own tests while proving nothing about what actually ran.
 		if producer == ProducerPhysical && s.processTree {
-			tree := Record{
-				ProducerBinary: s.producerBinary,
-				Kind:           "process_tree", Role: roleOrPanic(ProducerPhysical, level), Level: level,
-				Source: SourceProcessLifecycle, Seqno: seq, Run: run, Containment: ident,
-				Proc: s.childProc(level, seq), RawProcs: []int{},
-				Instant: Instant{ClockID: s.clockID, Mono: Nanos(end), BootID: synthBoot,
-					Realtime: time.Unix(0, end).UTC().Format(time.RFC3339Nano) + "/" + time.Unix(0, end+1000).UTC().Format(time.RFC3339Nano)},
-				Note: "cgroup.procs members at close: 0",
-			}
-			if mutate != nil {
-				mutate(level, seq, ProducerPhysical, "process_tree", &tree)
-			}
-			if _, err := w.Append(tree); err != nil {
-				t.Fatal(err)
+			// TWO reads, because they answer different questions and
+			// production takes both. The ADMITTED read happens while the
+			// measured child is in the containment and is the only evidence
+			// that anything was ever admitted; the DRAINED read happens after
+			// the containment empties and is the closure.
+			//
+			// The fixture used to emit one record, taken at close, with
+			// `RawProcs: []int{}` — the same empty shape production wrote
+			// after the drain. That made the positive tests unable to detect a
+			// missing historical membership at all: their "good" evidence WAS
+			// the defect.
+			child := s.childProc(level, seq)
+			for _, tree := range []struct {
+				boundary string
+				ns       int64
+				procs    []int
+			}{
+				{"start", start, []int{child.PID}},
+				{"end", end, nil},
+			} {
+				if tree.boundary == s.dropProcessTree {
+					continue
+				}
+				rec := Record{
+					ProducerBinary: s.producerBinary,
+					Kind:           "process_tree", Boundary: tree.boundary,
+					Role: roleOrPanic(ProducerPhysical, level), Level: level,
+					Source: SourceProcessLifecycle, Seqno: seq, Run: run, Containment: ident,
+					Proc: child,
+					Instant: Instant{ClockID: s.clockID, Mono: Nanos(tree.ns), BootID: synthBoot,
+						Realtime: time.Unix(0, tree.ns).UTC().Format(time.RFC3339Nano) + "/" + time.Unix(0, tree.ns+1000).UTC().Format(time.RFC3339Nano)},
+					Note: fmt.Sprintf("cgroup.procs members at %s: %d", tree.boundary, len(tree.procs)),
+				}
+				// The retained kernel evidence a physical record carries, on
+				// the same footing as a peer or trace endpoint's.
+				rec.RawEventID = fmt.Sprintf("%s:%s:tree-%s:%d", ProducerPhysical, level, tree.boundary, seq)
+				rec.RawEventBytes = []byte("populated 0\nfrozen 0\n")
+				if len(tree.procs) > 0 {
+					rec.RawEventBytes = []byte("populated 1\nfrozen 0\n")
+				}
+				rec.RawEventDigest = DigestBytes(append([]byte(rec.RawEventID+"\x00"), rec.RawEventBytes...))
+				var membership string
+				for _, pid := range tree.procs {
+					membership += fmt.Sprintf("%d\n", pid)
+				}
+				rec.RawProcsBytes = []byte(membership)
+				rec.RawProcs, _ = parseCgroupProcs(rec.RawProcsBytes)
+				rec.RawProcsDigest = DigestBytes(append([]byte(rec.RawEventID+"\x00"), rec.RawProcsBytes...))
+				if mutate != nil {
+					mutate(level, seq, ProducerPhysical, "process_tree:"+tree.boundary, &rec)
+				}
+				if _, err := w.Append(rec); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 		if err := w.Close(); err != nil {
@@ -419,6 +462,7 @@ func (s *synthRun) childProc(level Level, seq int) ProcIdentity {
 	return ProcIdentity{
 		PID:       70000 + levelRank(level)*100 + seq,
 		PGID:      70000 + levelRank(level)*100 + seq,
+		SessionID: 70000 + levelRank(level)*100 + seq,
 		StartID:   fmt.Sprintf("88%d%d", levelRank(level), seq),
 		ParentPID: 4242 + seq,
 		ExitCode:  0,

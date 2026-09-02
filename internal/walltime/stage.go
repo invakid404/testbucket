@@ -527,6 +527,17 @@ type Stage1Manifest struct {
 	// AllowedDifferences enumerates what may differ between the two arms of a
 	// pair. Anything else differing fails the pair.
 	AllowedDifferences []string `json:"allowed_differences"`
+	// AblationStratum is the topology stratum this manifest authorises, when
+	// it authorises a pre-campaign ablation rather than a campaign arm.
+	//
+	// It is HERE, inside the authority-signed document, because the campaign
+	// index is unsigned: a stratum label that lived only in the index could be
+	// swapped between two ablations without changing any manifest, verdict,
+	// records digest or signature, and the gate that requires three in each of
+	// four strata would count the relabelled pair exactly as before. The
+	// authority decides which experiment a run belongs to, and it decides it
+	// before the run.
+	AblationStratum string `json:"ablation_stratum,omitempty"`
 	// Schedule is the authority-frozen campaign identity and pair order. The
 	// contract requires Stage 1 to bind campaign/pair order before planning
 	// and role assignment, and to freeze that order before the first candidate

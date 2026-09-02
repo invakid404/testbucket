@@ -189,8 +189,32 @@ func checkAblationRow(where string, a CampaignAblationRef, loader CampaignLoader
 	if err != nil {
 		return nil, append(problems, fmt.Sprintf("%s manifest: %v", where, err))
 	}
+	// VALIDATED BEFORE IT IS BELIEVED, exactly as loadArm validates an arm's.
+	//
+	// This checked the authority signature and nothing else, so a manifest the
+	// authority genuinely signed but which is not a well-formed Stage-1
+	// document at all — the wrong kind, no reviewed actions, no source profile
+	// — satisfied the mandatory prerequisite. A signature says who wrote a
+	// document; it does not make the document mean anything.
+	if err := m.Validate(); err != nil {
+		return nil, append(problems, fmt.Sprintf("%s manifest: %v", where, err))
+	}
 	if err := m.RequireApproval(authorityKeys, authority); err != nil {
 		return nil, append(problems, fmt.Sprintf("%s manifest authority: %v", where, err))
+	}
+	// THE STRATUM IS THE AUTHORITY'S, not the index's.
+	//
+	// CampaignAblationRef.Stratum lives in the unsigned campaign index, so
+	// swapping two labels changed no manifest, verdict, records digest or
+	// signature and still satisfied "three in each of the four strata". The
+	// authority-signed manifest says which experiment this run was authorised
+	// as, and the index may only agree with it.
+	if strings.TrimSpace(m.AblationStratum) == "" {
+		problems = append(problems, fmt.Sprintf(
+			"%s is authorised by a Stage-1 manifest that declares no ablation stratum; the campaign index label is unsigned, so nothing else states which of the four topology strata this run belongs to", where))
+	} else if m.AblationStratum != a.Stratum {
+		problems = append(problems, fmt.Sprintf(
+			"%s is indexed in stratum %q but its authority-signed manifest authorises stratum %q", where, a.Stratum, m.AblationStratum))
 	}
 	v, err := loader.Verdict(a.VerdictPath)
 	if err != nil {

@@ -193,7 +193,7 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 				candidate.Instrumentation.VerifierBinary, 84*second, 0),
 		})
 	}
-	addFixtureAblations(t, &idx, loader, baselineDigest, baseline.Instrumentation.VerifierBinary)
+	addFixtureAblations(t, &idx, loader, baseline, key)
 	return idx, loader, []string{PublicKeyOf(key)}, key
 }
 
@@ -206,9 +206,29 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 // gate authenticates them the same way the arms are authenticated. A fixture
 // that satisfied the count with unsigned or ineligible rows would prove only
 // that the counter counts.
-func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, stage1, verifier Digest) {
+func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, baseline *Stage1Manifest, authorityKey ed25519.PrivateKey) {
 	t.Helper()
+	verifier := baseline.Instrumentation.VerifierBinary
 	for i, stratum := range AblationStrata {
+		// ONE AUTHORITY-SIGNED MANIFEST PER STRATUM. The stratum is a property
+		// the authority fixes before the run, not a label the unsigned index
+		// carries — so each ablation is authorised into its stratum by a
+		// document nobody downstream can relabel.
+		manifestPath := fmt.Sprintf("ablation-stage1-%s.json", stratum)
+		m := *baseline
+		m.AblationStratum = stratum
+		m.Signature = nil
+		if err := m.Sign(CampaignAuthority, authorityKey); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Validate(); err != nil {
+			t.Fatalf("the fixture ablation manifest for %s does not validate: %v", stratum, err)
+		}
+		stage1, err := m.DigestOf()
+		if err != nil {
+			t.Fatal(err)
+		}
+		loader.manifests[manifestPath] = &m
 		for n := 0; n < AblationsPerStratum; n++ {
 			path := fmt.Sprintf("ablation-%s-%d.json", stratum, n)
 			// August: strictly before the campaign, which starts in September.
@@ -230,7 +250,7 @@ func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, 
 			loader.verdicts[path] = v
 			idx.Ablations = append(idx.Ablations, CampaignAblationRef{
 				Stratum: stratum, RunID: v.Run.RunID,
-				Stage1Path: "baseline.json", VerdictPath: path,
+				Stage1Path: manifestPath, VerdictPath: path,
 			})
 		}
 	}

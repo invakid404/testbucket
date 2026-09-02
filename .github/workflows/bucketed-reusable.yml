@@ -504,6 +504,18 @@ jobs:
           # SAME expression the `run-key:` input of `run-bucket` is given,
           # compared against empty. It yields `yes` or `no` and never the key.
           TB_RUN_KEY_SET: ${{ (secrets.run-key != '' && secrets.run-key || (inputs.run-key-secret != '' && secrets[inputs.run-key-secret] || '')) != '' && 'yes' || 'no' }}
+          # The RESOLVED verifier key, for exactly the same reason, and it was
+          # missing. `verify-wall` runs the human verification first and exits
+          # on its status; the JSON invocation that follows deliberately emits
+          # an UNSIGNED verdict when this key is empty, and the step's exit
+          # code never reflects that. So a scored arm with an unresolved
+          # verifier secret consumed the whole measurement, finished green, and
+          # uploaded a verdict no campaign can count — refused only much later
+          # by `wall campaign`. That is the fail-late shape the run-key
+          # predicate above exists to prevent, and this is the SAME expression
+          # the `verifier-key:` input of `verify-wall` is given, compared
+          # against empty. It yields `yes` or `no` and never the key.
+          TB_VERIFIER_KEY_SET: ${{ (secrets.verifier-key != '' && secrets.verifier-key || (inputs.verifier-key-secret != '' && secrets[inputs.verifier-key-secret] || '')) != '' && 'yes' || 'no' }}
           # The four identities run-bucket stamps onto every measured record.
           # They are resolved caller VALUES, so they are checked here for the
           # same reason the run key is: the pre-flight appends its --expect-*
@@ -534,6 +546,9 @@ jobs:
           fi
           if [ "$TB_RUN_KEY_SET" != "yes" ]; then
             say "needs a run key that RESOLVES here (the run-key secret, or run-key-secret naming one this workflow can actually read). Without a value the signer roster and the closing seal are written unsigned and every row is WT-023 ineligible; a secret name that maps to nothing is no key at all."
+          fi
+          if [ "$TB_VERIFIER_KEY_SET" != "yes" ]; then
+            say "needs a verifier key that RESOLVES here (the verifier-key secret, or verifier-key-secret naming one this workflow can actually read). Without a value the whole measurement runs, the step finishes green, and the JSON verdict it uploads is UNSIGNED — so no campaign can count the row and the failure surfaces only when the campaign gate authenticates it, long after the time was spent."
           fi
           if [ -z "$TB_STAGE1_DIGEST" ]; then
             say "needs stage1-digest. run-bucket stamps it onto every record; unsupplied, the pre-flight has nothing to compare and the row carries an identity nobody bound."

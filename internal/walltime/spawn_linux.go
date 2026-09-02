@@ -52,3 +52,19 @@ func processGroupOf(pid int) int {
 	}
 	return pgid
 }
+
+// processSessionOf is the child's session id, read while it is alive.
+//
+// The contract makes a session or PGID change terminal, and neither is
+// decidable from a record that never carried the session. Like the start
+// identity it is only readable before the child is reaped.
+func processSessionOf(pid int) int {
+	// Go's Linux syscall package exposes no Getsid wrapper, so the raw call is
+	// made directly. errno != 0 means the process is gone, which is the same
+	// answer as "no session could be read".
+	sid, _, errno := syscall.RawSyscall(syscall.SYS_GETSID, uintptr(pid), 0, 0)
+	if errno != 0 {
+		return 0
+	}
+	return int(sid)
+}
