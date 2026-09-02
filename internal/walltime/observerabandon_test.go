@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -18,6 +20,13 @@ import (
 // and would pass against an abandon() that did nothing at all only by luck of
 // timing. Waiting distinguishes the two.
 func diedFrom(t *testing.T, cmd *exec.Cmd) (syscall.Signal, bool) {
+	t.Helper()
+	return diedFromWithin(t, cmd, 5*time.Second)
+}
+
+// diedFromWithin is diedFrom with an explicit bound, for the case that asserts
+// a process was NOT killed and does not want to wait five seconds to say so.
+func diedFromWithin(t *testing.T, cmd *exec.Cmd, within time.Duration) (syscall.Signal, bool) {
 	t.Helper()
 	done := make(chan *os.ProcessState, 1)
 	go func() {
@@ -37,7 +46,7 @@ func diedFrom(t *testing.T, cmd *exec.Cmd) (syscall.Signal, bool) {
 			return 0, false
 		}
 		return ws.Signal(), true
-	case <-time.After(5 * time.Second):
+	case <-time.After(within):
 		return 0, false
 	}
 }
@@ -119,4 +128,172 @@ func TestTheActionStateCarriesBothObserverPIDs(t *testing.T) {
 			t.Errorf("the action state does not serialise %q: %s", key, b)
 		}
 	}
+}
+
+// TestADetachedCloseProvesTheObserverExited is the F4 regression for the
+// completion path.
+//
+// The reconstructed handle EndAction builds has no *exec.Cmd, and close() used
+// to return the moment it saw an end record — so the closing step wrote
+// "observers reaped" while a detached observer was still running. The contract
+// makes failure to reap after the containment signal terminal; it is not
+// something a note may assert on the strength of a record the observer wrote
+// before exiting.
+func TestADetachedCloseProvesTheObserverExited(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+
+	dir := t.TempDir()
+	o := &observerProc{
+		producer: ProducerPeer,
+		pid:      cmd.Process.Pid,
+		start:    processStartID(cmd.Process.Pid),
+		ctl:      control{base: filepath.Join(dir, "ctl")},
+		stream:   closedStream(t, dir),
+	}
+	// The end record is already on disk and the process is very much alive.
+	err := o.close(time.Now().Add(300 * time.Millisecond))
+	if err == nil {
+		t.Fatal("close() reported a completed lifecycle while the detached observer was still running")
+	}
+	if !strings.Contains(err.Error(), "had not exited") {
+		t.Errorf("error %q does not say the observer had not exited", err)
+	}
+	// And it is not a false alarm: once the process is gone, close returns.
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+	if err := o.close(time.Now().Add(5 * time.Second)); err != nil {
+		t.Errorf("close() refused a lifecycle whose observer had exited: %v", err)
+	}
+}
+
+// TestADetachedKillRequiresTheStartIdentity is the F4 regression for the
+// cancellation path.
+//
+// Between `wall begin` and `wall end` the kernel may have reused the pid, so a
+// bare number can name an unrelated process — the runner's own work, for
+// instance. abandon() signalled it anyway. It now signals only what it can
+// still identify as the process the opening step launched.
+func TestADetachedKillRequiresTheStartIdentity(t *testing.T) {
+	// Two separate processes: each cmd may be waited on exactly once, and the
+	// two halves of this test have to make opposite assertions about theirs.
+	bystander := startSleeper(t)
+	observer := startSleeper(t)
+
+	// A handle whose recorded identity is NOT the one now at that pid — the
+	// shape a reused pid produces between `wall begin` and `wall end`.
+	stranger := &observerProc{producer: ProducerPeer, pid: bystander.Process.Pid, start: "999999999999"}
+	stranger.abandon()
+	// WAITED FOR, not probed. A killed child of this test stays visible as a
+	// zombie until it is reaped, and signal 0 succeeds on a zombie — so a
+	// probe would report "still there" for a process abandon() had just
+	// killed, and would pass against the very defect this asserts.
+	if sig, died := diedFromWithin(t, bystander, 400*time.Millisecond); died {
+		t.Fatalf("abandon() killed a process at a REUSED pid (signal %v); a wrapper must not terminate work it cannot identify as its own", sig)
+	}
+
+	// And the handle that CAN identify its observer still ends it. On a
+	// platform that supplies no start identity this falls back to existence,
+	// which is the strongest claim available there; such a host has no
+	// cgroup-v2 containment either, so its rows are unscorable regardless.
+	ours := &observerProc{producer: ProducerPeer, pid: observer.Process.Pid, start: processStartID(observer.Process.Pid)}
+	ours.abandon()
+	sig, died := diedFrom(t, observer)
+	if !died {
+		t.Fatal("abandon() left the observer it could identify running")
+	}
+	if sig != syscall.SIGKILL {
+		t.Errorf("the observer died of %v, want SIGKILL", sig)
+	}
+}
+
+// startSleeper starts a long-lived process the test owns and cleans up.
+func startSleeper(t *testing.T) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd
+}
+
+// TestTheActionStateCarriesBothObserverStartIdentities: the closing step can
+// only check an identity the opening step wrote down.
+func TestTheActionStateCarriesBothObserverStartIdentities(t *testing.T) {
+	st := ActionState{PeerPID: 111, TracePID: 222, PeerStart: "12345", TraceStart: "67890"}
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"peer_pid", "trace_pid", "peer_start", "trace_start"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("the action state does not serialise %q, so the closing step must trust a bare number: %s", key, b)
+		}
+	}
+	var got ActionState
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.PeerStart != "12345" || got.TraceStart != "67890" {
+		t.Errorf("start identities round-tripped as peer=%q trace=%q", got.PeerStart, got.TraceStart)
+	}
+}
+
+// TestTheClosingNoteOnlyClaimsWhatWasProved: the note is read as a finding by
+// anyone auditing the ledger, and it used to assert a reap unconditionally.
+func TestTheClosingNoteOnlyClaimsWhatWasProved(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	live := &observerProc{producer: ProducerPeer, pid: cmd.Process.Pid, start: processStartID(cmd.Process.Pid)}
+	gone := &observerProc{producer: ProducerTrace, pid: -1}
+
+	if note := observerTeardownNote(live, gone); !strings.Contains(note, "had NOT exited") {
+		t.Errorf("the closing note claims %q while an observer was still running", note)
+	}
+	if note := observerTeardownNote(gone, gone); !strings.Contains(note, "not recorded") {
+		t.Errorf("the closing note claims %q for observers whose identity was never recorded", note)
+	}
+	exited := &observerProc{producer: ProducerPeer, pid: 1 << 30, start: "never"}
+	if note := observerTeardownNote(exited, exited); !strings.Contains(note, "exited and were reaped") {
+		t.Errorf("the closing note does not report a proved reap: %q", note)
+	}
+}
+
+// closedStream writes a signed stream whose only record is the closing
+// boundary, which is exactly what a detached observer leaves behind.
+func closedStream(t *testing.T, dir string) string {
+	t.Helper()
+	stream := filepath.Join(dir, streamName(ProducerPeer, LevelAction, 0))
+	key, err := NewSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWriter(stream, ProducerPeer, "detached#1", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(Record{
+		Kind: "boundary", Boundary: "end", Producer: ProducerPeer,
+		Level: LevelAction, Source: SourceContainment,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return stream
 }

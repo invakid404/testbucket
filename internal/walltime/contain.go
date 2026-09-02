@@ -102,6 +102,25 @@ func newRawEventID(observer string) string {
 // wrapper created without being handed the wrapper's object — and how a
 // mismatched inode (a containment that was destroyed and re-created under the
 // same path) is caught rather than silently observed.
+// newContainmentEvent builds the raw event for ONE `cgroup.events` read.
+//
+// The derivation lives here, portably, because three places must agree about
+// it exactly: the Linux producer that reads the kernel file, the verifier that
+// re-derives the digest from the retained bytes, and the tests that prove the
+// two agree. When the producer owned a private copy of this arithmetic, a test
+// could only restate it — and restating it is how a verifier came to demand a
+// containment state the producer can never observe.
+func newContainmentEvent(observer string, b []byte, procs []int) RawEvent {
+	id := newRawEventID(observer)
+	return RawEvent{
+		ID:     id,
+		Digest: DigestBytes(append([]byte(id+"\x00"), b...)),
+		Source: SourceContainment,
+		Bytes:  b,
+		Procs:  procs,
+	}
+}
+
 func AttachContainment(ident ContainmentIdentity) (Containment, error) {
 	switch ident.Primitive {
 	case PrimitiveProcessGroup:

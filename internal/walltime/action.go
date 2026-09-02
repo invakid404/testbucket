@@ -23,18 +23,49 @@ type ActionState struct {
 	Containment  ContainmentIdentity `json:"containment"`
 	PeerControl  string              `json:"peer_control"`
 	TraceControl string              `json:"trace_control"`
-	// PeerPID and TracePID are the detached observers' process ids.
+	// PeerPID and TracePID are the detached observers' process ids, and
+	// PeerStart and TraceStart are those processes' START IDENTITIES.
 	//
 	// `wall begin` and `wall end` are two different steps, so the handles the
-	// closing step reconstructs have no cmd. Without these, a lifecycle that
-	// could not be completed there had nothing to kill: the observers would
-	// outlive the action they were bracketing.
-	PeerPID  int    `json:"peer_pid,omitempty"`
-	TracePID int    `json:"trace_pid,omitempty"`
-	Deadline string `json:"deadline"`
+	// closing step reconstructs have no cmd. Without the pids, a lifecycle
+	// that could not be completed there had nothing to kill: the observers
+	// would outlive the action they were bracketing.
+	//
+	// The start identities are what make those numbers safe to use. A pid is
+	// reused, and between the two steps it may have come to name the runner's
+	// own work — so the closing step would signal a stranger, and would read
+	// "that pid is gone" as "the observer exited". Recording the identity the
+	// launching step read turns the pair into something that can be checked:
+	// either this is still our observer, or there is nothing of ours here.
+	PeerPID    int    `json:"peer_pid,omitempty"`
+	TracePID   int    `json:"trace_pid,omitempty"`
+	PeerStart  string `json:"peer_start,omitempty"`
+	TraceStart string `json:"trace_start,omitempty"`
+	Deadline   string `json:"deadline"`
 	// StartedAt is the AT_start reading, repeated here only so a human reading
 	// the file can find the record; the RECORD is the evidence.
 	StartedAt Instant `json:"started_at"`
+}
+
+// observerTeardownNote says what was actually established about the observers,
+// rather than asserting it.
+//
+// The closing record used to state "observers reaped" unconditionally. It was
+// written whether or not either observer had exited — and for a detached
+// observer nothing had even looked. A note is read as a finding by anyone
+// auditing the ledger, so it may only say what this step proved.
+func observerTeardownNote(peer, trace *observerProc) string {
+	for _, o := range []*observerProc{peer, trace} {
+		switch {
+		case o.pid <= 0:
+			// An older handoff, or one written before the pids were retained.
+			// "Could not be confirmed" is the whole truth about it.
+			return fmt.Sprintf("the %s observer's process identity was not recorded by the opening step, so its exit could not be confirmed here; ", o.producer)
+		case o.stillRunning():
+			return fmt.Sprintf("the %s observer (pid %d) had NOT exited when this reading was taken; ", o.producer, o.pid)
+		}
+	}
+	return "both observers exited and were reaped, "
 }
 
 // BeginAction opens the complete physical action envelope: it records AT_start
@@ -175,6 +206,7 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		Schema: SchemaVersion, Dir: dir, Run: run, Containment: cont.Identity(),
 		PeerControl: peer.ctl.base, TraceControl: trace.ctl.base,
 		PeerPID: peer.pid, TracePID: trace.pid,
+		PeerStart: peer.start, TraceStart: trace.start,
 		Deadline: deadline.UTC().Format(time.RFC3339Nano), StartedAt: start,
 	}
 	b, err := json.MarshalIndent(st, "", "  ")
@@ -322,13 +354,16 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 			terminal, reason = TerminalCrashUnclosed, emptyErr.Error()
 		}
 	}
-	// Reconstructed WITH the process ids the opening step recorded, so a
-	// close that cannot be completed can still end the observer rather than
-	// leaving it to watch a containment that no longer exists.
+	// Reconstructed WITH the process identities the opening step recorded — the
+	// pid AND the start identity — so a close that cannot be completed can end
+	// the observer rather than leaving it to watch a containment that no
+	// longer exists, and so it can only ever end THAT process.
 	trace := &observerProc{producer: ProducerTrace, ctl: control{base: st.TraceControl},
-		pid: st.TracePID, stream: filepath.Join(dir, streamName(ProducerTrace, LevelAction, 0))}
+		pid: st.TracePID, start: st.TraceStart,
+		stream: filepath.Join(dir, streamName(ProducerTrace, LevelAction, 0))}
 	peer := &observerProc{producer: ProducerPeer, ctl: control{base: st.PeerControl},
-		pid: st.PeerPID, stream: filepath.Join(dir, streamName(ProducerPeer, LevelAction, 0))}
+		pid: st.PeerPID, start: st.PeerStart,
+		stream: filepath.Join(dir, streamName(ProducerPeer, LevelAction, 0))}
 	if err := trace.close(deadline); err != nil && terminal == TerminalPassed {
 		terminal, reason = TerminalWrapperError, err.Error()
 	}
@@ -347,7 +382,7 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 		Kind: "boundary", Role: RolePhysicalAction, Level: LevelAction, Boundary: "end",
 		Source: SourceWrapper, Run: st.Run, Containment: st.Containment,
 		Instant: clock.Now(), Terminal: terminal, Reason: reason,
-		Note: "observers reaped, containment destroyed and the action-state handoff removed before this reading; only this record's own write and the ledger seal follow it",
+		Note: observerTeardownNote(peer, trace) + "containment destroyed and the action-state handoff removed before this reading; only this record's own write and the ledger seal follow it",
 	}); err != nil {
 		return st, err
 	}

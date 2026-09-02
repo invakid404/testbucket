@@ -619,7 +619,19 @@ type observerProc struct {
 	// cmd. Without a pid there was then nothing to kill: a lifecycle that
 	// could not be completed left a live observer watching the containment,
 	// and the one process able to reach it had thrown away its address.
-	pid    int
+	pid int
+	// start is the observer's PROCESS-START IDENTITY, read when it was
+	// launched. A pid alone is a number the kernel reuses, and this handle is
+	// reconstructed in a later step of the job — by which time that number may
+	// name an unrelated process. Signalling it then would kill whatever
+	// happened to inherit it, and "the pid is gone" would be read as "the
+	// observer exited" when the observer may still be running under a pid we
+	// no longer recognise. The pair (pid, start) is an identity; the pid alone
+	// is a guess.
+	//
+	// It is empty on a platform that cannot supply one. That is not a licence
+	// to signal blindly — see abandon.
+	start  string
 	ctl    control
 	stream string
 	// pub is the observer's signing identity, kept so the wrapper can declare
@@ -739,7 +751,8 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 		}
 	}
 	return &observerProc{
-		producer: p, cmd: cmd, pid: cmd.Process.Pid, ctl: control{base: base}, pub: PublicKeyOf(key),
+		producer: p, cmd: cmd, pid: cmd.Process.Pid, start: processStartID(cmd.Process.Pid),
+		ctl: control{base: base}, pub: PublicKeyOf(key),
 		stream: filepath.Join(opt.Dir, streamName(p, opt.Level, opt.Seq)),
 	}, nil
 }
@@ -874,11 +887,60 @@ func (o *observerProc) close(deadline time.Time) error {
 		return err
 	}
 	if o.cmd == nil {
-		// A detached observer is reaped by init; its closing RECORD is the
-		// receipt that matters, and it is already on disk.
-		return nil
+		// A DETACHED observer is not this process's child, so there is no
+		// Wait to call — but "it wrote its closing record" is not "it exited".
+		// Returning here let EndAction record that the observers had been
+		// reaped while they were still running, and the contract makes
+		// failure to reap after the containment signal terminal rather than
+		// something a note may assert.
+		//
+		// Because it is not our child it also cannot become a zombie for us:
+		// once it exits, init reaps it and the pid stops resolving. So its
+		// disappearance IS the exit proof, and waiting for it is honest.
+		return o.awaitExit(deadline)
 	}
 	return o.cmd.Wait()
+}
+
+// awaitExit waits for a detached observer to actually be gone.
+//
+// Gone means one of two things, and both are conclusive: the pid no longer
+// resolves at all, or it resolves to a process whose start identity is not the
+// one we launched — a reused number, which means ours is long finished. A
+// timeout is NOT gone, and is reported as such: the caller can refuse a row it
+// could not close, but it must not claim a reap that never happened.
+func (o *observerProc) awaitExit(deadline time.Time) error {
+	if o.pid <= 0 {
+		return fmt.Errorf("%s observer has no process identity to confirm exit for", o.producer)
+	}
+	for {
+		if !o.stillRunning() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s observer %d wrote its closing record but had not exited by the deadline; a lifecycle is not closed until the observer is gone", o.producer, o.pid)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// stillRunning reports whether the process THIS handle launched is still
+// there. A pid that resolves to a different start identity is a reused number
+// and is not our observer.
+func (o *observerProc) stillRunning() bool {
+	if o.pid <= 0 {
+		return false
+	}
+	// signal 0 probes for existence without delivering anything.
+	if err := syscall.Kill(o.pid, syscall.Signal(0)); err != nil {
+		return false
+	}
+	if o.start == "" {
+		// No identity was ever available on this platform, so existence is
+		// all that can be said.
+		return true
+	}
+	return processStartID(o.pid) == o.start
 }
 
 // abandon kills an observer whose lifecycle cannot be completed. Its partial
@@ -895,7 +957,19 @@ func (o *observerProc) abandon() {
 	// process's child any more, so there is nothing to reap — but it is still
 	// killable, and leaving it watching the containment would let a refused
 	// lifecycle keep writing records over whatever runs next.
-	if o.pid > 0 {
+	//
+	// ONLY IF IT IS STILL OURS. Begin and end are separate steps of the job,
+	// and the kernel reuses pids; a bare number from an earlier step may by
+	// then name the runner's own work. Killing it would be a wrapper that
+	// terminates an unrelated process to tidy up its own bookkeeping, which is
+	// worse than the leak it prevents. When the identity does not match there
+	// is nothing of ours to kill: either the observer already exited, or it is
+	// not at this pid.
+	//
+	// A platform that cannot supply a start identity gets existence alone,
+	// which is the strongest claim available there; the observer's own timeout
+	// still ends it.
+	if o.stillRunning() {
 		_ = syscall.Kill(o.pid, syscall.SIGKILL)
 	}
 }

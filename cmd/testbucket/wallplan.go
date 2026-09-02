@@ -445,11 +445,13 @@ func runWallReplay(args []string) error {
 
 	stage1 := issued.Stage1Digest
 	var lineage walltime.TrainingLineageID
-	// The keys Stage 1 declares for an INDEPENDENT replay. They are what makes
-	// the attestation compared below evidence rather than a file, so they are
+	// The keys Stage 1 declares for an INDEPENDENT replay, and the rest of the
+	// instrumentation identity it approved. They are what makes the
+	// attestation compared below evidence rather than a file, so they are
 	// taken from the authority-signed manifest this replay just checked, never
 	// from the attestation itself.
 	var replaySigners []string
+	var instrumentation walltime.InstrumentationIdentity
 	// The approval this replay independently observed on the Stage-1 manifest.
 	// An empty one means no manifest was supplied, and Matches then reports
 	// the receipt's claim as unre-derived rather than agreeing with it.
@@ -488,6 +490,7 @@ func runWallReplay(args []string) error {
 		stage1 = d
 		lineage = m.TrainingLineage
 		replaySigners = m.Instrumentation.ReplaySigners
+		instrumentation = m.Instrumentation
 		if replayApproval, err = walltime.ApprovalOf(m); err != nil {
 			return err
 		}
@@ -554,9 +557,15 @@ func runWallReplay(args []string) error {
 		if err := checkRecordIdentities(issued, stage1, registryDigest, *expectStage1, *expectStage2, *expectRegistry, *expectVerifier); err != nil {
 			return err
 		}
-		// And the verifier identity is bound to a SIGNED replay, not merely
-		// found to be non-empty.
-		if err := checkAttestedVerifier(*expectAttestation, *expectVerifier, replaySigners, authorityKeys); err != nil {
+		// And the verifier identity is bound to a SIGNED replay OF THIS PLAN,
+		// not merely to one that is signed and non-empty.
+		stage2Digest, err := issued.DigestOf()
+		if err != nil {
+			return err
+		}
+		if err := checkAttestedVerifier(*expectAttestation, preflightPlan{
+			issued: issued, stage2: stage2Digest, stage1: stage1, instrumentation: instrumentation,
+		}, *expectVerifier, replaySigners, authorityKeys); err != nil {
 			return err
 		}
 	}
@@ -649,7 +658,23 @@ func checkRecordIdentities(issued walltime.Stage2Receipt, stage1, registry wallt
 // declares, distinct from the authority key, under the identity it names.
 // Comparing against an unauthenticated file would prove nothing: the caller
 // could write one that agrees with whatever it passed.
-func checkAttestedVerifier(path, wantVerifier string, replaySigners, authorityKeys []string) error {
+// preflightPlan is the plan the pre-flight is running for, carried as one
+// value so the replay comparator cannot be handed a subset of it.
+//
+// Every field is one this command DERIVED or VERIFIED for itself: the issued
+// receipt it read, the digest it computed from that receipt, the Stage-1
+// digest it checked the authority signature over, and the instrumentation
+// identity that authority-signed manifest declares. None of them comes from
+// the attestation being checked, which would be the document vouching for
+// itself.
+type preflightPlan struct {
+	issued          walltime.Stage2Receipt
+	stage2          walltime.Digest
+	stage1          walltime.Digest
+	instrumentation walltime.InstrumentationIdentity
+}
+
+func checkAttestedVerifier(path string, plan preflightPlan, wantVerifier string, replaySigners, authorityKeys []string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("--expect-attestation was not supplied, so --expect-verifier-id is checked only for being non-blank; any other identity a caller resolves would open the envelope and be refused only after the bucket had run")
 	}
@@ -690,6 +715,22 @@ func checkAttestedVerifier(path, wantVerifier string, replaySigners, authorityKe
 	}
 	if strings.TrimSpace(wantVerifier) != a.VerifierID {
 		return fmt.Errorf("the measured records will be stamped --expect-verifier-id=%q, but the signed replay attestation this row is verified against was made by %q; the two must be the same resolved value BEFORE any measured work starts", strings.TrimSpace(wantVerifier), a.VerifierID)
+	}
+
+	// AND IT MUST BE A REPLAY OF THIS PLAN.
+	//
+	// Everything above authenticates the document and its signer. None of it
+	// asks which plan the document is about, so an attestation from an
+	// entirely different plan — correctly signed, by a declared replay signer,
+	// under the expected verifier identity — opened the gate. `wall verify`
+	// rejected it afterwards, which is the wrong side of AT_start: a refusal
+	// after the fact can invalidate the row, it cannot un-measure it.
+	//
+	// This is the SAME check the post-action verifier runs, run here, so the
+	// two boundaries cannot disagree about what counts as an attested plan.
+	if problems := a.Verify(plan.issued, plan.stage2, plan.stage1, plan.instrumentation, strings.TrimSpace(wantVerifier)); len(problems) > 0 {
+		return fmt.Errorf("the signed replay attestation does not attest the plan being pre-flighted, and no measured work may start:\n  %s",
+			strings.Join(problems, "\n  "))
 	}
 	return nil
 }

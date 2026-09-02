@@ -39,19 +39,46 @@ func verifyRawEvidence(v *Verdict, envs []Envelope) {
 			if !side.in.OK {
 				continue
 			}
-			checkRawEndpoint(v, label, side.who, "admission", side.in.start, true)
-			checkRawEndpoint(v, label, side.who, "verified-empty", side.in.end, false)
+			checkRawEndpoint(v, label, side.who, "admission", side.in.start)
+			checkRawEndpoint(v, label, side.who, "verified-empty", side.in.end)
+			// The two endpoints of ONE observer must be two observations.
+			// Both legitimately report an empty containment, so equal bytes
+			// are expected and prove nothing either way — but a shared raw
+			// event id means one read was recorded twice, which the contract
+			// forbids by requiring distinct admission and empty raw-event ids.
+			if side.in.start.Source == SourceContainment && side.in.end.Source == SourceContainment &&
+				side.in.start.RawEventID != "" && side.in.start.RawEventID == side.in.end.RawEventID {
+				v.add("WT-028", SeverityIneligible, fmt.Sprintf(
+					"%s %s delimits its lifecycle with one raw event id (%s) at both ends; the admission and the verified-empty read must be distinct observations, not one read filed twice",
+					label, side.who, side.in.start.RawEventID))
+			}
 		}
 	}
 }
 
 // checkRawEndpoint verifies one boundary record against the bytes it retains.
 //
-// wantPopulated says which side of the lifecycle this is: admission observes a
-// containment that HAS the child in it, and the closing read observes one the
-// kernel reports empty. A record whose retained bytes say the opposite is not
-// evidence for the interval it delimits.
-func checkRawEndpoint(v *Verdict, label string, who Producer, what string, r Record, wantPopulated bool) {
+// BOTH endpoints must observe an EMPTY containment, and this is the production
+// truth rather than a convenience.
+//
+// The contract puts peer and collector admission BEFORE every action-owned
+// child, and the producer follows it exactly: `RunObserver` takes its
+// admission read the moment the admit phase opens, and `Exec` only creates the
+// child after both observers have written their start records. The containment
+// is freshly made — `newCgroupUnder` refuses a directory that already exists —
+// so at that instant nothing is in it and `cgroup.events` truthfully says
+// `populated 0`. The contract states the same mapping: `cgroup_create/admit`
+// (containment inode plus boot/PID-start identity) to `cgroup.events
+// populated=0`.
+//
+// This check previously required the admission read to say `populated 1`. That
+// is a state the production ordering forbids, so every genuine scored run was
+// WT-028 ineligible and only a fixture describing an impossible sequence could
+// pass. Requiring EMPTY is not a relaxation: it turns the admission read into
+// the check for the contract's terminal "child before admission" — a
+// containment that already has members when it is admitted is one whose
+// lifecycle began before anybody was watching.
+func checkRawEndpoint(v *Verdict, label string, who Producer, what string, r Record) {
 	where := fmt.Sprintf("%s %s %s", label, who, what)
 
 	// Only an independently observed OS class may delimit a lifecycle, and
@@ -86,39 +113,61 @@ func checkRawEndpoint(v *Verdict, label string, who Producer, what string, r Rec
 	populated, ok := parseCgroupPopulated(r.RawEventBytes)
 	if !ok {
 		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
-			"%s retains bytes with no `populated` line; they are not a cgroup.events read", where))
+			"%s retains bytes with no well-formed `populated 0|1` line; they are not a cgroup.events read this verifier will interpret", where))
 		return
 	}
-	if populated != wantPopulated {
-		state := map[bool]string{true: "populated", false: "empty"}
-		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
-			"%s retains a cgroup.events read reporting %s, but a %s endpoint requires %s",
-			where, state[populated], what, state[wantPopulated]))
+	if populated {
+		// Which endpoint it is changes what a populated read MEANS, and
+		// neither meaning is admissible.
+		switch what {
+		case "admission":
+			v.add("WT-028", SeverityIneligible, fmt.Sprintf(
+				"%s retains a cgroup.events read reporting a POPULATED containment; the containment is created fresh and admitted before any child, so a member already inside it is the contract's child-before-admission — a lifecycle that began before this observer was watching", where))
+		default:
+			v.add("WT-028", SeverityIneligible, fmt.Sprintf(
+				"%s retains a cgroup.events read reporting a POPULATED containment, so the kernel had not reported it empty when this endpoint was written; a returned root with a live descendant is exactly the escape this endpoint exists to catch", where))
+		}
 		return
 	}
-	// AND THE MEMBERSHIP TAKEN WITH IT. A close that reports empty while its
-	// own snapshot lists members contradicts itself; the snapshot exists so
-	// "nothing was in it" can be checked rather than believed.
-	if !populated && len(r.RawProcs) > 0 {
+	// AND THE MEMBERSHIP TAKEN WITH IT. An endpoint that reports empty while
+	// its own snapshot lists members contradicts itself; the snapshot exists
+	// so "nothing was in it" can be checked rather than believed.
+	if len(r.RawProcs) > 0 {
 		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
 			"%s reports an empty containment while its own membership snapshot lists %d member(s): %v",
 			where, len(r.RawProcs), r.RawProcs))
 	}
-	if populated && len(r.RawProcs) == 0 {
-		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
-			"%s reports a populated containment but retains no membership snapshot, so what was admitted is unrecorded", where))
-	}
 }
 
-// parseCgroupPopulated reads the `populated 0|1` line the kernel writes. It
-// reports whether the line was found, so bytes that are not a cgroup.events
-// read are distinguishable from bytes that are and say "empty" — the first is
-// a missing observation, the second is an observation.
+// parseCgroupPopulated reads the `populated 0|1` line the kernel writes.
+//
+// The grammar is EXACT. It used to read "anything that is not 0" as populated,
+// which accepted `populated forged` — bytes no kernel produces — as a
+// well-formed observation of a populated containment. The producer's own
+// polling loop is deliberately permissive in the other direction, because
+// there "unparseable" must mean "children may still be running"; a verifier
+// adjudicating retained evidence after the fact has the opposite duty, and an
+// uninterpretable byte string is not an observation at all.
+//
+// found reports whether a well-formed line was present, so bytes that are not
+// a cgroup.events read stay distinguishable from bytes that are and say
+// "empty" — the first is a missing observation, the second is an observation.
 func parseCgroupPopulated(b []byte) (populated, found bool) {
 	for _, line := range strings.Split(string(b), "\n") {
 		f := strings.Fields(line)
-		if len(f) == 2 && f[0] == "populated" {
-			return f[1] != "0", true
+		if len(f) != 2 || f[0] != "populated" {
+			continue
+		}
+		switch f[1] {
+		case "0":
+			return false, true
+		case "1":
+			return true, true
+		default:
+			// A `populated` line the kernel would never write. Refusing here
+			// rather than continuing means a file carrying one malformed line
+			// and one well-formed one is still refused.
+			return false, false
 		}
 	}
 	return false, false

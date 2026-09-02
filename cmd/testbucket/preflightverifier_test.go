@@ -10,15 +10,66 @@ import (
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
-// attestedBy writes a replay attestation the way production does, so what these
-// tests compare against is a document the real writer emits rather than one
-// hand-assembled to agree with the checker.
-func attestedBy(t *testing.T, key ed25519.PrivateKey, verifierID string) string {
+// currentPlan is A REAL PLAN for the pre-flight to be run against: a bundle,
+// an issued Stage-2 receipt derived from it, and the two digests this command
+// would have computed for itself.
+//
+// The helper these tests used to share handed the writer three ZERO values, so
+// every attestation it produced was about no plan at all. That is exactly why
+// the coverage could not see F2: a comparator that never asks which plan a
+// replay is for agrees with an attestation about nothing just as readily as
+// with one about this plan.
+func currentPlan(t *testing.T) (walltime.PlanningInputBundle, walltime.Stage2Receipt, walltime.Digest, walltime.Digest) {
+	t.Helper()
+	const frozenProfileCommit = "d9ae1d433bb45012c04d567879b66fc4bf6112c6"
+	var bundle walltime.PlanningInputBundle
+	bundle.Kind = walltime.BundleKind
+	bundle.Source.Repository = "mandel-ai/mandel"
+	bundle.Source.Commit = frozenProfileCommit
+	bundle.Source.Tree = "sha256:tree"
+	bundleDigest, err := bundle.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := func(c byte) walltime.Digest { return walltime.Digest("sha256:" + strings.Repeat(string(c), 64)) }
+	issued := walltime.Stage2Receipt{
+		Kind: walltime.Stage2Kind, Stage1Digest: d('1'), BundleDigest: bundleDigest,
+		InputAccess: []walltime.InputAccess{{Field: "bundle", Digest: bundleDigest}},
+		PlanDigest:  d('5'), SemanticDigest: d('6'), AtomDigest: d('7'),
+		TopologyDigest: d('8'), MembershipDigest: d('9'), InvocationDigest: d('a'),
+		ScriptDigest: d('b'), MatrixDigest: d('c'),
+		PlannerResult: "pass", RendererResult: "pass",
+	}
+	issued.Algorithms.FullPlan = walltime.AlgorithmIdentity{
+		Name: walltime.FullPlanDigestAlgorithm, Canonicalizer: "rfc8785/v1", Implementation: "sha256:test"}
+	issued.Algorithms.SemanticPlan = walltime.AlgorithmIdentity{
+		Name: walltime.SemanticPlanDigestAlgorithm, Canonicalizer: "rfc8785/v1", Implementation: "sha256:test"}
+	if err := issued.Validate(); err != nil {
+		t.Fatalf("the fixture plan is not a valid issued receipt: %v", err)
+	}
+	stage2, err := issued.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle, issued, issued.Stage1Digest, stage2
+}
+
+// planOf is the pre-flight's view of that plan.
+func planOf(issued walltime.Stage2Receipt, stage1, stage2 walltime.Digest) preflightPlan {
+	return preflightPlan{issued: issued, stage2: stage2, stage1: stage1}
+}
+
+// attestedBy writes a replay attestation the way production does, FOR THE PLAN
+// it is handed, so what these tests compare against is a document the real
+// writer emits about a real plan.
+func attestedBy(t *testing.T, key ed25519.PrivateKey, verifierID string,
+	bundle walltime.PlanningInputBundle, issued walltime.Stage2Receipt) string {
 	t.Helper()
 	t.Setenv(replayKeyEnv, walltime.EncodeKey(key))
 	path := filepath.Join(t.TempDir(), "replay.json")
-	if err := writeReplayAttestation(path, verifierID,
-		walltime.Stage2Receipt{}, walltime.PlanningInputBundle{}, walltime.Stage2Receipt{}); err != nil {
+	// Recomputed is the receipt an honest independent replay would derive: the
+	// same plan. Matches compares them field by field.
+	if err := writeReplayAttestation(path, verifierID, issued, bundle, issued); err != nil {
 		t.Fatalf("writeReplayAttestation: %v", err)
 	}
 	return path
@@ -51,7 +102,14 @@ func TestThePreflightBindsTheVerifierIdentityToTheSignedReplay(t *testing.T) {
 	const genuine = "ewj2-verifier"
 	declared := []string{walltime.PublicKeyOf(replayKey)}
 	authorityKeys := []string{walltime.PublicKeyOf(authorityKey)}
-	good := attestedBy(t, replayKey, genuine)
+	bundle, issued, stage1, stage2 := currentPlan(t)
+	plan := planOf(issued, stage1, stage2)
+	good := attestedBy(t, replayKey, genuine, bundle, issued)
+
+	// A replay of SOME OTHER PLAN, signed correctly by a declared replay
+	// signer under exactly the expected verifier identity. Everything about
+	// the document authenticates; it is simply not about this plan.
+	foreign := attestedBy(t, replayKey, genuine, walltime.PlanningInputBundle{}, walltime.Stage2Receipt{})
 
 	for _, tc := range []struct {
 		name          string
@@ -84,9 +142,16 @@ func TestThePreflightBindsTheVerifierIdentityToTheSignedReplay(t *testing.T) {
 		{name: "a replay signer that is also the plan's authority",
 			path: good, want: genuine, signers: declared, auth: declared,
 			wantErr: "not an independent re-derivation"},
+
+		// THE DEFECT. Authenticated, independent, under the right identity —
+		// and about a different plan entirely. It used to open the gate, and
+		// only `wall verify` refused it, after the bucket had run.
+		{name: "an authenticated replay of a different plan",
+			path: foreign, want: genuine, signers: declared, auth: authorityKeys,
+			wantErr: "does not attest the plan being pre-flighted"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkAttestedVerifier(tc.path, tc.want, tc.signers, tc.auth)
+			err := checkAttestedVerifier(tc.path, plan, tc.want, tc.signers, tc.auth)
 			switch {
 			case tc.wantErr == "" && err != nil:
 				t.Fatalf("the genuine attested identity was refused: %v", err)
@@ -108,7 +173,8 @@ func TestAnAttestationSignedUnderAnotherPartysIdentityIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := attestedBy(t, key, "ewj2-verifier")
+	bundle, issued, stage1, stage2 := currentPlan(t)
+	path := attestedBy(t, key, "ewj2-verifier", bundle, issued)
 	var a walltime.ReplayAttestation
 	if err := walltime.ReadJSONFile(path, &a); err != nil {
 		t.Fatal(err)
@@ -120,7 +186,7 @@ func TestAnAttestationSignedUnderAnotherPartysIdentityIsRefused(t *testing.T) {
 	if err := walltime.WriteJSONFile(moved, a); err != nil {
 		t.Fatal(err)
 	}
-	err = checkAttestedVerifier(moved, "some-other-verifier", []string{walltime.PublicKeyOf(key)}, nil)
+	err = checkAttestedVerifier(moved, planOf(issued, stage1, stage2), "some-other-verifier", []string{walltime.PublicKeyOf(key)}, nil)
 	if err == nil {
 		t.Fatal("an attestation signed under another party's identity was accepted")
 	}
@@ -136,8 +202,9 @@ func TestABlankAttestedIdentityIsNotAnEquivalence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := attestedBy(t, key, "ewj2-verifier")
-	if err := checkAttestedVerifier(path, "   ", []string{walltime.PublicKeyOf(key)}, nil); err == nil {
+	bundle, issued, stage1, stage2 := currentPlan(t)
+	path := attestedBy(t, key, "ewj2-verifier", bundle, issued)
+	if err := checkAttestedVerifier(path, planOf(issued, stage1, stage2), "   ", []string{walltime.PublicKeyOf(key)}, nil); err == nil {
 		t.Error("a blank record verifier identity was accepted against a signed attestation")
 	}
 }

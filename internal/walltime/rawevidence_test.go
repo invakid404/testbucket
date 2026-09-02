@@ -61,17 +61,21 @@ func TestTheRetainedKernelBytesAreActuallyVerified(t *testing.T) {
 				r.RawEventBytes = []byte("frozen 0\n")
 				r.RawEventDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawEventBytes...))
 			}
-		}, "no `populated` line"},
+		}, "well-formed `populated 0|1` line"},
 
-		// The bytes are real and self-consistent, and say the OPPOSITE of what
-		// the boundary they delimit claims.
-		{"an admission whose kernel read says empty", func(_ Level, _ int, p Producer, b string, r *Record) {
+		// PRODUCTION TRUTH, both ways round. The containment is created
+		// fresh and admitted before any child, so a populated admission is
+		// the contract's child-before-admission, and a populated close is an
+		// escaped descendant. Neither is admissible, and the previous
+		// verifier had the admission case exactly inverted — it DEMANDED the
+		// state production forbids.
+		{"an admission whose kernel read says populated", func(_ Level, _ int, p Producer, b string, r *Record) {
 			if p != ProducerPhysical && admission(b) {
-				r.RawEventBytes = []byte("populated 0\nfrozen 0\n")
-				r.RawProcs = nil
+				r.RawEventBytes = []byte("populated 1\nfrozen 0\n")
+				r.RawProcs = []int{synthAdmittedPID}
 				r.RawEventDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawEventBytes...))
 			}
-		}, "requires populated"},
+		}, "child-before-admission"},
 
 		{"a close whose kernel read says populated", func(_ Level, _ int, p Producer, b string, r *Record) {
 			if p != ProducerPhysical && !admission(b) {
@@ -79,21 +83,49 @@ func TestTheRetainedKernelBytesAreActuallyVerified(t *testing.T) {
 				r.RawProcs = []int{synthAdmittedPID}
 				r.RawEventDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawEventBytes...))
 			}
-		}, "requires empty"},
+		}, "had not reported it empty"},
+
+		// A `populated` value no kernel writes. It used to read as POPULATED,
+		// because anything that was not literally "0" did.
+		{"a populated value outside the kernel grammar", func(_ Level, _ int, p Producer, _ string, r *Record) {
+			if p != ProducerPhysical {
+				r.RawEventBytes = []byte("populated forged\nfrozen 0\n")
+				r.RawEventDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawEventBytes...))
+			}
+		}, "well-formed `populated 0|1` line"},
+
+		{"a numeric populated value the grammar does not allow", func(_ Level, _ int, p Producer, _ string, r *Record) {
+			if p == ProducerTrace {
+				r.RawEventBytes = []byte("populated 2\nfrozen 0\n")
+				r.RawEventDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawEventBytes...))
+			}
+		}, "well-formed `populated 0|1` line"},
 
 		// The record contradicting ITSELF: the kernel line says empty, the
-		// membership snapshot taken with it lists a member.
+		// membership snapshot taken with it lists a member. True at either
+		// end, since production observes an empty containment at both.
+		{"an empty admission whose own snapshot lists members", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p != ProducerPhysical && admission(b) {
+				r.RawProcs = []int{synthAdmittedPID}
+			}
+		}, "membership snapshot lists"},
+
 		{"an empty close whose own snapshot lists members", func(_ Level, _ int, p Producer, b string, r *Record) {
 			if p != ProducerPhysical && !admission(b) {
 				r.RawProcs = []int{synthAdmittedPID}
 			}
 		}, "membership snapshot lists"},
 
-		{"a populated admission with no membership recorded", func(_ Level, _ int, p Producer, b string, r *Record) {
-			if p != ProducerPhysical && admission(b) {
-				r.RawProcs = nil
+		// ONE read filed twice. Both endpoints legitimately report an empty
+		// containment, so equal bytes prove nothing — but the contract
+		// requires distinct admission and empty raw-event ids, and a shared
+		// id means one observation was recorded as two.
+		{"one raw event id at both ends of a lifecycle", func(_ Level, _ int, p Producer, b string, r *Record) {
+			if p == ProducerPeer {
+				r.RawEventID = "peer:one-read-filed-twice"
+				r.RawEventDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawEventBytes...))
 			}
-		}, "retains no membership snapshot"},
+		}, "not one read filed twice"},
 
 		{"bytes carried under no raw event id", func(_ Level, _ int, p Producer, _ string, r *Record) {
 			if p == ProducerPeer {

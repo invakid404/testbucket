@@ -694,6 +694,30 @@ func runWallCampaign(args []string) error {
 	return nil
 }
 
+// verdictSigningIdentity is the identity a machine-readable verdict must be
+// signed under: the DELIVERY VERIFIER the measured records name.
+//
+// A signature covers `authority NUL digest`, and the retained authority is the
+// party the signature was made under. LoadCampaign requires that party to be
+// the delivery verifier the verdict's own body names, because a verdict signed
+// under some other identity attributes a row to somebody who did not verify
+// it.
+//
+// This used to be the --authority value, which in the scored workflow is the
+// protected Stage-1 environment `ewj2-campaign`, while the body's verifier
+// identity comes from the measured records and is `ewj2-verifier`. The
+// producer therefore emitted, by construction, exactly the verdict the
+// production campaign loader refuses — so no genuine population could ever
+// have been assembled from real runs. --authority keeps its own job: saying
+// which protected environment must have approved Stage 1.
+func verdictSigningIdentity(v *walltime.Verdict) (string, error) {
+	identity := strings.TrimSpace(v.Run.VerifierID)
+	if identity == "" {
+		return "", fmt.Errorf("these records name no delivery verifier identity, so there is nobody to sign this verdict as; signing it under any other name would attribute the row to a party that did not verify it")
+	}
+	return identity, nil
+}
+
 func runWallVerify(args []string) error {
 	fs := flag.NewFlagSet("wall verify", flag.ExitOnError)
 	dir := fs.String("dir", "", "records directory (required)")
@@ -744,7 +768,32 @@ func runWallVerify(args []string) error {
 			if err != nil {
 				return fmt.Errorf("%s: %w", verifierKeyEnv, err)
 			}
-			if err := v.Sign(*authority, priv); err != nil {
+			// THE DELIVERY VERIFIER SIGNS, not the Stage-1 authority.
+			//
+			// The identity is chosen by verdictSigningIdentity so the rule is
+			// one function rather than one line inside a command, and can be
+			// exercised directly against the campaign loader's requirement.
+			//
+			// A signature covers `authority NUL digest`, and the retained
+			// authority is the party the signature is made under. The campaign
+			// loader requires that party to be the delivery verifier the
+			// verdict's own body names — because a verdict signed under some
+			// other identity attributes a row to somebody who did not verify
+			// it.
+			//
+			// This used to sign under --authority, which in the scored
+			// workflow is the protected Stage-1 environment `ewj2-campaign`,
+			// while the body's verifier identity comes from the measured
+			// records and is `ewj2-verifier`. The producer therefore emitted,
+			// by construction, exactly the verdict the production campaign
+			// loader refuses: no genuine population could ever have been
+			// assembled. --authority keeps its own job, which is saying which
+			// protected environment must have approved Stage 1.
+			identity, err := verdictSigningIdentity(v)
+			if err != nil {
+				return err
+			}
+			if err := v.Sign(identity, priv); err != nil {
 				return err
 			}
 		} else {

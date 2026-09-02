@@ -116,15 +116,7 @@ func (c *cgroup2) Observe(observer string) (RawEvent, bool, error) {
 	// boolean. A read error here is not fatal: the events file is the
 	// authority on emptiness, and the snapshot is corroborating evidence.
 	procs, _ := c.Procs()
-	id := newRawEventID(observer)
-	ev := RawEvent{
-		ID:     id,
-		Digest: DigestBytes(append([]byte(id+"\x00"), b...)),
-		Source: SourceContainment,
-		Bytes:  b,
-		Procs:  procs,
-	}
-	return ev, cgroupPopulated(b), nil
+	return newContainmentEvent(observer, b, procs), cgroupPopulated(b), nil
 }
 
 // cgroupPopulated parses the `populated 0|1` line of cgroup.events. An

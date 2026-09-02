@@ -148,9 +148,10 @@ func (s *synthRun) spec(i int) SpecIdentity {
 	}
 }
 
-// synthAdmittedPID is the member a populated containment read reports. Its
-// value is immaterial; that the snapshot is NOT EMPTY when the kernel says
-// populated is the property the verifier checks.
+// synthAdmittedPID is a containment member a MUTATION can plant. Production
+// never records one at either endpoint: both reads observe an empty
+// containment, and a member in the snapshot contradicts the read taken with
+// it.
 const synthAdmittedPID = 4242
 
 // mutation is applied to a record just before it is written, so a test can
@@ -295,23 +296,24 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 			}
 			if producer != ProducerPhysical {
 				// The RETAINED KERNEL BYTES, in exactly the shape the Linux
-				// producer emits: a cgroup.events read that says populated at
-				// admission and empty at the close, the membership snapshot
-				// taken with the same read, and the digest derived from the
-				// observer's own id and those exact bytes.
+				// producer emits at each endpoint.
 				//
-				// The fixture used to carry an id and a digest of that id,
-				// with no bytes at all — which is precisely the shape the
-				// verifier now refuses, and precisely why it could not tell
-				// invented evidence from observed evidence.
+				// BOTH reads report an empty containment, because that is what
+				// production observes. The admission read is taken the moment
+				// the admit phase opens — before Exec creates the child, into
+				// a containment newCgroupUnder just made — so the kernel says
+				// `populated 0` and cgroup.procs is empty. The closing read is
+				// awaitEmpty's own conclusion, which by construction only
+				// returns once the kernel reports unpopulated.
+				//
+				// An earlier fixture said `populated 1` with a fake member at
+				// admission. Nothing in production can produce that, and a
+				// fixture describing an impossible sequence cannot establish
+				// that a real run verifies — which is exactly how a verifier
+				// that refused every genuine scored run passed its own tests.
 				rec.RawEventID = fmt.Sprintf("%s:%s:%s:%d", producer, level, p.boundary, seq)
-				if p.boundary == "start" {
-					rec.RawEventBytes = []byte("populated 1\nfrozen 0\n")
-					rec.RawProcs = []int{synthAdmittedPID}
-				} else {
-					rec.RawEventBytes = []byte("populated 0\nfrozen 0\n")
-					rec.RawProcs = nil
-				}
+				rec.RawEventBytes = []byte("populated 0\nfrozen 0\n")
+				rec.RawProcs = nil
 				rec.RawEventDigest = DigestBytes(append([]byte(rec.RawEventID+"\x00"), rec.RawEventBytes...))
 				rec.Phase = lifecyclePhase(level)
 			}
