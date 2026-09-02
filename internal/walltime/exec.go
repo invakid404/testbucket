@@ -396,6 +396,7 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 		StartID:   processStartID(cmd.Process.Pid),
 		SessionID: processSessionOf(cmd.Process.Pid),
 		ParentPID: os.Getpid(),
+		UID:       processUIDOf(cmd.Process.Pid),
 	}
 	// THE MEMBERSHIP, WHILE THE CHILD IS IN IT.
 	//
@@ -709,6 +710,35 @@ func retainProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment
 	_, _ = w.Append(rec)
 }
 
+// workloadArgv wraps the measured command so it runs under the WORKLOAD'S OWN
+// CREDENTIAL rather than the wrapper's.
+//
+// This is the privilege boundary, and it is the whole of it. The wrapper needs
+// to create containments, freeze them, admit into them and destroy them, so it
+// must be able to write the delegated subtree; the measured work must not,
+// because on cgroup-v2 `cgroup.procs` IS the process-migration control and a
+// workload that can write it can move itself between containments and rewrite
+// the membership history the envelope records.
+//
+// Both cannot be one credential, and no arrangement of files or environment
+// changes that — so the measured command is executed as a different account.
+// The wrapper stays where it is; only the thing being measured drops.
+//
+// Without a declared workload account the command runs as before: the run is
+// recorded in full and reported ineligible, because membershipControl then
+// reports a containment the workload could have written.
+func workloadArgv(argv []string) []string {
+	user := strings.TrimSpace(os.Getenv(WorkloadUserEnv))
+	if user == "" || len(argv) == 0 {
+		return argv
+	}
+	// `sudo -n` and never a password prompt: a measurement that stops to ask
+	// for one is a measurement that hangs. The runner grants the wrapper this;
+	// the workload account is deliberately granted no sudo at all, so it
+	// cannot travel back the other way.
+	return append([]string{"sudo", "-n", "-u", user, "--"}, argv...)
+}
+
 func membershipSnapshot(cont Containment) ([]int, string) {
 	pids, err := cont.Procs()
 	if err != nil {
@@ -939,6 +969,12 @@ var WallTimeSecretEnv = []string{
 	VerifierKeyEnv,  // signs a verifier verdict
 	ReplayKeyEnv,    // signs an independent replay attestation
 	BuilderKeyEnv,   // signs a build attestation
+	// A CAPABILITY IS NOT ONLY A KEY. The workload account is the credential
+	// the measured work runs under, and an observer that inherits its name can
+	// be asked to drop to it — an observer must never be able to become the
+	// thing it observes. The list is "what confers a capability", not "what
+	// looks like a secret", and the earlier list was the second.
+	WorkloadUserEnv,
 }
 
 // scrubSecrets removes every wall-time secret from an environment.

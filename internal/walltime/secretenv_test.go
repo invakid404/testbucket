@@ -26,6 +26,12 @@ var wallPrivateKeyEnvPattern = regexp.MustCompile(`"(TB_WALL_[A-Z0-9_]*KEY)"`)
 // This reads the source instead: any `TB_WALL_*KEY` literal anywhere in the
 // tree is a signing capability, and one the scrub list does not carry is a
 // capability that outlives the step it was granted to.
+//
+// A CAPABILITY IS NOT ONLY A KEY. `TB_WALL_WORKLOAD_USER` names the account
+// the measured work runs under, and an observer holding it can be asked to
+// become the thing it observes — so the scrub list carries it too, and this
+// test knows the difference between a capability and a configuration value
+// rather than pattern-matching on the word KEY.
 func TestEveryPrivateKeyEnvironmentVariableIsScrubbed(t *testing.T) {
 	scrubbed := map[string]bool{}
 	for _, k := range WallTimeSecretEnv {
@@ -81,10 +87,28 @@ func TestEveryPrivateKeyEnvironmentVariableIsScrubbed(t *testing.T) {
 	// is a rule about a capability that no longer exists, which quietly
 	// weakens the guarantee this test is meant to give.
 	for _, name := range WallTimeSecretEnv {
+		if nonKeyCapabilities[name] {
+			continue
+		}
 		if _, ok := found[name]; !ok {
 			t.Errorf("WallTimeSecretEnv scrubs %s, which nothing in the tree declares", name)
 		}
 	}
+	// The non-key capabilities are named here so adding one is a deliberate
+	// act, and so this test still refuses a stale KEY entry.
+	for name := range nonKeyCapabilities {
+		if !scrubbed[name] {
+			t.Errorf("%s confers a capability and is not scrubbed", name)
+		}
+	}
+}
+
+// nonKeyCapabilities are the capability-conferring variables that are not
+// signing keys. The workload account name is one: `sudo -u <it>` is the whole
+// of becoming the measured workload, and an observer must never be able to
+// become the thing it observes.
+var nonKeyCapabilities = map[string]bool{
+	WorkloadUserEnv: true,
 }
 
 func dedupePaths(in []string) []string {

@@ -82,6 +82,38 @@ inputs:
       such supervisor ships here, so scored rows on a same-uid runner are
       reported INELIGIBLE rather than scored on an absent boundary.
     default: ""
+  workload-user:
+    description: >-
+      The account the MEASURED WORK runs under, distinct from the account this
+      action runs as.
+
+      This is the whole privilege boundary. The wrapper must be able to create,
+      freeze, admit into and destroy containments, so it must be able to write
+      the delegated cgroup subtree; the measured work must NOT, because on
+      cgroup-v2 `cgroup.procs` is the process-migration control and a workload
+      that can write it can move itself between containments and rewrite the
+      membership history the envelope records. Both cannot be one credential,
+      so the wrapper executes the measured command as this account and stays
+      where it is.
+
+      Establish it in a PRIOR step of the caller's job, not here — anything
+      this action does before `wall begin` is action-owned work outside the
+      interval that claims to contain it. For example:
+
+          sudo useradd --system --create-home --shell /bin/bash tb-workload
+          sudo groupadd --system tb-wrapper
+          sudo usermod -aG tb-wrapper "$(id -un)"        # the WRAPPER, not the workload
+          sudo mkdir -p /sys/fs/cgroup/testbucket
+          sudo chown root:tb-wrapper /sys/fs/cgroup/testbucket
+          sudo chmod 0770 /sys/fs/cgroup/testbucket
+          sudo chown -R tb-workload "$GITHUB_WORKSPACE"
+
+      tb-workload must be in NO sudo group: a workload that could sudo would
+      take every capability back. Left empty, the measured work runs as this
+      action's own user, `membershipControl` reports the containment as
+      workload-writable, and the row is recorded in full and reported
+      INELIGIBLE rather than scored.
+    default: ""
   workload-uid:
     description: >-
       ADDITIONAL uids the measured workload may run as
@@ -194,95 +226,6 @@ runs:
         GH_TOKEN: ${{ github.token }}
       run: bash "${{ github.action_path }}/../install-testbucket.sh"
 
-    # THE PRIVILEGE BOUNDARY, established before AT_start.
-    #
-    # The wrapper and the measured workload used to run as the same uid, so
-    # every capability the evidence rests on — a containment whose
-    # `cgroup.procs` the workload cannot write, and the run key that
-    # countersigns producer registrations — was a capability the workload also
-    # held. That is why no scored row could be produced: the refusals were
-    # correct and nothing could satisfy them.
-    #
-    # This step creates the boundary with the privileges a GitHub-hosted Linux
-    # runner provides. It creates a distinct workload account with NO sudo
-    # rights, a wrapper group that may talk to the supervisor, a delegated
-    # cgroup subtree owned by root, and starts `wall supervise` as root holding
-    # the run key. The measured step then runs as that workload account: it can
-    # ASK for a containment or a producer registration and it cannot perform
-    # either itself.
-    #
-    # It is skipped when no cgroup root is supplied, which is the unscored
-    # path: the run is recorded in full and reported INELIGIBLE, exactly as
-    # before.
-    - name: Establish the supervised measurement boundary
-      id: supervisor
-      if: inputs.wall-time-dir != '' && inputs.cgroup-root != '' && runner.os == 'Linux'
-      shell: bash
-      env:
-        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
-        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
-        TB_SUPERVISOR_SOCKET: ${{ runner.temp }}/testbucket-supervisor.sock
-        TB_WORKLOAD_USER: tb-workload
-        TB_WRAPPER_GROUP: tb-wrapper
-        # Read on a descriptor, never on a command line: a key in argv is a key
-        # in the process table, readable by every process on the machine.
-        TB_WALL_RUN_KEY: ${{ inputs.run-key }}
-        TB_RUN_ID: ${{ github.run_id }}
-        TB_RUN_ATTEMPT: ${{ github.run_attempt }}
-        TB_BUCKET: ${{ inputs.name }}
-      run: |
-        set -euo pipefail
-        if ! sudo -n true 2>/dev/null; then
-          echo "::warning::no passwordless sudo on this runner, so no privileged supervisor can be started; the measurement will be recorded in full and reported INELIGIBLE"
-          exit 0
-        fi
-        if [ -z "$TB_WALL_RUN_KEY" ]; then
-          echo "::warning::no run key resolved here, so the supervisor would hold no authorizing capability; the measurement will be recorded in full and reported INELIGIBLE"
-          exit 0
-        fi
-
-        # A DISTINCT, NON-SUDO workload credential. The measured work runs as
-        # this account, which is deliberately absent from every sudo group: a
-        # workload that could sudo would simply take the capabilities back.
-        sudo useradd --system --create-home --shell /bin/bash "$TB_WORKLOAD_USER" 2>/dev/null || true
-        sudo groupadd --system "$TB_WRAPPER_GROUP" 2>/dev/null || true
-        sudo gpasswd -a "$TB_WORKLOAD_USER" "$TB_WRAPPER_GROUP" >/dev/null
-        workload_uid="$(id -u "$TB_WORKLOAD_USER")"
-        wrapper_gid="$(getent group "$TB_WRAPPER_GROUP" | cut -d: -f3)"
-        # The workload must be able to read the checkout and write the records
-        # directory and its own caches; it must NOT own the cgroup tree.
-        sudo chown -R "$TB_WORKLOAD_USER" "$GITHUB_WORKSPACE" "$TB_WALL_DIR" 2>/dev/null || true
-
-        # A delegated subtree owned by ROOT. 0755 leaves it readable, so every
-        # producer can take its own observations, and unwritable by the
-        # workload — which on cgroup-v2 is exactly the migration control.
-        sudo mkdir -p "$TB_WALL_CGROUP_ROOT"
-        sudo chown root:root "$TB_WALL_CGROUP_ROOT"
-        sudo chmod 0755 "$TB_WALL_CGROUP_ROOT"
-
-        key_file="$(mktemp)"
-        printf '%s' "$TB_WALL_RUN_KEY" > "$key_file"
-        chmod 0600 "$key_file"
-        sudo -n nohup env -i PATH="$PATH"           testbucket wall supervise             --socket "$TB_SUPERVISOR_SOCKET"             --cgroup-root "$TB_WALL_CGROUP_ROOT"             --workload-uid "$workload_uid"             --wrapper-gid "$wrapper_gid"             --key-fd 3             --campaign ewj2             --run "${TB_RUN_ID}-${TB_RUN_ATTEMPT}"             --bucket "$TB_BUCKET"           3< "$key_file" >"${RUNNER_TEMP}/supervisor.log" 2>&1 &
-        # The key file is removed as soon as the descriptor is open; the
-        # supervisor holds the key in memory and nothing else on the machine
-        # holds it at all.
-        for _ in $(seq 1 50); do
-          [ -S "$TB_SUPERVISOR_SOCKET" ] && break
-          sleep 0.1
-        done
-        rm -f "$key_file"
-        if [ ! -S "$TB_SUPERVISOR_SOCKET" ]; then
-          echo "::warning::the supervisor did not come up; see ${RUNNER_TEMP}/supervisor.log. The measurement will be recorded in full and reported INELIGIBLE"
-          exit 0
-        fi
-        {
-          echo "socket=$TB_SUPERVISOR_SOCKET"
-          echo "workload-user=$TB_WORKLOAD_USER"
-          echo "workload-uid=$workload_uid"
-        } >> "$GITHUB_OUTPUT"
-        echo "supervisor up as uid $(id -u) for workload uid $workload_uid"
-
     # AT_start. This is the FIRST action-owned operation, and it is first in
     # the step list for that reason: the containment, the two observer
     # processes and their admission handshakes are all real action time, and
@@ -298,11 +241,13 @@ runs:
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
-        TB_WALL_WORKLOAD_UID: ${{ steps.supervisor.outputs.workload-uid || inputs.workload-uid }}
-        # The supervisor this wrapper must ask for a containment or a producer
-        # registration. Empty means none was established, and the row is
-        # recorded in full and reported INELIGIBLE rather than scored.
-        TB_WALL_SUPERVISOR: ${{ steps.supervisor.outputs.socket }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
+        # The account the MEASURED WORK runs under. The wrapper stays as this
+        # step's user, which may write the delegated subtree; the measured
+        # command is executed as this account, which may not. Empty means no
+        # boundary was established, and the row is recorded in full and
+        # reported INELIGIBLE rather than scored.
+        TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
         # The run key, scoped to THIS step. `wall begin` seals the signer
         # roster with it before the measured script exists.
         TB_WALL_RUN_KEY: ${{ inputs.run-key }}
@@ -350,11 +295,13 @@ runs:
         TB_SETUP_COMMAND: ${{ inputs.setup-command }}
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
-        TB_WALL_WORKLOAD_UID: ${{ steps.supervisor.outputs.workload-uid || inputs.workload-uid }}
-        # The supervisor this wrapper must ask for a containment or a producer
-        # registration. Empty means none was established, and the row is
-        # recorded in full and reported INELIGIBLE rather than scored.
-        TB_WALL_SUPERVISOR: ${{ steps.supervisor.outputs.socket }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
+        # The account the MEASURED WORK runs under. The wrapper stays as this
+        # step's user, which may write the delegated subtree; the measured
+        # command is executed as this account, which may not. Empty means no
+        # boundary was established, and the row is recorded in full and
+        # reported INELIGIBLE rather than scored.
+        TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
       run: |
         set -euo pipefail
         if [ -n "$TB_WALL_DIR" ]; then
@@ -379,12 +326,13 @@ runs:
         TB_EVENTS_DIR: ${{ inputs.events-dir }}
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
-        TB_WALL_WORKLOAD_UID: ${{ steps.supervisor.outputs.workload-uid || inputs.workload-uid }}
-        # The supervisor this wrapper must ask for a containment or a producer
-        # registration. Empty means none was established, and the row is
-        # recorded in full and reported INELIGIBLE rather than scored.
-        TB_WALL_SUPERVISOR: ${{ steps.supervisor.outputs.socket }}
-        TB_WORKLOAD_USER: ${{ steps.supervisor.outputs.workload-user }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
+        # The account the MEASURED WORK runs under. The wrapper stays as this
+        # step's user, which may write the delegated subtree; the measured
+        # command is executed as this account, which may not. Empty means no
+        # boundary was established, and the row is recorded in full and
+        # reported INELIGIBLE rather than scored.
+        TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
         TB_SCORED: ${{ inputs.scored }}
         TB_VERSION: ${{ inputs.version }}
       run: |
@@ -491,11 +439,13 @@ runs:
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
-        TB_WALL_WORKLOAD_UID: ${{ steps.supervisor.outputs.workload-uid || inputs.workload-uid }}
-        # The supervisor this wrapper must ask for a containment or a producer
-        # registration. Empty means none was established, and the row is
-        # recorded in full and reported INELIGIBLE rather than scored.
-        TB_WALL_SUPERVISOR: ${{ steps.supervisor.outputs.socket }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
+        # The account the MEASURED WORK runs under. The wrapper stays as this
+        # step's user, which may write the delegated subtree; the measured
+        # command is executed as this account, which may not. Empty means no
+        # boundary was established, and the row is recorded in full and
+        # reported INELIGIBLE rather than scored.
+        TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
         # The run key again, scoped to THIS step. `wall end` seals the exact
         # bytes of every stream and of the key log with it, after the measured
         # script has finished and in a step that script was never in.

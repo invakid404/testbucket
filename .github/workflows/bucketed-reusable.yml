@@ -138,6 +138,18 @@ on:
           than scored: a process group cannot prove that no descendant escaped.
         type: string
         default: ""
+      workload-user:
+        description: >-
+          The account the MEASURED WORK runs under, distinct from the account
+          the wrapper runs as. This is the privilege boundary: the wrapper must
+          be able to write the delegated cgroup subtree to create and admit
+          containments, and the measured work must not, because on cgroup-v2
+          `cgroup.procs` is the process-migration control. Establish the
+          account, the wrapper group and the subtree ownership in a PRIOR step
+          of the calling job; left empty the row is recorded in full and
+          reported INELIGIBLE rather than scored.
+        type: string
+        default: ""
       workload-uid:
         description: >-
           ADDITIONAL uids the measured workload may run as, comma-separated,
@@ -707,6 +719,7 @@ jobs:
           wall-time-dir: ${{ inputs.wall-time-dir }}
           cgroup-root: ${{ inputs.cgroup-root }}
           workload-uid: ${{ inputs.workload-uid }}
+          workload-user: ${{ inputs.workload-user }}
           campaign-id: ${{ inputs.campaign-id }}
           stage1-digest: ${{ inputs.stage1-digest }}
           stage2-digest: ${{ inputs.stage2-digest }}

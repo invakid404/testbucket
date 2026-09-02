@@ -244,6 +244,25 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
 			"%s: the process-tree record for pid %d names no process group, so a PGID change is undecidable", label, p.PID))
 	}
+	// THE CREDENTIAL SEPARATION, OBSERVED.
+	//
+	// A containment whose `cgroup.procs` is owned by the credential the
+	// measured process ran under is a containment that process could have
+	// rewritten — and on cgroup-v2 that file is the migration control. This is
+	// the boundary itself rather than a declaration of it: the owner comes off
+	// the filesystem and the process's uid comes out of /proc, and they must
+	// differ.
+	if e.Containment.Primitive == PrimitiveCgroup2 && e.Containment.OwnerUID >= 0 {
+		switch {
+		case p.UID < 0:
+			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+				"%s: the process-tree record does not state the credential the measured process ran under, so nothing shows it could not write its own containment", label))
+		case p.UID == e.Containment.OwnerUID:
+			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+				"%s: the measured process ran as uid %d, which is the credential owning this containment's cgroup.procs; on cgroup-v2 that file is the process-migration control, so the measured work could have rewritten the membership this envelope records",
+				label, p.UID))
+		}
+	}
 	if p.SessionID <= 0 {
 		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
 			"%s: the process-tree record for pid %d names no session, and the contract makes a session change terminal — undecidable is not the same as absent", label, p.PID))

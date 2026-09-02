@@ -39,7 +39,58 @@ func membershipControl(dir string) string {
 	// enumerating the workload's supplementary groups and trusting the answer;
 	// refusing a widened mode outright is both simpler and the fail-closed
 	// direction.
-	return membershipModelFor(sys.Uid, info.Mode().Perm()&0o022 != 0, os.Getuid(), declaredWorkloadUIDs())
+	perm := info.Mode().Perm()
+	return membershipModelFor(MembershipFacts{
+		OwnerUID: sys.Uid, OwnerGID: sys.Gid,
+		GroupWritable: perm&0o020 != 0, OtherWritable: perm&0o002 != 0,
+		SelfUID:      os.Getuid(),
+		WorkloadUIDs: declaredWorkloadUIDs(),
+		WorkloadGIDs: declaredWorkloadGIDs(),
+	})
+}
+
+// declaredWorkloadGIDs is every group the declared workload account belongs
+// to, read from /etc/group and the account's own primary group.
+//
+// It is read rather than declared because the question the boundary turns on
+// is whether the WORKLOAD is in the group that may write the delegated
+// subtree, and a caller-supplied answer to that is a caller-supplied boundary.
+func declaredWorkloadGIDs() []int {
+	user := strings.TrimSpace(os.Getenv(WorkloadUserEnv))
+	if user == "" {
+		return nil
+	}
+	var out []int
+	if b, err := os.ReadFile("/etc/passwd"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			f := strings.Split(line, ":")
+			if len(f) > 3 && f[0] == user {
+				if gid, err := strconv.Atoi(f[3]); err == nil {
+					out = append(out, gid)
+				}
+			}
+		}
+	}
+	b, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Split(line, ":")
+		if len(f) < 4 {
+			continue
+		}
+		gid, err := strconv.Atoi(f[2])
+		if err != nil {
+			continue
+		}
+		for _, member := range strings.Split(f[3], ",") {
+			if strings.TrimSpace(member) == user {
+				out = append(out, gid)
+			}
+		}
+	}
+	return out
 }
 
 // declaredWorkloadUIDs is the caller's statement about which OTHER credentials

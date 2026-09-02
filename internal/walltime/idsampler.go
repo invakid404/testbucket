@@ -74,8 +74,18 @@ func (s *identitySampler) sample() {
 		PGID:      pgid,
 		StartID:   start,
 		SessionID: processSessionOf(s.pid),
-		ParentPID: s.parent,
+		// READ, not copied. The parent used to be the constructor's cached
+		// argument, so both records carried the value the wrapper EXPECTED and
+		// a reparent could not appear in either — the comparison was between a
+		// constant and itself.
+		ParentPID: processParentOf(s.pid),
+		UID:       processUIDOf(s.pid),
 	}
+	// NO FALLBACK to the parent this sampler was told to expect. Substituting
+	// it would put the expected value in the field whose whole purpose is to
+	// show when the real one changed, which is how the copy survived the first
+	// repair. A parent that cannot be read is recorded as unread, and the
+	// verifier already refuses a process-tree record that names none.
 	ev, _, err := s.cont.Observe(string(ProducerPhysical))
 	s.mu.Lock()
 	defer s.mu.Unlock()

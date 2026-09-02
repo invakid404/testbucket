@@ -254,8 +254,15 @@ func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, 
 		// is an intent; this is what the run realized.
 		receiptPath := fmt.Sprintf("ablation-stage2-%s.json", stratum)
 		receipt := testReceipt(stage1, Digest("sha256:ablation-bundle-"+stratum))
+		// Four DIFFERENT experiments derive four different plans. Whole-file
+		// multi-file, collision-atom, legal-non-atom-slice and sequential
+		// runs produce materially different atom and membership documents, and
+		// the fixture says so rather than handing them one generic shape.
 		receipt.PlanDigest = Digest("sha256:plan-" + stratum)
 		receipt.TopologyDigest = Digest("sha256:topology-" + stratum)
+		receipt.AtomDigest = Digest("sha256:atoms-" + stratum)
+		receipt.MembershipDigest = Digest("sha256:membership-" + stratum)
+		receipt.InvocationDigest = Digest("sha256:invocations-" + stratum)
 		if err := receipt.Validate(); err != nil {
 			t.Fatalf("the fixture ablation Stage-2 for %s does not validate: %v", stratum, err)
 		}

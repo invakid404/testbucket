@@ -200,12 +200,6 @@ func RegisterKey(dir string, e KeyLogEntry) error {
 // scoring, because on a single-credential runner nothing distinguishes it from
 // the measured work registering a producer for itself.
 func RegisterKeyFor(dir string, e KeyLogEntry, run RunIdentity) error {
-	if handled, err := supervisedRegisterKey(dir, e, run); handled {
-		if err != nil {
-			return fmt.Errorf("walltime: key log: %w", err)
-		}
-		return nil
-	}
 	runKey, err := RunKeyFromEnv()
 	if err != nil {
 		return fmt.Errorf("walltime: key log: %w", err)

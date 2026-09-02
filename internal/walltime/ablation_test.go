@@ -432,3 +432,73 @@ func TestTwelveLabelOnlyCopiesDoNotQualify(t *testing.T) {
 		}
 	}
 }
+
+// TestTheFourStrataMustRealizeDistinctPlans is the F6 repair.
+//
+// Binding each ablation to a Stage-2 receipt proves it derived a plan; it does
+// not prove the four strata are four experiments. Three strata handed ONE
+// generic receipt shape — the same atom, membership, topology and invocation
+// digests, differing only in the signed Stage-1 label above them — satisfied
+// every per-row check while realizing one topology three times.
+func TestTheFourStrataMustRealizeDistinctPlans(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+
+	// The control's own shape: give three non-sequential strata one generic
+	// receipt, keeping each signed Stage-1 parent and label.
+	var generic Stage2Receipt
+	for _, a := range idx.Ablations {
+		if a.Stratum == StratumWholeFileMultiFile {
+			generic = *loader.stage2[a.Stage2Path]
+			break
+		}
+	}
+	seen := map[string]bool{}
+	for _, a := range idx.Ablations {
+		if a.Stratum == StratumSequentialInvocs || seen[a.Stratum] {
+			continue
+		}
+		seen[a.Stratum] = true
+		stage1, err := loader.manifests[a.Stage1Path].DigestOf()
+		if err != nil {
+			t.Fatal(err)
+		}
+		copyOfGeneric := generic
+		copyOfGeneric.Stage1Digest = stage1
+		loader.stage2[a.Stage2Path] = &copyOfGeneric
+		stage2, err := copyOfGeneric.DigestOf()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range idx.Ablations {
+			if b.Stratum != a.Stratum {
+				continue
+			}
+			loader.stage2[b.Stage2Path] = &copyOfGeneric
+			resign(loader.verdicts[b.VerdictPath], testVerdictAuthority, func(v *Verdict) {
+				v.Run.Stage2 = stage2
+			})
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("the generic shape covered %d non-sequential strata, want 3", len(seen))
+	}
+
+	_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+	joined := strings.Join(problems, "\n")
+	if !strings.Contains(joined, "one experiment wearing two stratum labels") {
+		t.Errorf("three strata realizing one plan were accepted: %v", problems)
+	}
+}
+
+// TestRepetitionsWithinOneStratumAreNotADuplicate is the positive control: the
+// three runs of a single stratum ARE the same experiment repeated, so an
+// identical plan there says nothing and must not be refused.
+func TestRepetitionsWithinOneStratumAreNotADuplicate(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+	for _, p := range problems {
+		if strings.Contains(p, "one experiment wearing two stratum labels") {
+			t.Errorf("the fixture's within-stratum repetitions were reported as duplicates: %s", p)
+		}
+	}
+}

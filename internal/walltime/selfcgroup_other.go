@@ -6,3 +6,7 @@ package walltime
 // hierarchy to read this process's own membership out of, and such a host has
 // no scorable containment either.
 func SelfContainment() (*ContainmentIdentity, bool) { return nil, false }
+
+// absoluteCgroupPath is a Linux-only concept; off Linux there is no unified
+// hierarchy to resolve a containment path against.
+func absoluteCgroupPath(string) (string, bool) { return "", false }

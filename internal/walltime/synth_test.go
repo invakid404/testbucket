@@ -271,6 +271,10 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 		BootID:    synthBoot,
 		RootPID:   4242 + seq,
 		RootStart: "778899",
+		// The containment is owned by the WRAPPER's credential; the measured
+		// process below runs under the workload's. They differ, which is the
+		// boundary the verifier checks rather than assumes.
+		OwnerUID: 1000,
 		// The membership-control model production establishes by reading the
 		// filesystem. A scored containment is one whose `cgroup.procs` the
 		// measured workload cannot write.
@@ -470,6 +474,7 @@ func (s *synthRun) childProc(level Level, seq int) ProcIdentity {
 		PID:       70000 + levelRank(level)*100 + seq,
 		PGID:      70000 + levelRank(level)*100 + seq,
 		SessionID: 70000 + levelRank(level)*100 + seq,
+		UID:       1001,
 		StartID:   fmt.Sprintf("88%d%d", levelRank(level), seq),
 		ParentPID: 4242 + seq,
 		ExitCode:  0,

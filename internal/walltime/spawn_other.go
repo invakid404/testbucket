@@ -36,3 +36,7 @@ func processSessionOf(pid int) int {
 	}
 	return sid
 }
+
+// processParentOf cannot be read portably; the caller falls back to the parent
+// it knows it is.
+func processParentOf(int) int { return 0 }

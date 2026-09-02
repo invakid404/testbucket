@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -67,4 +69,27 @@ func processSessionOf(pid int) int {
 		return 0
 	}
 	return int(sid)
+}
+
+// processParentOf reads a process's real parent from /proc/<pid>/stat, so a
+// reparent is observed rather than assumed.
+func processParentOf(pid int) int {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	i := strings.LastIndexByte(string(b), ')')
+	if i < 0 {
+		return 0
+	}
+	// After the last ')': state, ppid, ...
+	fields := strings.Fields(string(b[i+1:]))
+	if len(fields) < 2 {
+		return 0
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0
+	}
+	return ppid
 }

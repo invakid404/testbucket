@@ -200,26 +200,69 @@ func TestTheMembershipDecisionCountsThisProcesssOwnCredential(t *testing.T) {
 		declared []int
 		want     string
 	}{
-		// THE DEFECT: owned by this process, with some other uid declared.
-		{"owned by this process, another uid declared", self, false, []int{self + 1}, MembershipWorkloadWritable},
+		// The single-credential runner: nothing declared, so the workload is
+		// taken to share this process's credential and owns what it could
+		// write. This is the shape that cannot be scored.
 		{"owned by this process, nothing declared", self, false, nil, MembershipWorkloadWritable},
-		{"owned by this process, many uids declared", self, false, []int{4, 65534}, MembershipWorkloadWritable},
+		// A DECLARED workload account that differs from the owner is the
+		// supervised shape. The declaration is not taken on trust: the wrapper
+		// SPAWNS the measured command as that account, so a false one fails
+		// the measurement rather than minting a scored row, and the verifier
+		// separately requires the measured process's own uid to differ from
+		// the containment owner's.
+		{"owned by the wrapper with a distinct workload declared", self, false, []int{self + 1}, MembershipSupervisorOwned},
+		{"owned by a declared workload uid among several", self, false, []int{4, self}, MembershipWorkloadWritable},
 
 		// A declaration WIDENS: another uid, declared as the workload's.
 		{"owned by a declared workload uid", 4242, false, []int{4242}, MembershipWorkloadWritable},
 		{"owned by one of several declared uids", 4242, false, []int{7, 4242}, MembershipWorkloadWritable},
+		{"world-writable however it is owned", 4242, true, []int{7}, MembershipWorkloadWritable},
 
 		// The only scorable shape.
 		{"owned by a credential nobody here runs as", 4242, false, []int{7}, MembershipSupervisorOwned},
-
-		// A widened mode is refused without asking about groups.
-		{"group or other writable", 4242, true, []int{7}, MembershipWorkloadWritable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := membershipModelFor(tc.owner, tc.widened, self, tc.declared); got != tc.want {
+			got := membershipModelFor(MembershipFacts{
+				OwnerUID: tc.owner, OtherWritable: tc.widened,
+				SelfUID: self, WorkloadUIDs: tc.declared,
+			})
+			if got != tc.want {
 				t.Errorf("membershipModelFor(owner=%d widened=%v self=%d declared=%v) = %q, want %q",
 					tc.owner, tc.widened, self, tc.declared, got, tc.want)
 			}
 		})
 	}
+}
+
+// TestGroupWritableIsAHoleOnlyWhenTheWorkloadIsInTheGroup: a delegated subtree
+// owned by root and writable by the WRAPPER's group is the boundary a
+// supervised run rests on, so refusing every group-writable mode outright
+// would refuse the only arrangement in which a scored row can exist. It is a
+// hole exactly when the workload is in that group.
+func TestGroupWritableIsAHoleOnlyWhenTheWorkloadIsInTheGroup(t *testing.T) {
+	base := MembershipFacts{
+		OwnerUID: 0, OwnerGID: 900, GroupWritable: true,
+		SelfUID: 1000, WorkloadUIDs: []int{1001},
+	}
+	t.Run("the workload is not in the owning group", func(t *testing.T) {
+		f := base
+		f.WorkloadGIDs = []int{1001, 100}
+		if got := membershipModelFor(f); got != MembershipSupervisorOwned {
+			t.Errorf("a root-owned, wrapper-group-writable subtree read as %q", got)
+		}
+	})
+	t.Run("the workload IS in the owning group", func(t *testing.T) {
+		f := base
+		f.WorkloadGIDs = []int{1001, 900}
+		if got := membershipModelFor(f); got != MembershipWorkloadWritable {
+			t.Errorf("a subtree writable by a group the workload is in read as %q", got)
+		}
+	})
+	t.Run("nothing established about the workload's groups", func(t *testing.T) {
+		f := base
+		f.WorkloadGIDs = nil
+		if got := membershipModelFor(f); got != MembershipWorkloadWritable {
+			t.Errorf("a group write bit that could not be shown to exclude the workload read as %q", got)
+		}
+	})
 }

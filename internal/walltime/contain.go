@@ -38,6 +38,15 @@ const (
 	MembershipUnknown = "unknown"
 )
 
+// WorkloadUserEnv names the account the measured workload runs as, so the
+// wrapper can establish which groups it belongs to.
+//
+// The group write bit on a delegated subtree is not by itself a hole: a
+// subtree owned by root and writable by the WRAPPER's group is the boundary a
+// supervised run rests on. It is a hole exactly when the workload is in that
+// group, and answering that needs the workload's identity.
+const WorkloadUserEnv = "TB_WALL_WORKLOAD_USER"
+
 // WorkloadUIDEnv names ADDITIONAL uids the measured workload may run as, when
 // the caller runs it under credentials other than the wrapper's.
 //
@@ -70,19 +79,58 @@ const WorkloadUIDEnv = "TB_WALL_WORKLOAD_UID"
 // changes credentials between itself and the measured child, so the workload
 // runs as exactly that uid; declared uids only WIDEN the set known to lack the
 // boundary.
-func membershipModelFor(ownerUID uint32, groupOrOtherWritable bool, selfUID int, declared []int) string {
-	if groupOrOtherWritable {
+func membershipModelFor(f MembershipFacts) string {
+	// World-writable is writable by the workload whoever it is.
+	if f.OtherWritable {
 		return MembershipWorkloadWritable
 	}
-	if ownerUID == uint32(selfUID) {
-		return MembershipWorkloadWritable
+	// THE WORKLOAD'S OWN CREDENTIAL. When the caller declares none, the
+	// workload is taken to share this process's — which is the single-credential
+	// runner, and the shape that cannot be scored.
+	workload := f.WorkloadUIDs
+	if len(workload) == 0 {
+		workload = []int{f.SelfUID}
 	}
-	for _, uid := range declared {
-		if ownerUID == uint32(uid) {
+	for _, uid := range workload {
+		if f.OwnerUID == uint32(uid) {
 			return MembershipWorkloadWritable
 		}
 	}
+	// GROUP-WRITABLE IS FINE ONLY IF THE WORKLOAD IS NOT IN THAT GROUP.
+	//
+	// A delegated subtree owned by root and writable by the wrapper's group is
+	// exactly the boundary a supervised run establishes: the wrapper may
+	// create, freeze, admit and destroy, and the workload may not. Refusing
+	// every group-writable mode outright would refuse the only arrangement in
+	// which a scored row can exist; refusing it when the workload is IN the
+	// group is the check that means something.
+	if f.GroupWritable {
+		if len(f.WorkloadGIDs) == 0 {
+			// Nothing was established about the workload's groups, so the
+			// group write bit cannot be shown to exclude it.
+			return MembershipWorkloadWritable
+		}
+		for _, gid := range f.WorkloadGIDs {
+			if f.OwnerGID == uint32(gid) {
+				return MembershipWorkloadWritable
+			}
+		}
+	}
 	return MembershipSupervisorOwned
+}
+
+// MembershipFacts is what a caller reads off the filesystem and the process
+// credentials, separated from the decision so the rule can be exercised on any
+// host.
+type MembershipFacts struct {
+	OwnerUID, OwnerGID           uint32
+	GroupWritable, OtherWritable bool
+	// SelfUID is this process's credential.
+	SelfUID int
+	// WorkloadUIDs and WorkloadGIDs are the measured workload's credential and
+	// its groups, as the caller declared them.
+	WorkloadUIDs []int
+	WorkloadGIDs []int
 }
 
 // cgroupRootEnv names the delegated cgroup-v2 subtree testbucket may create
@@ -181,22 +229,14 @@ type Containment interface {
 // A host with no delegated cgroup-v2 tree gets the unscored process-group
 // fallback rather than an error: the run still produces a full receipt, and
 // the verifier is what refuses to score it.
-// NewContainmentFor creates a containment for a named run, asking the
-// SUPERVISOR when one is configured.
+// NewContainmentFor creates a containment for a named run.
 //
-// The supervisor creates it under a credential the measured workload does not
-// have, so the resulting `cgroup.procs` — which on cgroup-v2 IS the
-// process-migration control — is not writable by the workload. Without a
-// supervisor the wrapper creates it itself, at the workload's own credential,
-// and `membershipControl` records that honestly as workload-writable so the
-// row is refused rather than scored on a boundary that is not there.
+// The privilege boundary is not a service this asks: it is WHICH CREDENTIAL
+// this process runs as. The wrapper runs as a credential that may write the
+// delegated subtree; the measured workload runs as one that may not, and is
+// spawned under it. `membershipControl` reads which is true and the verifier
+// refuses to score a containment the workload could have written.
 func NewContainmentFor(name string, parent *ContainmentIdentity, run RunIdentity) (Containment, error) {
-	if cont, handled, err := supervisedContainment(name, parent, run); handled {
-		if err != nil {
-			return nil, fmt.Errorf("walltime: supervisor containment: %w", err)
-		}
-		return cont, nil
-	}
 	return NewContainment(name, parent)
 }
 

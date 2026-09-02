@@ -77,8 +77,24 @@ func newCgroupUnder(root, name string) (Containment, error) {
 			// containment whose membership the workload can rewrite cannot
 			// prove the nested history the envelope is built on.
 			MembershipControl: membershipControl(dir),
+			OwnerUID:          containmentOwnerUID(dir),
 		},
 	}, nil
+}
+
+// containmentOwnerUID is the credential owning this containment's
+// `cgroup.procs`, retained so the verifier can compare it with the credential
+// the measured process actually ran under.
+func containmentOwnerUID(dir string) int {
+	info, err := os.Stat(filepath.Join(dir, "cgroup.procs"))
+	if err != nil {
+		return -1
+	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1
+	}
+	return int(sys.Uid)
 }
 
 func (c *cgroup2) Identity() ContainmentIdentity { return c.ident }

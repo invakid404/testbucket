@@ -165,6 +165,7 @@ func verifyAblations(index CampaignIndex, loader CampaignLoader, authorityKeys [
 		}
 	}
 
+	problems = append(problems, verifyStrataAreDistinct(index, loader)...)
 	for _, stratum := range AblationStrata {
 		if counts[stratum] != AblationsPerStratum {
 			problems = append(problems, fmt.Sprintf(
@@ -352,6 +353,60 @@ func checkAblationTopology(where string, a CampaignAblationRef, m *Stage1Manifes
 			"%s is authorised into the %s stratum but measured %d invocation(s); that topology is not realized by one",
 			where, StratumSequentialInvocs, len(v.InvocationNs)))
 	}
+	return problems
+}
+
+// verifyStrataAreDistinct requires the four strata to have realized DIFFERENT
+// plans.
+//
+// Binding each ablation to a Stage-2 receipt proves it derived a plan; it does
+// not prove the four strata are four experiments. Three strata handed one
+// generic receipt shape — the same atom, membership, topology and invocation
+// digests, differing only in the signed Stage-1 label above them — satisfied
+// every per-row check while realizing one topology three times. Whole-file
+// multi-file, collision-atom and legal-non-atom-slice runs derive materially
+// different atom and membership documents; if two strata's plans agree on
+// those digests, at most one of them is the experiment its label claims.
+//
+// The digests are compared rather than the documents re-derived because the
+// documents are the planner's and the gate holds only their bound identities.
+// Equality is decisive in the direction that matters: two identical plans
+// cannot be two different topologies.
+func verifyStrataAreDistinct(index CampaignIndex, loader CampaignLoader) []string {
+	type shape struct {
+		atom, membership, topology, invocation Digest
+	}
+	byStratum := map[string]shape{}
+	first := map[string]string{}
+	var problems []string
+	for i, a := range index.Ablations {
+		if strings.TrimSpace(a.Stage2Path) == "" {
+			continue
+		}
+		receipt, err := loader.Stage2(a.Stage2Path)
+		if err != nil {
+			continue
+		}
+		got := shape{receipt.AtomDigest, receipt.MembershipDigest, receipt.TopologyDigest, receipt.InvocationDigest}
+		where := fmt.Sprintf("ablation %d (%s)", i, a.Stratum)
+		if prev, seen := byStratum[a.Stratum]; seen {
+			// Within one stratum the three runs are repetitions of the same
+			// experiment, so an identical plan is expected and says nothing.
+			_ = prev
+		} else {
+			byStratum[a.Stratum] = got
+			first[a.Stratum] = where
+		}
+		for stratum, other := range byStratum {
+			if stratum == a.Stratum || other != got {
+				continue
+			}
+			problems = append(problems, fmt.Sprintf(
+				"%s realized the same plan as %s — identical atom, membership, topology and invocation digests — so the two rows are one experiment wearing two stratum labels",
+				where, first[stratum]))
+		}
+	}
+	sort.Strings(problems)
 	return problems
 }
 

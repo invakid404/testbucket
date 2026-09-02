@@ -42,7 +42,14 @@ type ActionState struct {
 	TracePID   int    `json:"trace_pid,omitempty"`
 	PeerStart  string `json:"peer_start,omitempty"`
 	TraceStart string `json:"trace_start,omitempty"`
-	Deadline   string `json:"deadline"`
+	// Root is the ACTION'S MEASURED ROOT: the process that opened the
+	// envelope. `wall begin` and `wall end` are different steps and therefore
+	// different processes, so the closing step must be told which process the
+	// action is accounted to rather than reading its own — which made every
+	// closing record describe a different root and read as a terminal identity
+	// transition the design itself produced.
+	Root     ProcIdentity `json:"root"`
+	Deadline string       `json:"deadline"`
 	// StartedAt is the AT_start reading, repeated here only so a human reading
 	// the file can find the record; the RECORD is the evidence.
 	StartedAt Instant `json:"started_at"`
@@ -56,16 +63,38 @@ type ActionState struct {
 // the action owns is started underneath — so the identity read here is the one
 // the whole envelope is accounted to.
 func retainActionProcessTree(w *Writer, run RunIdentity, clock Clock, cont Containment, boundary string) {
-	self := os.Getpid()
+	retainActionProcessTreeFor(w, run, clock, cont, boundary, actionRootIdentity(os.Getpid()))
+}
+
+// actionRootIdentity reads one process's identity as the action's measured
+// root.
+func actionRootIdentity(pid int) ProcIdentity {
+	parent := processParentOf(pid)
+	if parent <= 0 {
+		parent = os.Getppid()
+	}
+	return ProcIdentity{
+		PID: pid, PGID: processGroupOf(pid), StartID: processStartID(pid),
+		SessionID: processSessionOf(pid), ParentPID: parent, UID: processUIDOf(pid),
+	}
+}
+
+// retainActionProcessTreeFor writes one action process-tree record for a
+// GIVEN root identity.
+//
+// The root is passed in because `wall begin` and `wall end` are different
+// steps and therefore different processes. Reading the current pid in both
+// made the closing records describe the closing wrapper, which the verifier
+// then read as the measured root changing identity mid-envelope — a terminal
+// transition the design itself produced. The action's root is the process that
+// opened it, carried across the step boundary in the action state.
+func retainActionProcessTreeFor(w *Writer, run RunIdentity, clock Clock, cont Containment, boundary string, proc ProcIdentity) {
 	rec := Record{
 		Kind: "process_tree", Boundary: boundary,
 		Role: RolePhysicalAction, Level: LevelAction,
 		Source: SourceProcessLifecycle, Run: run,
 		Containment: cont.Identity(), Instant: clock.Now(),
-		Proc: ProcIdentity{
-			PID: self, PGID: processGroupOf(self), StartID: processStartID(self),
-			SessionID: processSessionOf(self), ParentPID: os.Getppid(),
-		},
+		Proc: proc,
 	}
 	ev, _, err := cont.Observe(string(ProducerPhysical))
 	if err != nil {
@@ -249,6 +278,17 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		return fail("admit the trace collector", err)
 	}
 
+	// THE ACTION ROOT JOINS ITS OWN CONTAINMENT FIRST.
+	//
+	// The start snapshot named this wrapper as the action's measured root
+	// while the containment was still empty, because nothing had been admitted
+	// to it — a record asserting a root that its own membership read did not
+	// contain. Joining here makes the read observe the process the record
+	// names, and it is the same join every action-owned child inherits.
+	if err := joinContainment(cont.Identity(), os.Getpid()); err != nil {
+		return fail("admit the action root to its containment", err)
+	}
+
 	// THE ACTION'S OWN PROCESS-TREE EVIDENCE.
 	//
 	// The verifier requires it for every cgroup envelope, and the action
@@ -283,6 +323,7 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		PeerControl: peer.ctl.base, TraceControl: trace.ctl.base,
 		PeerPID: peer.pid, TracePID: trace.pid,
 		PeerStart: peer.start, TraceStart: trace.start,
+		Root:     actionRootIdentity(os.Getpid()),
 		Deadline: deadline.UTC().Format(time.RFC3339Nano), StartedAt: start,
 	}
 	b, err := json.MarshalIndent(st, "", "  ")
@@ -382,6 +423,14 @@ func retainActionChild(dir string, st *ActionState, pid int, argv []string) {
 		return
 	}
 	defer w.Close()
+	// REGISTERED, or the record is signed by a key the closed signer set
+	// cannot attribute. A side stream minted its own key and never declared
+	// it, so the one record proving an action-owned child existed was the one
+	// record nobody could attribute.
+	_ = RegisterKeyFor(dir, KeyLogEntry{
+		Producer: ProducerPhysical, Level: LevelAction, Seq: actionChildSeq(dir),
+		PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
+	}, st.Run)
 	_, _ = w.Append(Record{
 		Kind: "action_child", Role: RolePhysicalAction, Level: LevelAction,
 		Source: SourceProcessLifecycle, Run: st.Run, Containment: st.Containment,
@@ -392,6 +441,22 @@ func retainActionChild(dir string, st *ActionState, pid int, argv []string) {
 		},
 		Note: "action-owned child: " + strings.Join(argv, " "),
 	})
+}
+
+// actionChildSeq numbers each action-owned child, so two of them do not claim
+// one producer role.
+func actionChildSeq(dir string) int {
+	logged, _, err := ReadKeyLog(dir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range logged {
+		if e.Level == LevelAction {
+			n++
+		}
+	}
+	return n
 }
 
 // retainActionTerminal appends a terminal record to the action stream on a
@@ -475,6 +540,14 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	if terminal == "" {
 		terminal = TerminalPassed
 	}
+	// THE OBSERVED READ, TAKEN BEFORE THE DRAIN.
+	//
+	// It used to follow enforceContainmentEmpty, so the "last observed" state
+	// was by construction the drained one: two records describing the same
+	// empty containment, and a descendant alive at the end of the action
+	// appeared in neither. This is the last moment anything was still in it.
+	retainActionProcessTreeFor(w, st.Run, clock, cont, "observed", st.Root)
+
 	if reaped, emptyErr := enforceContainmentEmpty(cont, deadline); emptyErr != nil {
 		// Same rule as the exec path: a cancelled action whose containment the
 		// wrapper itself killed and then verified empty is cancelled, not
@@ -503,11 +576,8 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 		terminal, reason = TerminalWrapperError, err.Error()
 	}
 
-	// The LAST OBSERVED and DRAINED reads for the action envelope, taken
-	// before the containment is destroyed: the first is the state while this
-	// wrapper is still in it, the second after it empties.
-	retainActionProcessTree(w, st.Run, clock, cont, "observed")
-	retainActionProcessTree(w, st.Run, clock, cont, "end")
+	// The DRAINED read, after the containment empties.
+	retainActionProcessTreeFor(w, st.Run, clock, cont, "end", st.Root)
 
 	// The epilogue — destroying the containment and removing the handoff — runs
 	// BEFORE the closing reading, because it is action-owned work and the

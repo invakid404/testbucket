@@ -27,19 +27,12 @@ func TestTheRunKeyReachesOnlyTheEnvelopeSteps(t *testing.T) {
 	// Named by the property each step has, not by its position: a step
 	// reordering must not silently satisfy this test.
 	want := map[string]bool{
-		"Refuse an unmeasurable scored row": false,
-		"Install testbucket":                false,
-		// The supervisor setup step SEES the key, and that is the point of it:
-		// it hands the key to a root process on a file descriptor and deletes
-		// the file, so the capability ends up held by a credential the
-		// measured workload does not have. Before this step existed there was
-		// nowhere for that capability to live except the measured step, which
-		// is why no lower-level producer could be authorized at all.
-		"Establish the supervised measurement boundary": true,
-		"Open the wall-time action envelope":            true,
-		"Set up the bucket":                             false,
-		"Run the bucket":                                false,
-		"Close the wall-time action envelope":           true,
+		"Refuse an unmeasurable scored row":   false,
+		"Install testbucket":                  false,
+		"Open the wall-time action envelope":  true,
+		"Set up the bucket":                   false,
+		"Run the bucket":                      false,
+		"Close the wall-time action envelope": true,
 	}
 
 	steps := actionSteps(t, filepath.Join("..", "..", ".github", "actions", "run-bucket", "action.yml"))

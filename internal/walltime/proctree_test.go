@@ -88,7 +88,7 @@ func TestAProcessTreeRecordIsBoundToItsEnvelope(t *testing.T) {
 	e := Envelope{Level: LevelScript, Seq: 0, Containment: ContainmentIdentity{
 		Primitive: PrimitiveCgroup2, ID: "/sys/fs/cgroup/testbucket/tb-action-0/tb-script-0",
 		Inode: "900001", BootID: "boot-1", RootPID: 4242, RootStart: "778899",
-		MembershipControl: MembershipSupervisorOwned,
+		MembershipControl: MembershipSupervisorOwned, OwnerUID: 1000,
 	}}
 	other := e.Containment
 	other.Inode = "999999"
@@ -96,7 +96,7 @@ func TestAProcessTreeRecordIsBoundToItsEnvelope(t *testing.T) {
 	checkProcessTree(v, "script[0]", e, Record{
 		Kind: "process_tree", Boundary: "start", Producer: ProducerPhysical,
 		Source: SourceProcessLifecycle, Containment: other,
-		Proc: ProcIdentity{PID: 70001, PGID: 70001, SessionID: 70001, StartID: "8810", ParentPID: 4242},
+		Proc: ProcIdentity{PID: 70001, PGID: 70001, SessionID: 70001, StartID: "8810", ParentPID: 4242, UID: 1001},
 	})
 	if len(findingsMentioning(v, "WT-033", "not this envelope's")) == 0 {
 		t.Errorf("a process-tree record for another containment was accepted: %+v", v.Findings)
@@ -106,7 +106,7 @@ func TestAProcessTreeRecordIsBoundToItsEnvelope(t *testing.T) {
 	checkProcessTree(ok, "script[0]", e, Record{
 		Kind: "process_tree", Boundary: "start", Producer: ProducerPhysical,
 		Source: SourceProcessLifecycle, Containment: e.Containment,
-		Proc: ProcIdentity{PID: 70001, PGID: 70001, SessionID: 70001, StartID: "8810", ParentPID: 4242},
+		Proc: ProcIdentity{PID: 70001, PGID: 70001, SessionID: 70001, StartID: "8810", ParentPID: 4242, UID: 1001},
 	})
 	if len(ok.Findings) > 0 {
 		t.Errorf("a well-formed process-tree record was refused: %+v", ok.Findings)
@@ -413,5 +413,66 @@ func TestTheAdmissionReadIsTakenUnderAFreeze(t *testing.T) {
 	if !(freeze < start && start < read && read < thaw) {
 		t.Errorf("the admission read is not taken under the freeze: freeze=%d start=%d read=%d thaw=%d; a child that is running when the read is taken may already have forked",
 			freeze, start, read, thaw)
+	}
+}
+
+// TestTheActionChildSignerIsRegistered is part of F5.
+//
+// `RunInAction` minted a fresh key and a side stream for every action-owned
+// child and never declared that signer, so the one record proving such a child
+// existed was the one record the closed signer set could not attribute.
+func TestTheActionChildSignerIsRegistered(t *testing.T) {
+	body := productionFunc(t, "action.go", "func retainActionChild(")
+	if !strings.Contains(body, "RegisterKeyFor(dir, KeyLogEntry{") {
+		t.Error("the action-child side stream still mints a signer nobody registered")
+	}
+	if !strings.Contains(body, "actionChildSeq(dir)") {
+		t.Error("action-owned children share one producer role, so two of them claim the same signer")
+	}
+}
+
+// TestTheActionRootJoinsBeforeItsOwnSnapshot is part of F5: the start record
+// named this wrapper as the action's measured root while the containment was
+// still empty, so the record's own membership read did not contain the process
+// it named.
+func TestTheActionRootJoinsBeforeItsOwnSnapshot(t *testing.T) {
+	body := productionFunc(t, "action.go", "func BeginAction(")
+	join := strings.Index(body, "joinContainment(cont.Identity(), os.Getpid())")
+	snapshot := strings.Index(body, `retainActionProcessTree(w, run, clock, cont, "start")`)
+	if join < 0 || snapshot < 0 {
+		t.Fatalf("the action admission is no longer recognisable: join=%d snapshot=%d", join, snapshot)
+	}
+	if join > snapshot {
+		t.Errorf("the action root joins at %d, after its own start snapshot at %d; the record names a root its membership read cannot contain", join, snapshot)
+	}
+}
+
+// TestTheActionObservedReadPrecedesTheDrain is part of F5: it followed
+// enforceContainmentEmpty, so the "last observed" state was by construction
+// the drained one and a descendant alive at the end of the action appeared in
+// neither record.
+func TestTheActionObservedReadPrecedesTheDrain(t *testing.T) {
+	body := productionFunc(t, "action.go", "func EndAction(")
+	observed := strings.Index(body, `retainActionProcessTreeFor(w, st.Run, clock, cont, "observed", st.Root)`)
+	drain := strings.Index(body, "enforceContainmentEmpty(cont, deadline)")
+	end := strings.Index(body, `retainActionProcessTreeFor(w, st.Run, clock, cont, "end", st.Root)`)
+	if observed < 0 || drain < 0 || end < 0 {
+		t.Fatalf("the close ordering is no longer recognisable: observed=%d drain=%d end=%d", observed, drain, end)
+	}
+	if !(observed < drain && drain < end) {
+		t.Errorf("the closing reads are ordered observed=%d drain=%d end=%d; the observed read must be the last moment anything was still in the containment", observed, drain, end)
+	}
+}
+
+// TestTheSamplerReadsTheParentRatherThanCopyingIt is part of F5. Substituting
+// the parent the sampler was told to expect put the expected value in the
+// field whose whole purpose is to show when the real one changed.
+func TestTheSamplerReadsTheParentRatherThanCopyingIt(t *testing.T) {
+	body := productionFunc(t, "idsampler.go", "func (s *identitySampler) sample()")
+	if !strings.Contains(body, "ParentPID: processParentOf(s.pid)") {
+		t.Error("the sampler does not read the real parent")
+	}
+	if strings.Contains(body, "id.ParentPID = s.parent") {
+		t.Error("the sampler still falls back to the parent it was told to expect, which is the copy this repair removed")
 	}
 }

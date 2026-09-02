@@ -162,6 +162,11 @@ type ContainmentIdentity struct {
 	// start time is not.
 	RootPID   int    `json:"root_pid,omitempty"`
 	RootStart string `json:"root_start,omitempty"`
+	// OwnerUID is the credential that owns this containment's `cgroup.procs`.
+	// The verifier compares it against the measured process's own uid: they
+	// must differ, or the thing being measured could have rewritten its own
+	// membership.
+	OwnerUID int `json:"owner_uid,omitempty"`
 	// MembershipControl is WHO may write this containment's `cgroup.procs` —
 	// the process-migration control on cgroup-v2 — established by reading the
 	// filesystem rather than asserted by Stage 1. See the Membership*
@@ -212,7 +217,13 @@ type ProcIdentity struct {
 	// SessionID is the child's session, read while it is alive. The contract
 	// makes a session or PGID change terminal, and neither is decidable from a
 	// record that never carried the session.
-	SessionID int    `json:"sid,omitempty"`
+	SessionID int `json:"sid,omitempty"`
+	// UID is the credential the measured process actually ran under, read from
+	// the kernel rather than declared. It is what turns the workload account
+	// from a caller's assertion into a fact: a containment owned by one
+	// credential and a measured process running under another is the boundary
+	// itself, observed.
+	UID       int    `json:"uid,omitempty"`
 	ParentPID int    `json:"ppid,omitempty"`
 	ExitKind  string `json:"exit_kind,omitempty"`
 	ExitCode  int    `json:"exit_code,omitempty"`
