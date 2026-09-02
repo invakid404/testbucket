@@ -277,6 +277,14 @@ func runWallExec(args []string) error {
 			fmt.Fprintf(os.Stderr, "testbucket wall: %v\n", err)
 			return err
 		}
+		if !ok {
+			// THE KERNEL'S OWN ANSWER. An invocation wrapper is started by the
+			// measured script and is therefore already inside the script's
+			// containment; asking the kernel which cgroup this process is in
+			// is a fact the measured work cannot forge, unlike the file it
+			// used to be told through.
+			ident, ok = walltime.SelfContainment()
+		}
 		if ok {
 			opt.Parent = ident
 		}

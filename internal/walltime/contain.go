@@ -38,14 +38,52 @@ const (
 	MembershipUnknown = "unknown"
 )
 
-// WorkloadUIDEnv names the uid the MEASURED WORKLOAD runs as, when the caller
-// runs it under a credential other than the wrapper's.
+// WorkloadUIDEnv names ADDITIONAL uids the measured workload may run as, when
+// the caller runs it under credentials other than the wrapper's.
 //
-// It is what makes a real boundary expressible: with the workload on a
-// different uid from the delegated subtree's owner, the wrapper can migrate
-// processes and the workload cannot. Unset means the workload shares this
-// process's credential, which is the shape that cannot be scored.
+// It cannot establish the boundary, only widen who is known to lack it. This
+// process's own uid always counts as the workload's, because nothing in this
+// wrapper changes credentials between itself and the measured child: the
+// declaration used to be the only uid compared against the owner, so naming
+// any other uid minted `supervisor-owned` for a file the wrapper itself owned
+// — a caller-controlled string standing in for a privilege nobody held.
+//
+// A genuinely scored deployment needs the delegated subtree owned by a
+// credential the wrapper does not run as, which in turn needs a privileged
+// supervisor to create and admit the nested containments on the wrapper's
+// behalf. This wrapper does not have one, so on a same-uid host every row is
+// recorded in full and reported ineligible. That refusal is the honest state,
+// and it is what this constant exists to make visible rather than to paper
+// over.
 const WorkloadUIDEnv = "TB_WALL_WORKLOAD_UID"
+
+// membershipModelFor decides who may write a containment's `cgroup.procs`,
+// from facts a caller has already read off the filesystem.
+//
+// It lives here, portably and separately from the reading, because it is the
+// part that was wrong and the part worth testing on any host: the decision
+// used to compare the owner against a caller-supplied string and nothing else,
+// so declaring any uid other than the owner's returned supervisor-owned for a
+// file the wrapper itself owned.
+//
+// selfUID always counts as the workload's credential. Nothing in this wrapper
+// changes credentials between itself and the measured child, so the workload
+// runs as exactly that uid; declared uids only WIDEN the set known to lack the
+// boundary.
+func membershipModelFor(ownerUID uint32, groupOrOtherWritable bool, selfUID int, declared []int) string {
+	if groupOrOtherWritable {
+		return MembershipWorkloadWritable
+	}
+	if ownerUID == uint32(selfUID) {
+		return MembershipWorkloadWritable
+	}
+	for _, uid := range declared {
+		if ownerUID == uint32(uid) {
+			return MembershipWorkloadWritable
+		}
+	}
+	return MembershipSupervisorOwned
+}
 
 // Containment primitives. Only PrimitiveCgroup2 can delimit a SCORED
 // lifecycle: it is the one primitive here whose membership the workload cannot
@@ -158,6 +196,13 @@ func newRawEventID(observer string) string {
 // containment state the producer can never observe.
 func newContainmentEvent(observer string, b, procsBytes []byte) RawEvent {
 	id := newRawEventID(observer)
+	// A producer that read bytes it cannot parse retains them and reports no
+	// membership: the verifier then refuses the endpoint rather than reading
+	// an unparseable file as an empty containment.
+	procs, ok := parseCgroupProcs(procsBytes)
+	if !ok {
+		procs = nil
+	}
 	return RawEvent{
 		ID:     id,
 		Digest: DigestBytes(append([]byte(id+"\x00"), b...)),
@@ -169,7 +214,7 @@ func newContainmentEvent(observer string, b, procsBytes []byte) RawEvent {
 		// therefore still carries something nobody can write without having
 		// taken it, which is what distinguishes it from a read that never
 		// happened.
-		Procs:       parseCgroupProcs(procsBytes),
+		Procs:       procs,
 		ProcsBytes:  procsBytes,
 		ProcsDigest: DigestBytes(append([]byte(id+"\x00"), procsBytes...)),
 	}
@@ -180,14 +225,36 @@ func newContainmentEvent(observer string, b, procsBytes []byte) RawEvent {
 // It returns a NON-NIL slice for a successful read, empty file included. That
 // is the whole point: nil means no snapshot was taken, and an empty
 // containment must not be indistinguishable from an unread one.
-func parseCgroupProcs(b []byte) []int {
+//
+// The grammar is EXACT, and ok reports whether the bytes are that grammar.
+// This used to tokenise with strings.Fields and silently drop everything
+// strconv.Atoi refused, so `not-a-pid\n` parsed to an empty list — and since
+// the verifier compared the record's readable list using the same permissive
+// parser, bytes no kernel ever wrote passed as proof that the containment was
+// empty. cgroup-v2 writes one decimal pid per line and nothing else; anything
+// else is not a membership snapshot, and a verifier adjudicating retained
+// evidence after the fact must say so rather than guess.
+func parseCgroupProcs(b []byte) ([]int, bool) {
 	out := []int{}
-	for _, line := range strings.Fields(string(b)) {
-		if pid, err := strconv.Atoi(line); err == nil {
-			out = append(out, pid)
-		}
+	text := string(b)
+	if text == "" {
+		return out, true
 	}
-	return out
+	// A non-empty file is newline-terminated, one pid per line.
+	if !strings.HasSuffix(text, "\n") {
+		return nil, false
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+		pid, err := strconv.Atoi(line)
+		if err != nil || pid <= 0 || line != strconv.Itoa(pid) {
+			// Rejecting `007` and ` 7` as well as `not-a-pid`: the kernel
+			// writes the canonical decimal, and accepting variants would make
+			// the retained bytes something other than what was read.
+			return nil, false
+		}
+		out = append(out, pid)
+	}
+	return out, true
 }
 
 func AttachContainment(ident ContainmentIdentity) (Containment, error) {

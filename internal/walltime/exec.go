@@ -365,15 +365,33 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time) (int, ProcI
 		return 1, ProcIdentity{PID: pid}, TerminalSpawnError, err.Error()
 	}
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	cancelled, escalation, waitErr := awaitChild(cont, sigs, done, deadline)
-
+	// THE CHILD'S IDENTITY, SAMPLED WHILE IT IS ALIVE.
+	//
+	// PGID and start id are read from /proc/<pid>, and this used to be done
+	// after awaitChild — which waits for cmd.Wait, and cmd.Wait reaps. On a
+	// normal Linux completion the entry is gone by then, so the start identity
+	// the schema says closes pid reuse came back EMPTY on exactly the runs
+	// that succeed, and the PGID lookup failed with it. The one moment the
+	// facts exist is between admission and the wait, and that is where they
+	// are taken now.
 	proc := ProcIdentity{
 		PID:       cmd.Process.Pid,
 		PGID:      processGroupOf(cmd.Process.Pid),
 		StartID:   processStartID(cmd.Process.Pid),
 		ParentPID: os.Getpid(),
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	cancelled, escalation, waitErr := awaitChild(cont, sigs, done, deadline)
+
+	// A late re-read can only ADD what the live sample could not have known;
+	// it never overwrites a fact taken while the process existed.
+	if proc.PGID == 0 {
+		proc.PGID = processGroupOf(cmd.Process.Pid)
+	}
+	if proc.StartID == "" {
+		proc.StartID = processStartID(cmd.Process.Pid)
 	}
 	code := 0
 	state := TerminalPassed
@@ -1038,20 +1056,36 @@ func (h ScriptHandoff) DigestOf() (Digest, error) {
 }
 
 func writeContainmentHandoff(dir string, ident ContainmentIdentity, run RunIdentity) error {
-	h := ScriptHandoff{Kind: ScriptHandoffKind, Containment: ident, Run: run}
 	key, err := RunKeyFromEnv()
 	if err != nil {
 		return err
 	}
-	if key != nil {
-		d, err := h.DigestOf()
-		if err != nil {
-			return err
-		}
-		h.Signature = &Signature{
-			Authority: run.CampaignID, KeyID: PublicKeyOf(key), Digest: d,
-			Value: SignApproval(run.CampaignID, key, d),
-		}
+	if key == nil {
+		// NOTHING IS WRITTEN when there is no key to sign with.
+		//
+		// This is the production path: the run key is scoped to `wall begin`
+		// and `wall end`, and the script wrapper that writes this file runs in
+		// the measured step, which does not hold it. So the file was always
+		// unsigned, always sat in a directory the measured script can write,
+		// and mode 0600 protects nothing from the same uid that owns it — the
+		// document deciding which containment an invocation is measured inside
+		// was one the measured work could rewrite.
+		//
+		// An unauthenticated handoff is worse than none, because the reader
+		// must then either trust it or refuse it, and refusing it breaks the
+		// legitimate case. Writing nothing leaves the invocation wrappers to
+		// ask the kernel where they are, which is the answer the workload
+		// cannot forge.
+		return nil
+	}
+	h := ScriptHandoff{Kind: ScriptHandoffKind, Containment: ident, Run: run}
+	d, err := h.DigestOf()
+	if err != nil {
+		return err
+	}
+	h.Signature = &Signature{
+		Authority: run.CampaignID, KeyID: PublicKeyOf(key), Digest: d,
+		Value: SignApproval(run.CampaignID, key, d),
 	}
 	b, err := json.MarshalIndent(h, "", "  ")
 	if err != nil {
@@ -1086,20 +1120,19 @@ func ScriptContainment(dir string) (*ContainmentIdentity, bool, error) {
 	if h.Kind != ScriptHandoffKind {
 		return nil, false, fmt.Errorf("the script containment handoff names kind %q, want %q", h.Kind, ScriptHandoffKind)
 	}
+	// AN UNSIGNED HANDOFF IS NEVER ACCEPTED, with or without a key to check it
+	// against. The reader used to accept one whenever it held no run key,
+	// which is precisely the production configuration — so the real path
+	// accepted whatever the file said, every time.
+	if h.Signature == nil {
+		return nil, false, fmt.Errorf("the script containment handoff is unsigned; a measured script can write this file, so an unsigned one names whatever it chose")
+	}
 	key, err := RunKeyFromEnv()
 	if err != nil {
 		return nil, false, err
 	}
 	if key == nil {
-		// No run key here means this is an unscored run; the handoff cannot be
-		// authenticated and the row is ineligible on other grounds anyway.
-		if h.Signature != nil {
-			return &h.Containment, true, nil
-		}
-		return &h.Containment, true, nil
-	}
-	if h.Signature == nil {
-		return nil, false, fmt.Errorf("the script containment handoff is unsigned; a measured script can write this file, so an unsigned one names whatever it chose")
+		return nil, false, fmt.Errorf("the script containment handoff is signed but this process holds no run key to check it against; an unverifiable handoff is not a handoff")
 	}
 	d, err := h.DigestOf()
 	if err != nil {

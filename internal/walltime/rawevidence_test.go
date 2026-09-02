@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -10,7 +11,15 @@ import (
 // names rather than tripping the digest check on its way there.
 func setMembership(r *Record, procs string) {
 	r.RawProcsBytes = []byte(procs)
-	r.RawProcs = parseCgroupProcs(r.RawProcsBytes)
+	parsed, ok := parseCgroupProcs(r.RawProcsBytes)
+	if !ok {
+		// A COHERENT malformed tuple: bytes, an empty non-nil list and a
+		// matching digest. This is the shape the grammar check exists for —
+		// leaving the list nil instead would trip the "no snapshot was taken"
+		// refusal first and the case would pass for the wrong reason.
+		parsed = []int{}
+	}
+	r.RawProcs = parsed
 	r.RawProcsDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawProcsBytes...))
 }
 
@@ -226,6 +235,68 @@ func TestParseCgroupPopulatedDistinguishesAbsenceFromEmptiness(t *testing.T) {
 		pop, found := parseCgroupPopulated([]byte(tc.in))
 		if pop != tc.pop || found != tc.found {
 			t.Errorf("parseCgroupPopulated(%q) = (%v, %v), want (%v, %v)", tc.in, pop, found, tc.pop, tc.found)
+		}
+	}
+}
+
+// TestTheRetainedMembershipBytesMustBeTheKernelGrammar is the F6 regression.
+//
+// parseCgroupProcs tokenised with strings.Fields and silently discarded every
+// token strconv.Atoi refused, so `not-a-pid\n` parsed to an empty list — and
+// because the verifier compared the record's readable list with that same
+// permissive parser, bytes no kernel ever wrote passed as proof that the
+// containment was empty. A coherent tuple of malformed bytes, an empty list
+// and a matching digest scored.
+func TestTheRetainedMembershipBytesMustBeTheKernelGrammar(t *testing.T) {
+	for _, bytes := range []string{
+		"not-a-pid\n",
+		"4242",    // unterminated
+		"0\n",     // not a pid
+		"-1\n",    // not a pid
+		"007\n",   // not the canonical decimal the kernel writes
+		" 42\n",   // padded
+		"42 43\n", // two on one line
+		"42\n\n",  // a blank line
+		"42\nx\n", // one good line does not redeem the file
+	} {
+		t.Run(strconv.Quote(bytes), func(t *testing.T) {
+			v := verifySynth(t, func(_ Level, _ int, p Producer, _ string, r *Record) {
+				if p != ProducerPhysical {
+					setMembership(r, bytes)
+				}
+			}, nil)
+			if len(findingsMentioning(v, "WT-028", "not the kernel's grammar")) == 0 {
+				t.Errorf("bytes %q raised no WT-028: %+v", bytes, v.Findings)
+			}
+			if v.Eligible {
+				t.Errorf("a run whose membership snapshot is %q scored", bytes)
+			}
+		})
+	}
+}
+
+// TestTheKernelGrammarAcceptsWhatTheKernelWrites is the positive control: the
+// strict parser must not refuse a real snapshot, or the table above would be
+// passing for the wrong reason.
+func TestTheKernelGrammarAcceptsWhatTheKernelWrites(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []int
+	}{
+		{"", []int{}},
+		{"42\n", []int{42}},
+		{"42\n43\n99999\n", []int{42, 43, 99999}},
+	} {
+		got, ok := parseCgroupProcs([]byte(tc.in))
+		if !ok {
+			t.Errorf("parseCgroupProcs(%q) refused a snapshot the kernel writes", tc.in)
+			continue
+		}
+		if !sameInts(got, tc.want) {
+			t.Errorf("parseCgroupProcs(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+		if got == nil {
+			t.Errorf("parseCgroupProcs(%q) returned nil, which means no snapshot was taken", tc.in)
 		}
 	}
 }

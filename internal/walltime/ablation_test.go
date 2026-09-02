@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -167,5 +168,84 @@ func TestTheAblationsAreNeverAggregatedIntoAGate(t *testing.T) {
 			t.Errorf("gate %s changed when only ablation outcomes changed: %q/%v -> %q/%v; an ablation's outcome must not tune the campaign's gates",
 				baseline[i].Name, baseline[i].Observed, baseline[i].Pass, after[i].Observed, after[i].Pass)
 		}
+	}
+}
+
+// TestAnAblationVerdictIsCryptographicallyAuthenticated is the F5 regression.
+//
+// The gate checked that a Signature object existed and that its authority
+// string equalled the verdict's own declared verifier id — two fields of the
+// same unverified document agreeing with each other. It never recomputed the
+// digest, never called VerifySigned, and never used the signers the manifest
+// declares, so a verdict whose signed body had been edited after signing
+// satisfied the mandatory prerequisite while the signature primitive itself
+// rejected the document.
+func TestAnAblationVerdictIsCryptographicallyAuthenticated(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	v := loader.verdicts[idx.Ablations[0].VerdictPath]
+	// Edited AFTER signing, exactly as a tamper is: the signature is still
+	// present and still names the right identity.
+	v.RecordsDigest = DigestBytes([]byte("tampered ablation records"))
+
+	d, err := v.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifySigned(v.Signature, d, testVerdictSigners()); err == nil {
+		t.Fatal("the control needs a signature the primitive itself rejects")
+	}
+	_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+	if !strings.Contains(strings.Join(problems, "\n"), "verdict signature") {
+		t.Errorf("problems %v do not report the unverifiable ablation signature", problems)
+	}
+}
+
+// TestOneAblationCannotStandInForTwelve: copying one genuinely signed
+// measurement under twelve pathnames and spreading those names across the four
+// strata satisfied a path-only duplicate check exactly as well as twelve
+// measurements did. Identity is the measurement, not the filename.
+func TestOneAblationCannotStandInForTwelve(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	first := *loader.verdicts[idx.Ablations[0].VerdictPath]
+	for i := range idx.Ablations {
+		path := fmt.Sprintf("copied-ablation-%d.json", i)
+		copyOfFirst := first
+		loader.verdicts[path] = &copyOfFirst
+		idx.Ablations[i].VerdictPath = path
+	}
+	_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+	joined := strings.Join(problems, "\n")
+	for _, want := range []string{
+		"twelve references to one measurement is one measurement",
+		"is byte-identical to the verdict",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("problems do not report %q: %v", want, problems)
+		}
+	}
+}
+
+// TestAnAblationIsBoundToItsOwnDelivery: an authenticated verdict for some
+// other run, Stage-1 or verifier build cannot stand in for this ablation.
+func TestAnAblationIsBoundToItsOwnDelivery(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*Verdict)
+		want string
+	}{
+		{"another Stage-1", func(v *Verdict) { v.Run.Stage1 = "sha256:elsewhere" }, "not the"},
+		{"another verifier build", func(v *Verdict) { v.VerifierBinary = "sha256:other-build" }, "not the"},
+		{"another run", func(v *Verdict) { v.Run.RunID = "some-other-run" }, "but its verdict was recorded under"},
+		{"no records digest", func(v *Verdict) { v.RecordsDigest = "" }, "names no records digest"},
+		{"an incomplete measurement", func(v *Verdict) { v.Complete = false }, "not a complete measurement"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, loader, keys, _ := campaignFixture(t)
+			resign(loader.verdicts[idx.Ablations[0].VerdictPath], testVerdictAuthority, tc.edit)
+			_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+			if !strings.Contains(strings.Join(problems, "\n"), tc.want) {
+				t.Errorf("problems %v do not report %q", problems, tc.want)
+			}
+		})
 	}
 }

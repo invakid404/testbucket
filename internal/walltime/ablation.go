@@ -88,7 +88,17 @@ func verifyAblations(index CampaignIndex, loader CampaignLoader, authorityKeys [
 	campaignStart := earliestPairStart(index, loader)
 
 	counts := map[string]int{}
-	seen := map[string]bool{}
+	seenPath := map[string]bool{}
+	// Identity is the MEASUREMENT, not the pathname. Copying one genuinely
+	// signed verdict under twelve names and spreading those names across the
+	// four strata satisfied a path-only check exactly as well as twelve
+	// measurements did — so one ablation counted as the whole prerequisite.
+	// A measurement is identified by the records it was derived from, by the
+	// verdict document itself, and by the run it was recorded under; a
+	// collision in any of the three is the same measurement twice.
+	seenRecords := map[Digest]string{}
+	seenVerdict := map[Digest]string{}
+	seenRun := map[string]string{}
 	for i, a := range index.Ablations {
 		where := fmt.Sprintf("ablation %d (%s)", i, a.Stratum)
 		if !validStratum(a.Stratum) {
@@ -97,18 +107,53 @@ func verifyAblations(index CampaignIndex, loader CampaignLoader, authorityKeys [
 		} else {
 			counts[a.Stratum]++
 		}
-		// One verdict may not stand in for two ablations. Twelve references to
-		// three measurements is three measurements.
 		if strings.TrimSpace(a.VerdictPath) == "" {
 			problems = append(problems, where+" names no verdict, so there is no measured row behind it")
 			continue
 		}
-		if seen[a.VerdictPath] {
+		if seenPath[a.VerdictPath] {
 			problems = append(problems, fmt.Sprintf("%s reuses verdict %s, which another ablation already counted", where, a.VerdictPath))
 			continue
 		}
-		seen[a.VerdictPath] = true
-		problems = append(problems, checkAblationRow(where, a, loader, authorityKeys, authority, campaignStart)...)
+		seenPath[a.VerdictPath] = true
+		v, rowProblems := checkAblationRow(where, a, loader, authorityKeys, authority, campaignStart)
+		problems = append(problems, rowProblems...)
+		if v == nil {
+			continue
+		}
+		for _, dup := range []struct {
+			what  string
+			key   string
+			index map[string]string
+		}{
+			{"was recorded under run", v.Run.RunID, seenRun},
+		} {
+			if dup.key == "" {
+				continue
+			}
+			if prev, ok := dup.index[dup.key]; ok {
+				problems = append(problems, fmt.Sprintf(
+					"%s %s %q, which %s already counted; twelve references to one measurement is one measurement",
+					where, dup.what, dup.key, prev))
+			} else {
+				dup.index[dup.key] = where
+			}
+		}
+		if prev, ok := seenRecords[v.RecordsDigest]; ok {
+			problems = append(problems, fmt.Sprintf(
+				"%s was derived from records %s, which %s already counted; twelve references to one measurement is one measurement",
+				where, v.RecordsDigest, prev))
+		} else {
+			seenRecords[v.RecordsDigest] = where
+		}
+		if d, err := v.DigestOf(); err == nil {
+			if prev, ok := seenVerdict[d]; ok {
+				problems = append(problems, fmt.Sprintf(
+					"%s is byte-identical to the verdict %s already counted", where, prev))
+			} else {
+				seenVerdict[d] = where
+			}
+		}
 	}
 
 	for _, stratum := range AblationStrata {
@@ -135,32 +180,71 @@ func validStratum(s string) bool {
 // authenticated: an authority-signed manifest under the expected protected
 // environment, and an eligible verdict signed by the delivery verifier it
 // names.
-func checkAblationRow(where string, a CampaignAblationRef, loader CampaignLoader, authorityKeys []string, authority string, campaignStart time.Time) []string {
+func checkAblationRow(where string, a CampaignAblationRef, loader CampaignLoader, authorityKeys []string, authority string, campaignStart time.Time) (*Verdict, []string) {
 	var problems []string
 	if strings.TrimSpace(a.Stage1Path) == "" {
-		return append(problems, where+" names no Stage-1 manifest, so nothing authorised the inputs it measured")
+		return nil, append(problems, where+" names no Stage-1 manifest, so nothing authorised the inputs it measured")
 	}
 	m, err := loader.Manifest(a.Stage1Path)
 	if err != nil {
-		return append(problems, fmt.Sprintf("%s manifest: %v", where, err))
+		return nil, append(problems, fmt.Sprintf("%s manifest: %v", where, err))
 	}
 	if err := m.RequireApproval(authorityKeys, authority); err != nil {
-		return append(problems, fmt.Sprintf("%s manifest authority: %v", where, err))
+		return nil, append(problems, fmt.Sprintf("%s manifest authority: %v", where, err))
 	}
 	v, err := loader.Verdict(a.VerdictPath)
 	if err != nil {
-		return append(problems, fmt.Sprintf("%s verdict: %v", where, err))
+		return nil, append(problems, fmt.Sprintf("%s verdict: %v", where, err))
+	}
+	// THE SIGNATURE IS RECOMPUTED AND VERIFIED, exactly as an arm's is.
+	//
+	// This used to check that a Signature object existed and that its
+	// authority string equalled the verdict's own declared verifier id — two
+	// fields of the same unverified document agreeing with each other. It
+	// never recomputed the digest, never called VerifySigned, and never used
+	// the signers the manifest declares, so a verdict whose signed body had
+	// been edited after signing satisfied the prerequisite while the signature
+	// primitive itself rejected the document.
+	if v.Signature == nil {
+		return nil, append(problems, where+" carries an unsigned verdict, so nobody is attributable for it")
+	}
+	vd, err := v.DigestOf()
+	if err != nil {
+		return nil, append(problems, fmt.Sprintf("%s verdict: %v", where, err))
+	}
+	if len(m.VerdictSigners) == 0 {
+		return nil, append(problems, where+" has no predeclared verdict signer, so its verdict would be authenticated by the campaign authority's own key")
+	}
+	if err := VerifySigned(v.Signature, vd, m.VerdictSigners); err != nil {
+		return nil, append(problems, fmt.Sprintf("%s verdict signature: %v", where, err))
+	}
+	if strings.TrimSpace(v.Run.VerifierID) == "" {
+		return nil, append(problems, where+" names no delivery verifier identity")
+	}
+	if v.Signature.Authority != v.Run.VerifierID {
+		return nil, append(problems, fmt.Sprintf(
+			"%s was signed under authority %q but its body names delivery verifier %q", where, v.Signature.Authority, v.Run.VerifierID))
+	}
+	// BOUND to this ablation and to the delivery it was measured under, so an
+	// authenticated verdict for some other run cannot stand in for this one.
+	if v.RecordsDigest == "" {
+		problems = append(problems, where+" names no records digest, so it cannot be tied to the evidence it was derived from")
+	}
+	if md, err := m.DigestOf(); err == nil && v.Run.Stage1 != md {
+		problems = append(problems, fmt.Sprintf("%s names Stage-1 %s, not the %s its own manifest digests to", where, v.Run.Stage1, md))
+	}
+	if v.VerifierBinary != m.Instrumentation.VerifierBinary {
+		problems = append(problems, fmt.Sprintf("%s was produced by verifier %s, not the %s Stage 1 approved",
+			where, v.VerifierBinary, m.Instrumentation.VerifierBinary))
+	}
+	if strings.TrimSpace(a.RunID) != "" && v.Run.RunID != a.RunID {
+		problems = append(problems, fmt.Sprintf("%s is indexed under run %q but its verdict was recorded under %q", where, a.RunID, v.Run.RunID))
+	}
+	if !v.Complete {
+		problems = append(problems, where+" is not a complete measurement")
 	}
 	if !v.Eligible {
 		problems = append(problems, where+" is not an eligible measured row; an ablation that could not be scored did not qualify the envelope, the peer or the trace")
-	}
-	if v.Signature == nil {
-		problems = append(problems, where+" carries an unsigned verdict, so nobody is attributable for it")
-	} else if strings.TrimSpace(v.Run.VerifierID) == "" {
-		problems = append(problems, where+" names no delivery verifier identity")
-	} else if v.Signature.Authority != v.Run.VerifierID {
-		problems = append(problems, fmt.Sprintf(
-			"%s was signed under authority %q but its body names delivery verifier %q", where, v.Signature.Authority, v.Run.VerifierID))
 	}
 	// BEFORE the campaign. An "ablation" run after the pairs it is supposed to
 	// have informed is a post-hoc measurement wearing the name.
@@ -174,7 +258,7 @@ func checkAblationRow(where string, a CampaignAblationRef, loader CampaignLoader
 				where, at.UTC().Format(time.RFC3339), campaignStart.UTC().Format(time.RFC3339)))
 		}
 	}
-	return problems
+	return v, problems
 }
 
 // earliestPairStart is the campaign's own beginning, taken from the arms'

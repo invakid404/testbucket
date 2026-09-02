@@ -70,6 +70,12 @@ type synthRun struct {
 	// context with one key — the shape a single-process implementation
 	// produces, and the one the independence check exists to catch.
 	sharedObserverContext bool
+	// processTree emits the physical wrapper's process-tree record. A test can
+	// clear it to model a run that retains no evidence of what it measured.
+	processTree bool
+	// unauthorizedLowerKeys registers script/invocation signers with no
+	// run-key authorization: the shape a measured step can produce for itself.
+	unauthorizedLowerKeys bool
 	// runKey stands in for the key an Actions step holds and the measured
 	// script does not: it signs the roster and the closing seal, exactly as
 	// `wall begin` and `wall end` do.
@@ -91,6 +97,16 @@ type synthRun struct {
 // roster and seal to be attributable.
 func (s *synthRun) RunSigner() string { return PublicKeyOf(s.runKey) }
 
+// keyLogAuthorizer is the key that vouches for lower-level signers. A test can
+// clear it to model the measured step registering its own keys, which is what
+// the verifier must refuse.
+func (s *synthRun) keyLogAuthorizer() ed25519.PrivateKey {
+	if s.unauthorizedLowerKeys {
+		return nil
+	}
+	return s.runKey
+}
+
 func newSynthRun(dir string) *synthRun {
 	return &synthRun{
 		dir:                  dir,
@@ -101,6 +117,7 @@ func newSynthRun(dir string) *synthRun {
 		stage2:               synthStage2,
 		containmentPrimitive: PrimitiveCgroup2,
 		membershipControl:    MembershipSupervisorOwned,
+		processTree:          true,
 		clockID:              ClockMonotonic,
 		producerBinary:       synthBinary,
 		runKey:               mustSigningKey(),
@@ -304,10 +321,14 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 			s.rosterKeys = append(s.rosterKeys, RosterEntry{
 				Producer: producer, Level: level, PublicKey: PublicKeyOf(key), Binary: s.producerBinary,
 			})
-		} else if err := RegisterKey(s.dir, KeyLogEntry{
+		} else if err := RegisterKeyWith(s.dir, KeyLogEntry{
 			Producer: producer, Level: level, Seq: seq,
 			PublicKey: PublicKeyOf(key), Binary: s.producerBinary,
-		}); err != nil {
+			// AUTHORIZED by the run key, which is the shape a producer path
+			// holding a capability the measured work does not have produces.
+			// A fixture that registered lower-level keys unauthorized would be
+			// modelling the measured step attesting itself.
+		}, s.keyLogAuthorizer()); err != nil {
 			t.Fatal(err)
 		}
 		for _, p := range byProducer[producer] {
@@ -349,7 +370,7 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 				// which is the shape a failed read produces — so it could not
 				// tell a proved-empty containment from an unread one.
 				rec.RawProcsBytes = []byte("")
-				rec.RawProcs = parseCgroupProcs(rec.RawProcsBytes)
+				rec.RawProcs, _ = parseCgroupProcs(rec.RawProcsBytes)
 				rec.RawProcsDigest = DigestBytes(append([]byte(rec.RawEventID+"\x00"), rec.RawProcsBytes...))
 				rec.Phase = lifecyclePhase(level)
 			}
@@ -363,9 +384,44 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 				t.Fatal(err)
 			}
 		}
+		// THE PROCESS TREE, which production's physical wrapper writes after
+		// the observers close: the measured child's own pid, start identity,
+		// process group and parent, with the membership snapshot taken beside
+		// it. The fixture emitted none, so a verifier that never read one
+		// passed its own tests while proving nothing about what actually ran.
+		if producer == ProducerPhysical && s.processTree {
+			tree := Record{
+				ProducerBinary: s.producerBinary,
+				Kind:           "process_tree", Role: roleOrPanic(ProducerPhysical, level), Level: level,
+				Source: SourceProcessLifecycle, Seqno: seq, Run: run, Containment: ident,
+				Proc: s.childProc(level, seq), RawProcs: []int{},
+				Instant: Instant{ClockID: s.clockID, Mono: Nanos(end), BootID: synthBoot,
+					Realtime: time.Unix(0, end).UTC().Format(time.RFC3339Nano) + "/" + time.Unix(0, end+1000).UTC().Format(time.RFC3339Nano)},
+				Note: "cgroup.procs members at close: 0",
+			}
+			if mutate != nil {
+				mutate(level, seq, ProducerPhysical, "process_tree", &tree)
+			}
+			if _, err := w.Append(tree); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if err := w.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// childProc is the measured child's identity: distinct from the containment's
+// own root process, because the wrapper creates the containment and admits the
+// child into it.
+func (s *synthRun) childProc(level Level, seq int) ProcIdentity {
+	return ProcIdentity{
+		PID:       70000 + levelRank(level)*100 + seq,
+		PGID:      70000 + levelRank(level)*100 + seq,
+		StartID:   fmt.Sprintf("88%d%d", levelRank(level), seq),
+		ParentPID: 4242 + seq,
+		ExitCode:  0,
 	}
 }
 

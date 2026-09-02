@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -109,6 +110,78 @@ func TestTheScriptHandoffIsAuthenticated(t *testing.T) {
 	}
 	if _, _, err := ScriptContainment(dir); err == nil {
 		t.Error("a handoff signed by a key this run does not hold was accepted")
+	}
+}
+
+// TestTheProductionNoKeyPathPublishesNothing is the F3 regression.
+//
+// The writer signed only when a run key was present and the reader accepted
+// both signed and unsigned documents when one was absent — and absent is the
+// production configuration, because the run key is scoped to `wall begin` and
+// `wall end` while the script wrapper that writes this file runs in the
+// measured step. So the real path always emitted an unsigned document into a
+// directory the measured script can write, and mode 0600 protects nothing from
+// the uid that owns it.
+//
+// Nothing is published now when nothing can be signed, and an unsigned handoff
+// is never accepted. The invocation wrapper asks the kernel where it already
+// is instead, which is the answer the workload cannot forge.
+func TestTheProductionNoKeyPathPublishesNothing(t *testing.T) {
+	t.Setenv(RunKeyEnv, "")
+	dir := t.TempDir()
+	run := RunIdentity{CampaignID: "ewj2", RunID: "production-shape", BucketID: "0"}
+	ident := ContainmentIdentity{
+		Primitive: PrimitiveCgroup2, ID: "/sys/fs/cgroup/testbucket/tb-action-0/tb-script-0",
+		Inode: "900001", BootID: "boot", RootPID: 4242, RootStart: "778899",
+		MembershipControl: MembershipSupervisorOwned,
+	}
+	if err := writeContainmentHandoff(dir, ident, run); err != nil {
+		t.Fatalf("writeContainmentHandoff: %v", err)
+	}
+	if _, err := os.Stat(scriptHandoffPath(dir)); !os.IsNotExist(err) {
+		t.Fatalf("the no-key path published a handoff it could not sign (stat err=%v)", err)
+	}
+
+	// And if one is planted there anyway — which is exactly what a measured
+	// script would do — it is refused rather than obeyed.
+	planted := ScriptHandoff{Kind: ScriptHandoffKind, Run: run, Containment: ident}
+	planted.Containment.ID = "/sys/fs/cgroup/testbucket/attacker/tb-script-0"
+	b, err := json.Marshal(planted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptHandoffPath(dir), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, present, err := ScriptContainment(dir)
+	if err == nil {
+		t.Fatalf("an unsigned handoff was accepted in the production no-key path: got=%+v present=%v", got, present)
+	}
+	if !strings.Contains(err.Error(), "unsigned") {
+		t.Errorf("error %q does not say the handoff was unsigned", err)
+	}
+
+	// A SIGNED one is refused too when this process cannot check it: an
+	// unverifiable handoff is not a handoff.
+	signed := planted
+	key := mustSigningKey()
+	d, err := signed.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed.Signature = &Signature{
+		Authority: run.CampaignID, KeyID: PublicKeyOf(key), Digest: d,
+		Value: SignApproval(run.CampaignID, key, d),
+	}
+	sb, err := json.Marshal(signed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptHandoffPath(dir), sb, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ScriptContainment(dir); err == nil {
+		t.Error("a handoff this process holds no key to check was accepted")
 	}
 }
 

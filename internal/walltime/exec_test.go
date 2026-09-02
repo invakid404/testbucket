@@ -354,23 +354,33 @@ func TestExecPassesTheChildOutputThrough(t *testing.T) {
 }
 
 // TestScriptPublishesItsContainmentWhileItRuns: an invocation wrapper is a
-// separate process, and this handoff is how it finds the containment it must
-// nest inside. Nesting is not decoration — an invocation containment created
-// BESIDE the script's would take the invocation's processes out of the
-// lifecycle the script's trace claims to bracket.
+// separate process and has to find the containment it must nest inside.
+// Nesting is not decoration — an invocation containment created BESIDE the
+// script's would take the invocation's processes out of the lifecycle the
+// script's trace claims to bracket.
+//
+// It is published ONLY when it can be authenticated. A script wrapper that
+// holds the run key writes a signed handoff; one that does not writes nothing,
+// because a file in a directory the measured script can write, with no
+// signature on it, is not a handoff — it is whatever the workload last put
+// there. In that configuration the invocation wrapper asks the kernel which
+// cgroup it is already in instead, which is a fact the workload cannot forge.
 func TestScriptPublishesItsContainmentWhileItRuns(t *testing.T) {
+	probeScript := func(dir string) []string {
+		return []string{"sh", "-c", "cat " + filepath.Join(dir, "script-containment.json") +
+			" > " + filepath.Join(dir, "seen.json") + " 2>/dev/null; true"}
+	}
+
+	// WITH a run key: signed, and it names the containment the script recorded.
 	dir := t.TempDir()
-	probe := filepath.Join(dir, "seen.json")
-	// The child copies the handoff, so the test observes what an invocation
-	// wrapper would have seen mid-script.
-	script := "cat " + filepath.Join(dir, "script-containment.json") + " > " + probe
+	t.Setenv(RunKeyEnv, EncodeKey(mustSigningKey()))
 	if _, err := Exec(ExecOptions{
 		Level: LevelScript, Dir: dir, Cwd: dir, Timeout: 30 * time.Second,
-		Argv: []string{"sh", "-c", script},
+		Argv: probeScript(dir),
 	}); err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
-	b, err := os.ReadFile(probe)
+	b, err := os.ReadFile(filepath.Join(dir, "seen.json"))
 	if err != nil {
 		t.Fatalf("the script could not read its own containment handoff: %v", err)
 	}
@@ -378,14 +388,30 @@ func TestScriptPublishesItsContainmentWhileItRuns(t *testing.T) {
 	if err := json.Unmarshal(b, &handoff); err != nil {
 		t.Fatalf("the handoff is not a script handoff document: %v", err)
 	}
-	seen := handoff.Containment
+	if handoff.Signature == nil {
+		t.Error("the handoff is unsigned; a measured script sharing this directory could have written it")
+	}
 	recs, err := ReadRecords(filepath.Join(dir, streamName(ProducerPhysical, LevelScript, 0)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !seen.Same(recs[0].Containment) {
+	if seen := handoff.Containment; !seen.Same(recs[0].Containment) {
 		t.Errorf("the handoff names %s/%s but the script recorded %s/%s",
 			seen.ID, seen.Inode, recs[0].Containment.ID, recs[0].Containment.Inode)
+	}
+
+	// WITHOUT one — the production shape, since the run key is scoped to the
+	// envelope steps — nothing is published at all.
+	bare := t.TempDir()
+	t.Setenv(RunKeyEnv, "")
+	if _, err := Exec(ExecOptions{
+		Level: LevelScript, Dir: bare, Cwd: bare, Timeout: 30 * time.Second,
+		Argv: probeScript(bare),
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if _, err := os.Stat(scriptHandoffPath(bare)); !os.IsNotExist(err) {
+		t.Errorf("an unauthenticatable handoff was published anyway (stat err=%v); the measured work could rewrite it and choose its own enclosing containment", err)
 	}
 }
 

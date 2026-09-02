@@ -140,13 +140,17 @@ on:
         default: ""
       workload-uid:
         description: >-
-          The uid the MEASURED WORKLOAD runs as, when it runs under a
-          credential other than the wrapper's. On cgroup-v2 `cgroup.procs` is
-          the process-migration control, so a delegated subtree owned by the
-          same uid as the workload lets the workload move itself between
-          containments; such a row is recorded in full and reported INELIGIBLE
-          rather than scored. Set this, with a subtree owned by a different
-          credential, for a scored arm.
+          ADDITIONAL uids the measured workload may run as, comma-separated,
+          when it runs under credentials other than the wrapper's. On cgroup-v2
+          `cgroup.procs` is the process-migration control, so a delegated
+          subtree owned by the same uid as the workload lets the workload move
+          itself between containments; such a row is recorded in full and
+          reported INELIGIBLE rather than scored.
+
+          This input cannot create that boundary and is not trusted to: the
+          wrapper's own uid always counts as the workload's. A scored arm needs
+          a privileged supervisor owning the subtree, which does not ship
+          here.
         type: string
         default: ""
       campaign-id:

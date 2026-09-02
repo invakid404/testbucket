@@ -157,7 +157,14 @@ func checkRawEndpoint(v *Verdict, label string, who Producer, what string, r Rec
 	}
 	// The listed pids must be the ones those bytes name, so the readable list
 	// and the retained evidence cannot disagree.
-	if listed := parseCgroupProcs(r.RawProcsBytes); !sameInts(listed, r.RawProcs) {
+	listed, ok := parseCgroupProcs(r.RawProcsBytes)
+	if !ok {
+		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
+			"%s retains cgroup.procs bytes that are not the kernel's grammar (%q); one decimal pid per line is what a membership snapshot is, and bytes nobody could have read are not proof that the containment was empty",
+			where, string(r.RawProcsBytes)))
+		return
+	}
+	if !sameInts(listed, r.RawProcs) {
 		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
 			"%s lists members %v while its retained cgroup.procs bytes name %v", where, r.RawProcs, listed))
 		return

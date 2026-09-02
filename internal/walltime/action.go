@@ -187,7 +187,12 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		Kind: "boundary", Role: RolePhysicalAction, Level: LevelAction, Boundary: "start",
 		Source: SourceWrapper, Run: run, Containment: cont.Identity(), Instant: start,
 	}); err != nil {
-		return nil, err
+		// THROUGH THE GUARD, like every other failure after the containment
+		// exists. This returned directly, so the one failure that happens
+		// immediately after the rollback is armed was the one failure that
+		// bypassed it: the containment stayed, and nothing recorded that it
+		// had. A guard with a hole next to where it is armed is not a guard.
+		return fail("record the action start boundary", err)
 	}
 
 	deadline := time.Now().Add(timeout)

@@ -76,19 +76,31 @@ inputs:
       in full and reported INELIGIBLE.
 
       A scored row needs the subtree owned by a credential the measured
-      workload does NOT run as, and `workload-uid` set to the uid the workload
-      runs under, so the wrapper can migrate processes and the workload cannot.
+      workload does NOT run as. That requires a privileged supervisor to create
+      and admit the nested containments, because a subtree protected from the
+      workload uid is equally unwritable by the same-uid inner wrappers. No
+      such supervisor ships here, so scored rows on a same-uid runner are
+      reported INELIGIBLE rather than scored on an absent boundary.
     default: ""
   workload-uid:
     description: >-
-      The uid the MEASURED WORKLOAD runs as (TB_WALL_WORKLOAD_UID), when it is
-      run under a credential other than the wrapper's.
+      ADDITIONAL uids the measured workload may run as
+      (TB_WALL_WORKLOAD_UID), comma-separated, when the caller runs it under
+      credentials other than this action's.
 
-      It is what makes the membership boundary expressible: the wrapper
-      compares it against the owner of each containment's `cgroup.procs` and
-      records `supervisor-owned` only when they differ and no group or other
-      write bit widens the mode. Left empty, the workload is taken to share the
-      wrapper's credential — which is the shape that cannot be scored.
+      It cannot create the membership boundary, and it is not trusted to. The
+      wrapper's own uid always counts as the workload's, because nothing here
+      changes credentials between the wrapper and the measured child; this
+      input only WIDENS the set of credentials known to lack the boundary. A
+      row whose `cgroup.procs` is owned by the wrapper's uid is recorded in
+      full and reported INELIGIBLE however this input is set.
+
+      A genuinely scored deployment needs the delegated subtree owned by a
+      credential this action does not run as, which in turn needs a privileged
+      supervisor to create and admit the nested containments on its behalf.
+      This action does not ship one, so on a same-uid runner every scored row
+      is ineligible — deliberately, because the alternative is asserting a
+      boundary that is not there.
     default: ""
   scored:
     description: >-

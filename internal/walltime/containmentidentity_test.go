@@ -3,6 +3,7 @@ package walltime
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -143,5 +144,82 @@ func TestTheMembershipModelIsReadNotAsserted(t *testing.T) {
 		if strings.Contains(line, "membership not modifiable by the workload") {
 			t.Errorf("Stage 1 still asserts that the workload cannot modify membership: %s\nNothing established that property, and the documented setup gave the workload exactly that capability", strings.TrimSpace(line))
 		}
+	}
+}
+
+// TestADeclaredWorkloadUIDCannotMintTheBoundary is the F4 regression.
+//
+// membershipControl compared the owner of `cgroup.procs` against
+// TB_WALL_WORKLOAD_UID and nothing else, so declaring any uid other than the
+// owner's returned `supervisor-owned` for a file this very process owns. The
+// declaration is a caller-controlled string standing in for a privilege nobody
+// held: nothing in this wrapper changes credentials between itself and the
+// measured child — not runChild, not RunInAction, not the workflow step — so
+// the workload runs as exactly this uid.
+func TestADeclaredWorkloadUIDCannotMintTheBoundary(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, declared := range []string{
+		strconv.Itoa(os.Getuid() + 1),
+		strconv.Itoa(os.Getuid()+1) + ",65534",
+		"",
+		"not-a-uid",
+	} {
+		t.Setenv(WorkloadUIDEnv, declared)
+		// NOT supervisor-owned is the invariant, on every platform: Linux
+		// reads the owner and answers workload-writable, and a host with no
+		// cgroup-v2 to read answers unknown. Both are unscorable; what must
+		// never happen is a declaration producing the one answer that scores.
+		if got := membershipControl(dir); got == MembershipSupervisorOwned {
+			t.Errorf("declaring workload uid %q made a file this process owns %q; a declaration cannot make the workload somebody else",
+				declared, got)
+		}
+	}
+	// The declaration may still WIDEN who lacks the boundary, never narrow it.
+	t.Setenv(WorkloadUIDEnv, strconv.Itoa(os.Getuid()))
+	if got := membershipControl(dir); got == MembershipSupervisorOwned {
+		t.Errorf("membershipControl=%q for a file owned by a declared workload uid", got)
+	}
+}
+
+// TestTheMembershipDecisionCountsThisProcesssOwnCredential is the portable F4
+// regression: the decision itself, on any host.
+//
+// The rule used to compare the owner against TB_WALL_WORKLOAD_UID and nothing
+// else, so a caller declaring any uid other than the owner's minted
+// `supervisor-owned` for a file the wrapper itself owned — a caller-controlled
+// string standing in for a privilege nobody held.
+func TestTheMembershipDecisionCountsThisProcesssOwnCredential(t *testing.T) {
+	const self = 1000
+	for _, tc := range []struct {
+		name     string
+		owner    uint32
+		widened  bool
+		declared []int
+		want     string
+	}{
+		// THE DEFECT: owned by this process, with some other uid declared.
+		{"owned by this process, another uid declared", self, false, []int{self + 1}, MembershipWorkloadWritable},
+		{"owned by this process, nothing declared", self, false, nil, MembershipWorkloadWritable},
+		{"owned by this process, many uids declared", self, false, []int{4, 65534}, MembershipWorkloadWritable},
+
+		// A declaration WIDENS: another uid, declared as the workload's.
+		{"owned by a declared workload uid", 4242, false, []int{4242}, MembershipWorkloadWritable},
+		{"owned by one of several declared uids", 4242, false, []int{7, 4242}, MembershipWorkloadWritable},
+
+		// The only scorable shape.
+		{"owned by a credential nobody here runs as", 4242, false, []int{7}, MembershipSupervisorOwned},
+
+		// A widened mode is refused without asking about groups.
+		{"group or other writable", 4242, true, []int{7}, MembershipWorkloadWritable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := membershipModelFor(tc.owner, tc.widened, self, tc.declared); got != tc.want {
+				t.Errorf("membershipModelFor(owner=%d widened=%v self=%d declared=%v) = %q, want %q",
+					tc.owner, tc.widened, self, tc.declared, got, tc.want)
+			}
+		})
 	}
 }

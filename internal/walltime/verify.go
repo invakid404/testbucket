@@ -264,6 +264,7 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	verifyIndependence(v, envelopes)
 	verifyRawEvidence(v, envelopes)
 	verifyContainmentHierarchy(v, envelopes)
+	verifyProcessTree(v, envelopes, recs)
 	v.Phases = derivePartition(v, envelopes)
 	v.Recon = reconcile(envelopes)
 	summarise(v, envelopes)

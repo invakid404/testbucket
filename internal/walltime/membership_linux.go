@@ -39,23 +39,18 @@ func membershipControl(dir string) string {
 	// enumerating the workload's supplementary groups and trusting the answer;
 	// refusing a widened mode outright is both simpler and the fail-closed
 	// direction.
-	if info.Mode().Perm()&0o022 != 0 {
-		return MembershipWorkloadWritable
-	}
-	if uint32(workloadUID()) == sys.Uid {
-		return MembershipWorkloadWritable
-	}
-	return MembershipSupervisorOwned
+	return membershipModelFor(sys.Uid, info.Mode().Perm()&0o022 != 0, os.Getuid(), declaredWorkloadUIDs())
 }
 
-// workloadUID is the credential the measured workload runs as: the caller's
-// declared one, or this process's own when the caller declares none — which
-// means the workload shares the wrapper's credential.
-func workloadUID() int {
-	if v := strings.TrimSpace(os.Getenv(WorkloadUIDEnv)); v != "" {
-		if uid, err := strconv.Atoi(v); err == nil {
-			return uid
+// declaredWorkloadUIDs is the caller's statement about which OTHER credentials
+// the measured workload may run as. It never removes this process's own uid
+// from consideration; see membershipModelFor.
+func declaredWorkloadUIDs() []int {
+	var out []int
+	for _, field := range strings.Split(os.Getenv(WorkloadUIDEnv), ",") {
+		if uid, err := strconv.Atoi(strings.TrimSpace(field)); err == nil {
+			out = append(out, uid)
 		}
 	}
-	return os.Getuid()
+	return out
 }

@@ -128,20 +128,83 @@ func (s *Seal) Sign(authority string, key ed25519.PrivateKey) error {
 
 // KeyLogEntry registers one signing key that was minted after the roster was
 // sealed. Script- and invocation-level wrappers are started by the measured
-// step, so their keys cannot be predeclared; what CAN be fixed is that the set
-// is closed at AT_end and nothing may be added to it afterwards.
+// step, so their keys cannot be predeclared; the log is closed at AT_end and
+// nothing may be added to it afterwards.
+//
+// Closing the set is NOT the same as authorising it. The log lives in the
+// records directory, which the measured step can write, and an entry says who
+// its author claims to be. So a hostile script running as the same user could
+// mint a key for every lower-level physical, peer and trace producer, append
+// each to this file, write ledgers signed by them, and be scored — the trusted
+// closing step's seal fixes those bytes but says nothing about who produced
+// them. Sealing attacker-writable bytes establishes finality, not provenance.
+//
+// Authorization is therefore a SIGNATURE by the run key, over the entry's
+// whole claimed identity. The run key is delivered only to the envelope steps
+// and never to the measured work, so an entry carrying a valid one was
+// registered by a party that holds a capability the measured step does not.
+// Binding producer, level, seq and binary into the signed payload is what
+// stops an admitted key being replayed under a different role.
 type KeyLogEntry struct {
 	Producer  Producer `json:"producer"`
 	Level     Level    `json:"level"`
 	Seq       int      `json:"seq"`
 	PublicKey string   `json:"public_key"`
 	Binary    Digest   `json:"binary"`
+	// Authorization is the run-key signature over this entry. An entry
+	// without one is retained — the record it explains still exists — but it
+	// cannot admit a signer, because nothing distinguishes it from an entry
+	// the measured work wrote for itself.
+	Authorization *Signature `json:"authorization,omitempty"`
 }
 
-// RegisterKey appends one minted public key to the directory's key log.
+// DigestOf is the canonical digest the authorization covers: the entry's whole
+// claimed identity, minus the signature itself.
+func (e KeyLogEntry) DigestOf() (Digest, error) {
+	e.Authorization = nil
+	return DigestJSON(e)
+}
+
+// Authorize countersigns one entry with the run key.
+func (e *KeyLogEntry) Authorize(authority string, key ed25519.PrivateKey) error {
+	d, err := e.DigestOf()
+	if err != nil {
+		return err
+	}
+	e.Authorization = &Signature{
+		Authority: authority, KeyID: PublicKeyOf(key), Digest: d,
+		Value: SignApproval(authority, key, d),
+	}
+	return nil
+}
+
+// RegisterKey appends one minted public key to the directory's key log,
+// countersigned by the run key when this process holds one.
+//
+// In a deployment where the run key reaches only the envelope steps, nothing
+// inside the measured window can produce an authorized entry — which is the
+// point. The lower-level evidence is still written and still retained; what it
+// cannot do is qualify a row. Making it qualify requires a producer path that
+// holds a capability the measured work does not, and this is the check that
+// says whether one existed.
 func RegisterKey(dir string, e KeyLogEntry) error {
+	runKey, err := RunKeyFromEnv()
+	if err != nil {
+		return fmt.Errorf("walltime: key log: %w", err)
+	}
+	return RegisterKeyWith(dir, e, runKey)
+}
+
+// RegisterKeyWith is RegisterKey with the authorizing key supplied directly,
+// for a producer path that holds it without going through the environment.
+func RegisterKeyWith(dir string, e KeyLogEntry, runKey ed25519.PrivateKey) error {
 	if dir == "" {
 		return nil
+	}
+	if runKey != nil {
+		if err := e.Authorize(keyLogAuthority(e), runKey); err != nil {
+			return fmt.Errorf("walltime: key log: %w", err)
+		}
 	}
 	b, err := json.Marshal(e)
 	if err != nil {
@@ -343,14 +406,46 @@ func verifySignerSet(v *Verdict, opt VerifyOptions, declared []string, recs []Re
 	for _, e := range roster.Entries {
 		allowed[e.PublicKey] = true
 	}
+	// A LOGGED KEY IS ADMITTED ONLY IF THE RUN KEY AUTHORIZED IT.
+	//
+	// Every logged key used to be added unconditionally. The key log is
+	// written during the measured step, so that let a hostile script running
+	// as the same user mint a key for every lower-level physical, peer and
+	// trace producer, register them all, write ledgers signed by them, and be
+	// scored — the closing seal fixed those bytes without saying who produced
+	// them.
+	//
+	// The countersignature is checked against the SAME predeclared run-signer
+	// set the roster and the seal are checked against, so an entry is
+	// admissible exactly when a party holding a capability the measured work
+	// does not have vouched for it.
+	// registered is every key the log names; allowed is the subset a run-key
+	// authorization vouches for. The distinction matters for the SEVERITY: a
+	// record signed by a key nobody registered at all is malformed evidence
+	// and terminal, while one signed by a registered-but-unauthorized key is
+	// well-formed evidence nobody with the right capability vouched for, which
+	// is unscorable. Collapsing the two would report a developer run with no
+	// run key as a broken record chain.
+	registered := map[string]bool{}
+	unauthorized := map[string]bool{}
 	for _, e := range logged {
+		registered[e.PublicKey] = true
+		if err := checkKeyLogAuthorization(e, keys); err != nil {
+			if !unauthorized[e.PublicKey] {
+				unauthorized[e.PublicKey] = true
+				v.add("WT-032", SeverityIneligible, fmt.Sprintf(
+					"the key log registers %s/%s signer %s %v; the log is written during the measured step, so a self-registered lower-level key is the measured work choosing who attests it",
+					e.Producer, e.Level, e.PublicKey, err))
+			}
+			continue
+		}
 		allowed[e.PublicKey] = true
 	}
 	// Report each undeclared signer once: one substituted producer writes many
 	// records, and twenty findings naming one key is noise, not detail.
 	undeclared := map[string]bool{}
 	for _, r := range recs {
-		if r.SignerID != "" && !allowed[r.SignerID] && !undeclared[r.SignerID] {
+		if r.SignerID != "" && !allowed[r.SignerID] && !registered[r.SignerID] && !undeclared[r.SignerID] {
 			undeclared[r.SignerID] = true
 			v.add("WT-023", SeverityTerminal,
 				fmt.Sprintf("a %s/%s record is signed by %s, which neither the roster declared nor the key log registered", r.Producer, r.Level, r.SignerID))
@@ -417,6 +512,34 @@ func verifySignerSet(v *Verdict, opt VerifyOptions, declared []string, recs []Re
 // verifyRunKeySignature checks one run-key attestation against the predeclared
 // signer set. An unsigned attestation and one signed by an undeclared key are
 // different findings because they call for different fixes.
+// keyLogAuthority is the label a key-log authorization is retained under. It
+// is the entry's own role rather than a campaign name, so a signature over one
+// producer's registration cannot be lifted onto another's.
+func keyLogAuthority(e KeyLogEntry) string {
+	return fmt.Sprintf("keylog:%s:%s:%d", e.Producer, e.Level, e.Seq)
+}
+
+// checkKeyLogAuthorization decides whether one logged key may sign records.
+func checkKeyLogAuthorization(e KeyLogEntry, keys []string) error {
+	if e.Authorization == nil {
+		return fmt.Errorf("with no run-key authorization")
+	}
+	if want := keyLogAuthority(e); e.Authorization.Authority != want {
+		return fmt.Errorf("under authority %q, not the %q this entry claims", e.Authorization.Authority, want)
+	}
+	if len(keys) == 0 {
+		return fmt.Errorf("with no predeclared run signer to check it against")
+	}
+	d, err := e.DigestOf()
+	if err != nil {
+		return fmt.Errorf("whose entry cannot be digested: %v", err)
+	}
+	if err := VerifySigned(e.Authorization, d, keys); err != nil {
+		return fmt.Errorf("whose authorization does not verify: %v", err)
+	}
+	return nil
+}
+
 func verifyRunKeySignature(v *Verdict, what string, sig *Signature, digest Digest, keys []string) {
 	if sig == nil {
 		v.add("WT-023", SeverityIneligible,

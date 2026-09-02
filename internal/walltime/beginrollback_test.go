@@ -113,3 +113,47 @@ func TestASuccessfulBeginDisarmsTheRollback(t *testing.T) {
 		}
 	}
 }
+
+// TestEveryArmedBeginFailureRunsTheRollback is the F7 regression.
+//
+// The guard is armed the moment the action containment exists, and the very
+// next operation — appending the AT_start boundary — returned its error
+// directly instead of going through the failure path. So the one failure that
+// happens immediately after the rollback is armed was the one failure that
+// bypassed it: the containment stayed, and nothing recorded that it had. A
+// guard with a hole beside where it is armed is not a guard.
+//
+// This is asserted from the production source, because the property is "every
+// return after the arming point goes through fail", and no single injected
+// failure can demonstrate all of them.
+func TestEveryArmedBeginFailureRunsTheRollback(t *testing.T) {
+	body := productionFunc(t, "action.go", "func BeginAction(")
+	armed := strings.Index(body, "rollback = append(rollback, func() string {")
+	if armed < 0 {
+		t.Fatal("BeginAction no longer arms a rollback")
+	}
+	disarmed := strings.Index(body, "rollback = nil")
+	if disarmed < 0 || disarmed < armed {
+		t.Fatalf("BeginAction does not disarm the rollback after arming it: armed=%d disarmed=%d", armed, disarmed)
+	}
+	// Between the two, every error return must be a fail(...) call. A bare
+	// `return nil, err` there is a resource this function created and left.
+	window := body[armed:disarmed]
+	for _, line := range strings.Split(window, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "return ") {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "return fail("):
+		case strings.HasPrefix(trimmed, "return endObserver("):
+		case strings.HasPrefix(trimmed, `return "`):
+		default:
+			t.Errorf("a return between arming and disarming the rollback does not go through fail: %q", trimmed)
+		}
+	}
+	// And the boundary append specifically, which is the one that bypassed it.
+	if !strings.Contains(body, `return fail("record the action start boundary", err)`) {
+		t.Error("the action start boundary failure does not go through the rollback")
+	}
+}
