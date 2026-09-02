@@ -225,9 +225,13 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Signed AS the verifier it names. The signature covers the authority
+	// label, so that label is the only signer identity the document carries —
+	// a retained VerifierID that disagreed with it would be an unchecked
+	// string beside an authenticated one.
 	replay.Signature = &Signature{
-		Authority: "ewj2-campaign", KeyID: PublicKeyOf(replayKey), Digest: rd,
-		Value: signValue("ewj2-campaign", replayKey, rd),
+		Authority: replay.VerifierID, KeyID: PublicKeyOf(replayKey), Digest: rd,
+		Value: signValue(replay.VerifierID, replayKey, rd),
 	}
 
 	docs := frozenDocs{
@@ -294,7 +298,7 @@ func testBundle() PlanningInputBundle {
 	// an empty store beside a receipt claiming five classified rows, which is
 	// exactly the disagreement the receipt is now derived-checked for.
 	b.Store = NewRawSnapshot("test-timings.json", nil, "/repo", testStoreBytes())
-	b.Source.Repository = "example/mandel"
+	b.Source.Repository = FrozenProfileRepository
 	b.Source.Commit = testConsumerCommit
 	b.Source.Tree = "sha256:tree"
 	b.Acquisition.Argv = []string{"testbucket", "wall", "bundle"}
@@ -402,7 +406,7 @@ func mustLockParserIdentity(name string) ParserIdentity {
 func testSourceProfile() SourceProfileReceipt {
 	lock := []byte(testPnpmLock)
 	return SourceProfileReceipt{
-		Repository: "example/mandel", Commit: testConsumerCommit,
+		Repository: FrozenProfileRepository, Commit: testConsumerCommit,
 		Facade:      DigestBytes([]byte(testFacade)),
 		Config:      DigestBytes([]byte(testViteConfig)),
 		Lockfile:    DigestBytes(lock),
@@ -576,7 +580,7 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	m.Source.BinaryDigest = synthBinary
 	m.Source.BuildAttestation = testBuildAttestation(synthBinary, testTip)
 	m.BuilderKeys = testBuilderKeys()
-	m.Consumer.Repository = "example/mandel"
+	m.Consumer.Repository = FrozenProfileRepository
 	m.Consumer.Commit = testConsumerCommit
 	m.Consumer.WorkflowSHA = testWorkflowSHA
 	m.Consumer.DownstreamRef = "refs/heads/main@" + testConsumerCommit

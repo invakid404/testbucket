@@ -1132,7 +1132,9 @@ func verifyReplay(v *Verdict, opt VerifyOptions, stage1 *Stage1Manifest, stage2 
 	if stage1 != nil {
 		instr = stage1.Instrumentation
 	}
-	for _, p := range a.Verify(*stage2, bound.stage2, bound.stage1, instr) {
+	// The verifier identity the MEASURED RECORDS carry. Without it the replay
+	// document is checked in isolation and never joined to the row it attests.
+	for _, p := range a.Verify(*stage2, bound.stage2, bound.stage1, instr, v.Run.VerifierID) {
 		v.add("WT-018", SeverityIneligible, "the independent replay does not attest this plan: "+p)
 	}
 	// The attestation is a claim by a party; it has to be signed by one the

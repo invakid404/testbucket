@@ -400,6 +400,17 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   The second is A_GH: GitHub reports whole seconds, so it is never a gate, but
   it says which step a ledger measured and accounts for the wrapper install
   that necessarily precedes AT_start.
+- The frozen profile is **enforced, not assumed**. Stage-1 validation requires
+  the source profile, the consumer identity and the bundle source to be exactly
+  `mandel-ai/mandel@d9ae1d43…`. Internal agreement among caller-supplied fields
+  proves a manifest describes one workload; only this proves it describes the
+  one the contract froze, and an authority signature does not rescue a manifest
+  for another.
+- A refused observer launch **leaves nothing running**. Every failure after
+  `cmd.Start` — the key write, the key close, the key-log registration —
+  terminates and reaps the child before the error returns, because the caller
+  gets no handle and an observer from a refused launch would otherwise watch
+  the containment for its whole timeout.
 - Scoring needs an **independent replay**. The Stage-2 receipt is the planner's
   own account of what it produced, and checking it against itself proves
   nothing, so `wall verify --replay` requires a signed attestation from a
@@ -407,7 +418,11 @@ correctly instrumented run for the crime of accounting for its own bootstrap.
   (`wall replay --attest`). That attestation is retained and signed under the
   REPLAYING PARTY's identity, not the campaign authority's: naming the
   authority there would erase the very distinction the attestation exists to
-  establish.
+  establish. Every signed claim it carries is checked — including its own
+  top-level bundle digest, which a validly signed document could otherwise
+  contradict in the receipt it encloses — and its verifier identity must be
+  both the identity that signed it and the verifier the measured records were
+  delivered against. A non-empty string is presentation, not attribution.
 - `wall campaign --index` assembles its population from **verifier verdicts**,
   not from durations in a file: every row must be an `eligible: true` verdict
   that names the same campaign, run and Stage-1 manifest, and each pair's two

@@ -3,6 +3,7 @@ package walltime
 import (
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -678,15 +679,30 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 		return nil, err
 	}
 	logf.Close()
+	// EVERY failure from here on has already started a child.
+	//
+	// Returning (nil, err) hands the caller no handle, so nothing else can
+	// reap it — and the process is a real observer that will sit watching the
+	// containment for its whole timeout, writing records for a launch that was
+	// refused. It contaminates exactly what it was meant to measure: the
+	// lifecycle boundaries and the timing of whatever runs next.
+	//
+	// reapStarted kills and waits before the error leaves this function, so a
+	// refused launch leaves nothing behind. It is the same rule the wrapper
+	// applies to its measured child; an observer is not exempt because it is
+	// ours.
+	fail := func(err error) (*observerProc, error) {
+		return nil, reapStarted(p, cmd, err)
+	}
 	// Write and close AFTER Start: the child holds the read end, so the write
 	// end must be closed here or the child's read never sees EOF.
 	_, writeErr := io.WriteString(keyW, EncodeKey(key))
 	closeErr := keyW.Close()
 	if writeErr != nil {
-		return nil, fmt.Errorf("walltime: hand the %s its key: %w", p, writeErr)
+		return fail(fmt.Errorf("walltime: hand the %s its key: %w", p, writeErr))
 	}
 	if closeErr != nil {
-		return nil, fmt.Errorf("walltime: hand the %s its key: %w", p, closeErr)
+		return fail(fmt.Errorf("walltime: hand the %s its key: %w", p, closeErr))
 	}
 	if opt.Level != LevelAction {
 		// Action-level observers are declared in the roster instead; anything
@@ -695,13 +711,39 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 			Producer: p, Level: opt.Level, Seq: opt.Seq,
 			PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
 		}); err != nil {
-			return nil, err
+			return fail(err)
 		}
 	}
 	return &observerProc{
 		producer: p, cmd: cmd, ctl: control{base: base}, pub: PublicKeyOf(key),
 		stream: filepath.Join(opt.Dir, streamName(p, opt.Level, opt.Seq)),
 	}, nil
+}
+
+// reapStarted terminates and waits for an observer this function started but
+// is about to abandon, and folds the outcome into the error it returns.
+//
+// It KILLs rather than asking politely: the child is an observer whose launch
+// has already failed, there is nothing for it to finish, and the caller is
+// blocked until it is gone. The wait is what makes it a reap rather than a
+// signal — an unwaited child is a zombie, and the contract's rule is
+// terminate AND reap.
+//
+// A failure to reap is folded into the returned error rather than replacing
+// it: the original cause is why the launch was abandoned, and "we also could
+// not clean it up" is a second fact about the same event, not a substitute
+// for the first.
+func reapStarted(p Producer, cmd *exec.Cmd, cause error) error {
+	if cmd.Process == nil {
+		return cause
+	}
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("%w; the already-started %s could not be killed: %v", cause, p, err)
+	}
+	if _, err := cmd.Process.Wait(); err != nil {
+		return fmt.Errorf("%w; the already-started %s was killed but not reaped: %v", cause, p, err)
+	}
+	return cause
 }
 
 // observerKeyFD is the descriptor an observer reads its signing key from. It

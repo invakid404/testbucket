@@ -125,7 +125,11 @@ func (s *synthRun) run() RunIdentity {
 		CampaignID: "ewj2", BucketID: "bucket-1", RunID: "r1",
 		Repository: "example/mandel", WorkflowRun: "run-1", Job: "test",
 		Step: "run-bucket", StepAttempt: "1",
-		Stage2: s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+		// The delivery-bound verifier the row is measured against. The replay
+		// attestation must name this same identity, or it is an independent
+		// re-derivation of the right plan by somebody nobody bound to this row.
+		VerifierID: "synthetic-verifier",
+		Stage2:     s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
 	}
 }
 

@@ -592,10 +592,33 @@ type SourceProfileReceipt struct {
 // against.
 const RequiredVitest = "4.1.10"
 
-// FrozenProfileCommit is the Mandel commit the acceptance contract freezes the
-// profile at. It is named here so a test can read the real lockfile the
-// contract points at rather than an approximation of it.
-const FrozenProfileCommit = "d9ae1d433bb45012c04d567879b66fc4bf6112c6"
+// The EXACT source profile the acceptance contract freezes: Mandel at one
+// commit, named in the contract's first section.
+//
+// These were a test constant and a human convention. Stage-1 validation
+// checked that the caller's repository and commit fields agreed with EACH
+// OTHER and that the commit was a well-formed full SHA — so an internally
+// consistent, authority-signed manifest for `attacker/other-consumer` at any
+// 40-hex string passed every check and reached the campaign gates. Internal
+// consistency proves the manifest describes ONE workload; it cannot prove it
+// describes THIS one, and the contract names exactly one.
+const (
+	FrozenProfileRepository = "mandel-ai/mandel"
+	FrozenProfileCommit     = "d9ae1d433bb45012c04d567879b66fc4bf6112c6"
+)
+
+// RequireFrozenProfile refuses a repository/commit pair that is not the frozen
+// profile the contract names.
+//
+// where says which field is being checked, so a manifest that disagrees in one
+// place says which place.
+func RequireFrozenProfile(where, repository, commit string) error {
+	if repository != FrozenProfileRepository || commit != FrozenProfileCommit {
+		return fmt.Errorf("%s names %s@%s, but the frozen acceptance contract profiles exactly %s@%s; an internally consistent manifest for another workload is a manifest for another workload",
+			where, repository, commit, FrozenProfileRepository, FrozenProfileCommit)
+	}
+	return nil
+}
 
 // Validate proves the closure contains vitest and every @vitest/* package at
 // the recorded version. A missing @vitest/runner is the interesting case: the
@@ -1275,6 +1298,18 @@ func (m Stage1Manifest) Validate() error {
 			m.Store.Token, m.Bundle.Selection.Token)
 	}
 
+	// THE FROZEN PROFILE ITSELF, before any question of internal agreement.
+	// Consistency among caller-supplied fields says they describe one
+	// workload; only this says they describe the one the contract froze.
+	for _, f := range []struct{ where, repository, commit string }{
+		{"the source profile", m.SourceProfile.Repository, m.SourceProfile.Commit},
+		{"the consumer identity", m.Consumer.Repository, m.Consumer.Commit},
+		{"the planning-input bundle source", m.Bundle.Source.Repository, m.Bundle.Source.Commit},
+	} {
+		if err := RequireFrozenProfile("stage-1 manifest: "+f.where, f.repository, f.commit); err != nil {
+			return err
+		}
+	}
 	// The source profile must describe the SOURCE THIS BUNDLE FROZE. A valid
 	// receipt for some other tree proves that tree, not this one.
 	if m.SourceProfile.Repository != m.Bundle.Source.Repository {
@@ -1816,7 +1851,7 @@ func (a ReplayAttestation) DigestOf() (Digest, error) {
 
 // Verify checks the attestation against the issued receipt and the Stage-1
 // identities, and reports everything that disagrees.
-func (a ReplayAttestation) Verify(issued Stage2Receipt, issuedDigest, stage1 Digest, instr InstrumentationIdentity) []string {
+func (a ReplayAttestation) Verify(issued Stage2Receipt, issuedDigest, stage1 Digest, instr InstrumentationIdentity, recordVerifierID string) []string {
 	var problems []string
 	if a.Kind != ReplayKind {
 		problems = append(problems, fmt.Sprintf("kind is %q, want %q", a.Kind, ReplayKind))
@@ -1827,6 +1862,25 @@ func (a ReplayAttestation) Verify(issued Stage2Receipt, issuedDigest, stage1 Dig
 	if stage1 != "" && a.Stage1Digest != stage1 {
 		problems = append(problems, fmt.Sprintf("it names Stage-1 %s, not the verified %s", a.Stage1Digest, stage1))
 	}
+	// The attestation's OWN top-level bundle claim.
+	//
+	// `Matches` compares the issued and recomputed receipts' bundle digests,
+	// which makes those two agree with each other — and says nothing about
+	// this separate signed field. A validly signed document could therefore
+	// state one bundle at the top level and another in the receipt it carries,
+	// and be scored: the signature covers the contradiction rather than
+	// resolving it. Every signed claim has to be checked, not merely the ones
+	// that happen to be compared elsewhere.
+	if a.BundleDigest != a.Recomputed.BundleDigest {
+		problems = append(problems, fmt.Sprintf(
+			"it claims to have replayed planning-input bundle %s while the receipt it recomputed names %s",
+			a.BundleDigest, a.Recomputed.BundleDigest))
+	}
+	if issued.BundleDigest != "" && a.BundleDigest != issued.BundleDigest {
+		problems = append(problems, fmt.Sprintf(
+			"it claims to have replayed planning-input bundle %s, but the issued receipt was derived from %s",
+			a.BundleDigest, issued.BundleDigest))
+	}
 	if err := a.Recomputed.Validate(); err != nil {
 		problems = append(problems, "the recomputed receipt is not well formed: "+err.Error())
 	}
@@ -1836,8 +1890,27 @@ func (a ReplayAttestation) Verify(issued Stage2Receipt, issuedDigest, stage1 Dig
 	if instr.VerifierBinary != "" && a.VerifierBinary != instr.VerifierBinary {
 		problems = append(problems, fmt.Sprintf("the replay ran verifier binary %s, not the %s Stage 1 approved", a.VerifierBinary, instr.VerifierBinary))
 	}
+	// WHO replayed it, attributably.
+	//
+	// A non-empty string is presentation, not attribution. The identity has to
+	// be the one the signature was made under — the signature covers the
+	// authority label, so that is the only signer identity the document
+	// actually carries — and it has to be the verifier the measured run was
+	// delivered against, or the replay is an independent re-derivation of the
+	// right plan by somebody nobody bound to this row.
 	if strings.TrimSpace(a.VerifierID) == "" {
 		problems = append(problems, "the replay names no verifier")
+		return problems
+	}
+	if a.Signature != nil && a.Signature.Authority != a.VerifierID {
+		problems = append(problems, fmt.Sprintf(
+			"it names verifier %q but was signed under authority %q; the retained verifier identity must be the identity that signed",
+			a.VerifierID, a.Signature.Authority))
+	}
+	if recordVerifierID != "" && a.VerifierID != recordVerifierID {
+		problems = append(problems, fmt.Sprintf(
+			"it was produced by verifier %q, but the measured records were delivered against %q",
+			a.VerifierID, recordVerifierID))
 	}
 	return problems
 }
