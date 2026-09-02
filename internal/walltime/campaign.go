@@ -91,6 +91,11 @@ func (r CampaignRelease) Bound() bool { return strings.TrimSpace(r.SHA) != "" }
 type CampaignLoader interface {
 	Verdict(path string) (*Verdict, error)
 	Manifest(path string) (*Stage1Manifest, error)
+	// Stage2 loads the derived-plan receipt an ablation realized. It is here
+	// because a pre-campaign ablation must prove the topology it actually ran,
+	// and a Stage-1 manifest states an intent while the Stage-2 receipt is the
+	// plan that was derived from it.
+	Stage2(path string) (*Stage2Receipt, error)
 }
 
 // FileCampaignLoader reads them from disk.
@@ -103,6 +108,15 @@ func (FileCampaignLoader) Verdict(path string) (*Verdict, error) {
 		return nil, err
 	}
 	return &v, nil
+}
+
+// Stage2 loads one Stage-2 derived-plan receipt.
+func (FileCampaignLoader) Stage2(path string) (*Stage2Receipt, error) {
+	var r Stage2Receipt
+	if err := ReadJSONFile(path, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
 }
 
 // Manifest loads one Stage-1 manifest.

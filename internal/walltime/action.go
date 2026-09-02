@@ -48,6 +48,36 @@ type ActionState struct {
 	StartedAt Instant `json:"started_at"`
 }
 
+// retainActionProcessTree writes one process-tree record for the ACTION
+// envelope, whose measured root is this wrapper process.
+//
+// The action level had no such record at all. Its root is not a spawned child
+// but the wrapper itself — it joins the containment it created and everything
+// the action owns is started underneath — so the identity read here is the one
+// the whole envelope is accounted to.
+func retainActionProcessTree(w *Writer, run RunIdentity, clock Clock, cont Containment, boundary string) {
+	self := os.Getpid()
+	rec := Record{
+		Kind: "process_tree", Boundary: boundary,
+		Role: RolePhysicalAction, Level: LevelAction,
+		Source: SourceProcessLifecycle, Run: run,
+		Containment: cont.Identity(), Instant: clock.Now(),
+		Proc: ProcIdentity{
+			PID: self, PGID: processGroupOf(self), StartID: processStartID(self),
+			SessionID: processSessionOf(self), ParentPID: os.Getppid(),
+		},
+	}
+	ev, _, err := cont.Observe(string(ProducerPhysical))
+	if err != nil {
+		rec.Note = "cgroup.procs unreadable: " + err.Error()
+	} else {
+		rec.RawEventID, rec.RawEventDigest, rec.RawEventBytes = ev.ID, ev.Digest, ev.Bytes
+		rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
+		rec.Note = fmt.Sprintf("cgroup.procs members at %s: %d", boundary, len(ev.Procs))
+	}
+	_, _ = w.Append(rec)
+}
+
 // observerTeardownNote says what was actually established about the observers,
 // rather than asserting it.
 //
@@ -173,7 +203,7 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		return nil, fmt.Errorf("walltime: %s: %w", reason, cause)
 	}
 
-	cont, err := NewContainment(containmentName(ExecOptions{Level: LevelAction, Run: run}), nil)
+	cont, err := NewContainmentFor(containmentName(ExecOptions{Level: LevelAction, Run: run}), nil, run)
 	if err != nil {
 		return fail("create the action containment", err)
 	}
@@ -218,6 +248,16 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	if err := trace.admit(deadline); err != nil {
 		return fail("admit the trace collector", err)
 	}
+
+	// THE ACTION'S OWN PROCESS-TREE EVIDENCE.
+	//
+	// The verifier requires it for every cgroup envelope, and the action
+	// lifecycle emitted none — so once the containment model is scorable at
+	// all, every action envelope would be WT-033 ineligible for want of a
+	// record nothing wrote. The action's measured root is this wrapper
+	// process, which joins the containment it created, so its identity is read
+	// here while it plainly exists.
+	retainActionProcessTree(w, run, clock, cont, "start")
 
 	// The roster is sealed HERE, inside the envelope and before the measured
 	// script exists, and it is signed with a key delivered only to this step.
@@ -307,13 +347,51 @@ func RunInAction(dir string, argv []string, cwd string, stdout, stderr *os.File)
 		stderr = os.Stderr
 	}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
-	if err := cmd.Run(); err != nil {
+	// EVERY ACTION-OWNED CHILD is retained, because the contract requires
+	// containment proof before every one of them and RunInAction may be called
+	// more than once. The record is appended to the action stream with the
+	// child's own identity, read while it is running.
+	if err := cmd.Start(); err != nil {
+		return 1, err
+	}
+	retainActionChild(dir, st, cmd.Process.Pid, argv)
+	if err := cmd.Wait(); err != nil {
 		if cmd.ProcessState != nil {
 			return cmd.ProcessState.ExitCode(), nil
 		}
 		return 1, err
 	}
 	return 0, nil
+}
+
+// retainActionChild records one action-owned child while it is alive.
+//
+// It is best-effort and appended to a side stream rather than the sealed
+// action ledger, because RunInAction runs after `wall begin` has closed its
+// writer: what matters is that the child is not invisible. A setup command
+// that started, forked and vanished used to leave no trace of its identity at
+// all, and the contract asks for containment proof before every action-owned
+// child.
+func retainActionChild(dir string, st *ActionState, pid int, argv []string) {
+	key, err := NewSigningKey()
+	if err != nil {
+		return
+	}
+	w, err := NewWriter(filepath.Join(dir, "physical_wrapper.action-child.jsonl"), ProducerPhysical, ProducerID(ProducerPhysical), key)
+	if err != nil {
+		return
+	}
+	defer w.Close()
+	_, _ = w.Append(Record{
+		Kind: "action_child", Role: RolePhysicalAction, Level: LevelAction,
+		Source: SourceProcessLifecycle, Run: st.Run, Containment: st.Containment,
+		Instant: NewSystemClock().Now(),
+		Proc: ProcIdentity{
+			PID: pid, PGID: processGroupOf(pid), StartID: processStartID(pid),
+			SessionID: processSessionOf(pid), ParentPID: os.Getpid(),
+		},
+		Note: "action-owned child: " + strings.Join(argv, " "),
+	})
 }
 
 // retainActionTerminal appends a terminal record to the action stream on a
@@ -424,6 +502,12 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	if err := peer.close(deadline); err != nil && terminal == TerminalPassed {
 		terminal, reason = TerminalWrapperError, err.Error()
 	}
+
+	// The LAST OBSERVED and DRAINED reads for the action envelope, taken
+	// before the containment is destroyed: the first is the state while this
+	// wrapper is still in it, the second after it empties.
+	retainActionProcessTree(w, st.Run, clock, cont, "observed")
+	retainActionProcessTree(w, st.Run, clock, cont, "end")
 
 	// The epilogue — destroying the containment and removing the handoff — runs
 	// BEFORE the closing reading, because it is action-owned work and the

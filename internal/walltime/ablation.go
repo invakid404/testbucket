@@ -49,6 +49,15 @@ type CampaignAblationRef struct {
 	RunID string `json:"run_id"`
 	// Stage1Path is the authority-signed manifest that authorised it.
 	Stage1Path string `json:"stage1"`
+	// Stage2Path is the derived-plan receipt this ablation realized.
+	//
+	// The stratum in a signed Stage-1 manifest states an INTENT. It does not
+	// show that the run produced the topology that intent names, and twelve
+	// label-only copies of one baseline manifest satisfied the count exactly
+	// as well as twelve experiments did. The Stage-2 receipt is the plan that
+	// was actually derived; the verdict's own invocation and reconciliation
+	// evidence is what it realized.
+	Stage2Path string `json:"stage2"`
 	// VerdictPath is the verifier verdict for the measured row.
 	VerdictPath string `json:"verdict"`
 }
@@ -270,6 +279,7 @@ func checkAblationRow(where string, a CampaignAblationRef, loader CampaignLoader
 	if !v.Eligible {
 		problems = append(problems, where+" is not an eligible measured row; an ablation that could not be scored did not qualify the envelope, the peer or the trace")
 	}
+	problems = append(problems, checkAblationTopology(where, a, m, v, loader)...)
 	// BEFORE the campaign. An "ablation" run after the pairs it is supposed to
 	// have informed is a post-hoc measurement wearing the name.
 	if !campaignStart.IsZero() {
@@ -283,6 +293,66 @@ func checkAblationRow(where string, a CampaignAblationRef, loader CampaignLoader
 		}
 	}
 	return v, problems
+}
+
+// checkAblationTopology requires the ablation to have REALIZED the topology
+// its stratum names, from the derived plan and the row's own evidence.
+//
+// A signed stratum in the Stage-1 manifest states an intent, and the gate
+// believed it. Twelve rows built by copying one baseline manifest, changing
+// only that label, re-signing and pairing a generic eligible verdict passed
+// the whole prerequisite — no Stage-2 receipt, no invocation timings, no
+// peer/trace reconciliation, nothing that showed twelve experiments had
+// happened rather than one label written twelve times.
+//
+// What is required now is the evidence a real ablation necessarily produces:
+// the derived plan it ran, bound to the same Stage-1 that authorised it; the
+// invocation observations the row measured; and the peer/trace reconciliation
+// that only exists when both observers bracketed the same lifecycle — which is
+// what "physical-envelope/containment-peer/trace-qualified" means.
+func checkAblationTopology(where string, a CampaignAblationRef, m *Stage1Manifest, v *Verdict, loader CampaignLoader) []string {
+	var problems []string
+	if strings.TrimSpace(a.Stage2Path) == "" {
+		return append(problems, where+" names no Stage-2 receipt, so nothing states the plan it actually derived; a signed stratum label is an intent, not a realized topology")
+	}
+	receipt, err := loader.Stage2(a.Stage2Path)
+	if err != nil {
+		return append(problems, fmt.Sprintf("%s Stage-2: %v", where, err))
+	}
+	if err := receipt.Validate(); err != nil {
+		return append(problems, fmt.Sprintf("%s Stage-2: %v", where, err))
+	}
+	stage2, err := receipt.DigestOf()
+	if err != nil {
+		return append(problems, fmt.Sprintf("%s Stage-2: %v", where, err))
+	}
+	// BOUND to the manifest that authorised it and to the row that ran it.
+	if md, err := m.DigestOf(); err == nil && receipt.Stage1Digest != md {
+		problems = append(problems, fmt.Sprintf(
+			"%s ran a plan derived from Stage-1 %s, not the %s that authorised it", where, receipt.Stage1Digest, md))
+	}
+	if v.Run.Stage2 != stage2 {
+		problems = append(problems, fmt.Sprintf(
+			"%s measured Stage-2 %s but the receipt it names digests to %s", where, v.Run.Stage2, stage2))
+	}
+	// THE REALIZED OBSERVATION TOPOLOGY. A reconciliation entry exists only
+	// where a peer and a trace both bracketed the same lifecycle, so its
+	// absence means the row was not trace-qualified whatever its label says.
+	if len(v.Recon) == 0 {
+		problems = append(problems, where+" retains no peer/trace reconciliation, so nothing shows it was the physical-envelope/containment-peer/trace-qualified observation the contract requires")
+	}
+	if len(v.InvocationNs) == 0 {
+		problems = append(problems, where+" retains no invocation observations, so its realized invocation topology is unstated")
+	}
+	// AND THE STRATUM'S OWN SHAPE. The four strata differ in what the run must
+	// have executed, and the one that is decidable from retained evidence is
+	// the sequential-invocation stratum: a single invocation cannot realize it.
+	if a.Stratum == StratumSequentialInvocs && len(v.InvocationNs) < 2 {
+		problems = append(problems, fmt.Sprintf(
+			"%s is authorised into the %s stratum but measured %d invocation(s); that topology is not realized by one",
+			where, StratumSequentialInvocs, len(v.InvocationNs)))
+	}
+	return problems
 }
 
 // earliestPairStart is the campaign's own beginning, taken from the arms'

@@ -14,11 +14,6 @@ import (
 // containment.
 const cgroup2SuperMagic = 0x63677270
 
-// cgroupRootEnv names the delegated cgroup-v2 subtree testbucket may create
-// containments under. It is required: guessing a path and writing to it is how
-// an action ends up moving processes it does not own.
-const cgroupRootEnv = "TB_WALL_CGROUP_ROOT"
-
 type cgroup2 struct {
 	dir   string
 	ident ContainmentIdentity
@@ -90,6 +85,20 @@ func (c *cgroup2) Identity() ContainmentIdentity { return c.ident }
 
 func (c *cgroup2) Admit(pid int) error {
 	return os.WriteFile(filepath.Join(c.dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644)
+}
+
+// Freeze writes cgroup.freeze, the kernel's own suspend primitive for a
+// subtree. A child cloned into a frozen containment is created stopped, which
+// is what lets the admission read observe exactly what was admitted.
+func (c *cgroup2) Freeze(frozen bool) error {
+	value := "0"
+	if frozen {
+		value = "1"
+	}
+	if err := os.WriteFile(filepath.Join(c.dir, "cgroup.freeze"), []byte(value), 0o644); err != nil {
+		return fmt.Errorf("cgroup.freeze=%s: %w", value, err)
+	}
+	return nil
 }
 
 func (c *cgroup2) Procs() ([]int, error) {

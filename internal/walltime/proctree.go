@@ -38,12 +38,14 @@ func verifyProcessTree(v *Verdict, envs []Envelope, recs []Record) {
 				"%s retains no process-tree record, so nothing states the pid, start identity, process group or parent of the process that was measured; the envelope proves a containment existed and not what ran inside it", label))
 			continue
 		}
-		var admitted, drained []Record
+		var admitted, observed, drained []Record
 		for _, r := range found {
 			checkProcessTree(v, label, e, r)
 			switch r.Boundary {
 			case "start":
 				admitted = append(admitted, r)
+			case "observed":
+				observed = append(observed, r)
 			case "end":
 				drained = append(drained, r)
 			}
@@ -64,11 +66,32 @@ func verifyProcessTree(v *Verdict, envs []Envelope, recs []Record) {
 			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
 				"%s retains no process-tree record taken after the containment drained, so nothing states that it ended empty", label))
 		}
+		if len(observed) == 0 {
+			v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+				"%s retains no process-tree record of the measured process as it was LAST OBSERVED; the admission read alone cannot show a reparent, a session change, a process-group change or a descendant that lived and exited inside the interval", label))
+		}
 		for _, r := range admitted {
 			checkAdmittedMembership(v, label, r)
 		}
+		for _, r := range observed {
+			requireMembershipEvidence(v, label+" observed process tree", r)
+		}
 		for _, r := range drained {
 			checkDrainedMembership(v, label, r)
+		}
+		// THE IDENTITY MUST NOT HAVE MOVED.
+		//
+		// The wrapper wrote one sample into two records, so they could not
+		// disagree and every transition the contract makes terminal was
+		// unobservable. The closing identity is now an independent sample, and
+		// this is what makes that sampling load-bearing: a measured process
+		// that changed parent, session, process group or start identity
+		// between admission and its last observation is not the process the
+		// envelope admitted.
+		for _, first := range admitted {
+			for _, later := range append(append([]Record{}, observed...), drained...) {
+				checkIdentityTransition(v, label, first.Proc, later.Proc, later.Boundary)
+			}
 		}
 	}
 }
@@ -135,6 +158,20 @@ func requireMembershipEvidence(v *Verdict, where string, r Record) bool {
 			"%s lists a membership snapshot with no raw event id or digest binding it to an observation", where))
 		return false
 	}
+	// THE EVENT BYTES TOO. The record carries a cgroup.events read beside its
+	// membership, and only the membership digest was rederived — so event
+	// bytes could be replaced while the digest stayed bound to the originals
+	// and nothing noticed.
+	if r.RawEventDigest == "" {
+		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+			"%s carries no raw event digest, so the containment state it retains is a claim", where))
+		return false
+	}
+	if want := DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawEventBytes...)); r.RawEventDigest != want {
+		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
+			"%s records raw event digest %s, but its own id and retained event bytes derive %s", where, r.RawEventDigest, want))
+		return false
+	}
 	if want := DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawProcsBytes...)); r.RawProcsDigest != want {
 		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
 			"%s records membership digest %s, but its own event id and retained cgroup.procs bytes derive %s", where, r.RawProcsDigest, want))
@@ -179,9 +216,9 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 			label, r.Source, SourceProcessLifecycle))
 		return
 	}
-	if r.Boundary != "start" && r.Boundary != "end" {
+	if r.Boundary != "start" && r.Boundary != "observed" && r.Boundary != "end" {
 		v.add("WT-033", SeverityIneligible, fmt.Sprintf(
-			"%s: a process-tree record names boundary %q; it is either the admission read or the drained read, and an unlabelled one belongs to neither", label, r.Boundary))
+			"%s: a process-tree record names boundary %q; it is the admission read, the last observed read or the drained read, and an unlabelled one belongs to none of them", label, r.Boundary))
 		return
 	}
 	p := r.Proc
@@ -219,6 +256,43 @@ func checkProcessTree(v *Verdict, label string, e Envelope, r Record) {
 		v.add("WT-033", SeverityTerminal, fmt.Sprintf(
 			"%s: the measured process %d/%s is the containment's own root process; the wrapper creates the containment and admits the child into it, so these cannot be the same process",
 			label, p.PID, p.StartID))
+	}
+}
+
+// checkIdentityTransition compares the admission identity with a later one.
+//
+// Each field names a terminal case in the contract: a changed parent is a
+// reparent, a changed session or process group is the escape a session leader
+// can perform, and a changed start identity means the pid is not the process
+// that was admitted at all.
+func checkIdentityTransition(v *Verdict, label string, admitted, later ProcIdentity, boundary string) {
+	if later.PID == 0 && later.StartID == "" {
+		// Nothing was observed later; the absence is already reported by the
+		// record's own completeness check.
+		return
+	}
+	where := fmt.Sprintf("%s %s process tree", label, boundary)
+	for _, f := range []struct {
+		what        string
+		was, is     string
+		consequence string
+	}{
+		{"process id", fmt.Sprint(admitted.PID), fmt.Sprint(later.PID),
+			"a different pid is a different process, not a later view of this one"},
+		{"start identity", admitted.StartID, later.StartID,
+			"a pid whose start identity moved is a reused number, not the process that was admitted"},
+		{"parent", fmt.Sprint(admitted.ParentPID), fmt.Sprint(later.ParentPID),
+			"the contract makes reparenting terminal"},
+		{"session", fmt.Sprint(admitted.SessionID), fmt.Sprint(later.SessionID),
+			"the contract makes a session change terminal"},
+		{"process group", fmt.Sprint(admitted.PGID), fmt.Sprint(later.PGID),
+			"the contract makes a PGID change terminal"},
+	} {
+		if f.was != f.is {
+			v.add("WT-033", SeverityTerminal, fmt.Sprintf(
+				"%s: the measured process was admitted with %s %s and last observed with %s; %s",
+				where, f.what, f.was, f.is, f.consequence))
+		}
 	}
 }
 

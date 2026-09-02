@@ -179,7 +179,7 @@ func Exec(opt ExecOptions) (int, error) {
 		}
 	}
 
-	cont, err := NewContainment(containmentName(opt), opt.Parent)
+	cont, err := NewContainmentFor(containmentName(opt), opt.Parent, opt.Run)
 	if err != nil {
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "create containment: "+err.Error())
 	}
@@ -347,7 +347,25 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigs)
 
+	// THE ADMISSION IS RACE-FREE, because the containment is frozen before the
+	// child exists.
+	//
+	// Clone-into-cgroup puts the child in the containment at birth, but the
+	// child runs from its first instruction — so the membership read that
+	// followed raced a child that may already have forked, and "exactly one
+	// member" was an assertion the protocol never established. A child cloned
+	// into a FROZEN containment is created stopped. The read below therefore
+	// observes what was admitted rather than whatever happened to be there.
+	frozen := cont.Identity().Primitive == PrimitiveCgroup2
+	if frozen {
+		if err := cont.Freeze(true); err != nil {
+			return 1, ProcIdentity{}, TerminalSpawnError, "freeze the containment before admission: " + err.Error()
+		}
+	}
 	if err := cmd.Start(); err != nil {
+		if frozen {
+			_ = cont.Freeze(false)
+		}
 		return 1, ProcIdentity{}, TerminalSpawnError, err.Error()
 	}
 	if err := postSpawnAdmit(cont, cmd.Process.Pid); err != nil {
@@ -356,6 +374,9 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 		// with no handle for anyone else to reap. A child that cannot be
 		// admitted is a child that must not run.
 		pid := cmd.Process.Pid
+		if frozen {
+			_ = cont.Freeze(false)
+		}
 		err = reapStarted(ProducerPhysical, cmd, fmt.Errorf("admit child: %w", err))
 		return 1, ProcIdentity{PID: pid}, TerminalSpawnError, err.Error()
 	}
@@ -388,9 +409,30 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	// bytes and a digest binding them to this observer's own read.
 	retainProcessTree(w, opt, clock, cont, proc, "start")
 
+	// THAWED, and only now does the measured work begin.
+	if frozen {
+		if err := cont.Freeze(false); err != nil {
+			_ = reapStarted(ProducerPhysical, cmd, err)
+			return 1, proc, TerminalWrapperError, "thaw the containment after admission: " + err.Error()
+		}
+	}
+
+	// An INDEPENDENT sampler runs beside the child: it re-reads the child's
+	// identity and the containment's membership while the process exists, and
+	// keeps the last successful pair.
+	//
+	// Reusing the admission identity for the closing record made reparenting,
+	// a session change, a PGID change and a start-identity change unobservable
+	// — the two records were one sample written twice. Sampling here is the
+	// only way to observe them, because after cmd.Wait reaps the child there
+	// is nothing left in /proc to read.
+	sampler := newIdentitySampler(cmd.Process.Pid, cont, os.Getpid())
+	sampler.start()
+
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	cancelled, escalation, waitErr := awaitChild(cont, sigs, done, deadline)
+	observed, observedEvent := sampler.stop()
 
 	// A late re-read can only ADD what the live sample could not have known;
 	// it never overwrites a fact taken while the process existed.
@@ -400,6 +442,10 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	if proc.StartID == "" {
 		proc.StartID = processStartID(cmd.Process.Pid)
 	}
+	// The LAST OBSERVED state, retained beside the admission read: the
+	// identity as it was seen last, and the membership as it was last seen —
+	// which is where a descendant that existed during the interval appears.
+	retainObservedTree(w, opt, clock, cont, observed, observedEvent)
 	code := 0
 	state := TerminalPassed
 	reason := ""
@@ -620,6 +666,31 @@ func waitContainmentEmpty(cont Containment, deadline time.Time) error {
 // saying so, because "the membership could not be read" is a fact about the
 // run and the verifier decides what it means. What it never does is present an
 // unread or absent snapshot as an observed one.
+// retainObservedTree writes the LAST OBSERVED state as its own record.
+//
+// It is a third boundary because it answers a third question. The admission
+// read says what was admitted; the drained read says the containment ended
+// empty; this one says what the measured process looked like the last time
+// anyone could see it, and which processes were in the containment then. A
+// descendant that lived and exited inside the interval appears here or
+// nowhere.
+func retainObservedTree(w *Writer, opt ExecOptions, clock Clock, cont Containment, proc ProcIdentity, ev *RawEvent) {
+	rec := Record{
+		Kind: "process_tree", Boundary: "observed",
+		Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
+		Source: SourceProcessLifecycle, Seqno: opt.Seq, Run: opt.Run,
+		Containment: cont.Identity(), Proc: proc, Instant: clock.Now(),
+	}
+	if ev == nil {
+		rec.Note = "the measured process was never observed alive after admission"
+	} else {
+		rec.RawEventID, rec.RawEventDigest, rec.RawEventBytes = ev.ID, ev.Digest, ev.Bytes
+		rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
+		rec.Note = fmt.Sprintf("cgroup.procs members last observed alive: %d", len(ev.Procs))
+	}
+	_, _ = w.Append(rec)
+}
+
 func retainProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment, proc ProcIdentity, boundary string) {
 	rec := Record{
 		Kind: "process_tree", Boundary: boundary,
@@ -793,10 +864,10 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 	if opt.Level != LevelAction {
 		// Action-level observers are declared in the roster instead; anything
 		// below it registers, for the same reason the physical wrapper does.
-		if err := RegisterKey(opt.Dir, KeyLogEntry{
+		if err := RegisterKeyFor(opt.Dir, KeyLogEntry{
 			Producer: p, Level: opt.Level, Seq: opt.Seq,
 			PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
-		}); err != nil {
+		}, opt.Run); err != nil {
 			return fail(err)
 		}
 	}

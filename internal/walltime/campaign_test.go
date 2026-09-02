@@ -13,6 +13,16 @@ import (
 type memoryLoader struct {
 	verdicts  map[string]*Verdict
 	manifests map[string]*Stage1Manifest
+	stage2    map[string]*Stage2Receipt
+}
+
+func (m memoryLoader) Stage2(path string) (*Stage2Receipt, error) {
+	r, ok := m.stage2[path]
+	if !ok {
+		return nil, fmt.Errorf("no stage-2 receipt at %s", path)
+	}
+	c := *r
+	return &c, nil
 }
 
 func (m memoryLoader) Verdict(path string) (*Verdict, error) {
@@ -121,6 +131,7 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 	loader := memoryLoader{
 		verdicts:  map[string]*Verdict{},
 		manifests: map[string]*Stage1Manifest{"baseline.json": baseline, "candidate.json": candidate},
+		stage2:    map[string]*Stage2Receipt{},
 	}
 	order, err := schedule.OrderDigest()
 	if err != nil {
@@ -197,6 +208,15 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 	return idx, loader, []string{PublicKeyOf(key)}, key
 }
 
+// ablationInvocations is the realized invocation topology per stratum. The
+// sequential stratum runs more than one invocation; the others run one.
+func ablationInvocations(stratum string) []int64 {
+	if stratum == StratumSequentialInvocs {
+		return []int64{40 * second, 35 * second, 30 * second}
+	}
+	return []int64{60 * second}
+}
+
 // addFixtureAblations gives the fixture the twelve controlled ablations the
 // contract requires to precede the campaign: three in each of the four
 // topology strata, each a genuine eligible verdict signed by the delivery
@@ -229,6 +249,21 @@ func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, 
 			t.Fatal(err)
 		}
 		loader.manifests[manifestPath] = &m
+		// THE DERIVED PLAN this stratum's ablations actually ran, bound to the
+		// manifest that authorised it. A stratum label with no plan behind it
+		// is an intent; this is what the run realized.
+		receiptPath := fmt.Sprintf("ablation-stage2-%s.json", stratum)
+		receipt := testReceipt(stage1, Digest("sha256:ablation-bundle-"+stratum))
+		receipt.PlanDigest = Digest("sha256:plan-" + stratum)
+		receipt.TopologyDigest = Digest("sha256:topology-" + stratum)
+		if err := receipt.Validate(); err != nil {
+			t.Fatalf("the fixture ablation Stage-2 for %s does not validate: %v", stratum, err)
+		}
+		stage2, err := receipt.DigestOf()
+		if err != nil {
+			t.Fatal(err)
+		}
+		loader.stage2[receiptPath] = &receipt
 		for n := 0; n < AblationsPerStratum; n++ {
 			path := fmt.Sprintf("ablation-%s-%d.json", stratum, n)
 			// August: strictly before the campaign, which starts in September.
@@ -239,9 +274,16 @@ func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, 
 				RecordsDigest:  Digest(fmt.Sprintf("sha256:records-ablation-%s-%d", stratum, n)),
 				VerifierBinary: verifier,
 				StartedAt:      at, Terminal: TerminalPassed,
+				// The REALIZED topology: the invocations this ablation
+				// measured and the peer/trace reconciliation that only exists
+				// where both observers bracketed the same lifecycle. The
+				// sequential-invocation stratum measures more than one, which
+				// is the part of its shape retained evidence can decide.
+				InvocationNs: ablationInvocations(stratum),
+				Recon:        []Reconciliation{{Level: LevelInvocation, Deltas: []int64{millisecond, -millisecond}}},
 				Run: RunIdentity{
 					CampaignID: "ewj2", RunID: fmt.Sprintf("ablation-%s-%d", stratum, n),
-					BucketID: "0", Stage1: stage1, VerifierID: testVerdictIdentity,
+					BucketID: "0", Stage1: stage1, Stage2: stage2, VerifierID: testVerdictIdentity,
 				},
 			}
 			if err := v.Sign(testVerdictIdentity, testVerdictAuthority); err != nil {
@@ -250,7 +292,7 @@ func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, 
 			loader.verdicts[path] = v
 			idx.Ablations = append(idx.Ablations, CampaignAblationRef{
 				Stratum: stratum, RunID: v.Run.RunID,
-				Stage1Path: manifestPath, VerdictPath: path,
+				Stage1Path: manifestPath, Stage2Path: receiptPath, VerdictPath: path,
 			})
 		}
 	}

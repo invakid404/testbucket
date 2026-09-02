@@ -1789,12 +1789,13 @@ func TestRawEvidenceIsRetained(t *testing.T) {
 	if boundaries != 4 {
 		t.Errorf("saw %d peer/trace boundary records, want 4", boundaries)
 	}
-	// TWO: the admission read taken while the child is in the containment, and
-	// the drained read after it empties. One record could only ever be the
-	// second, and an empty close snapshot is not evidence that anything was
-	// admitted.
-	if trees != 2 {
-		t.Errorf("saw %d process-tree records, want 2 (admitted and drained)", trees)
+	// THREE: the admission read taken with the containment frozen so it
+	// observes exactly what was admitted, the last read taken while the
+	// process was still observable, and the drained read after it empties.
+	// One record could only ever be the last, and an empty close snapshot is
+	// not evidence that anything was admitted.
+	if trees != 3 {
+		t.Errorf("saw %d process-tree records, want 3 (admitted, observed and drained)", trees)
 	}
 }
 

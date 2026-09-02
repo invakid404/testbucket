@@ -338,3 +338,97 @@ func TestTheAblationStratumComesFromTheSignedManifest(t *testing.T) {
 		t.Errorf("an ablation whose manifest names no stratum was accepted: %v", problems)
 	}
 }
+
+// TestAnAblationMustProveItsRealizedTopology is the F5 regression.
+//
+// A signed stratum in the Stage-1 manifest states an INTENT. The gate believed
+// it, so twelve rows built by copying one baseline manifest, changing only that
+// label, re-signing and pairing a generic eligible verdict passed the whole
+// mandatory prerequisite — no derived plan, no invocation timings, no
+// peer/trace reconciliation, nothing showing twelve experiments had happened
+// rather than one label written twelve times.
+func TestAnAblationMustProveItsRealizedTopology(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*CampaignIndex, memoryLoader)
+		want string
+	}{
+		{"no derived plan at all", func(idx *CampaignIndex, _ memoryLoader) {
+			idx.Ablations[0].Stage2Path = ""
+		}, "names no Stage-2 receipt"},
+
+		{"a plan the row did not measure", func(idx *CampaignIndex, l memoryLoader) {
+			resign(l.verdicts[idx.Ablations[0].VerdictPath], testVerdictAuthority, func(v *Verdict) {
+				v.Run.Stage2 = "sha256:some-other-plan"
+			})
+		}, "but the receipt it names digests to"},
+
+		{"a plan derived from another Stage-1", func(idx *CampaignIndex, l memoryLoader) {
+			r := *l.stage2[idx.Ablations[0].Stage2Path]
+			r.Stage1Digest = "sha256:elsewhere"
+			l.stage2[idx.Ablations[0].Stage2Path] = &r
+		}, "not the"},
+
+		// A reconciliation entry exists only where a peer AND a trace both
+		// bracketed the same lifecycle. Its absence means the row was not
+		// trace-qualified, whatever its label says.
+		{"no peer/trace reconciliation", func(idx *CampaignIndex, l memoryLoader) {
+			resign(l.verdicts[idx.Ablations[0].VerdictPath], testVerdictAuthority, func(v *Verdict) {
+				v.Recon = nil
+			})
+		}, "retains no peer/trace reconciliation"},
+
+		{"no invocation observations", func(idx *CampaignIndex, l memoryLoader) {
+			resign(l.verdicts[idx.Ablations[0].VerdictPath], testVerdictAuthority, func(v *Verdict) {
+				v.InvocationNs = nil
+			})
+		}, "realized invocation topology is unstated"},
+
+		// The one stratum shape retained evidence can decide: a single
+		// invocation cannot realize a sequential-invocation experiment.
+		{"a sequential stratum realized by one invocation", func(idx *CampaignIndex, l memoryLoader) {
+			for i, a := range idx.Ablations {
+				if a.Stratum != StratumSequentialInvocs {
+					continue
+				}
+				resign(l.verdicts[idx.Ablations[i].VerdictPath], testVerdictAuthority, func(v *Verdict) {
+					v.InvocationNs = []int64{60 * second}
+				})
+				return
+			}
+		}, "that topology is not realized by one"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, loader, keys, _ := campaignFixture(t)
+			tc.edit(&idx, loader)
+			_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+			if !strings.Contains(strings.Join(problems, "\n"), tc.want) {
+				t.Errorf("problems %v do not report %q", problems, tc.want)
+			}
+		})
+	}
+}
+
+// TestTwelveLabelOnlyCopiesDoNotQualify is the shape the defect had: one
+// baseline manifest copied twelve times with only the stratum changed, and
+// generic verdicts carrying no derived topology at all.
+func TestTwelveLabelOnlyCopiesDoNotQualify(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+	for _, a := range idx.Ablations {
+		resign(loader.verdicts[a.VerdictPath], testVerdictAuthority, func(v *Verdict) {
+			v.Run.Stage2 = ""
+			v.Recon = nil
+			v.InvocationNs = nil
+		})
+	}
+	_, problems := LoadCampaign(idx, loader, keys, CampaignAuthority)
+	if len(problems) == 0 {
+		t.Fatal("twelve signed stratum labels with no derived topology satisfied the prerequisite")
+	}
+	joined := strings.Join(problems, "\n")
+	for _, want := range []string{"retains no peer/trace reconciliation", "realized invocation topology is unstated"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("problems do not report %q: %v", want, problems)
+		}
+	}
+}

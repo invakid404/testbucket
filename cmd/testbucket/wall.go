@@ -96,6 +96,8 @@ func runWall(args []string) error {
 		return runWallRun(args[1:])
 	case "observe":
 		return runWallObserve(args[1:])
+	case "supervise":
+		return runWallSupervise(args[1:])
 	case "verify":
 		return runWallVerify(args[1:])
 	case "bundle":

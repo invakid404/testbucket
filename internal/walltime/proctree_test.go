@@ -246,7 +246,7 @@ func TestAProcessTreeRecordMustComeFromThePhysicalProducer(t *testing.T) {
 		{"a trace collector's record", func(r *Record) { r.Producer = ProducerTrace; r.Role = RoleTraceScript }, "written by"},
 		{"a wrapper annotation", func(r *Record) { r.Source = SourceWrapper }, "declares source"},
 		{"a reporter annotation", func(r *Record) { r.Source = SourceReporter }, "declares source"},
-		{"an unlabelled boundary", func(r *Record) { r.Boundary = "" }, "belongs to neither"},
+		{"an unlabelled boundary", func(r *Record) { r.Boundary = "" }, "belongs to none of them"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := base
@@ -323,5 +323,95 @@ func TestTheProcessTreeMembershipIsRetainedEvidence(t *testing.T) {
 				t.Errorf("a run with %s scored", tc.name)
 			}
 		})
+	}
+}
+
+// TestAnIdentityTransitionBetweenTheReadsIsTerminal is the F2 regression for
+// the independent closing sample.
+//
+// `runChild` sampled the child's identity once, at admission, and wrote that
+// same struct into both records — so two records carried one sample, could not
+// disagree, and every transition the contract makes terminal was unobservable
+// by construction. The closing identity is now an independent sample taken
+// while the process was still alive, and this is what makes that sampling
+// load-bearing.
+func TestAnIdentityTransitionBetweenTheReadsIsTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*ProcIdentity)
+		want string
+	}{
+		{"a reparent", func(p *ProcIdentity) { p.ParentPID++ }, "reparenting terminal"},
+		{"a session change", func(p *ProcIdentity) { p.SessionID++ }, "session change terminal"},
+		{"a process-group change", func(p *ProcIdentity) { p.PGID++ }, "PGID change terminal"},
+		{"a start-identity change", func(p *ProcIdentity) { p.StartID += "-moved" }, "reused number"},
+		{"a different pid entirely", func(p *ProcIdentity) { p.PID++ }, "a different pid is a different process"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, boundary := range []string{"process_tree:observed", "process_tree:end"} {
+				v := verifySynth(t, func(_ Level, _ int, p Producer, b string, r *Record) {
+					if p == ProducerPhysical && b == boundary {
+						tc.edit(&r.Proc)
+					}
+				}, nil)
+				if len(findingsMentioning(v, "WT-033", tc.want)) == 0 {
+					t.Errorf("%s at %s raised no WT-033: %+v", tc.name, boundary, v.Findings)
+				}
+				if v.Eligible {
+					t.Errorf("a run with %s at %s scored", tc.name, boundary)
+				}
+			}
+		})
+	}
+}
+
+// TestTheProcessTreeEventBytesAreRederived: the record carries a cgroup.events
+// read beside its membership, and only the membership digest was rederived —
+// so event bytes could be replaced while the digest stayed bound to the
+// originals and nothing noticed.
+func TestTheProcessTreeEventBytesAreRederived(t *testing.T) {
+	v := verifySynth(t, func(_ Level, _ int, p Producer, b string, r *Record) {
+		if p == ProducerPhysical && strings.HasPrefix(b, "process_tree:") {
+			r.RawEventBytes = []byte("invented event bytes\n")
+		}
+	}, nil)
+	if len(findingsMentioning(v, "WT-033", "retained event bytes derive")) == 0 {
+		t.Errorf("event bytes that do not derive the retained digest were accepted: %+v", v.Findings)
+	}
+	if v.Eligible {
+		t.Error("a run whose process-tree event bytes were replaced scored")
+	}
+	// And an absent event digest is not a pass either.
+	v = verifySynth(t, func(_ Level, _ int, p Producer, b string, r *Record) {
+		if p == ProducerPhysical && b == "process_tree:start" {
+			r.RawEventDigest = ""
+		}
+	}, nil)
+	if len(findingsMentioning(v, "WT-033", "no raw event digest")) == 0 {
+		t.Errorf("a process-tree record with no event digest was accepted: %+v", v.Findings)
+	}
+}
+
+// TestTheAdmissionReadIsTakenUnderAFreeze is the race-free half of F2.
+//
+// Clone-into-cgroup puts the child in the containment at birth, but the child
+// runs from its first instruction — so a membership read taken afterwards
+// races a child that may already have forked, and "exactly one member" was an
+// assertion the protocol never established. The containment is frozen before
+// the spawn, so the child is created stopped and the read observes what was
+// admitted. Asserted from the production source, because it is an ordering the
+// type system cannot express.
+func TestTheAdmissionReadIsTakenUnderAFreeze(t *testing.T) {
+	body := productionFunc(t, "exec.go", "func runChild(")
+	freeze := strings.Index(body, "cont.Freeze(true)")
+	start := strings.Index(body, "cmd.Start()")
+	read := strings.Index(body, `retainProcessTree(w, opt, clock, cont, proc, "start")`)
+	thaw := strings.Index(body, "cont.Freeze(false); err != nil")
+	if freeze < 0 || start < 0 || read < 0 || thaw < 0 {
+		t.Fatalf("the admission protocol is no longer recognisable: freeze=%d start=%d read=%d thaw=%d", freeze, start, read, thaw)
+	}
+	if !(freeze < start && start < read && read < thaw) {
+		t.Errorf("the admission read is not taken under the freeze: freeze=%d start=%d read=%d thaw=%d; a child that is running when the read is taken may already have forked",
+			freeze, start, read, thaw)
 	}
 }

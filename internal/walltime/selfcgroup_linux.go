@@ -59,7 +59,12 @@ func selfCgroupPath() (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	return unifiedCgroupLine(string(b))
+}
+
+// unifiedCgroupLine reads the `0::/path` line of a /proc/<pid>/cgroup file.
+func unifiedCgroupLine(text string) (string, bool) {
+	for _, line := range strings.Split(text, "\n") {
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) == 3 && parts[0] == "0" && parts[1] == "" && strings.HasPrefix(parts[2], "/") {
 			return parts[2], true

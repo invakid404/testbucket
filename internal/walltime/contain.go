@@ -85,6 +85,11 @@ func membershipModelFor(ownerUID uint32, groupOrOtherWritable bool, selfUID int,
 	return MembershipSupervisorOwned
 }
 
+// cgroupRootEnv names the delegated cgroup-v2 subtree testbucket may create
+// containments under. It is required: guessing a path and writing to it is how
+// an action ends up moving processes it does not own.
+const cgroupRootEnv = "TB_WALL_CGROUP_ROOT"
+
 // Containment primitives. Only PrimitiveCgroup2 can delimit a SCORED
 // lifecycle: it is the one primitive here whose membership the workload cannot
 // modify and whose emptiness the kernel reports as an event rather than as a
@@ -149,6 +154,16 @@ type Containment interface {
 	// both the observation and whether the containment is populated. observer
 	// distinguishes the producers so their event ids can never collide.
 	Observe(observer string) (RawEvent, bool, error)
+	// Freeze suspends or resumes every member.
+	//
+	// It is what makes the admission observation RACE-FREE. Clone-into-cgroup
+	// puts the child in the containment at birth, but the child runs from its
+	// first instruction — so a membership read taken afterwards races a child
+	// that has already forked, and "exactly one member" was an assertion the
+	// protocol did not establish. A containment frozen before the spawn holds
+	// a child that cannot execute, so the read observes what was admitted
+	// rather than what happened to be there.
+	Freeze(frozen bool) error
 	// Signal forwards a signal to every member.
 	Signal(sig syscall.Signal) error
 	// Destroy removes the containment after it is verified empty.
@@ -166,6 +181,25 @@ type Containment interface {
 // A host with no delegated cgroup-v2 tree gets the unscored process-group
 // fallback rather than an error: the run still produces a full receipt, and
 // the verifier is what refuses to score it.
+// NewContainmentFor creates a containment for a named run, asking the
+// SUPERVISOR when one is configured.
+//
+// The supervisor creates it under a credential the measured workload does not
+// have, so the resulting `cgroup.procs` — which on cgroup-v2 IS the
+// process-migration control — is not writable by the workload. Without a
+// supervisor the wrapper creates it itself, at the workload's own credential,
+// and `membershipControl` records that honestly as workload-writable so the
+// row is refused rather than scored on a boundary that is not there.
+func NewContainmentFor(name string, parent *ContainmentIdentity, run RunIdentity) (Containment, error) {
+	if cont, handled, err := supervisedContainment(name, parent, run); handled {
+		if err != nil {
+			return nil, fmt.Errorf("walltime: supervisor containment: %w", err)
+		}
+		return cont, nil
+	}
+	return NewContainment(name, parent)
+}
+
 func NewContainment(name string, parent *ContainmentIdentity) (Containment, error) {
 	return newContainment(name, parent)
 }

@@ -410,7 +410,14 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 				ns       int64
 				procs    []int
 			}{
+				// THREE reads, because they answer three questions. The
+				// admission read is taken with the containment frozen, so it
+				// observes exactly what was admitted; the observed read is the
+				// last state anyone could see while the process was alive,
+				// which is where a descendant that lived and exited inside the
+				// interval appears; the drained read is the closure.
 				{"start", start, []int{child.PID}},
+				{"observed", (start + end) / 2, []int{child.PID}},
 				{"end", end, nil},
 			} {
 				if tree.boundary == s.dropProcessTree {

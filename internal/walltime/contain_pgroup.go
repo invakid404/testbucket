@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"sync"
@@ -78,6 +79,14 @@ func (p *processGroup) Observe(observer string) (RawEvent, bool, error) {
 		// that no containment evidence exists.
 		Source: SourceProcessLifecycle,
 	}, populated, nil
+}
+
+// Freeze cannot be done to a process group: there is no kernel object to
+// suspend as a unit, and SIGSTOP to a group races the very fork it is meant to
+// exclude. Saying so is better than pretending, and a run on this primitive is
+// unscorable regardless.
+func (p *processGroup) Freeze(bool) error {
+	return fmt.Errorf("walltime: a process group cannot be frozen as a unit (%s)", p.reason)
 }
 
 func (p *processGroup) Signal(sig syscall.Signal) error {

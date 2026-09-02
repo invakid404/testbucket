@@ -20,7 +20,11 @@ type recordingContainment struct {
 
 func (c *recordingContainment) Identity() ContainmentIdentity { return ContainmentIdentity{ID: "test"} }
 func (c *recordingContainment) Admit(int) error               { return nil }
-func (c *recordingContainment) Procs() ([]int, error)         { return nil, nil }
+
+// Freeze is a no-op for the double: these tests exercise cancellation, and the
+// freeze protocol belongs to the admission read.
+func (c *recordingContainment) Freeze(bool) error     { return nil }
+func (c *recordingContainment) Procs() ([]int, error) { return nil, nil }
 func (c *recordingContainment) Observe(string) (RawEvent, bool, error) {
 	return RawEvent{}, false, nil
 }

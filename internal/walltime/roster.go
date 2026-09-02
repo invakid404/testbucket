@@ -188,6 +188,24 @@ func (e *KeyLogEntry) Authorize(authority string, key ed25519.PrivateKey) error 
 // holds a capability the measured work does not, and this is the check that
 // says whether one existed.
 func RegisterKey(dir string, e KeyLogEntry) error {
+	return RegisterKeyFor(dir, e, RunIdentity{})
+}
+
+// RegisterKeyFor registers one key for a named run.
+//
+// When a SUPERVISOR is configured it decides: the wrapper asking runs in the
+// measured workload's credential domain, so it must not hold the key that makes
+// a registration admissible. Without one the entry is written unauthorized —
+// retained, so the record it explains is still explicable, and refused for
+// scoring, because on a single-credential runner nothing distinguishes it from
+// the measured work registering a producer for itself.
+func RegisterKeyFor(dir string, e KeyLogEntry, run RunIdentity) error {
+	if handled, err := supervisedRegisterKey(dir, e, run); handled {
+		if err != nil {
+			return fmt.Errorf("walltime: key log: %w", err)
+		}
+		return nil
+	}
 	runKey, err := RunKeyFromEnv()
 	if err != nil {
 		return fmt.Errorf("walltime: key log: %w", err)
@@ -205,6 +223,17 @@ func RegisterKeyWith(dir string, e KeyLogEntry, runKey ed25519.PrivateKey) error
 		if err := e.Authorize(keyLogAuthority(e), runKey); err != nil {
 			return fmt.Errorf("walltime: key log: %w", err)
 		}
+	}
+	return appendKeyLogEntry(dir, e)
+}
+
+// appendKeyLogEntry writes one entry exactly as it stands, for a caller that
+// has already obtained its authorization elsewhere — the supervised path,
+// where the countersignature is made by a process holding a key this one does
+// not.
+func appendKeyLogEntry(dir string, e KeyLogEntry) error {
+	if dir == "" {
+		return nil
 	}
 	b, err := json.Marshal(e)
 	if err != nil {
