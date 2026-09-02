@@ -129,14 +129,59 @@ func checkRawEndpoint(v *Verdict, label string, who Producer, what string, r Rec
 		}
 		return
 	}
-	// AND THE MEMBERSHIP TAKEN WITH IT. An endpoint that reports empty while
-	// its own snapshot lists members contradicts itself; the snapshot exists
-	// so "nothing was in it" can be checked rather than believed.
+	// AND THE MEMBERSHIP TAKEN WITH IT.
+	//
+	// The snapshot must have HAPPENED. A nil membership and a successful read
+	// of an empty containment used to serialise identically, so a producer
+	// whose `cgroup.procs` read failed — or which never took one — emitted
+	// evidence indistinguishable from proof that nothing was inside. The
+	// contract asks for retained `cgroup.procs` snapshots at every level, and
+	// "the field is absent" is not one.
+	if r.RawProcs == nil {
+		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
+			"%s retains no cgroup.procs membership snapshot; a read that never happened is not proof that the containment was empty", where))
+		return
+	}
+	// And it must be the snapshot this observation took: its own bytes, under
+	// this observation's own event id.
+	if r.RawProcsDigest == "" {
+		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
+			"%s lists a membership snapshot with no digest binding it to this observation", where))
+		return
+	}
+	if want := DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawProcsBytes...)); r.RawProcsDigest != want {
+		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
+			"%s records membership digest %s, but its own event id and retained cgroup.procs bytes derive %s",
+			where, r.RawProcsDigest, want))
+		return
+	}
+	// The listed pids must be the ones those bytes name, so the readable list
+	// and the retained evidence cannot disagree.
+	if listed := parseCgroupProcs(r.RawProcsBytes); !sameInts(listed, r.RawProcs) {
+		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
+			"%s lists members %v while its retained cgroup.procs bytes name %v", where, r.RawProcs, listed))
+		return
+	}
+	// An endpoint that reports empty while its own snapshot lists members
+	// contradicts itself; the snapshot exists so "nothing was in it" can be
+	// checked rather than believed.
 	if len(r.RawProcs) > 0 {
 		v.add("WT-028", SeverityIneligible, fmt.Sprintf(
 			"%s reports an empty containment while its own membership snapshot lists %d member(s): %v",
 			where, len(r.RawProcs), r.RawProcs))
 	}
+}
+
+func sameInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // parseCgroupPopulated reads the `populated 0|1` line the kernel writes.

@@ -5,6 +5,15 @@ import (
 	"testing"
 )
 
+// setMembership rewrites a record's membership snapshot COHERENTLY — bytes,
+// parsed list and digest together — so a case exercises the invariant it
+// names rather than tripping the digest check on its way there.
+func setMembership(r *Record, procs string) {
+	r.RawProcsBytes = []byte(procs)
+	r.RawProcs = parseCgroupProcs(r.RawProcsBytes)
+	r.RawProcsDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawProcsBytes...))
+}
+
 // findingsMentioning collects every finding whose code and detail match, so a
 // case can assert on the reason rather than on a count.
 func findingsMentioning(v *Verdict, code, substr string) []string {
@@ -104,17 +113,49 @@ func TestTheRetainedKernelBytesAreActuallyVerified(t *testing.T) {
 		// The record contradicting ITSELF: the kernel line says empty, the
 		// membership snapshot taken with it lists a member. True at either
 		// end, since production observes an empty containment at both.
+		// A COHERENT snapshot — bytes, list and digest all agreeing — that
+		// lists a member while the kernel line says empty. The record
+		// contradicts itself, at either end.
 		{"an empty admission whose own snapshot lists members", func(_ Level, _ int, p Producer, b string, r *Record) {
 			if p != ProducerPhysical && admission(b) {
-				r.RawProcs = []int{synthAdmittedPID}
+				setMembership(r, "4242\n")
 			}
 		}, "membership snapshot lists"},
 
 		{"an empty close whose own snapshot lists members", func(_ Level, _ int, p Producer, b string, r *Record) {
 			if p != ProducerPhysical && !admission(b) {
-				r.RawProcs = []int{synthAdmittedPID}
+				setMembership(r, "4242\n")
 			}
 		}, "membership snapshot lists"},
+
+		// THE F2 DEFECT: no snapshot at all. A nil membership and a
+		// successful read of an empty containment used to serialise
+		// identically, so a failed read proved emptiness.
+		{"no membership snapshot at any observer endpoint", func(_ Level, _ int, p Producer, _ string, r *Record) {
+			if p != ProducerPhysical {
+				r.RawProcs = nil
+			}
+		}, "retains no cgroup.procs membership snapshot"},
+
+		{"a membership snapshot with no digest", func(_ Level, _ int, p Producer, _ string, r *Record) {
+			if p == ProducerPeer {
+				r.RawProcsDigest = ""
+			}
+		}, "no digest binding it to this observation"},
+
+		{"a membership digest over some other observation", func(_ Level, _ int, p Producer, _ string, r *Record) {
+			if p == ProducerTrace {
+				r.RawProcsDigest = DigestBytes(append([]byte("someone-else\x00"), r.RawProcsBytes...))
+			}
+		}, "derive"},
+
+		// The readable list and the retained bytes disagreeing: one of them
+		// was edited after the observation.
+		{"a member list its own retained bytes do not name", func(_ Level, _ int, p Producer, _ string, r *Record) {
+			if p == ProducerPeer {
+				r.RawProcs = []int{synthAdmittedPID}
+			}
+		}, "retained cgroup.procs bytes name"},
 
 		// ONE read filed twice. Both endpoints legitimately report an empty
 		// containment, so equal bytes prove nothing — but the contract

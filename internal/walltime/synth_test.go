@@ -55,7 +55,10 @@ type synthRun struct {
 	stage2 Digest
 	// containmentPrimitive lets a test make the run unscorable.
 	containmentPrimitive string
-	clockID              string
+	// membershipControl is who may write the containment's cgroup.procs; a
+	// test can move it to the shape a same-uid delegation produces.
+	membershipControl string
+	clockID           string
 	// producerBinary is the executable identity every record claims. A test
 	// can move it to prove the verifier compares the FULL digest.
 	producerBinary Digest
@@ -97,6 +100,7 @@ func newSynthRun(dir string) *synthRun {
 		peerLeadNs:           1_000_000,
 		stage2:               synthStage2,
 		containmentPrimitive: PrimitiveCgroup2,
+		membershipControl:    MembershipSupervisorOwned,
 		clockID:              ClockMonotonic,
 		producerBinary:       synthBinary,
 		runKey:               mustSigningKey(),
@@ -215,17 +219,42 @@ func (s *synthRun) attest(t *testing.T) {
 	}
 }
 
+// synthContainmentPath is the nested containment path production builds: each
+// level's directory inside its parent's. The action is the root of the tree,
+// the script sits inside it, and every invocation sits inside the script.
+func synthContainmentPath(level Level, seq int) string {
+	const root = "/sys/fs/cgroup/testbucket"
+	action := root + "/tb-action-0"
+	switch level {
+	case LevelAction:
+		return action
+	case LevelScript:
+		return fmt.Sprintf("%s/tb-script-%d", action, seq)
+	default:
+		return fmt.Sprintf("%s/tb-script-0/tb-invocation-%03d", action, seq)
+	}
+}
+
 // writeLevel emits the three ledgers of one envelope with the contract's
 // ordering built in.
 func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int64, spec *SpecIdentity, mutate mutation) {
 	t.Helper()
 	ident := ContainmentIdentity{
 		Primitive: s.containmentPrimitive,
-		ID:        fmt.Sprintf("/sys/fs/cgroup/testbucket/tb-%s-%d", level, seq),
+		// NESTED, the way production creates them: newCgroupUnder makes each
+		// level's containment a directory inside its parent's, so a script
+		// lives under the action and an invocation under its script. The
+		// fixture used to emit three SIBLINGS, which no wrapper produces and
+		// which cannot exercise the hierarchy the verifier must prove.
+		ID:        synthContainmentPath(level, seq),
 		Inode:     fmt.Sprintf("%d", 900000+seq+levelRank(level)*10),
 		BootID:    synthBoot,
 		RootPID:   4242 + seq,
 		RootStart: "778899",
+		// The membership-control model production establishes by reading the
+		// filesystem. A scored containment is one whose `cgroup.procs` the
+		// measured workload cannot write.
+		MembershipControl: s.membershipControl,
 	}
 	peerStart, peerEnd := start+s.bootstrapNs, end-s.suffixNs
 	traceStart, traceEnd := peerStart+s.peerLeadNs, peerEnd-s.peerLeadNs
@@ -313,8 +342,15 @@ func (s *synthRun) writeLevel(t *testing.T, level Level, seq int, start, end int
 				// that refused every genuine scored run passed its own tests.
 				rec.RawEventID = fmt.Sprintf("%s:%s:%s:%d", producer, level, p.boundary, seq)
 				rec.RawEventBytes = []byte("populated 0\nfrozen 0\n")
-				rec.RawProcs = nil
 				rec.RawEventDigest = DigestBytes(append([]byte(rec.RawEventID+"\x00"), rec.RawEventBytes...))
+				// The membership snapshot TAKEN WITH that read: an empty
+				// cgroup.procs, its exact bytes, and the digest binding them
+				// to this observation. The fixture used to leave RawProcs nil,
+				// which is the shape a failed read produces — so it could not
+				// tell a proved-empty containment from an unread one.
+				rec.RawProcsBytes = []byte("")
+				rec.RawProcs = parseCgroupProcs(rec.RawProcsBytes)
+				rec.RawProcsDigest = DigestBytes(append([]byte(rec.RawEventID+"\x00"), rec.RawProcsBytes...))
 				rec.Phase = lifecyclePhase(level)
 			}
 			if p.boundary == "end" {

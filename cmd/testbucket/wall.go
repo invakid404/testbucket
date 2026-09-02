@@ -264,7 +264,20 @@ func runWallExec(args []string) error {
 	}
 	if opt.Level == walltime.LevelInvocation {
 		opt.JoinParent = false
-		if ident, ok := walltime.ScriptContainment(*dir); ok {
+		// FAIL CLOSED on a handoff that exists and cannot be authenticated.
+		//
+		// The fallback for "no handoff" is to nest under the action, which is
+		// the right topology for an invocation started outside a measured
+		// script. It must never become the silent outcome of a measured script
+		// having rewritten or corrupted the file: that would let the workload
+		// choose its own enclosing containment and then be accounted under the
+		// one it chose.
+		ident, ok, err := walltime.ScriptContainment(*dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "testbucket wall: %v\n", err)
+			return err
+		}
+		if ok {
 			opt.Parent = ident
 		}
 	}

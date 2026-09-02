@@ -115,6 +115,7 @@ func RunObserver(cfg ObserverConfig) error {
 		Kind: "boundary", Role: role, Level: cfg.Level, Boundary: "start",
 		Source: ev.Source, RawEventID: ev.ID, RawEventDigest: ev.Digest,
 		RawEventBytes: ev.Bytes, RawProcs: ev.Procs,
+		RawProcsBytes: ev.ProcsBytes, RawProcsDigest: ev.ProcsDigest,
 		Phase: lifecyclePhase(cfg.Level), Seqno: cfg.Seq,
 		Run: cfg.Run, Containment: cont.Identity(), Instant: clock.Now(),
 	}); err != nil {
@@ -135,6 +136,7 @@ func RunObserver(cfg ObserverConfig) error {
 		Kind: "boundary", Role: role, Level: cfg.Level, Boundary: "end",
 		Source: last.Source, RawEventID: last.ID, RawEventDigest: last.Digest,
 		RawEventBytes: last.Bytes, RawProcs: last.Procs,
+		RawProcsBytes: last.ProcsBytes, RawProcsDigest: last.ProcsDigest,
 		Phase: lifecyclePhase(cfg.Level), Seqno: cfg.Seq,
 		Run: cfg.Run, Containment: cont.Identity(), Instant: clock.Now(),
 		Terminal: TerminalPassed,

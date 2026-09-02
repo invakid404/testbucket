@@ -263,6 +263,7 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	verifyEndpoints(v, envelopes)
 	verifyIndependence(v, envelopes)
 	verifyRawEvidence(v, envelopes)
+	verifyContainmentHierarchy(v, envelopes)
 	v.Phases = derivePartition(v, envelopes)
 	v.Recon = reconcile(envelopes)
 	summarise(v, envelopes)
@@ -728,6 +729,25 @@ func verifyEndpoints(v *Verdict, envs []Envelope) {
 			v.add("WT-009", SeverityIneligible,
 				fmt.Sprintf("%s: containment is %q, which cannot prove that no descendant escaped", label, e.Containment.Primitive))
 		}
+		// WHO MAY MOVE PROCESSES BETWEEN CONTAINMENTS.
+		//
+		// On cgroup-v2 `cgroup.procs` is the migration control, and the
+		// documented setup gave the delegated subtree to the runner uid — the
+		// same uid the measured workload runs as. The workload therefore held
+		// exactly the capability Stage 1's ContainmentPolicy said it did not:
+		// it could move itself or a descendant between the action, script,
+		// invocation and sibling containments and rewrite the membership
+		// history this envelope is built on. Stage 1 asserting otherwise made
+		// it a false security claim rather than a control.
+		//
+		// It is now a fact the producer establishes by reading the filesystem,
+		// and a run the workload could have migrated itself in is recorded in
+		// full and reported ineligible rather than scored.
+		if e.Containment.Primitive == PrimitiveCgroup2 && e.Containment.MembershipControl != MembershipSupervisorOwned {
+			v.add("WT-031", SeverityIneligible, fmt.Sprintf(
+				"%s: the containment's membership control is %q; on cgroup-v2 `cgroup.procs` is the process-migration control, so a workload that can write it can move itself between containments and the nested membership this envelope records proves nothing. A scored run needs the delegated subtree owned by a credential the measured workload does not run as (%s)",
+				label, containmentControlOrUnknown(e.Containment.MembershipControl), WorkloadUIDEnv))
+		}
 		for _, r := range []Record{e.Peer.start, e.Peer.end, e.Trace.start, e.Trace.end} {
 			if !r.Containment.Same(e.Containment) {
 				v.add("WT-008", SeverityTerminal,
@@ -735,7 +755,43 @@ func verifyEndpoints(v *Verdict, envs []Envelope) {
 						label, r.Producer, r.Containment.ID, r.Containment.Inode, e.Containment.ID, e.Containment.Inode))
 			}
 		}
+		// THE ROOT PROCESS IDENTITY, required and compared.
+		//
+		// The schema documents RootPID plus RootStart as the pair that closes
+		// pid reuse, and nothing asked for it: a run whose every containment
+		// record omitted the start identity scored, and so did one where the
+		// trace named a different root process than the physical wrapper and
+		// the peer. A path and an inode identify the containment; they say
+		// nothing about which process it was made for, and two observers
+		// watching containments created for different processes are not two
+		// observers of one lifecycle.
+		if e.Containment.Primitive == PrimitiveCgroup2 {
+			for _, r := range []Record{e.Physical.start, e.Physical.end, e.Peer.start, e.Peer.end, e.Trace.start, e.Trace.end} {
+				if r.Containment.RootPID <= 0 || strings.TrimSpace(r.Containment.RootStart) == "" {
+					v.add("WT-029", SeverityIneligible, fmt.Sprintf(
+						"%s: a %s endpoint names containment root process %d/%q; a pid without its start identity is a number the kernel reuses, and the contract binds PID-start identity at every level",
+						label, r.Producer, r.Containment.RootPID, r.Containment.RootStart))
+					continue
+				}
+				if !r.Containment.SameRoot(e.Containment) {
+					v.add("WT-029", SeverityIneligible, fmt.Sprintf(
+						"%s: the %s ledger names containment root process %d/%s, but the physical ledger names %d/%s; the observers did not watch a containment made for the same process",
+						label, r.Producer, r.Containment.RootPID, r.Containment.RootStart,
+						e.Containment.RootPID, e.Containment.RootStart))
+				}
+			}
+		}
 	}
+}
+
+// containmentControlOrUnknown names an unset membership-control fact rather
+// than printing an empty string: a record written before this was established
+// says nothing about the model, which is itself the answer.
+func containmentControlOrUnknown(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return MembershipUnknown + " (the record states none)"
+	}
+	return s
 }
 
 // verifyIndependence proves the peer and the trace are two observers, not one

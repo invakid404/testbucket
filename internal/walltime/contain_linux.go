@@ -78,6 +78,10 @@ func newCgroupUnder(root, name string) (Containment, error) {
 			BootID:    bootIdentity(),
 			RootPID:   self,
 			RootStart: processStartID(self),
+			// Established by reading the filesystem, not asserted. A
+			// containment whose membership the workload can rewrite cannot
+			// prove the nested history the envelope is built on.
+			MembershipControl: membershipControl(dir),
 		},
 	}, nil
 }
@@ -113,9 +117,17 @@ func (c *cgroup2) Observe(observer string) (RawEvent, bool, error) {
 	}
 	// The membership snapshot is taken with the same observation, so
 	// "unpopulated" comes with the list that was empty rather than as a bare
-	// boolean. A read error here is not fatal: the events file is the
-	// authority on emptiness, and the snapshot is corroborating evidence.
-	procs, _ := c.Procs()
+	// boolean.
+	//
+	// A READ ERROR IS FATAL HERE. It used to be discarded, which made a failed
+	// membership read produce evidence identical to a successful read of an
+	// empty containment — the one thing this snapshot exists to distinguish.
+	// The events file is still the authority on emptiness; what the caller may
+	// not do is claim a snapshot it never obtained.
+	procs, err := os.ReadFile(filepath.Join(c.dir, "cgroup.procs"))
+	if err != nil {
+		return RawEvent{}, false, fmt.Errorf("read the containment membership snapshot: %w", err)
+	}
 	return newContainmentEvent(observer, b, procs), cgroupPopulated(b), nil
 }
 

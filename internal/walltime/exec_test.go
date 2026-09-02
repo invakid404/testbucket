@@ -233,7 +233,7 @@ func TestActionEnvelopeSpansSteps(t *testing.T) {
 	// The handoff a script leaves for its invocation wrappers must not outlive
 	// it: nesting under a containment that no longer exists would attribute an
 	// invocation to a lifecycle that had already closed.
-	if _, ok := ScriptContainment(dir); ok {
+	if _, ok, _ := ScriptContainment(dir); ok {
 		t.Errorf("the script containment handoff outlived the script")
 	}
 	if _, err := EndAction(dir, TerminalPassed, ""); err != nil {
@@ -374,10 +374,11 @@ func TestScriptPublishesItsContainmentWhileItRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the script could not read its own containment handoff: %v", err)
 	}
-	var seen ContainmentIdentity
-	if err := json.Unmarshal(b, &seen); err != nil {
-		t.Fatalf("the handoff is not a containment identity: %v", err)
+	var handoff ScriptHandoff
+	if err := json.Unmarshal(b, &handoff); err != nil {
+		t.Fatalf("the handoff is not a script handoff document: %v", err)
 	}
+	seen := handoff.Containment
 	recs, err := ReadRecords(filepath.Join(dir, streamName(ProducerPhysical, LevelScript, 0)))
 	if err != nil {
 		t.Fatal(err)
@@ -678,9 +679,16 @@ func TestAPreWriterBootstrapFailureIsRetained(t *testing.T) {
 func TestObserversNeverInheritAWallTimeSecret(t *testing.T) {
 	// Every secret is set, so the test fails if a new one is added to the
 	// scrub list without being covered here — and fails if any is missed.
+	//
+	// The run key carries a REAL encoded key rather than a sentinel string,
+	// because the script wrapper now signs its containment handoff with it and
+	// an undecodable key is a loud failure by design. What is under test here
+	// is that the value does not reach the observer, and a well-formed key
+	// proves that exactly as well as a malformed one.
 	for _, name := range WallTimeSecretEnv {
 		t.Setenv(name, "secret-value-for-"+name)
 	}
+	t.Setenv(RunKeyEnv, EncodeKey(mustSigningKey()))
 	// An ambient variable the observer legitimately needs, to prove the scrub
 	// is a denylist and not a wholesale drop.
 	t.Setenv("TB_WALLTIME_TEST_AMBIENT", "must-survive")

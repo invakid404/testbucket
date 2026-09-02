@@ -208,7 +208,7 @@ func Exec(opt ExecOptions) (int, error) {
 		// processes; this is how they find the containment they must nest
 		// inside. It is removed when the script closes, so a later run cannot
 		// nest under a containment that no longer exists.
-		if err := writeContainmentHandoff(opt.Dir, cont.Identity()); err != nil {
+		if err := writeContainmentHandoff(opt.Dir, cont.Identity(), opt.Run); err != nil {
 			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
 		}
 	}
@@ -1012,30 +1012,103 @@ func terminalExec(w *Writer, opt ExecOptions, spec *SpecIdentity, start Instant,
 // for the invocation wrappers its own script starts.
 func scriptHandoffPath(dir string) string { return filepath.Join(dir, "script-containment.json") }
 
-func writeContainmentHandoff(dir string, ident ContainmentIdentity) error {
-	b, err := json.MarshalIndent(ident, "", "  ")
+// ScriptHandoff is the script containment identity, SIGNED by the run key.
+//
+// The identity used to be written as bare JSON, mode 0644, into the measured
+// records directory — a directory the measured script can write. The script
+// could therefore rewrite it to name any containment at all, and the
+// invocation wrappers it starts would nest under whatever it said. Signing it
+// with the run key is what makes it a handoff rather than a suggestion: the
+// key is bound to the envelope steps and never to the measured work, so the
+// script can delete the file (which fails closed) but cannot mint a new one.
+type ScriptHandoff struct {
+	Kind        string              `json:"kind"`
+	Containment ContainmentIdentity `json:"containment"`
+	Run         RunIdentity         `json:"run"`
+	Signature   *Signature          `json:"signature,omitempty"`
+}
+
+// ScriptHandoffKind identifies the handoff document.
+const ScriptHandoffKind = "tb.walltime.script-handoff/v1"
+
+// DigestOf is the canonical digest the signature covers.
+func (h ScriptHandoff) DigestOf() (Digest, error) {
+	h.Signature = nil
+	return DigestJSON(h)
+}
+
+func writeContainmentHandoff(dir string, ident ContainmentIdentity, run RunIdentity) error {
+	h := ScriptHandoff{Kind: ScriptHandoffKind, Containment: ident, Run: run}
+	key, err := RunKeyFromEnv()
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(scriptHandoffPath(dir), b, 0o644); err != nil {
+	if key != nil {
+		d, err := h.DigestOf()
+		if err != nil {
+			return err
+		}
+		h.Signature = &Signature{
+			Authority: run.CampaignID, KeyID: PublicKeyOf(key), Digest: d,
+			Value: SignApproval(run.CampaignID, key, d),
+		}
+	}
+	b, err := json.MarshalIndent(h, "", "  ")
+	if err != nil {
+		return err
+	}
+	// 0600, not 0644. The handoff is addressed to the wrapper processes this
+	// step starts, not to everything that can reach the records directory.
+	if err := os.WriteFile(scriptHandoffPath(dir), b, 0o600); err != nil {
 		return fmt.Errorf("write the script containment handoff: %w", err)
 	}
 	return nil
 }
 
-// ScriptContainment reads that handoff. A missing one is not an error: an
-// invocation run outside a measured script simply has no enclosing script
-// containment.
-func ScriptContainment(dir string) (*ContainmentIdentity, bool) {
+// ScriptContainment reads that handoff and AUTHENTICATES it.
+//
+// A missing one is not an error: an invocation run outside a measured script
+// simply has no enclosing script containment. What is an error is a handoff
+// that is present and unattributable, and the difference matters because the
+// caller's fallback for "absent" is to nest under the action — which is a
+// legitimate topology, and must not become the silent outcome of a measured
+// script having tampered with the file. The second return value distinguishes
+// "there is none" from "there is one and it cannot be trusted".
+func ScriptContainment(dir string) (*ContainmentIdentity, bool, error) {
 	b, err := os.ReadFile(scriptHandoffPath(dir))
 	if err != nil {
-		return nil, false
+		return nil, false, nil
 	}
-	var ident ContainmentIdentity
-	if err := json.Unmarshal(b, &ident); err != nil {
-		return nil, false
+	var h ScriptHandoff
+	if err := json.Unmarshal(b, &h); err != nil {
+		return nil, false, fmt.Errorf("the script containment handoff is present but unreadable: %w", err)
 	}
-	return &ident, true
+	if h.Kind != ScriptHandoffKind {
+		return nil, false, fmt.Errorf("the script containment handoff names kind %q, want %q", h.Kind, ScriptHandoffKind)
+	}
+	key, err := RunKeyFromEnv()
+	if err != nil {
+		return nil, false, err
+	}
+	if key == nil {
+		// No run key here means this is an unscored run; the handoff cannot be
+		// authenticated and the row is ineligible on other grounds anyway.
+		if h.Signature != nil {
+			return &h.Containment, true, nil
+		}
+		return &h.Containment, true, nil
+	}
+	if h.Signature == nil {
+		return nil, false, fmt.Errorf("the script containment handoff is unsigned; a measured script can write this file, so an unsigned one names whatever it chose")
+	}
+	d, err := h.DigestOf()
+	if err != nil {
+		return nil, false, err
+	}
+	if err := VerifySigned(h.Signature, d, []string{PublicKeyOf(key)}); err != nil {
+		return nil, false, fmt.Errorf("the script containment handoff is not signed by this run's key: %w", err)
+	}
+	return &h.Containment, true, nil
 }
 
 func containmentName(opt ExecOptions) string {

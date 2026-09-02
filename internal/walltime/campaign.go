@@ -43,6 +43,14 @@ type CampaignIndex struct {
 	// list, which is a selection nobody predeclared.
 	OrderDigest Digest            `json:"order_digest"`
 	Pairs       []CampaignPairRef `json:"pairs"`
+	// Ablations are the twelve controlled ablations the contract requires to
+	// PRECEDE the campaign — three in each of the four topology strata.
+	//
+	// Nothing represented them at all, so a release could be authorised by a
+	// population that skipped a mandatory experimental prerequisite and no
+	// gate would say so. They are referenced rather than summarised, for the
+	// same reason an arm is: an outcome copied into an index is a claim.
+	Ablations []CampaignAblationRef `json:"ablations"`
 }
 
 // CampaignRelease is the IMMUTABLE delivery a campaign is being asked to
@@ -176,6 +184,10 @@ func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []st
 	} else {
 		problems = append(problems, bindOrder(index, *schedule)...)
 	}
+	// The PRE-CAMPAIGN prerequisite, checked with the population rather than
+	// after it: a campaign that never ran the twelve controlled ablations is
+	// not a campaign whose gates mean what the contract says they mean.
+	problems = append(problems, verifyAblations(index, loader, authorityKeys, authority)...)
 	return pairs, problems
 }
 

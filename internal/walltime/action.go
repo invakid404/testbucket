@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -136,11 +137,38 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	// record is indistinguishable from an action that never started, and the
 	// contract is explicit that a failed setup stays in the ledger with its
 	// reason rather than disappearing.
+	// THE ROLLBACK GUARD.
+	//
+	// Everything this function starts before the state handoff exists is owned
+	// by this function and by nobody else: the two DETACHED observers and the
+	// action containment. Once the handoff is written, EndAction owns them.
+	// In between there is a window — signing and writing the roster,
+	// serialising and writing the state — where a failure used to return with
+	// both observers still running and the containment still present, and
+	// nothing downstream had a handle to either. They would watch the
+	// containment for their whole timeout while the action reported that its
+	// lifecycle never opened.
+	//
+	// rollback is armed as each resource is created and disarmed exactly once,
+	// at the successful handoff. Its outcome is retained in the terminal
+	// record: a cleanup that could not complete is a fact about the run, not a
+	// detail to swallow.
+	var rollback []func() string
 	fail := func(reason string, cause error) (*ActionState, error) {
+		var cleanup []string
+		for i := len(rollback) - 1; i >= 0; i-- {
+			if note := rollback[i](); note != "" {
+				cleanup = append(cleanup, note)
+			}
+		}
+		detail := reason + ": " + cause.Error()
+		if len(cleanup) > 0 {
+			detail += " [rollback: " + strings.Join(cleanup, "; ") + "]"
+		}
 		_, _ = w.Append(Record{
 			Kind: "terminal", Role: RolePhysicalAction, Level: LevelAction,
 			Source: SourceWrapper, Run: run, Instant: clock.Now(),
-			Terminal: TerminalWrapperError, Reason: reason + ": " + cause.Error(),
+			Terminal: TerminalWrapperError, Reason: detail,
 		})
 		return nil, fmt.Errorf("walltime: %s: %w", reason, cause)
 	}
@@ -149,6 +177,12 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	if err != nil {
 		return fail("create the action containment", err)
 	}
+	rollback = append(rollback, func() string {
+		if err := cont.Destroy(); err != nil {
+			return "the action containment could not be destroyed: " + err.Error()
+		}
+		return "the action containment was destroyed"
+	})
 	if _, err := w.Append(Record{
 		Kind: "boundary", Role: RolePhysicalAction, Level: LevelAction, Boundary: "start",
 		Source: SourceWrapper, Run: run, Containment: cont.Identity(), Instant: start,
@@ -162,24 +196,21 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	if err != nil {
 		return fail("start the containment peer", err)
 	}
+	rollback = append(rollback, func() string { return endObserver(peer) })
 	trace, err := startObserver(ProducerTrace, opt, cont.Identity(), deadline, true)
 	if err != nil {
-		peer.abandon()
 		return fail("start the trace collector", err)
 	}
+	rollback = append(rollback, func() string { return endObserver(trace) })
 	// BOTH detached observers end when either admission fails. Abandoning only
 	// the other one left the one that failed running — and these are detached,
 	// so nothing downstream inherits a handle to it: it would watch the action
 	// containment for its whole timeout while the action reports that its
 	// lifecycle never opened.
 	if err := peer.admit(deadline); err != nil {
-		peer.abandon()
-		trace.abandon()
 		return fail("admit the containment peer", err)
 	}
 	if err := trace.admit(deadline); err != nil {
-		trace.abandon()
-		peer.abandon()
 		return fail("admit the trace collector", err)
 	}
 
@@ -216,7 +247,25 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	if err := os.WriteFile(filepath.Join(dir, actionStateFile), b, 0o644); err != nil {
 		return fail("write the action state handoff", err)
 	}
+	// DISARMED. The handoff exists, so EndAction owns the observers and the
+	// containment from here.
+	rollback = nil
 	return st, nil
+}
+
+// endObserver terminates one observer this function started and PROVES it is
+// gone, returning what it established.
+//
+// abandon kills and waits, so a handle that still owns its command is reaped
+// here rather than left as a process nobody will collect. The note is retained
+// because "the cleanup ran" and "the cleanup worked" are different facts, and
+// only the second one may be asserted.
+func endObserver(o *observerProc) string {
+	o.abandon()
+	if o.stillRunning() {
+		return fmt.Sprintf("the %s observer (pid %d) was signalled but had NOT exited", o.producer, o.pid)
+	}
+	return fmt.Sprintf("the %s observer exited and was reaped", o.producer)
 }
 
 // RunInAction runs one action-owned command INSIDE the action containment,

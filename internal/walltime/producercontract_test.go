@@ -45,10 +45,12 @@ func TestTheVerifierAcceptsWhatTheProducerCanActuallyObserve(t *testing.T) {
 	// 2. THE RECORD, built through the producer's own derivation from the
 	// bytes a fresh containment yields — not restated here.
 	for _, endpoint := range []string{"admission", "verified-empty"} {
-		ev := newContainmentEvent("containment_peer", []byte(freshCgroupEvents), nil)
+		// An empty cgroup.procs: the exact bytes a fresh containment yields.
+		ev := newContainmentEvent("containment_peer", []byte(freshCgroupEvents), []byte(""))
 		rec := Record{
 			Kind: "boundary", Boundary: "start", Source: ev.Source,
-			RawEventID: ev.ID, RawEventDigest: ev.Digest, RawEventBytes: ev.Bytes, RawProcs: ev.Procs,
+			RawEventID: ev.ID, RawEventDigest: ev.Digest, RawEventBytes: ev.Bytes,
+			RawProcs: ev.Procs, RawProcsBytes: ev.ProcsBytes, RawProcsDigest: ev.ProcsDigest,
 		}
 		v := &Verdict{}
 		checkRawEndpoint(v, "script[0]", ProducerPeer, endpoint, rec)
@@ -63,10 +65,11 @@ func TestTheVerifierAcceptsWhatTheProducerCanActuallyObserve(t *testing.T) {
 // containment that already has members when it is admitted is the contract's
 // terminal child-before-admission, and it is refused under that name.
 func TestAPopulatedAdmissionIsChildBeforeAdmission(t *testing.T) {
-	ev := newContainmentEvent("containment_peer", []byte("populated 1\nfrozen 0\n"), []int{4242})
+	ev := newContainmentEvent("containment_peer", []byte("populated 1\nfrozen 0\n"), []byte("4242\n"))
 	rec := Record{
 		Kind: "boundary", Source: ev.Source,
-		RawEventID: ev.ID, RawEventDigest: ev.Digest, RawEventBytes: ev.Bytes, RawProcs: ev.Procs,
+		RawEventID: ev.ID, RawEventDigest: ev.Digest, RawEventBytes: ev.Bytes,
+		RawProcs: ev.Procs, RawProcsBytes: ev.ProcsBytes, RawProcsDigest: ev.ProcsDigest,
 	}
 	v := &Verdict{}
 	checkRawEndpoint(v, "script[0]", ProducerPeer, "admission", rec)
@@ -87,7 +90,7 @@ func TestTheProducerAndVerifierShareOneEventDerivation(t *testing.T) {
 	if !strings.Contains(string(linux), "newContainmentEvent(observer, b, procs)") {
 		t.Error("the Linux producer no longer builds its raw event through the shared derivation")
 	}
-	ev := newContainmentEvent("containment_trace", []byte(freshCgroupEvents), nil)
+	ev := newContainmentEvent("containment_trace", []byte(freshCgroupEvents), []byte(""))
 	if want := DigestBytes(append([]byte(ev.ID+"\x00"), ev.Bytes...)); ev.Digest != want {
 		t.Errorf("the shared derivation produced %s, but re-deriving it the way the verifier does gives %s", ev.Digest, want)
 	}

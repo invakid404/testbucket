@@ -207,7 +207,18 @@ func runWallStage1(args []string) error {
 		Schema:         walltime.SchemaVersion,
 		PhysicalBinary: selfDigest, PeerBinary: selfDigest,
 		TraceBinary: selfDigest, VerifierBinary: selfDigest,
-		ContainmentPolicy:  "dedicated cgroup-v2 subtree per level; membership not modifiable by the workload",
+		// The ENFORCED RULE, not a property asserted about the environment.
+		//
+		// This used to read "membership not modifiable by the workload" while
+		// the documented setup handed the delegated subtree to the runner uid
+		// — the same uid the measured workload runs as — so the workload held
+		// exactly the migration capability the sentence denied it. A manifest
+		// cannot make a boundary exist by describing one. What it can do is
+		// name the rule the verifier applies, which is now that each
+		// containment carries the membership-control model its producer read
+		// off the filesystem, and that a workload-writable one is recorded and
+		// refused rather than scored.
+		ContainmentPolicy:  "dedicated cgroup-v2 subtree per level, nested action > script > invocation; each containment records the membership-control model its producer established by reading cgroup.procs, and a run whose workload could write it is INELIGIBLE rather than scored",
 		ChildAdmission:     "clone-into-cgroup before exec; no child starts before its peer's admission receipt",
 		EndpointOrder:      "physical <= peer <= trace <= trace <= peer <= physical, on fresh non-copied reads",
 		CancellationPolicy: walltime.CancellationPolicyID,

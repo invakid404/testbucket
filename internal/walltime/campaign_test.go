@@ -193,7 +193,47 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 				candidate.Instrumentation.VerifierBinary, 84*second, 0),
 		})
 	}
+	addFixtureAblations(t, &idx, loader, baselineDigest, baseline.Instrumentation.VerifierBinary)
 	return idx, loader, []string{PublicKeyOf(key)}, key
+}
+
+// addFixtureAblations gives the fixture the twelve controlled ablations the
+// contract requires to precede the campaign: three in each of the four
+// topology strata, each a genuine eligible verdict signed by the delivery
+// verifier, and every one of them dated BEFORE the campaign's first pair.
+//
+// They are built the same way the arms are rather than stubbed, because the
+// gate authenticates them the same way the arms are authenticated. A fixture
+// that satisfied the count with unsigned or ineligible rows would prove only
+// that the counter counts.
+func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, stage1, verifier Digest) {
+	t.Helper()
+	for i, stratum := range AblationStrata {
+		for n := 0; n < AblationsPerStratum; n++ {
+			path := fmt.Sprintf("ablation-%s-%d.json", stratum, n)
+			// August: strictly before the campaign, which starts in September.
+			at := fmt.Sprintf("2026-08-%02dT0%d:00:00Z", 10+i, n)
+			v := &Verdict{
+				Schema: SchemaVersion, Complete: true, Eligible: true,
+				ActionNs:       90 * second,
+				RecordsDigest:  Digest(fmt.Sprintf("sha256:records-ablation-%s-%d", stratum, n)),
+				VerifierBinary: verifier,
+				StartedAt:      at, Terminal: TerminalPassed,
+				Run: RunIdentity{
+					CampaignID: "ewj2", RunID: fmt.Sprintf("ablation-%s-%d", stratum, n),
+					BucketID: "0", Stage1: stage1, VerifierID: testVerdictIdentity,
+				},
+			}
+			if err := v.Sign(testVerdictIdentity, testVerdictAuthority); err != nil {
+				t.Fatal(err)
+			}
+			loader.verdicts[path] = v
+			idx.Ablations = append(idx.Ablations, CampaignAblationRef{
+				Stratum: stratum, RunID: v.Run.RunID,
+				Stage1Path: "baseline.json", VerdictPath: path,
+			})
+		}
+	}
 }
 
 // TestCampaignIndexAuthenticatesEveryRow is the positive control: a campaign
@@ -545,8 +585,13 @@ func TestCampaignEnforcesThePopulationWideAetaMean(t *testing.T) {
 
 	// Give every row a forecast that is 15 s out — inside the 20 s per-row
 	// limit, outside the 10 s population mean.
-	for path, v := range loader.verdicts {
-		_ = path
+	//
+	// The PAIR rows only. The pre-campaign ablations are in the same loader
+	// and are deliberately not part of any population the gates compute over:
+	// the contract says their outcome cannot tune these gates, so a test that
+	// swept them in would be measuring something the evaluator must never
+	// read.
+	for _, v := range pairVerdicts(loader, idx) {
 		resign(v, testVerdictAuthority, func(v *Verdict) {
 			v.AetaSample.PointNs = v.ActionNs + 15*second
 			v.AetaSample.LowerNs = v.AetaSample.PointNs - 20*second
@@ -575,7 +620,7 @@ func TestCampaignEnforcesThePopulationWideAetaMean(t *testing.T) {
 
 	// And a well-calibrated population passes it.
 	idx, loader, keys, _ = campaignFixture(t)
-	for _, v := range loader.verdicts {
+	for _, v := range pairVerdicts(loader, idx) {
 		resign(v, testVerdictAuthority, func(v *Verdict) { v.AetaSample.PointNs = v.ActionNs + 2*second })
 	}
 	gates, problems = EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
@@ -1058,6 +1103,23 @@ func TestThePopulationDatesComeFromTheRecords(t *testing.T) {
 	if dateGate.Pass {
 		t.Errorf("a population whose records all fall on one UTC date passed the population gate: %s", dateGate.Observed)
 	}
+}
+
+// pairVerdicts is the verdicts the campaign's five pairs are made of, in a
+// stable order. It deliberately excludes the pre-campaign ablations, which the
+// evaluator must never aggregate.
+func pairVerdicts(l memoryLoader, idx CampaignIndex) []*Verdict {
+	var out []*Verdict
+	for _, p := range idx.Pairs {
+		for _, arm := range []CampaignArm{p.Baseline, p.Candidate} {
+			for _, path := range arm.VerdictPaths {
+				if v, ok := l.verdicts[path]; ok {
+					out = append(out, v)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // sortedVerdictPaths is every verdict in the loader, in a stable order.

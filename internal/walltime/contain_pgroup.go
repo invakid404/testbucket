@@ -67,8 +67,11 @@ func (p *processGroup) Observe(observer string) (RawEvent, bool, error) {
 	id := newRawEventID(observer)
 	state := "populated=" + strconv.FormatBool(populated) + ";pgid=" + strconv.Itoa(pgid)
 	return RawEvent{
-		ID:     id,
-		Bytes:  []byte(state),
+		ID:    id,
+		Bytes: []byte(state),
+		// No membership snapshot: a process group cannot be enumerated
+		// portably, and Procs stays nil so the absence is visible rather than
+		// presented as an empty containment. Such a run is unscorable anyway.
 		Digest: DigestBytes([]byte(id + "\x00" + state)),
 		// A process-group probe is a process-lifecycle observation, not a
 		// containment event; naming it honestly is what lets the verifier see

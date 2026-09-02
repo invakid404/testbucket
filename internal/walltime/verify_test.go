@@ -508,6 +508,12 @@ func evidenceLabel(id string, ns int64, features ...Feature) TrainingLabel {
 			Level: LevelInvocation, Producer: ProducerPhysical, Source: SourceContainment,
 			Containment: ContainmentIdentity{
 				Primitive: PrimitiveCgroup2, ID: "tb-" + id, Inode: "9" + id, BootID: "boot-1",
+				// The root process identity a scorable containment must carry:
+				// a pid alone is a number the kernel reuses.
+				RootPID: 4242, RootStart: "778899",
+				// Owned by a credential the measured workload does not have:
+				// on cgroup-v2 `cgroup.procs` is the migration control.
+				MembershipControl: MembershipSupervisorOwned,
 			},
 			Terminal: TerminalPassed, ObservedAt: at, DurationNs: ns,
 			SelectedWorkDigest: workDigest, TopologyReceipt: topologyDigest,

@@ -60,8 +60,35 @@ inputs:
       Delegated cgroup-v2 subtree the wrapper may create containments under
       (TB_WALL_CGROUP_ROOT). Without it the run is recorded in full and reported
       INELIGIBLE rather than scored — a process group cannot prove that no
-      descendant escaped. Create it in a prior step, e.g.
+      descendant escaped.
+
+      For an UNSCORED measurement, any subtree the wrapper can write will do:
       `sudo mkdir -p /sys/fs/cgroup/testbucket && sudo chown -R "$(id -u)" /sys/fs/cgroup/testbucket`.
+
+      That setup is NOT sufficient for a scored row, and the verifier now says
+      so instead of trusting Stage 1's word for it. On cgroup-v2 `cgroup.procs`
+      is the process-migration control, so a subtree owned by the runner uid is
+      writable by the measured workload too — it can move itself or a
+      descendant between the action, script, invocation and sibling
+      containments, and the nested membership the envelope records proves
+      nothing. Each containment now carries the membership-control model its
+      producer read off the filesystem, and a workload-writable one is recorded
+      in full and reported INELIGIBLE.
+
+      A scored row needs the subtree owned by a credential the measured
+      workload does NOT run as, and `workload-uid` set to the uid the workload
+      runs under, so the wrapper can migrate processes and the workload cannot.
+    default: ""
+  workload-uid:
+    description: >-
+      The uid the MEASURED WORKLOAD runs as (TB_WALL_WORKLOAD_UID), when it is
+      run under a credential other than the wrapper's.
+
+      It is what makes the membership boundary expressible: the wrapper
+      compares it against the owner of each containment's `cgroup.procs` and
+      records `supervisor-owned` only when they differ and no group or other
+      write bit widens the mode. Left empty, the workload is taken to share the
+      wrapper's credential — which is the shape that cannot be scored.
     default: ""
   scored:
     description: >-
@@ -170,6 +197,7 @@ runs:
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
         # The run key, scoped to THIS step. `wall begin` seals the signer
         # roster with it before the measured script exists.
         TB_WALL_RUN_KEY: ${{ inputs.run-key }}
@@ -217,6 +245,7 @@ runs:
         TB_SETUP_COMMAND: ${{ inputs.setup-command }}
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
       run: |
         set -euo pipefail
         if [ -n "$TB_WALL_DIR" ]; then
@@ -241,6 +270,7 @@ runs:
         TB_EVENTS_DIR: ${{ inputs.events-dir }}
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
         TB_SCORED: ${{ inputs.scored }}
         TB_VERSION: ${{ inputs.version }}
       run: |
@@ -337,6 +367,7 @@ runs:
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
         # The run key again, scoped to THIS step. `wall end` seals the exact
         # bytes of every stream and of the key log with it, after the measured
         # script has finished and in a step that script was never in.

@@ -162,11 +162,39 @@ type ContainmentIdentity struct {
 	// start time is not.
 	RootPID   int    `json:"root_pid,omitempty"`
 	RootStart string `json:"root_start,omitempty"`
+	// MembershipControl is WHO may write this containment's `cgroup.procs` —
+	// the process-migration control on cgroup-v2 — established by reading the
+	// filesystem rather than asserted by Stage 1. See the Membership*
+	// constants. A containment the measured workload can migrate itself out
+	// of cannot prove the membership history the envelope is built on.
+	MembershipControl string `json:"membership_control,omitempty"`
 }
 
 // Scorable reports whether this containment can delimit a scored lifecycle.
+//
+// The ROOT PROCESS IDENTITY is required, not merely documented. RootPID plus
+// RootStart is what the schema says closes PID reuse, and a containment
+// identity that omits it cannot say which process the containment was made
+// for: the path and inode survive a reboot's worth of pid recycling, and
+// "some process with this number" is not an identity. It used to be checked
+// for none of that, so a run whose every record omitted the start identity
+// scored exactly as well as one that carried it.
 func (c ContainmentIdentity) Scorable() bool {
-	return c.Primitive == PrimitiveCgroup2 && c.ID != "" && c.Inode != "" && c.BootID != ""
+	return c.Primitive == PrimitiveCgroup2 && c.ID != "" && c.Inode != "" && c.BootID != "" &&
+		c.RootPID > 0 && strings.TrimSpace(c.RootStart) != "" &&
+		c.MembershipControl == MembershipSupervisorOwned
+}
+
+// SameRoot reports whether two identities name the same root process.
+//
+// It is separate from Same because the two answer different questions and
+// carry different consequences: Same asks whether this is the same stable
+// containment, while this asks whether the producers agree about the process
+// it was created for. Disagreement there means the observers watched
+// containments made for different processes, which is unscorable rather than
+// malformed.
+func (c ContainmentIdentity) SameRoot(o ContainmentIdentity) bool {
+	return c.RootPID == o.RootPID && c.RootStart == o.RootStart
 }
 
 // Same reports whether two records name the same stable containment. Identity
@@ -221,7 +249,22 @@ type Record struct {
 	// trust it. RawProcs is the containment membership snapshot taken with the
 	// same read.
 	RawEventBytes []byte `json:"raw_event_bytes,omitempty"`
-	RawProcs      []int  `json:"raw_procs,omitempty"`
+	// RawProcs is the containment membership snapshot taken WITH that read.
+	//
+	// It deliberately carries no `omitempty`. A successful read of an empty
+	// containment and a read that never happened used to serialise
+	// identically — both absent — so a producer whose `cgroup.procs` read
+	// failed emitted evidence indistinguishable from one that proved the
+	// containment empty. Without omitempty a taken snapshot is `[]` and an
+	// absent one is `null`, and the verifier can tell them apart.
+	//
+	// RawProcsBytes and RawProcsDigest are that snapshot's own retained
+	// evidence, derived exactly as the event's are: the digest binds this
+	// observer's event id to the exact `cgroup.procs` bytes, so an empty read
+	// still has a digest nobody can produce without having taken it.
+	RawProcs       []int  `json:"raw_procs"`
+	RawProcsBytes  []byte `json:"raw_procs_bytes,omitempty"`
+	RawProcsDigest Digest `json:"raw_procs_digest,omitempty"`
 	// Phase names a trace phase (invocation lifecycle, inter-invocation gap,
 	// script epilogue).
 	Phase string `json:"phase,omitempty"`

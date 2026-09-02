@@ -4,8 +4,48 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strconv"
+	"strings"
 	"syscall"
 )
+
+// Membership-control models: WHO may write the containment's `cgroup.procs`,
+// which on cgroup-v2 is the process-migration control.
+//
+// The contract requires a scored containment whose membership the workload
+// cannot modify. Stage 1 used to simply assert that property in a sentence
+// while the documented setup gave the delegated subtree to the runner uid —
+// the same uid the measured workload runs as — so the workload held exactly
+// the capability the sentence denied it. It could migrate itself or its
+// descendants between the action, script, invocation and sibling containments
+// and defeat the nested membership history the whole envelope rests on.
+//
+// So the model is now a MEASURED FACT carried on the containment identity, and
+// a run whose workload shares the migration capability is recorded in full and
+// reported ineligible rather than scored. A wrapper cannot grant itself a
+// privilege it does not have; what it can do is refuse to claim a property it
+// cannot demonstrate.
+const (
+	// MembershipSupervisorOwned means `cgroup.procs` is owned by a credential
+	// the measured workload does not have, and is not writable by group or
+	// other.
+	MembershipSupervisorOwned = "supervisor-owned"
+	// MembershipWorkloadWritable means the workload can write `cgroup.procs`
+	// — because it owns it, or because the mode grants it. Unscorable.
+	MembershipWorkloadWritable = "workload-writable"
+	// MembershipUnknown means this platform cannot establish the model. Also
+	// unscorable: an unestablished boundary is not a boundary.
+	MembershipUnknown = "unknown"
+)
+
+// WorkloadUIDEnv names the uid the MEASURED WORKLOAD runs as, when the caller
+// runs it under a credential other than the wrapper's.
+//
+// It is what makes a real boundary expressible: with the workload on a
+// different uid from the delegated subtree's owner, the wrapper can migrate
+// processes and the workload cannot. Unset means the workload shares this
+// process's credential, which is the shape that cannot be scored.
+const WorkloadUIDEnv = "TB_WALL_WORKLOAD_UID"
 
 // Containment primitives. Only PrimitiveCgroup2 can delimit a SCORED
 // lifecycle: it is the one primitive here whose membership the workload cannot
@@ -47,6 +87,12 @@ type RawEvent struct {
 	// observed. "Populated: no" with a membership list is checkable; a boolean
 	// is a claim.
 	Procs []int
+	// ProcsBytes is the EXACT `cgroup.procs` output the snapshot was read
+	// from, and ProcsDigest binds those bytes to this observation's own event
+	// id. A snapshot with no retained bytes is a claim; these make an empty
+	// containment's snapshot as checkable as a populated one.
+	ProcsBytes  []byte
+	ProcsDigest Digest
 }
 
 // Containment is the level-owned process container. The physical wrapper
@@ -110,15 +156,38 @@ func newRawEventID(observer string) string {
 // two agree. When the producer owned a private copy of this arithmetic, a test
 // could only restate it — and restating it is how a verifier came to demand a
 // containment state the producer can never observe.
-func newContainmentEvent(observer string, b []byte, procs []int) RawEvent {
+func newContainmentEvent(observer string, b, procsBytes []byte) RawEvent {
 	id := newRawEventID(observer)
 	return RawEvent{
 		ID:     id,
 		Digest: DigestBytes(append([]byte(id+"\x00"), b...)),
 		Source: SourceContainment,
 		Bytes:  b,
-		Procs:  procs,
+		// The membership snapshot is EVIDENCE, on the same footing as the
+		// events read: its exact bytes and a digest binding them to this
+		// observer's event id. A successful read of an empty containment
+		// therefore still carries something nobody can write without having
+		// taken it, which is what distinguishes it from a read that never
+		// happened.
+		Procs:       parseCgroupProcs(procsBytes),
+		ProcsBytes:  procsBytes,
+		ProcsDigest: DigestBytes(append([]byte(id+"\x00"), procsBytes...)),
 	}
+}
+
+// parseCgroupProcs reads a `cgroup.procs` file into the pids it lists.
+//
+// It returns a NON-NIL slice for a successful read, empty file included. That
+// is the whole point: nil means no snapshot was taken, and an empty
+// containment must not be indistinguishable from an unread one.
+func parseCgroupProcs(b []byte) []int {
+	out := []int{}
+	for _, line := range strings.Fields(string(b)) {
+		if pid, err := strconv.Atoi(line); err == nil {
+			out = append(out, pid)
+		}
+	}
+	return out
 }
 
 func AttachContainment(ident ContainmentIdentity) (Containment, error) {
