@@ -51,12 +51,18 @@ const WorkloadUserEnv = "TB_WALL_WORKLOAD_USER"
 // WorkloadUIDEnv names ADDITIONAL uids the measured workload may run as, when
 // the caller runs it under credentials other than the wrapper's.
 //
-// It cannot establish the boundary, only widen who is known to lack it. This
-// process's own uid always counts as the workload's, because nothing in this
-// wrapper changes credentials between itself and the measured child: the
-// declaration used to be the only uid compared against the owner, so naming
-// any other uid minted `supervisor-owned` for a file the wrapper itself owned
-// — a caller-controlled string standing in for a privilege nobody held.
+// It cannot establish the boundary, only widen who is known to lack it. A
+// declaration is a caller-controlled string, and a string cannot make the
+// workload somebody else: the declaration used to be the only uid compared
+// against the owner, so naming any other uid minted `supervisor-owned` for a
+// file the wrapper itself owned — a privilege nobody held. So this process's
+// own uid still counts as the workload's ALONGSIDE anything declared here.
+//
+// What DOES move the boundary is a resolved account, not a number:
+// TB_WALL_WORKLOAD_USER names an account the wrapper opens and drops to, and
+// only when that succeeds does the measured workload genuinely run as someone
+// else and this process's uid stop counting as its own. See membershipModelFor,
+// which is where the two cases are actually distinguished.
 //
 // A genuinely scored deployment needs the delegated subtree owned by a
 // credential the wrapper does not run as, which in turn needs a privileged
@@ -104,10 +110,13 @@ type WorkloadCredential struct {
 // so declaring any uid other than the owner's returned supervisor-owned for a
 // file the wrapper itself owned.
 //
-// selfUID always counts as the workload's credential. Nothing in this wrapper
-// changes credentials between itself and the measured child, so the workload
-// runs as exactly that uid; declared uids only WIDEN the set known to lack the
-// boundary.
+// selfUID counts as the workload's credential UNLESS a workload account was
+// actually resolved. A bare declaration only WIDENS the set known to lack the
+// boundary and never replaces the wrapper's own uid; a resolved account —
+// TB_WALL_WORKLOAD_USER opened and dropped to — does replace it, because in
+// that deployment the measured child really does run as someone else. The
+// distinction is the whole point: it is what separates a boundary a caller
+// asserted from one the host established.
 func membershipModelFor(f MembershipFacts) string {
 	// World-writable is writable by the workload whoever it is.
 	if f.OtherWritable {

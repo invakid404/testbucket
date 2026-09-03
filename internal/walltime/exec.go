@@ -1254,6 +1254,15 @@ func (o *observerProc) awaitExit(deadline time.Time) error {
 	if o.pid <= 0 {
 		return fmt.Errorf("%s observer has no process identity to confirm exit for", o.producer)
 	}
+	// A BARE NUMBER PROVES NOTHING, so it is not allowed to look like proof.
+	// Where the platform can identify processes, a detached handle without an
+	// identity can neither confirm the observer exited nor rule out that its
+	// pid now names something else. Returning "exited" from that position
+	// would close a lifecycle on a guess; the lifecycle stays incomplete
+	// instead, and the caller records it as such.
+	if startIDsAvailable && o.cmd == nil && o.start == "" {
+		return fmt.Errorf("%s observer %d was reconstructed without a start identity; a bare pid cannot show that the observer exited", o.producer, o.pid)
+	}
 	for {
 		if !o.stillRunning() {
 			return nil
@@ -1288,14 +1297,49 @@ func (o *observerProc) awaitExit(deadline time.Time) error {
 // So the answer is taken from what the process IS: reap it if it is ours,
 // which turns an exited child into the disappearance the proof looks for, and
 // otherwise ask the kernel for its state rather than for its existence.
+// ownsPID reports whether this handle is entitled to ACT on the number it
+// holds — to wait for it, reap it, or signal it.
+//
+// OBSERVING A PID IS FREE; ACTING ON ONE IS NOT. Reaping consumes an exited
+// child's status and takes it away from whoever was actually waiting for it,
+// and signalling ends whatever is there now. Both need the handle to own the
+// process at that number, and a bare pid cannot establish that: the kernel
+// reuses pids, and this handle is rebuilt in a later step of the job, by which
+// time the number may name unrelated work. Only the pair (pid, start) is an
+// identity, so the pair is checked BEFORE any of those actions, never after.
+func (o *observerProc) ownsPID() bool {
+	if o.pid <= 0 {
+		return false
+	}
+	if o.cmd != nil {
+		// STILL OUR LIVE CHILD. The process handle is held here and has not
+		// been reaped, so the kernel cannot hand this number to anything else
+		// behind our back: the pid is ours by construction.
+		return true
+	}
+	if o.start == "" {
+		// Detached, with nothing to authenticate it. Where the platform can
+		// identify processes, that is a handle which lost its identity and it
+		// gets no authority over the number. Where no identity was ever
+		// obtainable, there is nothing being withheld.
+		return !startIDsAvailable
+	}
+	return processStartID(o.pid) == o.start
+}
+
 func (o *observerProc) stillRunning() bool {
 	if o.pid <= 0 {
 		return false
 	}
-	// OURS AND FINISHED: collect it. A reaped child is gone, which is the
-	// strongest form of the exit proof and costs nothing when it is still
-	// running (WNOHANG) or was never ours (ECHILD).
-	if reapExitedChild(o.pid) {
+	// AUTHENTICATE FIRST, THEN COLLECT. Reaping is an action, so it happens
+	// only once the pair says this process is ours: a handle whose start
+	// identity does not match the process now at its pid would otherwise
+	// consume an unrelated child's exit status on its way to deciding it
+	// owned nothing.
+	if o.ownsPID() && reapExitedChild(o.pid) {
+		// Ours and finished. A reaped child is gone, which is the strongest
+		// form of the exit proof, and WNOHANG costs nothing when it is still
+		// running or was never ours.
 		return false
 	}
 	// signal 0 probes for existence without delivering anything.
@@ -1309,7 +1353,8 @@ func (o *observerProc) stillRunning() bool {
 	}
 	if o.start == "" {
 		// No identity was ever available on this platform, so existence is
-		// all that can be said.
+		// all that can be said. It is deliberately NOT enough to act on —
+		// see ownsPID.
 		return true
 	}
 	return processStartID(o.pid) == o.start
@@ -1353,7 +1398,15 @@ func (o *observerProc) abandon() {
 	// A platform that cannot supply a start identity gets existence alone,
 	// which is the strongest claim available there; the observer's own timeout
 	// still ends it.
-	if o.stillRunning() {
+	//
+	// FAIL CLOSED. Where the platform can identify processes, a handle that
+	// has no start identity is refused the kill outright: the alternative is
+	// signalling a number on nothing but the belief that it is still the same
+	// process, and a wrapper that kills the runner's unrelated work to tidy up
+	// its own bookkeeping has done more damage than the leak it was avoiding.
+	// The observer's own timeout still ends it, and the lifecycle stays
+	// incomplete, which is the honest record.
+	if o.ownsPID() && o.stillRunning() {
 		_ = syscall.Kill(o.pid, syscall.SIGKILL)
 	}
 }

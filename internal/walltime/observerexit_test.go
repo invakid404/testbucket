@@ -97,3 +97,79 @@ func TestEveryObserverGetsItsOwnCloseBudget(t *testing.T) {
 		t.Errorf("close budget %v ran past the action deadline %v", got, near)
 	}
 }
+
+// A HANDLE THAT DOES NOT OWN THE PID DOES NOT REAP IT.
+//
+// Reaping is an action, not an observation: `Wait4` consumes an exited child's
+// status and takes it away from whoever was actually waiting for it. The
+// wrapper used to reap FIRST and compare the start identity afterwards, so a
+// handle rebuilt in a later step — holding a pid the kernel had since handed
+// to unrelated work — collected that unrelated child's exit status on its way
+// to concluding it owned nothing at all. The real owner's `Wait` then failed
+// with ECHILD.
+//
+// This is the candidate's own version of the external control that found it.
+func TestAWrongIdentityHandleDoesNotReapAnUnrelatedExitedChild(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let it exit and stay unreaped, so there is a status available to steal.
+	// A deliberately wrong start identity models the reused pid.
+	time.Sleep(250 * time.Millisecond)
+	o := &observerProc{producer: ProducerPeer, pid: cmd.Process.Pid, start: "not-the-process-at-this-pid"}
+
+	if o.stillRunning() {
+		t.Fatal("a process with the wrong start identity was reported as our observer")
+	}
+	if o.ownsPID() {
+		t.Error("a handle whose start identity does not match claimed the pid")
+	}
+
+	// THE REAL OWNER MUST STILL BE ABLE TO COLLECT ITS CHILD. An ECHILD here
+	// means the handle acted on the number before authenticating it.
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("wrong-identity observer handle reaped an unrelated child: %v", err)
+	}
+}
+
+// A DETACHED HANDLE WITH NO IDENTITY FAILS CLOSED.
+//
+// On a platform that can identify processes, a reconstructed handle holding
+// only a pid has lost its identity rather than never having had one. It may
+// not signal that number — the process there may be the runner's own work —
+// and it may not report an exit it cannot see. Both refusals leave the
+// lifecycle incomplete, which is the honest record; the observer's own timeout
+// still ends it.
+func TestADetachedHandleWithoutAnIdentityWillNotActOnItsPID(t *testing.T) {
+	if !startIDsAvailable {
+		t.Skip("this platform supplies no start identities at all, so there is none to withhold")
+	}
+	t.Parallel()
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+
+	// The handle a later step rebuilds when the identity was never recorded.
+	o := &observerProc{producer: ProducerTrace, pid: cmd.Process.Pid}
+
+	if o.ownsPID() {
+		t.Error("a detached handle with no start identity claimed authority over its pid")
+	}
+
+	o.abandon()
+	if _, killed := diedFrom(t, cmd); killed {
+		t.Error("abandon() signalled a pid it could not authenticate; an unrelated process at a reused number would have been killed")
+	}
+
+	// And it does not pass off existence as an exit proof.
+	if err := o.awaitExit(time.Now().Add(time.Second)); err == nil {
+		t.Error("awaitExit reported an exit for a pid it could not authenticate; the lifecycle must stay incomplete")
+	}
+}

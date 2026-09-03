@@ -22,6 +22,18 @@ func newContainment(name string, parent *ContainmentIdentity) (Containment, erro
 // verifier already treats as unscorable.
 func processStartID(int) string { return "" }
 
+// startIDsAvailable says whether THIS PLATFORM can identify a process at all.
+//
+// It is the difference between a handle that LOST its identity and a host
+// where no identity was ever obtainable, and the two call for opposite
+// answers. Where identities exist, a handle without one is holding a bare
+// number it cannot justify acting on, and the wrapper refuses to act. Where
+// none exists anywhere, refusing would disable the observation entirely on
+// every host of this kind rather than making anything safer, so existence
+// remains the strongest available claim — which is exactly why a containment
+// here is reported unscorable.
+const startIDsAvailable = false
+
 // attachCgroup2 cannot exist off Linux; saying so is better than pretending a
 // directory is a containment.
 func attachCgroup2(ident ContainmentIdentity) (Containment, error) {

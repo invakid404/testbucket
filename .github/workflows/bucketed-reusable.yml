@@ -173,12 +173,17 @@ on:
           itself between containments; such a row is recorded in full and
           reported INELIGIBLE rather than scored.
 
-          This input cannot create that boundary and is not trusted to: the
-          wrapper's own uid always counts as the workload's. A scored arm needs
-          the subtree owned by a credential the measured work does not run as,
-          which is what workload-user and script-user establish; the nesting
-          beneath the script containment is done by the script-level wrapper
-          on request rather than by the measured script.
+          This input cannot create that boundary and is not trusted to: a
+          declaration only WIDENS the set of credentials known to lack it, and
+          the wrapper's own uid still counts as the workload's alongside
+          anything named here. A scored arm needs the subtree owned by a
+          credential the measured work does not run as, which is what
+          workload-user and script-user establish — and only when such an
+          account is actually resolved and dropped to does the wrapper's uid
+          stop counting as the workload's. The nesting beneath the script
+          containment is done by the script-level wrapper on request rather
+          than by the measured script, whose containment is never delegated
+          to it.
         type: string
         default: ""
       campaign-id:

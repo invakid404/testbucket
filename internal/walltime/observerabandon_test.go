@@ -70,8 +70,11 @@ func TestADetachedObserverIsStillKillableWithoutItsCommand(t *testing.T) {
 	_ = pid
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 
-	// The handle EndAction reconstructs: an identity and a pid, no command.
-	o := &observerProc{producer: ProducerPeer, pid: pid}
+	// The handle EndAction reconstructs: the pid AND the start identity the
+	// opening step recorded, no command. The identity is not decoration — it
+	// is what entitles this handle to signal the number at all, and production
+	// carries it through the action state for exactly that reason.
+	o := &observerProc{producer: ProducerPeer, pid: pid, start: processStartID(pid)}
 	o.abandon()
 
 	sig, killed := diedFrom(t, cmd)

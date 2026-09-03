@@ -176,10 +176,15 @@ inputs:
       Running the script as this action's own user instead made the script
       level unscorable by the wrapper's own rule, because the measured process
       was then the credential owning its own containment; that contradiction
-      is why this input exists. The script containment is delegated to this
-      account's group by the wrapper, immediately before the script starts,
-      and the enclosing ACTION containment is not — so the script can arrange
-      containments beneath it and cannot leave the lifecycle that brackets it.
+      is why this input exists. The script containment is NOT delegated to
+      this account, and neither is the enclosing ACTION containment: giving
+      the measured script write access to its own `cgroup.procs` is precisely
+      the arrangement the membership rule exists to refuse, and it made every
+      complete-script row ineligible. The script asks the script-level wrapper
+      to create and admit each nested containment over the controller channel,
+      which authenticates the asker by the kernel's SO_PEERCRED answer rather
+      than by anything the caller claims. So the script arranges nothing
+      itself and cannot leave the lifecycle that brackets it.
 
       Set up alongside workload-user in the same prior step (see the example
       above). tb-script may sudo to tb-workload and to nothing else; left
@@ -192,12 +197,17 @@ inputs:
       (TB_WALL_WORKLOAD_UID), comma-separated, when the caller runs it under
       credentials other than this action's.
 
-      It cannot create the membership boundary, and it is not trusted to. The
-      wrapper's own uid always counts as the workload's, because nothing here
-      changes credentials between the wrapper and the measured child; this
-      input only WIDENS the set of credentials known to lack the boundary. A
+      It cannot create the membership boundary, and it is not trusted to. A
+      declaration is a caller-controlled string, so this input only WIDENS the
+      set of credentials known to lack the boundary: the wrapper's own uid
+      still counts as the workload's alongside whatever is named here, and a
       row whose `cgroup.procs` is owned by the wrapper's uid is recorded in
       full and reported INELIGIBLE however this input is set.
+
+      What does move the boundary is workload-user, not this input. When that
+      account is resolved and dropped to, the measured child genuinely runs as
+      someone else and the wrapper's uid stops counting as the workload's.
+      A number named here never has that effect.
 
       A genuinely scored deployment needs the subtree owned by a credential
       the measured work does not run as. The script-level wrapper is the party

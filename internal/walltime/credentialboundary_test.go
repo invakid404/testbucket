@@ -498,3 +498,93 @@ func TestTheScriptLevelIsJudgedOnTheScriptsOwnCredential(t *testing.T) {
 		}
 	}
 }
+
+// TestThePublicInputsDoNotContradictTheMembershipBoundary is the F2/F3
+// regression.
+//
+// The public action inputs are a consumer contract: a caller provisions
+// accounts and permissions from what they say, and nothing else. Two of them
+// described a system this wrapper deliberately does not build.
+//
+// `script-user` said the script containment is delegated to the measured
+// account's group "so the script can arrange containments beneath it" — while
+// the same input, four lines earlier, correctly said the containment stays
+// wrapper-owned. Delegating it is the one arrangement the membership rule
+// exists to refuse: it hands the measured process write access to the
+// `cgroup.procs` deciding what its own envelope contains, which is exactly
+// what made every complete-script row ineligible before the controller
+// existed. A caller who provisioned from the wrong half would have built that
+// hole on purpose, and the runtime being safer would not have told them.
+//
+// `workload-uid` said the wrapper's uid "always counts as the workload's,
+// because nothing here changes credentials" — true before `workload-user`
+// existed, false now that the wrapper drops to a resolved account. A reviewer
+// reading it would conclude a two-account deployment cannot establish the
+// boundary, which is the opposite of what `membershipModelFor` decides.
+//
+// The descriptions are checked, not just the code, because the code was right
+// in both cases and the contract was still wrong.
+func TestThePublicInputsDoNotContradictTheMembershipBoundary(t *testing.T) {
+	// YAML folds these descriptions across lines; collapse to one space so a
+	// phrase is matched however it happens to be wrapped.
+	fold := func(t *testing.T, path string) string {
+		t.Helper()
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(strings.Fields(string(b)), " ")
+	}
+
+	action := fold(t, filepath.Join("..", "..", ".github", "actions", "run-bucket", "action.yml"))
+	reusable := fold(t, filepath.Join("..", "..", ".github", "workflows", "bucketed-reusable.yml"))
+
+	for _, tc := range []struct {
+		name    string
+		doc     string
+		claim   string
+		why     string
+		require string
+	}{
+		{
+			name:    "run-bucket does not promise the script containment is delegated",
+			doc:     action,
+			claim:   "The script containment is delegated to this account's group",
+			why:     "a caller provisioning from this would give the measured script write access to its own cgroup.procs, which is the arrangement the membership rule refuses",
+			require: "The script containment is NOT delegated",
+		},
+		{
+			name:    "run-bucket does not promise a declaration is powerless because credentials never change",
+			doc:     action,
+			claim:   "because nothing here changes credentials between the wrapper and the measured child",
+			why:     "workload-user resolves an account and drops to it, so credentials do change and the wrapper's uid stops counting as the workload's",
+			require: "What does move the boundary is workload-user",
+		},
+		{
+			name:    "the reusable workflow does not promise the wrapper uid always counts",
+			doc:     reusable,
+			claim:   "is not trusted to: the wrapper's own uid always counts as the workload's",
+			why:     "a resolved workload account replaces the wrapper's uid, which is the only way a scored arm is reachable",
+			require: "only when such an account is actually resolved and dropped to does the wrapper's uid stop counting",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if strings.Contains(tc.doc, tc.claim) {
+				t.Errorf("the public contract still says %q; %s", tc.claim, tc.why)
+			}
+			if !strings.Contains(tc.doc, tc.require) {
+				t.Errorf("the public contract no longer states %q, so the corrected model is not documented anywhere a caller reads", tc.require)
+			}
+		})
+	}
+
+	// AND THE SAFE MODEL IS STATED POSITIVELY, not merely left unsaid.
+	for _, must := range []string{
+		"the controller channel",
+		"SO_PEERCRED",
+	} {
+		if !strings.Contains(action, must) {
+			t.Errorf("run-bucket's script-user no longer explains %q, so how the nesting actually happens is undocumented", must)
+		}
+	}
+}
