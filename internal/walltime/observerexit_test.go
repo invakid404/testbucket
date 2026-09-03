@@ -1,7 +1,9 @@
 package walltime
 
 import (
+	"os"
 	"os/exec"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -30,7 +32,8 @@ func TestAnExitedObserverIsNotWaitedFor(t *testing.T) {
 
 	// The handle a later step reconstructs: a pid and its start identity, no
 	// cmd, and deliberately no Wait — this process has NOT reaped it.
-	o := &observerProc{producer: ProducerTrace, pid: pid, start: processStartID(pid)}
+	o := &observerProc{producer: ProducerTrace, pid: pid, start: processStartID(pid),
+		proc: retainOwnership(t, cmd)}
 
 	// Give the child time to actually finish. It is not reaped here, so on
 	// Linux it is now a zombie and on any platform it is an exited child of
@@ -145,9 +148,6 @@ func TestAWrongIdentityHandleDoesNotReapAnUnrelatedExitedChild(t *testing.T) {
 // lifecycle incomplete, which is the honest record; the observer's own timeout
 // still ends it.
 func TestADetachedHandleWithoutAnIdentityWillNotActOnItsPID(t *testing.T) {
-	if !startIDsAvailable {
-		t.Skip("this platform supplies no start identities at all, so there is none to withhold")
-	}
 	t.Parallel()
 
 	cmd := exec.Command("sleep", "30")
@@ -171,5 +171,87 @@ func TestADetachedHandleWithoutAnIdentityWillNotActOnItsPID(t *testing.T) {
 	// And it does not pass off existence as an exit proof.
 	if err := o.awaitExit(time.Now().Add(time.Second)); err == nil {
 		t.Error("awaitExit reported an exit for a pid it could not authenticate; the lifecycle must stay incomplete")
+	}
+}
+
+// SIGNALLING GOES THROUGH A HANDLE, NOT A NUMBER, WHERE THE PLATFORM HAS ONE.
+//
+// `ownsPID` answering yes and the signal landing are two separate moments. In
+// between, the process may exit and the kernel may give its pid to something
+// else — so a check-then-kill can verify one process and signal another. The
+// window is small; killing the runner's unrelated work is not a small
+// consequence.
+//
+// pidfd_open pins the process before the identity is re-read, so a pid that
+// changed hands is detected instead of signalled. This exercises that path
+// directly, including its refusal.
+func TestSignallingPrefersAPinnedHandleOverAPID(t *testing.T) {
+	if !signalByIdentity(os.Getpid(), processStartID(os.Getpid()), syscall.Signal(0)) {
+		t.Skip("no pinned-handle signalling on this platform or kernel")
+	}
+	t.Parallel()
+
+	// A MATCHING IDENTITY IS SIGNALLED.
+	victim := exec.Command("sleep", "30")
+	if err := victim.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = victim.Process.Kill(); _, _ = victim.Process.Wait() })
+	if !signalByIdentity(victim.Process.Pid, processStartID(victim.Process.Pid), syscall.SIGKILL) {
+		t.Fatal("a pinned handle with a matching identity did not deliver the signal")
+	}
+	if _, died := diedFromWithin(t, victim, 2*time.Second); !died {
+		t.Error("the signal was reported delivered but the process survived")
+	}
+
+	// A MISMATCHED IDENTITY IS REFUSED, after the pin rather than before it.
+	bystander := exec.Command("sleep", "30")
+	if err := bystander.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bystander.Process.Kill(); _, _ = bystander.Process.Wait() })
+	if signalByIdentity(bystander.Process.Pid, "999999999999", syscall.SIGKILL) {
+		t.Fatal("a pinned handle signalled a process whose identity did not match")
+	}
+	if _, died := diedFromWithin(t, bystander, 400*time.Millisecond); died {
+		t.Error("the refused signal was delivered anyway")
+	}
+}
+
+// THE REGISTRY STOPS VOUCHING ONCE THE PROCESS IS REAPED.
+//
+// A retained handle is ownership only while the child is unreaped: that is
+// exactly what stops the kernel reusing its pid. The moment the wrapper reaps
+// it, the number is the kernel's again — and a registry still holding the
+// handle would go on answering "ours" for a pid that may now belong to
+// anything, handing back the bare-pid authority this whole rule removes.
+func TestTheRegistryReleasesAPIDOnceItIsReaped(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	rememberObserver(cmd.Process)
+	t.Cleanup(func() { forgetObserver(pid) })
+
+	o := &observerProc{producer: ProducerPeer, pid: pid, proc: recallObserver(pid)}
+	if !o.ownsPID() {
+		t.Fatal("a retained handle for an unreaped child was not treated as ownership")
+	}
+
+	// Let it exit, then collect it the way the close path does.
+	deadline := time.Now().Add(10 * time.Second)
+	for o.stillRunning() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if p := recallObserver(pid); p != nil {
+		t.Error("the registry still vouches for a pid that has been reaped and released for reuse")
+	}
+	bare := &observerProc{producer: ProducerPeer, pid: pid, proc: recallObserver(pid)}
+	if bare.ownsPID() {
+		t.Error("a reaped pid still claimed ownership; the number is the kernel's again")
 	}
 }

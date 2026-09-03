@@ -19,6 +19,22 @@ import (
 // zombie — so a probe would report "alive" for a process that is already dead
 // and would pass against an abandon() that did nothing at all only by luck of
 // timing. Waiting distinguishes the two.
+// retainOwnership mirrors what production does with an observer it launched:
+// the OS handle is remembered at launch and recovered by the later step
+// through the registry. A test that means "this observer is ours" has to say
+// so the same way, because ownership is now the thing that authorizes a
+// signal — a bare pid authorizes nothing on any platform.
+func retainOwnership(t *testing.T, cmd *exec.Cmd) *os.Process {
+	t.Helper()
+	rememberObserver(cmd.Process)
+	t.Cleanup(func() { forgetObserver(cmd.Process.Pid) })
+	p := recallObserver(cmd.Process.Pid)
+	if p == nil {
+		t.Fatal("the observer registry did not return the handle it was just given")
+	}
+	return p
+}
+
 func diedFrom(t *testing.T, cmd *exec.Cmd) (syscall.Signal, bool) {
 	t.Helper()
 	return diedFromWithin(t, cmd, 5*time.Second)
@@ -74,7 +90,8 @@ func TestADetachedObserverIsStillKillableWithoutItsCommand(t *testing.T) {
 	// opening step recorded, no command. The identity is not decoration — it
 	// is what entitles this handle to signal the number at all, and production
 	// carries it through the action state for exactly that reason.
-	o := &observerProc{producer: ProducerPeer, pid: pid, start: processStartID(pid)}
+	o := &observerProc{producer: ProducerPeer, pid: pid, start: processStartID(pid),
+		proc: retainOwnership(t, cmd)}
 	o.abandon()
 
 	sig, killed := diedFrom(t, cmd)
@@ -154,6 +171,7 @@ func TestADetachedCloseProvesTheObserverExited(t *testing.T) {
 		producer: ProducerPeer,
 		pid:      cmd.Process.Pid,
 		start:    processStartID(cmd.Process.Pid),
+		proc:     retainOwnership(t, cmd),
 		ctl:      control{base: filepath.Join(dir, "ctl")},
 		stream:   closedStream(t, dir),
 	}
@@ -198,11 +216,11 @@ func TestADetachedKillRequiresTheStartIdentity(t *testing.T) {
 		t.Fatalf("abandon() killed a process at a REUSED pid (signal %v); a wrapper must not terminate work it cannot identify as its own", sig)
 	}
 
-	// And the handle that CAN identify its observer still ends it. On a
-	// platform that supplies no start identity this falls back to existence,
-	// which is the strongest claim available there; such a host has no
-	// cgroup-v2 containment either, so its rows are unscorable regardless.
-	ours := &observerProc{producer: ProducerPeer, pid: observer.Process.Pid, start: processStartID(observer.Process.Pid)}
+	// And the handle that CAN identify its observer still ends it — on every
+	// platform, because it holds the OS handle for a child it has not reaped
+	// rather than a number it hopes is still the same process.
+	ours := &observerProc{producer: ProducerPeer, pid: observer.Process.Pid,
+		start: processStartID(observer.Process.Pid), proc: retainOwnership(t, observer)}
 	ours.abandon()
 	sig, died := diedFrom(t, observer)
 	if !died {

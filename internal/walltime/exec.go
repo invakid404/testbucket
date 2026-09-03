@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -919,6 +920,15 @@ var ObserverLauncher = func(args []string) (*exec.Cmd, error) {
 type observerProc struct {
 	producer Producer
 	cmd      *exec.Cmd
+	// proc is the OS PROCESS HANDLE, retained when this process launched the
+	// observer and has not yet reaped it.
+	//
+	// It is the strongest form of ownership available, and the only one that
+	// needs no comparison: an unreaped child holds its pid, so the kernel
+	// cannot hand that number to anything else while this handle is held.
+	// A later step in the same process recovers it through the observer
+	// registry rather than rebuilding a bare number and hoping.
+	proc *os.Process
 	// pid is the observer's process id, retained SEPARATELY from cmd.
 	//
 	// A detached action observer outlives the step that started it, so the
@@ -1057,9 +1067,11 @@ func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadl
 			return fail(err)
 		}
 	}
+	rememberObserver(cmd.Process)
 	return &observerProc{
 		producer: p, cmd: cmd, pid: cmd.Process.Pid, start: processStartID(cmd.Process.Pid),
-		ctl: control{base: base}, pub: PublicKeyOf(key),
+		proc: cmd.Process,
+		ctl:  control{base: base}, pub: PublicKeyOf(key),
 		stream: filepath.Join(opt.Dir, streamName(p, opt.Level, opt.Seq)),
 	}, nil
 }
@@ -1260,7 +1272,7 @@ func (o *observerProc) awaitExit(deadline time.Time) error {
 	// pid now names something else. Returning "exited" from that position
 	// would close a lifecycle on a guess; the lifecycle stays incomplete
 	// instead, and the caller records it as such.
-	if startIDsAvailable && o.cmd == nil && o.start == "" {
+	if o.cmd == nil && o.proc == nil && o.start == "" {
 		return fmt.Errorf("%s observer %d was reconstructed without a start identity; a bare pid cannot show that the observer exited", o.producer, o.pid)
 	}
 	for {
@@ -1317,12 +1329,24 @@ func (o *observerProc) ownsPID() bool {
 		// behind our back: the pid is ours by construction.
 		return true
 	}
+	if o.proc != nil {
+		// The OS handle for a child we have not reaped. The kernel cannot
+		// recycle this pid while it is held, so the number is still ours.
+		return true
+	}
 	if o.start == "" {
-		// Detached, with nothing to authenticate it. Where the platform can
-		// identify processes, that is a handle which lost its identity and it
-		// gets no authority over the number. Where no identity was ever
-		// obtainable, there is nothing being withheld.
-		return !startIDsAvailable
+		// DETACHED, WITH NOTHING TO AUTHENTICATE IT — on any platform.
+		//
+		// This used to answer "true wherever start identities are
+		// unobtainable", on the reasoning that existence was then the
+		// strongest available claim. Existence is an OBSERVATION; it is not
+		// ownership, and being unable to identify a process is not a licence
+		// to signal it. On that branch a handle holding nothing but a reusable
+		// integer killed an unrelated live process and reaped an unrelated
+		// exited one. A platform that cannot identify processes gets no
+		// authority here — it gets an incomplete lifecycle, which is the
+		// honest record.
+		return false
 	}
 	return processStartID(o.pid) == o.start
 }
@@ -1369,7 +1393,14 @@ func (o *observerProc) stillRunning() bool {
 func reapExitedChild(pid int) bool {
 	var status syscall.WaitStatus
 	got, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
-	return err == nil && got == pid
+	if err != nil || got != pid {
+		return false
+	}
+	// REAPED, SO THE PID IS THE KERNEL'S AGAIN. The retained handle must not
+	// outlive the process it names, or the registry would go on vouching for a
+	// number that has been released for reuse.
+	forgetObserver(pid)
+	return true
 }
 
 // abandon kills an observer whose lifecycle cannot be completed. Its partial
@@ -1406,7 +1437,25 @@ func (o *observerProc) abandon() {
 	// its own bookkeeping has done more damage than the leak it was avoiding.
 	// The observer's own timeout still ends it, and the lifecycle stays
 	// incomplete, which is the honest record.
-	if o.ownsPID() && o.stillRunning() {
+	if !o.ownsPID() {
+		return
+	}
+	// THROUGH A HANDLE WHERE ONE EXISTS, because ownsPID answering yes and the
+	// signal landing are two moments, and the pid may change hands between
+	// them.
+	if o.proc != nil {
+		// Our own unreaped child: the handle cannot be redirected, and the
+		// kernel cannot reuse the number while we hold it.
+		_ = o.proc.Signal(syscall.SIGKILL)
+		return
+	}
+	if signalByIdentity(o.pid, o.start, syscall.SIGKILL) {
+		return
+	}
+	// No handle available on this platform. The identity was checked and the
+	// signal is sent by number, which is the older, racier path and the reason
+	// the two above are preferred.
+	if o.stillRunning() {
 		_ = syscall.Kill(o.pid, syscall.SIGKILL)
 	}
 }
@@ -1609,4 +1658,43 @@ func observerCloseBy(deadline time.Time) time.Time {
 		return deadline
 	}
 	return grace
+}
+
+// THE OBSERVER REGISTRY: process handles this process is still holding.
+//
+// A detached observer is reconstructed by a LATER STEP from the action state,
+// which can only carry numbers and strings. When that step runs in the same
+// process that launched the observer — a single-step action, and every test —
+// the live OS handle is still here, and it is a better answer than any pair of
+// numbers: an unreaped child holds its pid, so the handle proves ownership
+// instead of arguing for it.
+//
+// Across processes there is nothing to recover and the reconstruction falls
+// back to the (pid, start) pair, which is why that pair is still recorded.
+var observerHandles sync.Map // pid -> *os.Process
+
+func rememberObserver(p *os.Process) {
+	if p != nil {
+		observerHandles.Store(p.Pid, p)
+	}
+}
+
+// recallObserver returns the retained handle for a pid, if this process is the
+// one that launched it and has not forgotten it.
+func recallObserver(pid int) *os.Process {
+	if pid <= 0 {
+		return nil
+	}
+	if v, ok := observerHandles.Load(pid); ok {
+		if p, ok := v.(*os.Process); ok {
+			return p
+		}
+	}
+	return nil
+}
+
+// forgetObserver drops a handle once its process has been reaped, so the
+// registry cannot hand out ownership of a pid the kernel is free to reuse.
+func forgetObserver(pid int) {
+	observerHandles.Delete(pid)
 }

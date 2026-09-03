@@ -758,11 +758,16 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	// pid AND the start identity — so a close that cannot be completed can end
 	// the observer rather than leaving it to watch a containment that no
 	// longer exists, and so it can only ever end THAT process.
+	//
+	// AND WITH THE LIVE HANDLE where this is still the process that launched
+	// them. The state can only carry numbers; the registry can return the OS
+	// handle itself, which proves ownership rather than arguing for it from a
+	// pid that the kernel is entitled to reuse.
 	trace := &observerProc{producer: ProducerTrace, ctl: control{base: st.TraceControl},
-		pid: st.TracePID, start: st.TraceStart,
+		pid: st.TracePID, start: st.TraceStart, proc: recallObserver(st.TracePID),
 		stream: filepath.Join(dir, streamName(ProducerTrace, LevelAction, 0))}
 	peer := &observerProc{producer: ProducerPeer, ctl: control{base: st.PeerControl},
-		pid: st.PeerPID, start: st.PeerStart,
+		pid: st.PeerPID, start: st.PeerStart, proc: recallObserver(st.PeerPID),
 		stream: filepath.Join(dir, streamName(ProducerPeer, LevelAction, 0))}
 	// EACH OBSERVER GETS ITS OWN BOUNDED SHARE OF THE CLOSING BUDGET.
 	//

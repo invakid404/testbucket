@@ -262,12 +262,6 @@ func (c *cgroup2) Destroy() error {
 	return nil
 }
 
-// startIDsAvailable says whether THIS PLATFORM can identify a process at all.
-// Linux can, through /proc, so a handle here that has no start identity is a
-// handle that lost one — not a host that never had any — and the wrapper
-// refuses to wait for, reap or signal the bare number it is left holding.
-const startIDsAvailable = true
-
 // processStartID reads a PID's start time from /proc, which is what makes a
 // PID an identity rather than a reusable number.
 func processStartID(pid int) string {
