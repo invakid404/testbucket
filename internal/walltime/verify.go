@@ -488,6 +488,45 @@ func groupStreams(recs []Record) map[streamKey][]Record {
 	return out
 }
 
+// verifyStreamNamesBindTheirRows requires the ledger a record was READ FROM to
+// be the ledger its own stated identity names.
+//
+// Every producer writes to `streamName(producer, level, seq)` and every record
+// states that same triple, so the file name and the rows are two independent
+// statements of one fact — and nothing compared them. The consequence is not
+// theoretical: after an evidence set is fully written, signed, authorized and
+// sealed, swapping two ledgers on disk re-attributes every row in them to the
+// wrong producer. Each record's hash, chain and signature is still valid,
+// because none of them covers the name of the file the record sits in; the
+// roster and key log still authorize the signers, because those keys really
+// did sign those rows; and a seal taken afterwards covers the swapped layout
+// faithfully. A verifier that never asks which file a row came from accepts
+// the whole thing, and then reports a containment peer's interval as the
+// physical wrapper's.
+//
+// The check is the comparison that was missing. It is TERMINAL rather than
+// ineligible because a row read from a ledger that is not its own is not a
+// weaker claim about the measurement — it is a claim about a different
+// producer than the one that made it.
+//
+// Records a caller supplied in memory carry no source ledger and are skipped:
+// there is no file to disagree with. The production path always reads a
+// directory, where every record is stamped by ReadRecords.
+func verifyStreamNamesBindTheirRows(v *Verdict, streams map[streamKey][]Record) {
+	for _, key := range sortedKeys(streams) {
+		if key.File == "" {
+			continue
+		}
+		want := streamName(key.Producer, key.Level, key.Ordinal)
+		if key.File == want {
+			continue
+		}
+		v.add("WT-034", SeverityTerminal, fmt.Sprintf(
+			"%d record(s) claiming producer %s at %s[%d] were read from the ledger %q, which is the file %s writes; a record signs its own contents and never the name of the file it sits in, so two ledgers exchanged after signing leave every hash, chain, signature and seal intact while attributing each row to a producer that did not make it",
+			len(streams[key]), key.Producer, key.Level, key.Ordinal, key.File, want))
+	}
+}
+
 // verifyStreamIdentitiesAreUnique reports two LEDGERS claiming one stream
 // identity.
 //
@@ -535,6 +574,7 @@ func mapOfKeys(m map[string]map[string]bool) map[string]string {
 // record that was rewritten after the fact cannot survive this, which is the
 // point of writing the chain at all.
 func verifyChains(v *Verdict, streams map[streamKey][]Record) {
+	verifyStreamNamesBindTheirRows(v, streams)
 	verifyStreamIdentitiesAreUnique(v, streams)
 	for _, key := range sortedKeys(streams) {
 		recs := streams[key]
