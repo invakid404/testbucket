@@ -11,10 +11,6 @@ import (
 // SignerDelegationKind identifies the document that opens a signer delegation.
 const SignerDelegationKind = "tb.walltime.signer-delegation/v1"
 
-// signerDelegateFile is where `wall begin` leaves the delegate private key for
-// the wrapper chain, inside the evidence directory.
-const signerDelegateFile = ".signer-delegate.key"
-
 // SignerDelegation is the run key's statement that ONE OTHER KEY may authorize
 // key-log registrations, for one run, at the lower levels only.
 //
@@ -29,25 +25,41 @@ const signerDelegateFile = ".signer-delegate.key"
 // row ineligible for want of an authorization nobody could produce.
 //
 // A delegation is the missing party. `wall begin` mints a fresh key, signs
-// this document with the run key naming it, and leaves the private half where
-// the wrapper chain can read it and the measured workload cannot. Holding it
-// confers strictly less than the run key:
+// this document with the run key naming it, and PRINTS the private half for
+// the caller to place in the measured step's environment. Holding it confers
+// strictly less than the run key:
 //
 //   - it is bound to ONE run, so it cannot vouch for another;
-//   - it may authorize the SCRIPT and INVOCATION levels only, so it cannot
-//     register an action-level signer — `wall begin` and `wall end` remain the
-//     only parties that can;
+//   - each scope names a level AND the lowest sequence number it may
+//     authorize, so the action envelope's own signers — declared by the roster
+//     `wall begin` seals at sequence 0 — stay out of its reach while the
+//     action-owned CHILDREN it must register, which start at 1, are inside it;
 //   - it cannot sign the roster or the closing seal, which are checked against
 //     the predeclared run signers directly.
+//
+// THE PRIVATE HALF IS NEVER WRITTEN TO DISK. It used to be left in the
+// evidence directory, mode 0640 and grouped to the script account — readable
+// by the measured bucket script, which is the party that must not choose its
+// own attesters, and readable by every observer, which is handed that same
+// directory as `--dir` and so is not isolated from it by an environment scrub.
+// It travels in the environment instead, exactly as the run key does, where
+// the observer scrub removes it and `sudo` strips it from the measured child.
 type SignerDelegation struct {
 	Kind string `json:"kind"`
 	// Run is the run this delegation is good for.
 	Run RunIdentity `json:"run"`
 	// PublicKey is the delegate that may authorize registrations.
 	PublicKey string `json:"public_key"`
-	// Levels are the levels it may authorize. The action level is never among
-	// them.
-	Levels []Level `json:"levels"`
+	// Scopes are what it may authorize: a level, and the lowest sequence
+	// number within it.
+	//
+	// The sequence bound is what lets the action level appear here at all. The
+	// action ENVELOPE's physical, peer and trace signers are sequence 0 and
+	// are declared by the roster the run key signs; the action-owned CHILDREN
+	// are sequence 1 upwards and are registered from inside the measured step,
+	// where no run key exists. A delegate scoped to `action` from 1 can
+	// register those and cannot touch the envelope's own.
+	Scopes []DelegationScope `json:"scopes"`
 	// Binary is the build that opened the delegation.
 	Binary    Digest     `json:"binary"`
 	Signature *Signature `json:"signature,omitempty"`
@@ -92,10 +104,23 @@ func (d SignerDelegation) Verify(run RunIdentity, keys []string) (string, error)
 	if run.RunID != "" && d.Run.RunID != run.RunID {
 		return "", fmt.Errorf("the signer delegation is for run %q, not %q", d.Run.RunID, run.RunID)
 	}
-	for _, l := range d.Levels {
-		if l == LevelAction {
-			return "", fmt.Errorf("the signer delegation claims the action level; the action signers are declared by the roster the run key signs, and a delegate that could register them would be the run key")
+	for _, sc := range d.Scopes {
+		// THE ACTION ENVELOPE'S OWN SIGNERS ARE THE ROSTER'S.
+		//
+		// A delegate reaching sequence 0 at the action level could register a
+		// second physical, peer or trace producer for the envelope itself,
+		// which is what the roster exists to fix before the measured work
+		// starts. Above 0 are the action-owned children, which are created
+		// during that work and have no other authorizing party.
+		if sc.Level == LevelAction && sc.MinSeq < 1 {
+			return "", fmt.Errorf("the signer delegation claims the action level from sequence %d; the action envelope's own signers are declared by the roster the run key signs, so a delegate may only reach the action-owned children at sequence 1 and above", sc.MinSeq)
 		}
+		if strings.TrimSpace(string(sc.Level)) == "" {
+			return "", fmt.Errorf("the signer delegation carries a scope with no level")
+		}
+	}
+	if len(d.Scopes) == 0 {
+		return "", fmt.Errorf("the signer delegation authorizes nothing")
 	}
 	if d.Signature == nil {
 		return "", fmt.Errorf("the signer delegation is unsigned; an unauthorized delegate is the measured work choosing who attests it")
@@ -116,10 +141,16 @@ func (d SignerDelegation) Verify(run RunIdentity, keys []string) (string, error)
 	return d.PublicKey, nil
 }
 
-// authorizes reports whether this delegation covers one entry's level.
-func (d SignerDelegation) authorizes(level Level) bool {
-	for _, l := range d.Levels {
-		if l == level {
+// DelegationScope is one level a delegate may authorize, from MinSeq upwards.
+type DelegationScope struct {
+	Level  Level `json:"level"`
+	MinSeq int   `json:"min_seq"`
+}
+
+// authorizes reports whether this delegation covers one entry.
+func (d SignerDelegation) authorizes(e KeyLogEntry) bool {
+	for _, s := range d.Scopes {
+		if s.Level == e.Level && e.Seq >= s.MinSeq {
 			return true
 		}
 	}
@@ -127,35 +158,39 @@ func (d SignerDelegation) authorizes(level Level) bool {
 }
 
 // OpenSignerDelegation mints the delegate, signs the delegation with the run
-// key, and leaves both where they belong: the document in the evidence
-// directory beside the roster, the private key in a file the wrapper chain can
-// read and the measured workload cannot.
+// key, writes the public document beside the roster and RETURNS the private
+// half for the caller to hand to the measured step.
 //
-// Without a run key nothing is delegated. That is the developer run: no
+// It returns "" when there is no run key: that is the developer run, where no
 // capability exists to delegate, the lower keys stay unauthorized, and the
 // verifier reports the row ineligible rather than scoring evidence nobody
 // vouched for.
-func OpenSignerDelegation(dir string, run RunIdentity, runKey ed25519.PrivateKey) error {
+func OpenSignerDelegation(dir string, run RunIdentity, runKey ed25519.PrivateKey) (string, error) {
 	if runKey == nil {
-		return nil
+		return "", nil
 	}
 	key, err := NewSigningKey()
 	if err != nil {
-		return err
+		return "", err
 	}
 	d := SignerDelegation{
 		Kind: SignerDelegationKind, Run: run, PublicKey: PublicKeyOf(key),
-		// THE LOWER LEVELS ONLY.
-		Levels: []Level{LevelScript, LevelInvocation},
+		Scopes: []DelegationScope{
+			{Level: LevelScript, MinSeq: 0},
+			{Level: LevelInvocation, MinSeq: 0},
+			// The action-owned CHILDREN, never the action envelope's own
+			// signers at sequence 0.
+			{Level: LevelAction, MinSeq: 1},
+		},
 		Binary: SelfDigest(),
 	}
 	if err := d.Sign(runKey); err != nil {
-		return err
+		return "", err
 	}
 	if err := WriteJSONFile(filepath.Join(dir, signerDelegationFile), d); err != nil {
-		return err
+		return "", err
 	}
-	return writeDelegateKey(filepath.Join(dir, signerDelegateFile), key)
+	return EncodeKey(key), nil
 }
 
 // signerDelegationFile is the delegation document's name in the evidence
@@ -174,28 +209,24 @@ func LoadSignerDelegation(dir string) (*SignerDelegation, error) {
 	return &d, nil
 }
 
-// delegateKeyFromEnvOrDir is the delegate private key the wrapper chain
-// authorizes registrations with.
+// delegateKeyFromEnv is the delegate private key the wrapper chain authorizes
+// registrations with.
 //
-// The environment is consulted first because that is how a nested wrapper
-// inherits it without reading the evidence directory at all; the file is the
-// fallback for a wrapper started by a script that did not carry it. Both are
-// readable by the wrapper chain and by nothing the measured workload runs as:
-// the variable is scrubbed from every observer, and `sudo` resets the
-// environment of the measured child.
-func delegateKeyFromEnvOrDir(dir string) (ed25519.PrivateKey, error) {
-	if v := strings.TrimSpace(os.Getenv(SignerDelegateKeyEnv)); v != "" {
-		return DecodeKey(v)
-	}
-	if dir == "" {
+// The ENVIRONMENT is the only channel. It used to fall back to a file in the
+// evidence directory, which put the capability where the measured script could
+// read it — the script account was given group read deliberately — and where
+// every observer could open it by path, since observers are handed that same
+// directory as `--dir` and run under the wrapper's own credential. A capability
+// in a directory the reader is told to walk is not isolated by scrubbing the
+// variable that names it.
+//
+// In the environment it is covered by the scrub every observer already gets,
+// and `sudo` resets the environment of the measured child, so neither party
+// that must not hold it can.
+func delegateKeyFromEnv() (ed25519.PrivateKey, error) {
+	v := strings.TrimSpace(os.Getenv(SignerDelegateKeyEnv))
+	if v == "" {
 		return nil, nil
 	}
-	b, err := os.ReadFile(filepath.Join(dir, signerDelegateFile))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return DecodeKey(strings.TrimSpace(string(b)))
+	return DecodeKey(v)
 }

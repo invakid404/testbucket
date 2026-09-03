@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -66,17 +67,80 @@ func TestTheEvidenceDirectoryIsDelegatedAppendOnly(t *testing.T) {
 	// And the production path applies it where the directory is created.
 	body := productionFunc(t, "action.go", "func BeginAction(")
 	mkdir := strings.Index(body, "os.MkdirAll(dir, 0o755)")
-	chmod := strings.Index(body, "evidenceDirDelegation(); gid >= 0")
+	prepare := strings.Index(body, "prepareEvidenceDir(dir)")
 	writer := strings.Index(body, "NewWriter(filepath.Join(dir,")
-	if mkdir < 0 || chmod < 0 || writer < 0 {
-		t.Fatalf("the evidence-directory path is not recognizable: mkdir=%d chmod=%d writer=%d", mkdir, chmod, writer)
+	if mkdir < 0 || prepare < 0 || writer < 0 {
+		t.Fatalf("the evidence-directory path is not recognizable: mkdir=%d prepare=%d writer=%d", mkdir, prepare, writer)
 	}
-	if !(mkdir < chmod && chmod < writer) {
-		t.Errorf("the delegation at %d does not happen between the mkdir at %d and the first ledger at %d", chmod, mkdir, writer)
+	if !(mkdir < prepare && prepare < writer) {
+		t.Errorf("the preparation at %d does not happen between the mkdir at %d and the first ledger at %d", prepare, mkdir, writer)
 	}
-	for _, want := range []string{"os.Chown(dir, -1, gid)", "os.Chmod(dir, mode)"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("BeginAction does not apply %s, so the declared script account cannot create a single file here", want)
+	// AND THE WRAPPER DOES NOT CHOWN. On Linux an unprivileged owner may set a
+	// file's group only to a group it is itself in, and the wrapper is
+	// deliberately not in the measured script's — so the chown this used to
+	// perform could only ever fail, before a scorable envelope could open. The
+	// group comes from a setgid parent the caller prepares; the wrapper sets
+	// the mode, which an owner may always do, and CHECKS the result.
+	// The CODE, not the comment explaining why it is gone.
+	for _, line := range strings.Split(body, "\n") {
+		code, _, _ := strings.Cut(line, "//")
+		if strings.Contains(code, "os.Chown(dir") {
+			t.Errorf("BeginAction still tries to change the evidence directory's group, which the wrapper credential cannot do: %s", strings.TrimSpace(line))
 		}
+	}
+	prep := productionFunc(t, "contain_linux.go", "func prepareEvidenceDir(")
+	if strings.Contains(prep, "os.Chown(") {
+		t.Error("prepareEvidenceDir still tries to change the group")
+	}
+	for _, want := range []string{"os.Chmod(dir, mode)", "int(sys.Gid) != gid", "setgid"} {
+		if !strings.Contains(prep, want) {
+			t.Errorf("prepareEvidenceDir does not %q; an unverified delegation fails later, where it cannot be explained", want)
+		}
+	}
+}
+
+// TestTheKeyLogIsWrittenOnlyByTheWrapper is the F3 regression.
+//
+// The shared key log is created append/create mode 0644 by the wrapper before
+// the bucket script starts. The nested invocation wrappers used to be launched
+// by the measured script and to run as the SEPARATE script credential, which
+// cannot write an existing 0644 file owned by somebody else however the
+// directory is delegated — so the authorization path that had just been built
+// could not produce its own ledger.
+//
+// The controller dissolves it: the nested wrapper asks and the wrapper
+// registers. What has to hold is that the asking side never writes.
+func TestTheKeyLogIsWrittenOnlyByTheWrapper(t *testing.T) {
+	// The ledger stays owner-writable and owner-owned; nothing widens it,
+	// because widening it would let the measured party choose its attesters.
+	dir := t.TempDir()
+	if err := RegisterKeyWith(dir, KeyLogEntry{
+		Producer: ProducerPhysical, Level: LevelInvocation, Seq: 0, PublicKey: "pk",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, keyLogFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		t.Errorf("the key log is group- or world-writable (%v); the measured party could then register its own signers", info.Mode())
+	}
+
+	// AND THE ASKING SIDE NEVER REGISTERS. The invocation client returns the
+	// controller's answer before any of `walltime.Exec` runs, so it opens no
+	// ledger, registers no key and creates no containment.
+	b, err := os.ReadFile(filepath.Join("..", "..", "cmd", "testbucket", "wall.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	ask := strings.Index(src, "walltime.RequestInvocation(*dir, opt.Seq, *spec)")
+	measure := strings.Index(src, "code, err := walltime.Exec(opt)")
+	if ask < 0 || measure < 0 {
+		t.Fatalf("the invocation path is not recognizable: ask=%d measure=%d", ask, measure)
+	}
+	if ask > measure {
+		t.Errorf("the client measures at %d before asking at %d, so it would write the ledgers itself", measure, ask)
 	}
 }

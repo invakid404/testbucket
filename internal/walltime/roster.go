@@ -212,7 +212,7 @@ func RegisterKeyFor(dir string, e KeyLogEntry, run RunIdentity) error {
 	// authorizing party at all. `wall begin` opens a delegation for exactly
 	// those levels; this is where the wrapper chain uses it.
 	if runKey == nil {
-		delegate, err := delegateKeyFromEnvOrDir(dir)
+		delegate, err := delegateKeyFromEnv()
 		if err != nil {
 			return fmt.Errorf("walltime: key log: signer delegate: %w", err)
 		}
@@ -619,8 +619,8 @@ func checkKeyLogAuthorization(e KeyLogEntry, keys, authorizers []string, delegat
 	if err := VerifySigned(e.Authorization, d, authorizers); err != nil {
 		return fmt.Errorf("whose authorization does not verify: %v", err)
 	}
-	if delegation == nil || !delegation.authorizes(e.Level) {
-		return fmt.Errorf("whose authorization is a delegate signature at the %s level, which no delegation covers", e.Level)
+	if delegation == nil || !delegation.authorizes(e) {
+		return fmt.Errorf("whose authorization is a delegate signature for %s/%s sequence %d, which no delegation scope covers", e.Producer, e.Level, e.Seq)
 	}
 	return nil
 }

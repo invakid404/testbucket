@@ -298,26 +298,45 @@ func TestBothMeasuredLevelsDropToTheirOwnAccount(t *testing.T) {
 	}
 }
 
-// TestTheScriptSubtreeIsDelegatedBeforeTheScriptStarts is the other half of
-// F2: the drop is only executable if the dropped account can still do the work
-// that level owns.
+// TestTheScriptDoesItsOwnNestingThroughTheController is the other half of F2.
 //
-// cgroup-v2 requires write access to the COMMON ANCESTOR's `cgroup.procs` to
-// place a process into a sub-cgroup, so a script account with no delegated
-// subtree could not create a single invocation containment — the drop would
-// compile, ship, and break the nested topology on the first bucket.
-func TestTheScriptSubtreeIsDelegatedBeforeTheScriptStarts(t *testing.T) {
-	body := productionFunc(t, "exec.go", "func Exec(")
-	delegate := strings.Index(body, "delegateScriptSubtree(cont)")
-	child := strings.Index(body, "runChild(")
-	if delegate < 0 {
-		t.Fatal("Exec never delegates the script subtree; the dropped script cannot create the invocation containments it is supposed to start")
+// The subtree used to be DELEGATED to the measured script so it could create
+// the invocation containments itself. cgroup-v2 requires write access to the
+// common ancestor's `cgroup.procs` to place a process into a sub-cgroup, so a
+// script able to do that is a script able to write the migration control its
+// own envelope rests on — and the verifier correctly made every
+// complete-script row ineligible for exactly that reason.
+//
+// The nesting is done FOR it instead, by the wrapper that already holds the
+// credential, over a channel the script can only ask on.
+func TestTheScriptDoesItsOwnNestingThroughTheController(t *testing.T) {
+	// The delegation is gone from the tree, not merely unused.
+	for _, file := range []string{"contain_linux.go", "contain_other.go", "exec.go"} {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, gone := range []string{"func delegateSubtree(", "func delegateScriptSubtree(", "delegateScriptSubtree(cont)"} {
+			if strings.Contains(string(b), gone) {
+				t.Errorf("%s still carries %s; delegating the script's own containment to the measured script is the arrangement the membership rule exists to refuse", file, gone)
+			}
+		}
 	}
-	if child >= 0 && delegate > child {
-		t.Errorf("the delegation at %d happens after the child at %d; the script would already be running", delegate, child)
+	body := productionFunc(t, "exec.go", "func Exec(")
+	start := strings.Index(body, "StartInvocationController(opt, cont.Identity())")
+	child := strings.Index(body, "runChild(")
+	if start < 0 {
+		t.Fatal("Exec starts no invocation controller, so a dropped script cannot get an invocation measured at all")
+	}
+	if child >= 0 && start > child {
+		t.Errorf("the controller opens at %d, after the script starts at %d", start, child)
 	}
 	if !strings.Contains(body, "if opt.Level == LevelScript {") {
-		t.Error("the delegation is not scoped to the script level; delegating an invocation containment would hand the test code the migration control")
+		t.Error("the controller is not scoped to the script level")
+	}
+	// And it closes inside the envelope, with the handoff.
+	if !strings.Contains(body, "controller.Close()") {
+		t.Error("the controller outlives the envelope it serves")
 	}
 }
 

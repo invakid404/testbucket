@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -72,5 +73,76 @@ func TestTheAcquisitionAndTheRecordShareOneEnvironmentSnapshot(t *testing.T) {
 	before, _, _ := strings.Cut(src, "func resetPlanningSnapshot")
 	if strings.Contains(before, "resetPlanningSnapshot()") {
 		t.Error("production code re-reads the environment through resetPlanningSnapshot")
+	}
+}
+
+// TestTheClosureIsResolvedAndVersionedInTheFrozenEnvironment is the F6
+// regression.
+//
+// One snapshot governed the acquisition subprocess and the retained record,
+// and nothing else. The closure was still resolved with `exec.LookPath`, which
+// reads the process environment at the moment of the call, and each
+// `--version` subprocess ran with a nil `Cmd.Env`, which Go expands from the
+// environment current at Start. A PATH or a variable that moved after the
+// acquisition therefore bound a program the plan was not derived under, or a
+// version it never reported.
+func TestTheClosureIsResolvedAndVersionedInTheFrozenEnvironment(t *testing.T) {
+	root := t.TempDir()
+	frozenBin := filepath.Join(root, "frozen")
+	movedBin := filepath.Join(root, "moved")
+	for _, d := range []string{frozenBin, movedBin} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tool := func(dir, name, says string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nprintf '"+says+"-%s\\n' \"${TB_SNAPSHOT_PROBE:-missing}\"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	head := tool(frozenBin, "probe-head", "head")
+	frozenNode := tool(frozenBin, "node", "frozen-node")
+	tool(frozenBin, "npm", "frozen-npm")
+	tool(movedBin, "node", "moved-node")
+	tool(movedBin, "npm", "moved-npm")
+
+	t.Setenv("PATH", frozenBin)
+	t.Setenv("TB_SNAPSHOT_PROBE", "frozen")
+	resetPlanningSnapshot()
+	t.Cleanup(resetPlanningSnapshot)
+	_ = planningEnvArgs()
+
+	// The world moves after the acquisition. It can: nothing stops another
+	// step, or this process, from changing PATH or any variable.
+	t.Setenv("PATH", movedBin)
+	t.Setenv("TB_SNAPSHOT_PROBE", "moved")
+
+	execs, tools, err := closureResolver(root, map[string]string{"probe-head": head})([]string{"probe-head"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execs["probe-head"] != head {
+		t.Errorf("the observed head moved: %q", execs["probe-head"])
+	}
+	if got := tools["probe-head"].Version; got != "head-frozen" {
+		t.Errorf("the head was versioned in the ambient environment: got %q, want head-frozen", got)
+	}
+	if got := tools["node"].Path; got != frozenNode {
+		t.Errorf("node resolved from the ambient PATH: got %q, want the frozen %q", got, frozenNode)
+	}
+	if got := tools["node"].Version; got != "frozen-node-frozen" {
+		t.Errorf("node was versioned in the ambient environment: got %q", got)
+	}
+
+	// And a program that is not on the FROZEN path is unresolved, whatever the
+	// ambient one now holds: an unbound program is refused rather than
+	// resolved against an environment the plan was not derived under.
+	if _, err := resolveProgram("moved-only"); err == nil {
+		t.Error("a program absent from the frozen PATH resolved anyway")
+	}
+	if _, err := lookPathIn(frozenBin, "node"); err != nil {
+		t.Errorf("the frozen PATH does not resolve its own program: %v", err)
 	}
 }

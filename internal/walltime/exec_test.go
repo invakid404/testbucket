@@ -731,7 +731,12 @@ func TestObserversNeverInheritAWallTimeSecret(t *testing.T) {
 	}
 	t.Cleanup(func() { ObserverLauncher = original })
 
-	dir := t.TempDir()
+	// A SHORT records directory. The script level now opens a unix socket in
+	// it for the invocation controller, and a socket path is bounded by the
+	// kernel at ~104 bytes; the default per-test temporary directory is longer
+	// than that on this platform, which would fail the envelope for a reason
+	// this test is not about.
+	dir := shortTempDir(t)
 	run := RunIdentity{CampaignID: "ewj2", RunID: "r1", BucketID: "bucket-1", Stage2: "sha256:test"}
 	// Both levels: the action level detaches, the script level does not, and
 	// neither may carry a secret.

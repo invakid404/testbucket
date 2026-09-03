@@ -57,6 +57,18 @@ type ActionState struct {
 	// StartedAt is the AT_start reading, repeated here only so a human reading
 	// the file can find the record; the RECORD is the evidence.
 	StartedAt Instant `json:"started_at"`
+
+	// SignerDelegate is the delegate PRIVATE key this step minted, returned to
+	// the caller in memory and never serialized.
+	//
+	// It has to reach the measured step — that is where the script and
+	// invocation producers, and the action-owned children, mint the keys it
+	// authorizes — and it must reach nothing else. Writing it into the
+	// evidence directory put it where the measured script could read it and
+	// where every observer is told to look; the caller places it in the
+	// measured step's ENVIRONMENT instead, where the observer scrub removes it
+	// and `sudo` strips it from the measured child.
+	SignerDelegate string `json:"-"`
 }
 
 // retainActionProcessTree writes one process-tree record for the ACTION
@@ -183,28 +195,32 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		// saying so is more useful than a bare mkdir error.
 		return nil, fmt.Errorf("walltime: create the records directory (no terminal record can be retained without it): %w", err)
 	}
-	// THE EVIDENCE DIRECTORY IS DELEGATED, APPEND-ONLY, TO THE SCRIPT ACCOUNT.
+	// THE EVIDENCE DIRECTORY IS APPEND-ONLY FOR THE SCRIPT ACCOUNT, AND THE
+	// WRAPPER DOES NOT CHOWN IT.
 	//
-	// The measured bucket script runs as its own account and must create files
-	// here: one invocation spec per call, and the nested ledgers the
-	// invocation wrappers open beside them. The directory was 0755 and owned
-	// by the wrapper, so it could create none of them and the two-account path
-	// stopped before it could produce a row.
+	// The measured bucket script runs as its own account and must create one
+	// invocation spec per call here. It cannot be given general write access —
+	// it would then be able to rewrite the evidence being attested — so what
+	// it gets is CREATE and nothing else: group write and search, setgid so
+	// new files carry the directory's group, and the STICKY bit so a file may
+	// be removed or renamed only by its owner. The wrapper's ledgers stay 0644
+	// and wrapper-owned.
 	//
-	// General write access is not the answer — the measured script would then
-	// be able to rewrite the evidence being attested. This grants CREATE and
-	// nothing else: the group gets write and search, setgid makes new files
-	// carry the directory's group, and the STICKY BIT means a file may be
-	// removed or renamed only by its owner. The wrapper's ledgers and key log
-	// stay 0644 and wrapper-owned, so the script cannot modify them, cannot
-	// delete them, and cannot replace them with files of its own.
-	if gid, mode := evidenceDirDelegation(); gid >= 0 {
-		if err := os.Chown(dir, -1, gid); err != nil {
-			return nil, preWriter("give the evidence directory to the script account's group", err)
-		}
-		if err := os.Chmod(dir, mode); err != nil {
-			return nil, preWriter("make the evidence directory append-only for that group", err)
-		}
+	// The group is INHERITED, not assigned. This used to call
+	// `os.Chown(dir, -1, scriptGID)`, which cannot work: on Linux an
+	// unprivileged owner may change a file's group only to a group it is
+	// itself in, and the wrapper is deliberately not in the measured script's
+	// group — putting it there would destroy the separation the chown exists
+	// to serve. A setgid PARENT makes the kernel do it instead, so the caller
+	// prepares the parent once, privileged, and the wrapper only sets the mode
+	// on a directory it owns, which is always permitted.
+	//
+	// And it is VERIFIED rather than assumed: if a script account is declared
+	// and the directory did not come out owned by that account's group, the
+	// envelope refuses here instead of opening a run whose measured script
+	// cannot write its first spec file.
+	if err := prepareEvidenceDir(dir); err != nil {
+		return nil, preWriter("prepare the evidence directory for the script account", err)
 	}
 	if err := probeErr(atRecordsDir, dir); err != nil {
 		return nil, preWriter("prepare the records directory", err)
@@ -358,7 +374,8 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	// is that capability, bound to this run and to the lower levels only, so
 	// what it can do is exactly what the wrapper chain must do and nothing the
 	// roster reserves to this step.
-	if err := OpenSignerDelegation(dir, run, runKey); err != nil {
+	delegate, err := OpenSignerDelegation(dir, run, runKey)
+	if err != nil {
 		return fail("open the signer delegation", err)
 	}
 
@@ -369,6 +386,9 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		PeerStart: peer.start, TraceStart: trace.start,
 		Root:     actionRootIdentity(os.Getpid()),
 		Deadline: deadline.UTC().Format(time.RFC3339Nano), StartedAt: start,
+		// In memory only: `json:"-"` keeps it out of the file written below,
+		// which the measured script can read the directory of.
+		SignerDelegate: delegate,
 	}
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {

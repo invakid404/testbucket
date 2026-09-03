@@ -305,7 +305,18 @@ runs:
         # The records directory is created by `wall begin` itself, INSIDE the
         # envelope: creating it here would put action-owned work before
         # AT_start and report an action shorter than the one that ran.
-        testbucket wall begin \
+        # THE SIGNER DELEGATE TRAVELS IN THE ENVIRONMENT, NOT ON DISK.
+        #
+        # `wall begin` holds the run key and mints a delegate that may
+        # authorize the signers the MEASURED step creates: the script and
+        # invocation producers, and the action-owned children. That capability
+        # has to reach the measured step and nothing else, so it is printed on
+        # stdout here and exported for the later steps of this job — never
+        # written into the evidence directory, which the measured script can
+        # read and which every observer is handed as `--dir`.
+        #
+        # `wall begin` masks it before printing, so it cannot reach the job log.
+        delegate="$(testbucket wall begin \
           --dir "$TB_WALL_DIR" \
           --bucket-id "$BUCKET_NAME" \
           --campaign-id "$TB_CAMPAIGN_ID" \
@@ -319,7 +330,10 @@ runs:
           --stage1 "$TB_STAGE1" \
           --stage2 "$TB_STAGE2" \
           --registry "$TB_REGISTRY" \
-          --verifier-id "$TB_VERIFIER_ID"
+          --verifier-id "$TB_VERIFIER_ID")"
+        if [ -n "$delegate" ]; then
+          echo "TB_WALL_SIGNER_DELEGATE_KEY=$delegate" >> "$GITHUB_ENV"
+        fi
 
     # A consumer's own per-runner provisioning, run once before the bucket's test
     # command. Passed through the environment and executed as a bash block (never
@@ -417,15 +431,17 @@ runs:
             # moving alias or an exact tag and nothing else; there is no
             # release asset at an arbitrary commit SHA to download and
             # checksum-verify, so a SHA is refused rather than promised.
+            # EXACT STABLE SemVer, by regex rather than by shell glob: in a
+            # shell pattern `*` is unrestricted, so `v[0-9]*.[0-9]*.[0-9]*`
+            # also accepted `v1x.2y.3junk` and `v1.2.3-rc.1`. The installer
+            # applies a strict expression later, which only turned a falsely
+            # accepted scored request into a failure further downstream.
             if [ "$TB_SCORED" = "true" ]; then
-              case "$TB_VERSION" in
-                v[0-9]*.[0-9]*.[0-9]*) ;;
-                *)
-                  echo "scored=true needs an exact published release tag (vX.Y.Z), got '"'"'$TB_VERSION'"'"'." >&2
-                  echo "A moving alias is descriptive metadata rather than a delivery identity; a commit SHA has no release asset to download and checksum-verify." >&2
-                  exit 1
-                  ;;
-              esac
+              if ! printf "%s" "$TB_VERSION" | grep -Eq "^v[0-9]+\.[0-9]+\.[0-9]+$"; then
+                echo "scored=true needs an exact published stable release tag (vMAJOR.MINOR.PATCH), got '"'"'$TB_VERSION'"'"'." >&2
+                echo "A moving alias is descriptive metadata rather than a delivery identity; a prerelease is a build the project has not stood behind; a commit SHA has no release asset to download and checksum-verify." >&2
+                exit 1
+              fi
             fi
 
             # The generated script tees its events into this directory; create
@@ -437,8 +453,15 @@ runs:
             # script group gets create access — setgid so new files carry the
             # group, sticky so only an owner may remove or rename anything.
             # Without that the dropped script cannot write a single event file.
+            # THE ACCOUNT'"'"'S ACTUAL PRIMARY GROUP, resolved rather than
+            # assumed. An account name is not a group name: `useradd` often
+            # creates a like-named group, but a valid account can have any
+            # primary group, and `chgrp "$TB_WALL_SCRIPT_USER"` then fails and
+            # the measured script cannot write one event file. The Go boundary
+            # resolves the real GID; this resolves the same thing.
             if [ -n "${TB_WALL_SCRIPT_USER:-}" ]; then
-              chgrp "$TB_WALL_SCRIPT_USER" "$TB_EVENTS_DIR"
+              script_gid="$(id -g "$TB_WALL_SCRIPT_USER")"
+              chgrp "$script_gid" "$TB_EVENTS_DIR"
               chmod 3770 "$TB_EVENTS_DIR"
             fi
             echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="

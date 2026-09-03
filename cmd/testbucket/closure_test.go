@@ -37,6 +37,11 @@ func TestTheClosureBindsTheProgramThatActuallyLaunchesTheFacade(t *testing.T) {
 		shim(t, filepath.Join(bin, p.name), p.version)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// The closure is resolved in the FROZEN acquisition environment, so a test
+	// that arranges a PATH must take its snapshot after doing so — the same
+	// thing `wall bundle` does before it acquires anything.
+	resetPlanningSnapshot()
+	t.Cleanup(resetPlanningSnapshot)
 
 	execs, tools, err := closureResolver(root, nil)([]string{"pnpm", "exec", "tsx", "scripts/tb-vitest.ts"})
 	if err != nil {
@@ -80,6 +85,11 @@ func TestAnUnresolvableDelegatedProgramFailsClosed(t *testing.T) {
 		shim(t, filepath.Join(bin, p.name), p.version)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// The closure is resolved in the FROZEN acquisition environment, so a test
+	// that arranges a PATH must take its snapshot after doing so — the same
+	// thing `wall bundle` does before it acquires anything.
+	resetPlanningSnapshot()
+	t.Cleanup(resetPlanningSnapshot)
 
 	_, _, err := closureResolver(root, nil)([]string{"pnpm", "exec", "definitely-not-installed", "x.ts"})
 	if err == nil {
@@ -102,6 +112,11 @@ func TestAnOrdinaryCommandDelegatesToNothing(t *testing.T) {
 		shim(t, filepath.Join(bin, p.name), p.version)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// The closure is resolved in the FROZEN acquisition environment, so a test
+	// that arranges a PATH must take its snapshot after doing so — the same
+	// thing `wall bundle` does before it acquires anything.
+	resetPlanningSnapshot()
+	t.Cleanup(resetPlanningSnapshot)
 
 	// `vitest list --json` is not a launcher; nothing is delegated.
 	execs, _, err := closureResolver(root, nil)([]string{"vitest", "list", "--filesOnly", "--json"})

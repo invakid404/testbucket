@@ -183,17 +183,26 @@ func Exec(opt ExecOptions) (int, error) {
 	if err != nil {
 		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "create containment: "+err.Error())
 	}
-	// THE SCRIPT'S SUBTREE, DELEGATED BEFORE THE SCRIPT EXISTS.
+	// THE SCRIPT'S NESTING IS DONE FOR IT, NOT BY IT.
 	//
-	// The measured bucket script runs as its own account and starts the
-	// nested invocation wrappers, and cgroup-v2 requires write access to the
-	// common ancestor's `cgroup.procs` to place a process into a sub-cgroup.
-	// Without this the dropped script could not create a single invocation
-	// containment; with it, it can rearrange only inside a subtree whose
-	// enclosing action containment it still cannot write.
+	// The subtree used to be DELEGATED to the measured script so it could
+	// create the invocation containments itself. That cannot be made
+	// eligible: cgroup-v2 requires write access to the common ancestor's
+	// `cgroup.procs` to place a process into a sub-cgroup, so a script able to
+	// do its own nesting is a script able to write the migration control its
+	// own envelope rests on — and the verifier correctly refused every
+	// complete-script row that resulted.
+	//
+	// The controller is the other half of that trade. This wrapper stays
+	// alive, keeps the credential, and creates, admits, measures and records
+	// each invocation ON REQUEST; the script asks and does none of it. The
+	// script containment is left supervisor-owned, which is what makes the
+	// level scorable, and the script cannot leave it either.
+	var controller *InvocationController
 	if opt.Level == LevelScript {
-		if err := delegateScriptSubtree(cont); err != nil {
-			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "delegate the script subtree: "+err.Error())
+		controller, err = StartInvocationController(opt, cont.Identity())
+		if err != nil {
+			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "open the invocation controller: "+err.Error())
 		}
 	}
 	// Cleanup is EXPLICIT rather than deferred, because a defer would run
@@ -301,8 +310,10 @@ func Exec(opt ExecOptions) (int, error) {
 
 	if opt.Level == LevelScript {
 		// The handoff is script-owned work; removing it here rather than in a
-		// defer keeps it inside the envelope.
+		// defer keeps it inside the envelope. The controller closes with it:
+		// the channel must not outlive the interval it served.
 		_ = os.Remove(scriptHandoffPath(opt.Dir))
+		_ = controller.Close()
 	}
 	destroy()
 	probe(atEndReading, opt.Dir)

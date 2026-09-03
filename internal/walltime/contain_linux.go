@@ -115,73 +115,15 @@ func retainMembershipFactsFor(ident *ContainmentIdentity, dir, account string) {
 	ident.WorkloadGIDs = append([]int(nil), w.GIDs...)
 }
 
-// delegateScriptSubtree delegates a script containment to the declared script
-// account and RE-READS the facts, because delegating changed them.
+// The script subtree is deliberately NOT delegated any more.
 //
-// Retaining the pre-delegation owner and mode would have described a
-// containment that no longer existed by the time the script started, and the
-// verifier reruns the membership rule over exactly these retained values.
-func delegateScriptSubtree(cont Containment) error {
-	c, ok := cont.(*cgroup2)
-	if !ok {
-		return nil
-	}
-	user := strings.TrimSpace(os.Getenv(ScriptUserEnv))
-	if user == "" {
-		return nil
-	}
-	if err := delegateSubtree(c.dir, user); err != nil {
-		return err
-	}
-	retainMembershipFacts(&c.ident, c.dir)
-	return nil
-}
-
-// delegateSubtree hands a containment's SUBTREE to a named account's group,
-// so that account can create containments inside it and admit its own
-// processes into them — and cannot do either anywhere else.
-//
-// This is what makes the script level's credential drop executable rather than
-// decorative. The measured bucket script starts nested `wall exec` wrappers,
-// and cgroup-v2 requires write access to the COMMON ANCESTOR's `cgroup.procs`
-// to place a process into a sub-cgroup: without the delegated subtree the
-// dropped script simply could not create the invocation containments, and with
-// it the script can rearrange only inside a subtree it cannot leave, because
-// the enclosing action containment stays supervisor-owned.
-//
-// The workload account is deliberately NOT delegated anything. The membership
-// rule is rerun against the workload's own credential, so this delegation is
-// visible in the retained owner/mode facts rather than asserted here.
-func delegateSubtree(dir, user string) error {
-	user = strings.TrimSpace(user)
-	if user == "" {
-		return nil
-	}
-	w := resolveWorkloadCredential(user)
-	if len(w.GIDs) == 0 {
-		return fmt.Errorf("resolve the primary group of %q", user)
-	}
-	gid := w.GIDs[0]
-	for _, path := range []string{dir, filepath.Join(dir, "cgroup.procs"), filepath.Join(dir, "cgroup.subtree_control")} {
-		info, err := os.Stat(path)
-		if err != nil {
-			// cgroup.subtree_control is absent on a leaf without enabled
-			// controllers; the two that matter are the directory and
-			// cgroup.procs, and their absence is a real failure below.
-			if os.IsNotExist(err) && strings.HasSuffix(path, "cgroup.subtree_control") {
-				continue
-			}
-			return err
-		}
-		if err := os.Chown(path, -1, gid); err != nil {
-			return fmt.Errorf("chgrp %s to %s: %w", path, user, err)
-		}
-		if err := os.Chmod(path, info.Mode().Perm()|0o070); err != nil {
-			return fmt.Errorf("chmod %s: %w", path, err)
-		}
-	}
-	return nil
-}
+// delegateScriptSubtree and delegateSubtree gave the measured script's group
+// write access to its own containment so it could create the nested invocation
+// containments. That is the one arrangement the membership rule exists to
+// refuse — a measured process able to write the `cgroup.procs` that decides
+// what its own envelope contains — and the verifier correctly refused every
+// complete-script row because of it. The nesting is done by the script-level
+// wrapper instead, on request, over the controller channel; see controller.go.
 
 // containmentOwnerUID is the credential owning this containment's
 // `cgroup.procs`, retained so the verifier can compare it with the credential
@@ -358,6 +300,46 @@ func attachCgroup2(ident ContainmentIdentity) (Containment, error) {
 		return nil, fmt.Errorf("walltime: containment %s inode is %s, expected %s", ident.ID, got, ident.Inode)
 	}
 	return &cgroup2{dir: ident.ID, ident: ident}, nil
+}
+
+// prepareEvidenceDir makes the evidence directory append-only for the declared
+// script account, WITHOUT changing its group.
+//
+// The wrapper cannot change it: on Linux an unprivileged owner may set a
+// file's group only to one of its own groups, and the wrapper is deliberately
+// not in the measured script's group — putting it there would destroy the
+// separation the change was meant to serve. The group must therefore already
+// be right, which a setgid PARENT achieves: the caller's privileged setup
+// prepares that parent once and the kernel applies it to everything created
+// inside. All this does is set the mode, which an owner may always do, and
+// then CHECK the result.
+//
+// A declared script account whose group did not arrive is a hard refusal. The
+// measured script could not write its first invocation spec, so opening the
+// envelope would only defer the failure past the point where it can still be
+// explained.
+func prepareEvidenceDir(dir string) error {
+	gid, mode := evidenceDirDelegation()
+	if gid < 0 {
+		return nil
+	}
+	if err := os.Chmod(dir, mode); err != nil {
+		return fmt.Errorf("set the append-only mode on %s: %w", dir, err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot read the group of %s", dir)
+	}
+	if int(sys.Gid) != gid {
+		return fmt.Errorf(
+			"%s belongs to group %d, not the script account's group %d, and the wrapper cannot change it: an unprivileged owner may only set a group it is itself in, and it is deliberately not in that one. Create the PARENT of the wall directory setgid to that group in the caller's privileged setup — `sudo install -d -m 2775 -g <script-group> <parent>` — so the kernel gives this directory the right group when it is created",
+			dir, sys.Gid, gid)
+	}
+	return nil
 }
 
 // evidenceDirDelegation is the group and mode the evidence directory must

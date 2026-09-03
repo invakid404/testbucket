@@ -242,42 +242,133 @@ jobs:
       # unset or mismatching pin fails closed. It is deliberately NOT the
       # moving `v0` alias: an alias the release process can move is not a
       # separate root of trust.
-      - name: Obtain the pinned trusted verifier
+      # THE BOOTSTRAP TREE, checked out at its own pinned commit.
+      #
+      # It is a SEPARATE checkout into a separate path: the adjudicator is
+      # built from that tree, never from the candidate's. When the released
+      # asset pin is used instead this checks out nothing.
+      - name: Check out the pinned bootstrap adjudicator source
+        if: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT }}
+          path: ${{ runner.temp }}/trusted-src
+
+      # Go is set up ONLY for the bootstrap route, and only to build that
+      # separate tree. The released-asset route runs a downloaded binary and
+      # needs no toolchain at all.
+      - name: Set up Go for the bootstrap adjudicator
+        if: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+
+      - name: Obtain the pinned trusted adjudicator
         env:
           TB_TRUSTED_VERIFIER_TAG: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_TAG }}
           TB_TRUSTED_VERIFIER_SHA256: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_SHA256 }}
+          TB_TRUSTED_VERIFIER_COMMIT: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT }}
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_TRUSTED_OUT: ${{ runner.temp }}/testbucket-verifier
           GITHUB_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${TB_TRUSTED_VERIFIER_TAG:-}" ] || [ -z "${TB_TRUSTED_VERIFIER_SHA256:-}" ]; then
-            echo "REFUSED: no pinned trusted verifier." >&2
-            echo "Set TB_RELEASE_TRUSTED_VERIFIER_TAG to an exact previously published" >&2
-            echo "release tag (vX.Y.Z, never a moving alias) and TB_RELEASE_TRUSTED_VERIFIER_SHA256" >&2
-            echo "to that asset's exact digest. A verifier built from the candidate it judges" >&2
+          # EXACTLY ONE OF THE TWO PINS, and never both: two roots of trust
+          # where the workflow chooses between them is one root of trust the
+          # workflow chooses.
+          if [ -n "${TB_TRUSTED_VERIFIER_TAG:-}" ] && [ -n "${TB_TRUSTED_VERIFIER_COMMIT:-}" ]; then
+            echo "REFUSED: both a released-asset pin and a bootstrap-commit pin are set." >&2
+            echo "Set exactly one; a workflow that picks between two roots of trust is its own root." >&2
+            exit 1
+          fi
+
+          if [ -n "${TB_TRUSTED_VERIFIER_TAG:-}" ]; then
+            # THE RELEASED-ASSET PIN: a previously published release, named by
+            # an exact stable tag and an exact asset digest this workflow does
+            # not compute.
+            if [ -z "${TB_TRUSTED_VERIFIER_SHA256:-}" ]; then
+              echo "REFUSED: TB_RELEASE_TRUSTED_VERIFIER_TAG is set without TB_RELEASE_TRUSTED_VERIFIER_SHA256." >&2
+              echo "A tag names a release; only the digest names the bytes." >&2
+              exit 1
+            fi
+            # EXACT STABLE SemVer, by regex rather than by shell glob. In shell
+            # patterns `*` is unrestricted, so `v[0-9]*.[0-9]*.[0-9]*` also
+            # matched `v1x.2y.3junk` and `v1.2.3-rc.1`: a prerelease is a build
+            # the project has not stood behind and a malformed segment is not a
+            # version at all. This is the expression the alias job uses.
+            if ! printf '%s' "$TB_TRUSTED_VERIFIER_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "REFUSED: the trusted adjudicator pin '$TB_TRUSTED_VERIFIER_TAG' is not an exact stable release tag (vMAJOR.MINOR.PATCH)." >&2
+              echo "A moving alias can be repointed by the very process being verified." >&2
+              exit 1
+            fi
+            if [ "$TB_TRUSTED_VERIFIER_TAG" = "${GITHUB_REF_NAME:-}" ]; then
+              echo "REFUSED: the trusted adjudicator pin is the tag being released." >&2
+              exit 1
+            fi
+            # THE ASSET NAME IS goreleaser's, not uname's. The archives are
+            # named {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }} —
+            # `testbucket_0.2.2_linux_amd64.tar.gz`. The previous selector
+            # built `testbucket_Linux_x86_64.tar.gz` from `uname`, which
+            # matches no published asset at any tag, so this step could never
+            # obtain an adjudicator at all.
+            version="${TB_TRUSTED_VERIFIER_TAG#v}"
+            case "$(uname -m)" in
+              x86_64|amd64) arch=amd64 ;;
+              aarch64|arm64) arch=arm64 ;;
+              *) echo "REFUSED: no published asset for machine $(uname -m)." >&2; exit 1 ;;
+            esac
+            os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+            asset="testbucket_${version}_${os}_${arch}.tar.gz"
+            mkdir -p "$RUNNER_TEMP/trusted"
+            gh release download "$TB_TRUSTED_VERIFIER_TAG" \
+              --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/trusted"
+            echo "$TB_TRUSTED_VERIFIER_SHA256  $RUNNER_TEMP/trusted/$asset" | sha256sum -c -
+            tar -xzf "$RUNNER_TEMP/trusted/$asset" -C "$RUNNER_TEMP/trusted" testbucket
+            install -m 0755 "$RUNNER_TEMP/trusted/testbucket" "$TB_TRUSTED_OUT"
+            echo "trusted adjudicator: released asset $asset from $TB_TRUSTED_VERIFIER_TAG"
+          elif [ -n "${TB_TRUSTED_VERIFIER_COMMIT:-}" ]; then
+            # THE BOOTSTRAP PIN, and why it exists.
+            #
+            # The released-asset route cannot start: no published release
+            # carries the `wall` adjudication subcommands, and this step
+            # refuses the tag being released — so the first wall-capable
+            # release had no adjudicator it could ever obtain. The bootstrap is
+            # an exact 40-hex COMMIT of this repository, predeclared in a
+            # repository variable, checked out separately and built there.
+            #
+            # It is a real independence boundary and a weaker one than a
+            # published asset, and it is written down as such: the commit is
+            # not the candidate, it is fixed before the release runs, and it is
+            # a distinct tree from the one being judged. It is not
+            # reproducibly-attested bytes. Move to the asset pin as soon as one
+            # wall-capable release exists, and record that ceremony where the
+            # variable is set.
+            if ! printf '%s' "$TB_TRUSTED_VERIFIER_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "REFUSED: the bootstrap adjudicator pin is not a full 40-hex commit." >&2
+              exit 1
+            fi
+            if [ "$TB_TRUSTED_VERIFIER_COMMIT" = "$TB_RELEASE_SHA" ]; then
+              echo "REFUSED: the bootstrap adjudicator pin is the commit being released." >&2
+              echo "A candidate that adjudicates itself has been adjudicated by nobody." >&2
+              exit 1
+            fi
+            if [ ! -x "$RUNNER_TEMP/trusted-src/cmd/testbucket" ] && [ ! -d "$RUNNER_TEMP/trusted-src/cmd/testbucket" ]; then
+              echo "REFUSED: the bootstrap checkout is missing; the separate checkout step must run first." >&2
+              exit 1
+            fi
+            ( cd "$RUNNER_TEMP/trusted-src" && go build -o "$TB_TRUSTED_OUT" ./cmd/testbucket )
+            echo "trusted adjudicator: BOOTSTRAP build from $TB_TRUSTED_VERIFIER_COMMIT (not the candidate $TB_RELEASE_SHA)"
+          else
+            echo "REFUSED: no pinned trusted adjudicator." >&2
+            echo "Set TB_RELEASE_TRUSTED_VERIFIER_TAG + _SHA256 to an exact previously published" >&2
+            echo "release and asset digest, or — until a wall-capable release exists —" >&2
+            echo "TB_RELEASE_TRUSTED_VERIFIER_COMMIT to an exact 40-hex reviewed commit that is" >&2
+            echo "not the one being released. An adjudicator built from the candidate it judges" >&2
             echo "is the candidate judging itself." >&2
             exit 1
           fi
-          case "$TB_TRUSTED_VERIFIER_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *)
-              echo "REFUSED: the trusted verifier pin '$TB_TRUSTED_VERIFIER_TAG' is not an exact release tag." >&2
-              echo "A moving alias can be repointed by the very process being verified." >&2
-              exit 1
-              ;;
-          esac
-          if [ "$TB_TRUSTED_VERIFIER_TAG" = "${GITHUB_REF_NAME:-}" ]; then
-            echo "REFUSED: the trusted verifier pin is the tag being released." >&2
-            exit 1
-          fi
-          asset="testbucket_$(uname -s)_$(uname -m).tar.gz"
-          gh release download "$TB_TRUSTED_VERIFIER_TAG" \
-            --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/trusted"
-          echo "$TB_TRUSTED_VERIFIER_SHA256  $RUNNER_TEMP/trusted/$asset" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/trusted/$asset" -C "$RUNNER_TEMP/trusted" testbucket
-          install -m 0755 "$RUNNER_TEMP/trusted/testbucket" "$RUNNER_TEMP/testbucket-verifier"
-          echo "trusted verifier: $TB_TRUSTED_VERIFIER_TAG ($TB_TRUSTED_VERIFIER_SHA256)"
-          "$RUNNER_TEMP/testbucket-verifier" version || true
+          "$TB_TRUSTED_OUT" version
 
       - name: Countersign every asset independently
         env:
@@ -365,45 +456,134 @@ jobs:
       # an older adjudicator cannot enforce a gate it does not know about, and
       # that trade-off belongs to whoever moves the pin rather than to the
       # release being judged.
-      - name: Obtain the pinned trusted verifier
+      # THE BOOTSTRAP TREE, checked out at its own pinned commit.
+      #
+      # It is a SEPARATE checkout into a separate path: the adjudicator is
+      # built from that tree, never from the candidate's. When the released
+      # asset pin is used instead this checks out nothing.
+      - name: Check out the pinned bootstrap adjudicator source
+        if: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT }}
+          path: ${{ runner.temp }}/trusted-src
+
+      # Go is set up ONLY for the bootstrap route, and only to build that
+      # separate tree. The released-asset route runs a downloaded binary and
+      # needs no toolchain at all.
+      - name: Set up Go for the bootstrap adjudicator
+        if: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+
+      - name: Obtain the pinned trusted adjudicator
         env:
           TB_TRUSTED_VERIFIER_TAG: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_TAG }}
           TB_TRUSTED_VERIFIER_SHA256: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_SHA256 }}
+          TB_TRUSTED_VERIFIER_COMMIT: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT }}
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_TRUSTED_OUT: ${{ runner.temp }}/testbucket-gate
           GITHUB_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${TB_TRUSTED_VERIFIER_TAG:-}" ] || [ -z "${TB_TRUSTED_VERIFIER_SHA256:-}" ]; then
-            echo "REFUSED: no pinned trusted verifier (TB_RELEASE_TRUSTED_VERIFIER_TAG/_SHA256)." >&2
-            echo "A gate built from the candidate is the candidate deciding about itself." >&2
+          # EXACTLY ONE OF THE TWO PINS, and never both: two roots of trust
+          # where the workflow chooses between them is one root of trust the
+          # workflow chooses.
+          if [ -n "${TB_TRUSTED_VERIFIER_TAG:-}" ] && [ -n "${TB_TRUSTED_VERIFIER_COMMIT:-}" ]; then
+            echo "REFUSED: both a released-asset pin and a bootstrap-commit pin are set." >&2
+            echo "Set exactly one; a workflow that picks between two roots of trust is its own root." >&2
             exit 1
           fi
-          case "$TB_TRUSTED_VERIFIER_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *)
-              echo "REFUSED: the trusted verifier pin '$TB_TRUSTED_VERIFIER_TAG' is not an exact release tag." >&2
-              exit 1
-              ;;
-          esac
-          if [ "$TB_TRUSTED_VERIFIER_TAG" = "${GITHUB_REF_NAME:-}" ]; then
-            echo "REFUSED: the trusted verifier pin is the tag being released." >&2
-            exit 1
-          fi
-          asset="testbucket_$(uname -s)_$(uname -m).tar.gz"
-          gh release download "$TB_TRUSTED_VERIFIER_TAG" \
-            --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/trusted"
-          echo "$TB_TRUSTED_VERIFIER_SHA256  $RUNNER_TEMP/trusted/$asset" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/trusted/$asset" -C "$RUNNER_TEMP/trusted" testbucket
-          install -m 0755 "$RUNNER_TEMP/trusted/testbucket" "$RUNNER_TEMP/testbucket-gate"
-          echo "trusted adjudicator: $TB_TRUSTED_VERIFIER_TAG ($TB_TRUSTED_VERIFIER_SHA256)"
 
-      # THE ATTESTATION IS A RELEASE INPUT, not a file written beside one.
-      #
-      # Every asset about to be uploaded must carry an attestation that
-      # authenticates against BOTH predeclared keys and names the exact bytes
-      # on disk. Without this step the attestations were produced and then
-      # never consulted by anything downstream, so they gated nothing even on
-      # their own terms.
+          if [ -n "${TB_TRUSTED_VERIFIER_TAG:-}" ]; then
+            # THE RELEASED-ASSET PIN: a previously published release, named by
+            # an exact stable tag and an exact asset digest this workflow does
+            # not compute.
+            if [ -z "${TB_TRUSTED_VERIFIER_SHA256:-}" ]; then
+              echo "REFUSED: TB_RELEASE_TRUSTED_VERIFIER_TAG is set without TB_RELEASE_TRUSTED_VERIFIER_SHA256." >&2
+              echo "A tag names a release; only the digest names the bytes." >&2
+              exit 1
+            fi
+            # EXACT STABLE SemVer, by regex rather than by shell glob. In shell
+            # patterns `*` is unrestricted, so `v[0-9]*.[0-9]*.[0-9]*` also
+            # matched `v1x.2y.3junk` and `v1.2.3-rc.1`: a prerelease is a build
+            # the project has not stood behind and a malformed segment is not a
+            # version at all. This is the expression the alias job uses.
+            if ! printf '%s' "$TB_TRUSTED_VERIFIER_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "REFUSED: the trusted adjudicator pin '$TB_TRUSTED_VERIFIER_TAG' is not an exact stable release tag (vMAJOR.MINOR.PATCH)." >&2
+              echo "A moving alias can be repointed by the very process being verified." >&2
+              exit 1
+            fi
+            if [ "$TB_TRUSTED_VERIFIER_TAG" = "${GITHUB_REF_NAME:-}" ]; then
+              echo "REFUSED: the trusted adjudicator pin is the tag being released." >&2
+              exit 1
+            fi
+            # THE ASSET NAME IS goreleaser's, not uname's. The archives are
+            # named {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }} —
+            # `testbucket_0.2.2_linux_amd64.tar.gz`. The previous selector
+            # built `testbucket_Linux_x86_64.tar.gz` from `uname`, which
+            # matches no published asset at any tag, so this step could never
+            # obtain an adjudicator at all.
+            version="${TB_TRUSTED_VERIFIER_TAG#v}"
+            case "$(uname -m)" in
+              x86_64|amd64) arch=amd64 ;;
+              aarch64|arm64) arch=arm64 ;;
+              *) echo "REFUSED: no published asset for machine $(uname -m)." >&2; exit 1 ;;
+            esac
+            os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+            asset="testbucket_${version}_${os}_${arch}.tar.gz"
+            mkdir -p "$RUNNER_TEMP/trusted"
+            gh release download "$TB_TRUSTED_VERIFIER_TAG" \
+              --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/trusted"
+            echo "$TB_TRUSTED_VERIFIER_SHA256  $RUNNER_TEMP/trusted/$asset" | sha256sum -c -
+            tar -xzf "$RUNNER_TEMP/trusted/$asset" -C "$RUNNER_TEMP/trusted" testbucket
+            install -m 0755 "$RUNNER_TEMP/trusted/testbucket" "$TB_TRUSTED_OUT"
+            echo "trusted adjudicator: released asset $asset from $TB_TRUSTED_VERIFIER_TAG"
+          elif [ -n "${TB_TRUSTED_VERIFIER_COMMIT:-}" ]; then
+            # THE BOOTSTRAP PIN, and why it exists.
+            #
+            # The released-asset route cannot start: no published release
+            # carries the `wall` adjudication subcommands, and this step
+            # refuses the tag being released — so the first wall-capable
+            # release had no adjudicator it could ever obtain. The bootstrap is
+            # an exact 40-hex COMMIT of this repository, predeclared in a
+            # repository variable, checked out separately and built there.
+            #
+            # It is a real independence boundary and a weaker one than a
+            # published asset, and it is written down as such: the commit is
+            # not the candidate, it is fixed before the release runs, and it is
+            # a distinct tree from the one being judged. It is not
+            # reproducibly-attested bytes. Move to the asset pin as soon as one
+            # wall-capable release exists, and record that ceremony where the
+            # variable is set.
+            if ! printf '%s' "$TB_TRUSTED_VERIFIER_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "REFUSED: the bootstrap adjudicator pin is not a full 40-hex commit." >&2
+              exit 1
+            fi
+            if [ "$TB_TRUSTED_VERIFIER_COMMIT" = "$TB_RELEASE_SHA" ]; then
+              echo "REFUSED: the bootstrap adjudicator pin is the commit being released." >&2
+              echo "A candidate that adjudicates itself has been adjudicated by nobody." >&2
+              exit 1
+            fi
+            if [ ! -x "$RUNNER_TEMP/trusted-src/cmd/testbucket" ] && [ ! -d "$RUNNER_TEMP/trusted-src/cmd/testbucket" ]; then
+              echo "REFUSED: the bootstrap checkout is missing; the separate checkout step must run first." >&2
+              exit 1
+            fi
+            ( cd "$RUNNER_TEMP/trusted-src" && go build -o "$TB_TRUSTED_OUT" ./cmd/testbucket )
+            echo "trusted adjudicator: BOOTSTRAP build from $TB_TRUSTED_VERIFIER_COMMIT (not the candidate $TB_RELEASE_SHA)"
+          else
+            echo "REFUSED: no pinned trusted adjudicator." >&2
+            echo "Set TB_RELEASE_TRUSTED_VERIFIER_TAG + _SHA256 to an exact previously published" >&2
+            echo "release and asset digest, or — until a wall-capable release exists —" >&2
+            echo "TB_RELEASE_TRUSTED_VERIFIER_COMMIT to an exact 40-hex reviewed commit that is" >&2
+            echo "not the one being released. An adjudicator built from the candidate it judges" >&2
+            echo "is the candidate judging itself." >&2
+            exit 1
+          fi
+          "$TB_TRUSTED_OUT" version
+
       - name: Refuse an asset with no independently verified attestation
         env:
           TB_BUILD: ${{ runner.temp }}/build

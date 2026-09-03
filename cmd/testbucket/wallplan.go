@@ -406,7 +406,10 @@ func delegatedProgram(root string, argv []string) (delegated, error) {
 		}
 		return delegated{name: name, path: p}, nil
 	}
-	p, err := exec.LookPath(name)
+	// THE FROZEN PATH, for the same reason the head is resolved in it: a
+	// package-selected launcher found on a PATH the acquisition never had is
+	// a program the plan was not derived under.
+	p, err := lookPathIn(planningEnvValue("PATH"), name)
 	if err != nil {
 		return delegated{}, fmt.Errorf("resolve the %s-selected executable %q under %s: %w; the program that actually launches the façade may not be left unbound",
 			argv[0], name, root, err)
@@ -419,9 +422,19 @@ func fileExists(p string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// resolveProgram finds the exact file a program name runs. `testbucket` names
-// THIS process: it is the program that took the snapshot, and asking PATH for
-// it would resolve whatever copy happens to be installed instead.
+// resolveProgram finds the exact file a program name runs, SEARCHING THE
+// FROZEN PATH rather than the ambient one.
+//
+// `exec.LookPath` reads the process environment as it is at the moment of the
+// call, so a `PATH` that moved after the acquisition resolved the closure to
+// programs the plan was not derived under — the bundle then bound one
+// executable while the snapshot it claims to describe had run another. The
+// snapshot is the plan's environment by definition, so it is the environment
+// the closure is resolved in.
+//
+// `testbucket` names THIS process: it is the program that took the snapshot,
+// and asking any PATH for it would resolve whatever copy happens to be
+// installed instead.
 func resolveProgram(name string) (string, error) {
 	if name == "testbucket" {
 		self, err := os.Executable()
@@ -430,11 +443,59 @@ func resolveProgram(name string) (string, error) {
 		}
 		return self, nil
 	}
-	p, err := exec.LookPath(name)
+	p, err := lookPathIn(planningEnvValue("PATH"), name)
 	if err != nil {
 		return "", fmt.Errorf("resolve %q: %w; a plan may not be derived from an unresolved program", name, err)
 	}
 	return p, nil
+}
+
+// planningEnvValue reads one variable out of the frozen acquisition snapshot.
+func planningEnvValue(name string) string {
+	for _, kv := range planningSnapshot() {
+		if k, v, _ := strings.Cut(kv, "="); k == name {
+			return v
+		}
+	}
+	return ""
+}
+
+// lookPathIn is exec.LookPath against a GIVEN search path.
+//
+// Go's LookPath has no such form: it reads os.Getenv("PATH") itself. This
+// applies the same rules — an argument containing a separator is used as
+// written, otherwise each entry is tried in order — against the PATH the
+// acquisition actually ran with.
+func lookPathIn(searchPath, name string) (string, error) {
+	if strings.ContainsRune(name, os.PathSeparator) {
+		if err := executable(name); err != nil {
+			return "", err
+		}
+		return filepath.Abs(name)
+	}
+	for _, dir := range filepath.SplitList(searchPath) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, name)
+		if err := executable(candidate); err == nil {
+			return filepath.Abs(candidate)
+		}
+	}
+	return "", fmt.Errorf("%q not found in the frozen acquisition PATH", name)
+}
+
+// executable reports whether a path names a regular file this process may
+// execute.
+func executable(path string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if st.IsDir() || st.Mode()&0o111 == 0 {
+		return fmt.Errorf("%s is not executable", path)
+	}
+	return nil
 }
 
 // resolveTool records what a tool IS: its resolved path, the version it
@@ -477,6 +538,14 @@ func toolVersion(root, name, path string) (string, error) {
 	}
 	cmd := exec.Command(path, "--version")
 	cmd.Dir = root
+	// THE FROZEN ENVIRONMENT, NOT WHATEVER IS AMBIENT AT Start.
+	//
+	// A nil Cmd.Env makes Go expand the environment current when the process
+	// starts, so a variable that moved after the acquisition changed what the
+	// tool reported about itself — and the bundle then bound a version the
+	// plan was not derived under, beside an executable path that was exact.
+	// The tool is asked in the environment the acquisition ran in.
+	cmd.Env = planningEnvArgs()
 	b, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("ask %s at %s for its version: %w", name, path, err)

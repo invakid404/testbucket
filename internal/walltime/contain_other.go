@@ -31,11 +31,9 @@ func attachCgroup2(ident ContainmentIdentity) (Containment, error) {
 // retainLevelMembershipFacts has no cgroup facts to re-read off Linux.
 func retainLevelMembershipFacts(Containment, Level) {}
 
-// delegateScriptSubtree has no cgroup subtree to delegate off Linux. The run
-// is unscorable for want of a containment primitive long before the script
-// account matters.
-func delegateScriptSubtree(Containment) error { return nil }
-
 // evidenceDirDelegation has no second account to resolve off Linux; the shared
 // decision lives in contain.go so it is exercised on every host.
 func evidenceDirDelegation() (int, os.FileMode) { return evidenceDirDelegationFor(nil) }
+
+// prepareEvidenceDir has no second account to prepare for off Linux.
+func prepareEvidenceDir(string) error { return nil }

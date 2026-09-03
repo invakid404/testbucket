@@ -188,6 +188,25 @@ func runWallBegin(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "testbucket wall: action envelope open (containment %s, %s)\n",
 		st.Containment.ID, st.Containment.Primitive)
+	// THE SIGNER DELEGATE, ON STDOUT, FOR THE CALLER TO PLACE IN THE MEASURED
+	// STEP'S ENVIRONMENT.
+	//
+	// The script and invocation producers — and the action-owned children —
+	// mint their signing keys during the measured step, where no run key
+	// exists to authorize them. This is the capability that does, and it must
+	// reach that step and nothing else. It is printed rather than written into
+	// the evidence directory because the measured script can read that
+	// directory and every observer is handed it as `--dir`: a capability left
+	// where the reader is told to look is not isolated by scrubbing the
+	// variable that names it.
+	//
+	// Nothing else is written to stdout, so the caller reads exactly one line.
+	// The masking directive keeps it out of the job log even if a later step
+	// echoes the variable.
+	if st.SignerDelegate != "" {
+		fmt.Printf("::add-mask::%s\n", st.SignerDelegate)
+		fmt.Println(st.SignerDelegate)
+	}
 	return nil
 }
 
@@ -274,6 +293,33 @@ func runWallExec(args []string) error {
 	}
 	if opt.Level == walltime.LevelInvocation {
 		opt.JoinParent = false
+		// THE CONTROLLER MEASURES IT, IF ONE IS SERVING.
+		//
+		// The measured script runs as its own account and holds none of the
+		// capabilities an invocation envelope needs: it cannot create a
+		// containment under the script's, admit a process into it, write a
+		// ledger or register a signer. The script-level wrapper can, and stays
+		// alive to do exactly that on request. So this process asks, and
+		// relays the measured child's status; everything else happens under
+		// the wrapper's credential on the other side of the socket.
+		//
+		// With no controller — a developer run with no second account — this
+		// wrapper does the work itself, exactly as before.
+		if *spec != "" {
+			code, served, err := walltime.RequestInvocation(*dir, opt.Seq, *spec)
+			if served {
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "testbucket wall: %v\n", err)
+					if code == 0 {
+						code = 1
+					}
+				}
+				if code != 0 {
+					os.Exit(code)
+				}
+				return nil
+			}
+		}
 		// FAIL CLOSED on a handoff that exists and cannot be authenticated.
 		//
 		// The fallback for "no handoff" is to nest under the action, which is
