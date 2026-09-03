@@ -1296,3 +1296,194 @@ func sortedVerdictPaths(l memoryLoader) []string {
 	sort.Strings(out)
 	return out
 }
+
+// campaignRefusal returns why the campaign was refused, or "" if it passed.
+//
+// The REASON is asserted, not merely the refusal, because several of these
+// identity rules would otherwise be untestable: a byte-identical copy shares
+// its records digest too, so the records rule alone would reject it and a
+// pass/fail assertion could not tell whether the rule under test did anything.
+// The message is also what an operator reads to learn which replay happened,
+// so it is part of the control rather than decoration.
+func campaignRefusal(t *testing.T, idx CampaignIndex, loader memoryLoader, keys []string) string {
+	t.Helper()
+	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
+	var reasons []string
+	reasons = append(reasons, problems...)
+	for _, gate := range gates {
+		if !gate.Pass {
+			reasons = append(reasons, gate.Name+": "+gate.Detail)
+		}
+	}
+	return strings.Join(reasons, "\n")
+}
+
+// refusedBecause asserts the campaign was refused, and refused for the stated
+// reason rather than incidentally.
+func refusedBecause(t *testing.T, idx CampaignIndex, loader memoryLoader, keys []string, want, what string) {
+	t.Helper()
+	got := campaignRefusal(t, idx, loader, keys)
+	if got == "" {
+		t.Fatalf("the campaign passed %s", what)
+	}
+	if !strings.Contains(got, want) {
+		t.Errorf("the campaign was refused %s, but never said %q; it said:\n%s", what, want, got)
+	}
+}
+
+// campaignPasses reports whether the whole release campaign is accepted.
+func campaignPasses(t *testing.T, idx CampaignIndex, loader memoryLoader, keys []string) bool {
+	t.Helper()
+	gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
+	if len(problems) != 0 {
+		return false
+	}
+	for _, gate := range gates {
+		if !gate.Pass {
+			return false
+		}
+	}
+	return true
+}
+
+// ONE MEASUREMENT IS ONE ROW, however it is cited.
+//
+// Every row of a campaign is authenticated, and authentication proves what one
+// verdict SAYS — not that the eighty rows are eighty observations. Nothing
+// rejected a repeated citation, so a party holding a few genuinely favourable
+// signed measurements could cite them until the population was full, suppress
+// the outcomes it did not like, and obtain a cryptographically clean
+// CAMPAIGN_PASS: every signature, authority, schedule, run id, Stage-1
+// identity, Aeta sample and terminal state in the index real, and the release
+// gate — which counts slice lengths — satisfied.
+//
+// The mandatory ablation prerequisite already refuses this (see the identity
+// rule in verifyAblations). These are the same refusals for the eighty rows
+// the product claim actually rests on. Each subtest replays a real measurement
+// a different way, because the three ways defeat different checks: a repeated
+// path is one file cited twice, a byte-identical copy defeats a path-only
+// check, and a re-serialised copy defeats a document-digest check while
+// describing the very same evidence.
+func TestOneMeasurementCannotPopulateManyCampaignRows(t *testing.T) {
+	// The authentic fixture must keep passing, or these subtests prove only
+	// that something is broken.
+	t.Run("the authentic five-pair population passes", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		if !campaignPasses(t, idx, loader, keys) {
+			gates, problems := EvaluateCampaignIndex(idx, loader, keys, "ewj2-campaign", testRelease())
+			for _, p := range problems {
+				t.Errorf("authentic campaign reported: %s", p)
+			}
+			for _, g := range gates {
+				if !g.Pass {
+					t.Errorf("authentic campaign failed gate %s: %s", g.Name, g.Detail)
+				}
+			}
+			t.Fatal("the genuine five-pair fixture no longer passes; the duplicate rule must reject replay, not measurement")
+		}
+	})
+
+	// SAME PATH, twice. The plainest replay: one citation reused.
+	t.Run("the same verdict path cannot fill two rows", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		arm := &idx.Pairs[0].Baseline
+		arm.VerdictPaths[1] = arm.VerdictPaths[0]
+		refusedBecause(t, idx, loader, keys, "a second reference to one measurement is not a second measurement",
+			"while citing one verdict file for two of its buckets")
+	})
+
+	// BYTE-IDENTICAL COPY under another name. A path-only check sees two
+	// distinct citations; the document is the same document.
+	t.Run("a byte-identical copy under another path cannot fill a second row", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		arm := &idx.Pairs[0].Baseline
+		original := loader.verdicts[arm.VerdictPaths[0]]
+		copied := *original
+		loader.verdicts["baseline-0-copy.json"] = &copied
+		arm.VerdictPaths[1] = "baseline-0-copy.json"
+		refusedBecause(t, idx, loader, keys, "is byte-identical to the verdict",
+			"while filling two buckets from one verdict copied under a second name")
+	})
+
+	// SAME EVIDENCE, different document. Re-signing or re-serialising one
+	// measurement changes the verdict digest and leaves the records digest
+	// alone — so only an evidence-level identity catches it.
+	t.Run("a second verdict over the same records cannot fill a second row", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		arm := &idx.Pairs[0].Baseline
+		original := loader.verdicts[arm.VerdictPaths[0]]
+		restated := *original
+		// A genuinely different document: it observes a different bucket of
+		// the same run and is signed again, so neither the verdict digest nor
+		// the signed observation collides. Only the evidence it was derived
+		// from gives it away.
+		restated.Run.BucketID = "restated"
+		restated.Signature = nil
+		if err := restated.Sign(testVerdictIdentity, testVerdictAuthority); err != nil {
+			t.Fatal(err)
+		}
+		if d, err := restated.DigestOf(); err != nil {
+			t.Fatal(err)
+		} else if od, err := original.DigestOf(); err != nil {
+			t.Fatal(err)
+		} else if d == od {
+			t.Fatal("the restated verdict is byte-identical, so this subtest would not exercise the records rule")
+		}
+		loader.verdicts["baseline-0-restated.json"] = &restated
+		arm.VerdictPaths[1] = "baseline-0-restated.json"
+		refusedBecause(t, idx, loader, keys, "was derived from records",
+			"while filling two buckets from two verdicts over one measurement")
+	})
+
+	// AND ACROSS RUNS, not only within one. A measurement belongs to the run
+	// that produced it; lending it to a second run is the same replay one
+	// level up, and it is how a short campaign reaches ten runs.
+	t.Run("one measurement cannot be shared between two runs", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		idx.Pairs[1].Baseline.VerdictPaths[0] = idx.Pairs[0].Baseline.VerdictPaths[0]
+		refusedBecause(t, idx, loader, keys, "already counted",
+			"while two runs shared one measurement between them")
+	})
+
+	// TWO MEASUREMENTS OF ONE BUCKET are still one bucket. This is the case no
+	// other rule reaches: the two rows are genuinely different documents,
+	// derived from different evidence, cited under different paths — so path,
+	// verdict digest and records digest all differ. Only the signed (run,
+	// bucket) observation says the run measured bucket 0 twice and some other
+	// bucket not at all, which is seven buckets wearing eight rows.
+	t.Run("two distinct measurements of one bucket do not cover two buckets", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		arm := &idx.Pairs[0].Baseline
+		first := loader.verdicts[arm.VerdictPaths[0]]
+		second := *loader.verdicts[arm.VerdictPaths[1]]
+		if second.RecordsDigest == first.RecordsDigest {
+			t.Fatal("the fixture's two rows share evidence, so this subtest would not isolate the bucket rule")
+		}
+		second.Run.BucketID = first.Run.BucketID
+		second.Signature = nil
+		if err := second.Sign(testVerdictIdentity, testVerdictAuthority); err != nil {
+			t.Fatal(err)
+		}
+		loader.verdicts["baseline-1-rebucketed.json"] = &second
+		arm.VerdictPaths[1] = "baseline-1-rebucketed.json"
+		refusedBecause(t, idx, loader, keys, "a run's buckets are observed once each",
+			"while two of its rows observed the same bucket")
+	})
+
+	// A ROW MUST SAY WHICH BUCKET IT OBSERVED, or a run's eight rows are eight
+	// anonymous references and nothing establishes they are eight buckets.
+	t.Run("a row that names no bucket is refused", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		arm := &idx.Pairs[0].Baseline
+		anon := *loader.verdicts[arm.VerdictPaths[0]]
+		anon.Run.BucketID = ""
+		anon.Signature = nil
+		if err := anon.Sign(testVerdictIdentity, testVerdictAuthority); err != nil {
+			t.Fatal(err)
+		}
+		loader.verdicts["baseline-0-anon.json"] = &anon
+		arm.VerdictPaths[0] = "baseline-0-anon.json"
+		refusedBecause(t, idx, loader, keys, "names no bucket",
+			"with a row that named no bucket")
+	})
+}

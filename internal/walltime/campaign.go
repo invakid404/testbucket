@@ -166,14 +166,29 @@ func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []st
 	}
 
 	var pairs []CampaignPair
+	// ONE MEASUREMENT MAY POPULATE ONE ROW, campaign-wide.
+	//
+	// Every row below is authenticated, and authentication proves what a
+	// verdict SAYS — not that eight references to it are eight observations.
+	// Nothing rejected a repeated path, a repeated verdict, a repeated records
+	// digest or a repeated signed bucket observation, while the gates counted
+	// slice lengths: eighty appended entries derived from fifteen genuine
+	// signed verdicts passed the whole release. Every signature, authority,
+	// schedule, run id, Stage-1 identity and terminal state in that index was
+	// real, which is exactly why counting them was not enough.
+	//
+	// The ablation prerequisite already carries this rule (see verifyAblations)
+	// and the population it guards is the smaller one. This is the same rule
+	// for the eighty rows the product claim actually rests on.
+	seen := newCampaignIdentities()
 	// The frozen ORDER, bound before anything else is believed. Every other
 	// check in this file asks whether a row is genuine; this one asks whether
 	// this is the experiment the authority predeclared, and five genuine pairs
 	// chosen after the fact from ten attempts pass all the others.
 	var schedule *CampaignSchedule
 	for i, ref := range index.Pairs {
-		baseline, bm, bp := loadArm(index, ref.Baseline, "baseline", i, loader, authorityKeys, authority)
-		candidate, cm, cp := loadArm(index, ref.Candidate, "candidate", i, loader, authorityKeys, authority)
+		baseline, bm, bp := loadArm(index, ref.Baseline, "baseline", i, loader, authorityKeys, authority, seen)
+		candidate, cm, cp := loadArm(index, ref.Candidate, "candidate", i, loader, authorityKeys, authority, seen)
 		problems = append(problems, bp...)
 		problems = append(problems, cp...)
 		if bm != nil && cm != nil {
@@ -222,7 +237,7 @@ func LoadCampaign(index CampaignIndex, loader CampaignLoader, authorityKeys []st
 
 // loadArm authenticates one arm and returns its run, its manifest and every
 // reason it is not admissible.
-func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader CampaignLoader, authorityKeys []string, authority string) (CampaignRun, *Stage1Manifest, []string) {
+func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader CampaignLoader, authorityKeys []string, authority string, seen *campaignIdentities) (CampaignRun, *Stage1Manifest, []string) {
 	where := fmt.Sprintf("pair %d %s run %q", pair, role, arm.RunID)
 	var problems []string
 	// StartedAt and Terminal are deliberately NOT taken from the arm. The
@@ -271,6 +286,15 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 
 	for j, path := range arm.VerdictPaths {
 		row := fmt.Sprintf("%s bucket %d", where, j)
+		// THE SAME FILE CANNOT POPULATE TWO ROWS. Checked before the verdict
+		// is read, because a second reference to one path is a second row
+		// whatever the file turns out to contain.
+		if prev, ok := seen.path[path]; ok {
+			problems = append(problems, fmt.Sprintf(
+				"%s cites verdict %s, which %s already counted; a second reference to one measurement is not a second measurement", row, path, prev))
+			continue
+		}
+		seen.path[path] = row
 		v, err := loader.Verdict(path)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", row, err))
@@ -353,6 +377,16 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 		}
 		if manifestDigest != "" && v.Run.Stage1 != manifestDigest {
 			problems = append(problems, fmt.Sprintf("%s names Stage-1 %s, not this arm's %s", row, v.Run.Stage1, manifestDigest))
+		}
+		// THE ROW'S IDENTITY, checked only now: a duplicate is worth reporting
+		// as a duplicate rather than as whatever an unauthenticated copy would
+		// have failed first. A measurement is identified by the evidence it
+		// was derived from, by the verdict document itself, and by the bucket
+		// of the run it observed — a collision in any of the three is the same
+		// measurement appearing twice, under whatever names.
+		if dup := seen.claim(row, v, vd); dup != "" {
+			problems = append(problems, dup)
+			continue
 		}
 		run.ActionNs = append(run.ActionNs, v.ActionNs)
 		run.VerdictDigests = append(run.VerdictDigests, vd)
@@ -571,4 +605,69 @@ func releaseBindingGate(index CampaignIndex, loader CampaignLoader, release Camp
 		len(assets), strings.Join(assets, ", "), strings.Join(bound, "; "))
 	g.Pass = true
 	return g
+}
+
+// campaignIdentities is the campaign-wide record of which measurements have
+// already populated a row.
+//
+// It exists because AUTHENTICATION IS NOT COUNTING. Every check above proves
+// something about one verdict: that an approved verifier signed it, that it
+// names the run and Stage-1 it claims, that it is complete and eligible. None
+// of that says the row is a row nobody has used yet, and the release gates
+// count rows. A party holding one genuinely favourable signed measurement
+// could cite it eight times per run and suppress the outcomes it did not
+// like, and every signature in the resulting index would verify.
+type campaignIdentities struct {
+	// path is the citation, not the measurement: two rows naming one file.
+	path map[string]string
+	// verdict is the canonical digest of the document — the same bytes copied
+	// under another name.
+	verdict map[Digest]string
+	// records is the evidence the verdict was derived from — a re-signed or
+	// re-serialised copy of one measurement, which the verdict digest alone
+	// would not catch.
+	records map[Digest]string
+	// observation is the signed (run, bucket) pair: WHICH bucket of WHICH run
+	// this row claims to be. Two rows of one run cannot be the same bucket,
+	// and no bucket observation may be shared between runs.
+	observation map[string]string
+}
+
+func newCampaignIdentities() *campaignIdentities {
+	return &campaignIdentities{
+		path:        map[string]string{},
+		verdict:     map[Digest]string{},
+		records:     map[Digest]string{},
+		observation: map[string]string{},
+	}
+}
+
+// claim records this row's identities and returns the reason it is a repeat,
+// or "" if it is a measurement not yet counted.
+//
+// It claims ALL of them or none: a row rejected as a duplicate must not leave
+// its other identities registered, or the genuine row that legitimately holds
+// one of them would be rejected in turn.
+func (c *campaignIdentities) claim(row string, v *Verdict, vd Digest) string {
+	// The bucket a row observed has to be stated before it can be checked.
+	// Without it a run's eight rows are eight anonymous references and nothing
+	// says they are eight different buckets.
+	bucket := strings.TrimSpace(v.Run.BucketID)
+	if bucket == "" {
+		return row + " names no bucket, so nothing says which of the run's buckets it observed"
+	}
+	obs := v.Run.RunID + "\x00" + bucket
+	if prev, ok := c.verdict[vd]; ok {
+		return fmt.Sprintf("%s is byte-identical to the verdict %s already counted; copying one signed measurement under a second name does not measure anything twice", row, prev)
+	}
+	if prev, ok := c.records[v.RecordsDigest]; ok {
+		return fmt.Sprintf("%s was derived from records %s, which %s already counted; two verdicts over one measurement are one observation", row, v.RecordsDigest, prev)
+	}
+	if prev, ok := c.observation[obs]; ok {
+		return fmt.Sprintf("%s claims bucket %q of run %q, which %s already counted; a run's buckets are observed once each", row, bucket, v.Run.RunID, prev)
+	}
+	c.verdict[vd] = row
+	c.records[v.RecordsDigest] = row
+	c.observation[obs] = row
+	return ""
 }
