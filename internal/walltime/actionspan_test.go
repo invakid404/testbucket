@@ -308,7 +308,7 @@ func TestTheActionChildRecordCarriesItsOwnProof(t *testing.T) {
 	}
 	// THE PROOF PRECEDES THE CHILD. The record was written after the spawn,
 	// so nothing committed preceded the execution it is proof of.
-	run := productionFunc(t, "action.go", "func RunInAction(")
+	run := productionFunc(t, "action.go", "func RunInActionWith(")
 	open := strings.Index(run, "openActionChild(dir, st, argv)")
 	start := strings.Index(run, "cmd.Start()")
 	if open < 0 || start < 0 {

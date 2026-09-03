@@ -347,46 +347,47 @@ own peer, both bracketing the same admission-to-verified-empty lifecycle —
 never a trace against the longer physical envelope, which would fail a
 correctly instrumented run for the crime of accounting for its own bootstrap.
 
-### Two blockers to an eligible scored row on a single-uid runner
+### What an eligible scored row requires, and what still fails closed
 
-These are known, unresolved architectural gaps, not bugs in the checks below.
-Both are refusals working correctly; what is missing is a deployment shape in
-which a genuine run can satisfy them. On a runner where the wrapper and the
-measured workload run as the **same uid** — which is every GitHub-hosted runner
-as this action ships — no scored row can be produced, and the verifier says so
-rather than pretending otherwise.
+A scored row needs two things the wrapper cannot give itself, and both are now
+shipped rather than deferred. What has not changed is the refusal: a deployment
+that does not provide them is recorded in full and reported INELIGIBLE.
 
-1. **No party can authorize a lower-level signer.** Script- and
-   invocation-level physical, peer and trace keys are minted at runtime by
-   wrappers the measured script starts. A key-log entry is admissible only if
-   the run key countersigned it (WT-032), and the run key is deliberately
-   scoped to `wall begin` and `wall end` — it is absent from the measured step.
-   Placing it there would hand it to the workload, which runs as the same uid
-   in the same process tree and can read the environment, argv and descriptors
-   of the wrappers it spawns. So there is no capability an inner wrapper can
-   hold that the workload cannot, and every genuine lower-level key is
-   unauthorized.
+1. **A party that can authorize a lower-level signer.** Script- and
+   invocation-level physical, peer and trace keys are minted at runtime, during
+   the measured step, where the run key deliberately is not. `wall begin` — which
+   does hold it — signs a SIGNER DELEGATION naming a fresh key, bounded to one
+   complete run identity and to levels-with-sequences (script and invocation
+   from 0, the action-owned children from 1, never the action envelope's own
+   signers at 0, which stay with the roster). The private half is printed on
+   stdout and handed to the measured step alone through a step output; it is
+   never written into the evidence directory, and it is scrubbed from every
+   observer and from every consumer-supplied command.
 
-2. **No party can own the containment the workload cannot write.** On cgroup-v2
-   `cgroup.procs` is the process-migration control. `newCgroupUnder` creates
-   each level's containment as the wrapper's own uid, so the resulting
-   `cgroup.procs` is owned by the uid the workload also runs as, and the
-   membership model is `workload-writable` (WT-031). A pre-created
-   supervisor-owned directory is refused as non-fresh, and the same-uid inner
-   wrappers could not create children under it in any case.
+2. **A party that owns the containment the measured work cannot write.** On
+   cgroup-v2 `cgroup.procs` is the process-migration control, and placing a
+   process into a sub-cgroup requires write access to the common ancestor's —
+   so a measured script that could create its own nested containments could
+   also rewrite the membership its envelope rests on. It does not create them:
+   the script-level wrapper stays alive as a CONTROLLER and creates, admits,
+   measures and records each invocation on request, authenticating every
+   requester with `SO_PEERCRED`. The measured script asks and holds nothing,
+   and its own containment stays owned by the wrapper.
 
-Closing either one requires a privilege boundary this action does not have:
-running the measured workload under a **different uid** from the wrapper (which
-changes the measured environment — `HOME`, checkout ownership, package caches —
-and is therefore a consumer-visible decision), or a **root-privileged
-supervisor** that creates containments and authorizes producer keys on the
-wrapper's behalf. A supervisor alone does not close (1): it cannot distinguish
-a legitimate inner wrapper from the workload executing the same binary at the
-same uid.
+Both need a deployment where the wrapper and the measured work are **different
+uids** — `workload-user` for the test code, `script-user` for the generated
+bucket script — plus a cgroup root the wrapper owns and an evidence parent that
+is setgid to the script group with an explicit owner. The run-bucket action's
+`workload-user` input documents the exact provisioning, including the two
+things that silently do not work: `usermod -aG` does not change a runner
+process that is already running, and `install -d` without `-o` leaves a
+root-owned parent the wrapper cannot write.
 
-Until one ships, `--require eligible` fails closed and the campaign gate has
-nothing to count. That is the intended behaviour of a system that refuses to
-assert a boundary it does not have.
+On a runner where the wrapper and the measured workload share one uid — which
+is what this action does by default — no scored row can be produced, and the
+verifier says so rather than pretending otherwise. `--require eligible` fails
+closed and the campaign gate has nothing to count. That is the intended
+behaviour of a system that refuses to assert a boundary it does not have.
 
 ### It fails closed
 

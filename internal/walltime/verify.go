@@ -630,6 +630,21 @@ func sortedKeys(streams map[streamKey][]Record) []streamKey {
 	return keys
 }
 
+// isActionChildStream reports whether a ledger is an action-owned child's
+// rather than an envelope's. Such a ledger carries only `action_child`
+// records: the pre-spawn containment proof and the child's own identity.
+func isActionChildStream(recs []Record) bool {
+	if len(recs) == 0 {
+		return false
+	}
+	for _, r := range recs {
+		if r.Kind != "action_child" {
+			return false
+		}
+	}
+	return true
+}
+
 // buildEnvelopes pairs the three producers at each level and sequence.
 func buildEnvelopes(v *Verdict, streams map[streamKey][]Record) []Envelope {
 	type envKey struct {
@@ -638,6 +653,22 @@ func buildEnvelopes(v *Verdict, streams map[streamKey][]Record) []Envelope {
 	}
 	byEnv := map[envKey]*Envelope{}
 	for _, key := range sortedKeys(streams) {
+		// AN ENVELOPE IS A THING WITH BOUNDARIES.
+		//
+		// An action-owned child keeps its own ledger, with its own sequence
+		// number so its hash chain is not merged with the envelope's — and
+		// that sequence used to mint a phantom envelope here, which then had
+		// no physical/peer/trace start/end pair and was reported WT-004
+		// terminal on every action that ran a setup or bucket command.
+		//
+		// The test is what the stream IS, not whether it happens to carry
+		// boundaries: a ledger whose every record is an action-owned child's
+		// is adjudicated by checkActionChildren against the action envelope it
+		// names. A physical ledger that LOST its boundaries still opens an
+		// envelope and is still terminal, which is what WT-004 is for.
+		if isActionChildStream(streams[key]) {
+			continue
+		}
 		ek := envKey{key.Level, key.Ordinal}
 		e, ok := byEnv[ek]
 		if !ok {

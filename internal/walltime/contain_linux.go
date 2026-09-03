@@ -336,7 +336,7 @@ func prepareEvidenceDir(dir string) error {
 	}
 	if int(sys.Gid) != gid {
 		return fmt.Errorf(
-			"%s belongs to group %d, not the script account's group %d, and the wrapper cannot change it: an unprivileged owner may only set a group it is itself in, and it is deliberately not in that one. Create the PARENT of the wall directory setgid to that group in the caller's privileged setup — `sudo install -d -m 2775 -g <script-group> <parent>` — so the kernel gives this directory the right group when it is created",
+			"%s belongs to group %d, not the script account's group %d, and the wrapper cannot change it: an unprivileged owner may only set a group it is itself in, and it is deliberately not in that one. Create the PARENT of the wall directory setgid to that group in the caller's privileged setup, WITH AN EXPLICIT OWNER — `sudo install -d -m 2775 -o \"$(id -un)\" -g <script-group> <parent>` — so the kernel gives this directory the right group when this wrapper creates it. Without the -o the parent belongs to root and this wrapper cannot create anything inside it at all",
 			dir, sys.Gid, gid)
 	}
 	return nil

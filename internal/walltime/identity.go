@@ -128,13 +128,24 @@ func VerifySignature(r Record) error {
 	return nil
 }
 
-// streamName is the per-producer, per-level stream file. One writer per file
-// is load-bearing: the hash chain is per stream, and two processes appending
-// to one file would interleave into a chain neither of them can close.
+// streamName is the per-producer, per-level, PER-SEQUENCE stream file. One
+// writer per file is load-bearing: the hash chain is per stream, and two
+// processes appending to one file would interleave into a chain neither of
+// them can close.
+//
+// THE SEQUENCE IS ALWAYS IN THE NAME, at every level.
+//
+// It used to be added only for invocations, so the action envelope (sequence
+// 0) and every action-owned child (sequence 1 and up) resolved to the same
+// path. The writer resumes a file-wide chain while the verifier groups records
+// by producer, level AND sequence — so the child's records began with the
+// envelope's chain state and were then read as a stream of their own, which is
+// a terminal WT-002 on every action that runs a setup or bucket command. That
+// is every measured action.
+//
+// A rule with a level in it is a rule that gets this wrong again the next time
+// a level acquires sequences. One logical identity, one file: the name carries
+// everything the verifier groups by.
 func streamName(p Producer, l Level, seq int) string {
-	base := string(p) + "." + string(l)
-	if l == LevelInvocation {
-		base += fmt.Sprintf(".%03d", seq)
-	}
-	return base + ".jsonl"
+	return fmt.Sprintf("%s.%s.%03d.jsonl", p, l, seq)
 }

@@ -71,11 +71,11 @@ const WorkloadUIDEnv = "TB_WALL_WORKLOAD_UID"
 //
 // It is a second account because the script and the test code are different
 // parties. The script body is harness-generated: it writes the invocation
-// specs and then starts the nested `wall exec` wrappers, which create and
-// admit the invocation containments — so it needs the delegated script subtree
-// and the test code must never have it. Running the script as the supervisor
-// instead made the level unscorable by the wrapper's own rule, because the
-// measured process was then the credential owning its own containment.
+// specs and then starts the nested `wall exec` wrappers, which ASK the
+// script-level wrapper to create, admit and measure each invocation. The
+// script creates no containment itself — that is what keeps its own
+// containment owned by the wrapper, and a measured process that owned its
+// containment is exactly what the membership rule refuses.
 //
 // Empty means the script level does not drop, is recorded in full and is
 // reported ineligible for want of the boundary — the same refusal an

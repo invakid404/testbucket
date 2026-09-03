@@ -154,20 +154,21 @@ func TestTheUnresolvedProducerBlockersAreStatedNotHidden(t *testing.T) {
 	}
 	readme := string(b)
 	for _, want := range []string{
-		"blockers to an eligible scored row",
-		"No party can authorize a lower-level signer",
-		"No party can own the containment the workload cannot write",
-		"different uid",
-		"root-privileged\nsupervisor",
+		"What an eligible scored row requires, and what still fails closed",
+		"A party that can authorize a lower-level signer",
+		"A party that owns the containment the measured work cannot write",
+		"different\nuids",
+		"`usermod -aG` does not change a runner",
+		"`install -d` without `-o`",
 	} {
 		if !strings.Contains(readme, want) {
-			t.Errorf("the README no longer states %q; the two refusals are unresolved architectural gaps, and a reader who cannot find that will read them as defects in the checks", want)
+			t.Errorf("the README no longer states %q; a reader who cannot find what a scored row requires — and the two provisioning steps that silently do not work — will read the refusals as defects in the checks", want)
 		}
 	}
 	// And the diagnostic itself points at the requirement, so an operator
 	// reading a verdict is not left to infer it.
 	v := verifySynth(t, nil, func(s *synthRun) { s.unauthorizedLowerKeys = true })
-	if len(findingsMentioning(v, "WT-032", "a different workload uid, or a privileged supervisor")) == 0 {
+	if len(findingsMentioning(v, "WT-032", "the signer delegation `wall begin` opens for the lower levels")) == 0 {
 		t.Errorf("WT-032 does not say what would make a lower-level signer admissible: %+v", v.Findings)
 	}
 }

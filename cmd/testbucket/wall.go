@@ -188,8 +188,7 @@ func runWallBegin(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "testbucket wall: action envelope open (containment %s, %s)\n",
 		st.Containment.ID, st.Containment.Primitive)
-	// THE SIGNER DELEGATE, ON STDOUT, FOR THE CALLER TO PLACE IN THE MEASURED
-	// STEP'S ENVIRONMENT.
+	// THE SIGNER DELEGATE: EXACTLY ONE LINE ON STDOUT.
 	//
 	// The script and invocation producers — and the action-owned children —
 	// mint their signing keys during the measured step, where no run key
@@ -200,11 +199,16 @@ func runWallBegin(args []string) error {
 	// where the reader is told to look is not isolated by scrubbing the
 	// variable that names it.
 	//
-	// Nothing else is written to stdout, so the caller reads exactly one line.
-	// The masking directive keeps it out of the job log even if a later step
-	// echoes the variable.
+	// THE MASK DIRECTIVE GOES TO STDERR, and this is the whole of what stdout
+	// carries. The caller captures stdout in a command substitution, so a
+	// second line there is captured too: the runner never sees the workflow
+	// command it was meant to process, and the captured value becomes
+	// `::add-mask::<key>` followed by a bare line, which the environment-file
+	// parser rejects and which no base64 decoder can read. The runner reads
+	// workflow commands from the step's log, which stderr is part of, so the
+	// mask still takes effect — and stdout stays exactly one decodable value.
 	if st.SignerDelegate != "" {
-		fmt.Printf("::add-mask::%s\n", st.SignerDelegate)
+		fmt.Fprintf(os.Stderr, "::add-mask::%s\n", st.SignerDelegate)
 		fmt.Println(st.SignerDelegate)
 	}
 	return nil
@@ -367,6 +371,16 @@ func runWallRun(args []string) error {
 	fs := flag.NewFlagSet("wall run", flag.ExitOnError)
 	dir := fs.String("dir", "", "records directory (required)")
 	cwd := fs.String("cwd", "", "working directory for the command")
+	// THE CAPABILITY BOUNDARY, DECLARED AT THE CALL SITE.
+	//
+	// Two very different commands run through `wall run`: the bucket command,
+	// which is this tool's own wrapper starting the measured script and needs
+	// the wall-time capabilities to do it, and the consumer-supplied setup
+	// command, which is somebody else's code and needs none of them. The
+	// default is the scrubbed environment, so a caller that does not think
+	// about it does not hand a signing capability to code it did not write.
+	wrapperChain := fs.Bool("wrapper-chain", false,
+		"this child continues the wrapper chain and needs the wall-time capabilities (the bucket command). Without it the child runs with every wall-time secret and account selector removed, which is what a consumer-supplied setup command must get")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -376,7 +390,10 @@ func runWallRun(args []string) error {
 	if len(fs.Args()) == 0 {
 		return fmt.Errorf("no command: pass it after --")
 	}
-	code, err := walltime.RunInAction(*dir, fs.Args(), *cwd, os.Stdout, os.Stderr)
+	code, err := walltime.RunInActionWith(walltime.RunInActionOptions{
+		Dir: *dir, Argv: fs.Args(), Cwd: *cwd,
+		Stdout: os.Stdout, Stderr: os.Stderr, WrapperChain: *wrapperChain,
+	})
 	if err != nil {
 		return err
 	}

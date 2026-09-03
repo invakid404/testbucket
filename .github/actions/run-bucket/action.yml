@@ -76,11 +76,13 @@ inputs:
       in full and reported INELIGIBLE.
 
       A scored row needs the subtree owned by a credential the measured
-      workload does NOT run as. That requires a privileged supervisor to create
-      and admit the nested containments, because a subtree protected from the
-      workload uid is equally unwritable by the same-uid inner wrappers. No
-      such supervisor ships here, so scored rows on a same-uid runner are
-      reported INELIGIBLE rather than scored on an absent boundary.
+      workload does NOT run as. The controller is what makes that possible: the
+      script-level wrapper keeps the credential and creates, admits and
+      measures each nested invocation on request, so the subtree never has to
+      be writable by anything measured. On a SAME-UID runner — no workload-user
+      and no script-user — there is still no boundary, and those rows are
+      recorded in full and reported INELIGIBLE rather than scored on an absent
+      one.
     default: ""
   workload-user:
     description: >-
@@ -102,11 +104,39 @@ inputs:
 
           sudo useradd --system --create-home --shell /bin/bash tb-workload
           sudo useradd --system --create-home --shell /bin/bash tb-script
-          sudo groupadd --system tb-wrapper
-          sudo usermod -aG tb-wrapper "$(id -un)"        # the WRAPPER, not the measured accounts
+
+          # THE WRAPPER'S CGROUP ACCESS IS AN OWNERSHIP, NOT A GROUP IT JOINS.
+          #
+          # `usermod -aG` does NOT change a process that is already running.
+          # The GitHub runner and every step it starts were created before any
+          # setup step could run, so their supplementary groups are already
+          # fixed: adding the runner user to a new group leaves the live
+          # wrapper without it, and the cgroup root stays unwritable however
+          # correct /etc/group looks. Give the delegated subtree to the runner
+          # user itself, which needs no group refresh, and the wrapper can
+          # write it in the very next step.
+          #
+          # (If a group is preferred, membership must be established BEFORE the
+          # runner process starts — a self-hosted image built with it — or each
+          # wrapper invocation must enter it in a NEW process, e.g.
+          # `sg tb-wrapper -c '...'`. A `usermod` in a setup step cannot do it.)
           sudo mkdir -p /sys/fs/cgroup/testbucket
-          sudo chown root:tb-wrapper /sys/fs/cgroup/testbucket
-          sudo chmod 0770 /sys/fs/cgroup/testbucket
+          sudo chown "$(id -un)" /sys/fs/cgroup/testbucket
+          sudo chmod 0755 /sys/fs/cgroup/testbucket
+
+          # THE EVIDENCE PARENT IS OWNED BY THE WRAPPER AND setgid TO THE
+          # SCRIPT GROUP.
+          #
+          # `wall begin` creates the wall directory inside this parent and then
+          # sets its mode; it does NOT change its group, because an
+          # unprivileged owner may only set a group it is itself in and the
+          # wrapper is deliberately not in the script's. setgid on the parent
+          # makes the kernel assign that group instead. The `-o` matters as
+          # much as the `-g`: without an explicit owner the parent belongs to
+          # root and the wrapper's own mkdir inside it fails with permission
+          # denied, before any explanatory refusal can run.
+          sudo install -d -m 2775 -o "$(id -un)" -g tb-script "$RUNNER_TEMP/testbucket-wall-parent"
+
           sudo chown -R tb-workload "$GITHUB_WORKSPACE"
           # The wrapper may become either measured account; neither may become
           # anything. Two accounts because there are two measured parties —
@@ -137,9 +167,11 @@ inputs:
 
       There are two measured parties, and one account cannot be both. The
       bucket script is harness-generated: it writes the invocation specs and
-      starts the nested `wall exec` wrappers, which create and admit the
-      invocation containments — so it needs the delegated script subtree.
-      The test code the invocations run must have none of that.
+      starts the nested `wall exec` wrappers, which ASK the script-level
+      wrapper to create, admit and measure each invocation. The script itself
+      creates no containment and writes no ledger, so its own containment stays
+      owned by the wrapper — which is what makes the level scorable. The test
+      code the invocations run holds less still.
 
       Running the script as this action's own user instead made the script
       level unscorable by the wrapper's own rule, because the measured process
@@ -167,12 +199,13 @@ inputs:
       row whose `cgroup.procs` is owned by the wrapper's uid is recorded in
       full and reported INELIGIBLE however this input is set.
 
-      A genuinely scored deployment needs the delegated subtree owned by a
-      credential this action does not run as, which in turn needs a privileged
-      supervisor to create and admit the nested containments on its behalf.
-      This action does not ship one, so on a same-uid runner every scored row
-      is ineligible — deliberately, because the alternative is asserting a
-      boundary that is not there.
+      A genuinely scored deployment needs the subtree owned by a credential
+      the measured work does not run as. The script-level wrapper is the party
+      that creates and admits the nested containments on the measured script's
+      behalf, so no separate privileged daemon is needed — but on a same-uid
+      runner, where nothing drops, every scored row is still ineligible:
+      deliberately, because the alternative is asserting a boundary that is not
+      there.
     default: ""
   scored:
     description: >-
@@ -276,6 +309,7 @@ runs:
     # the `install` action first. A missing wrapper fails here, before the
     # envelope opens, which is a precondition rather than unmeasured work.
     - name: Open the wall-time action envelope
+      id: begin
       if: inputs.wall-time-dir != ''
       shell: bash
       env:
@@ -305,17 +339,25 @@ runs:
         # The records directory is created by `wall begin` itself, INSIDE the
         # envelope: creating it here would put action-owned work before
         # AT_start and report an action shorter than the one that ran.
-        # THE SIGNER DELEGATE TRAVELS IN THE ENVIRONMENT, NOT ON DISK.
+        # THE SIGNER DELEGATE IS A STEP OUTPUT, NOT A JOB-GLOBAL VARIABLE.
         #
         # `wall begin` holds the run key and mints a delegate that may
         # authorize the signers the MEASURED step creates: the script and
         # invocation producers, and the action-owned children. That capability
-        # has to reach the measured step and nothing else, so it is printed on
-        # stdout here and exported for the later steps of this job — never
-        # written into the evidence directory, which the measured script can
-        # read and which every observer is handed as `--dir`.
+        # must reach the measured step and nothing else.
         #
-        # `wall begin` masks it before printing, so it cannot reach the job log.
+        # It used to be appended to $GITHUB_ENV, which puts it in the
+        # environment of EVERY later step in the job — including the
+        # consumer-supplied setup command, which is somebody else's code
+        # running with the wrapper credential. A step output is the narrow
+        # channel: it enters a step's environment only where that step names
+        # it, and the bucket step below is the only one that does.
+        #
+        # `wall begin` writes the masking directive to stderr and exactly one
+        # base64 value to stdout, so this command substitution captures the
+        # value alone. A workflow command captured here would be swallowed
+        # rather than processed, and would make the exported value two lines
+        # that no decoder can read.
         delegate="$(testbucket wall begin \
           --dir "$TB_WALL_DIR" \
           --bucket-id "$BUCKET_NAME" \
@@ -331,9 +373,15 @@ runs:
           --stage2 "$TB_STAGE2" \
           --registry "$TB_REGISTRY" \
           --verifier-id "$TB_VERIFIER_ID")"
-        if [ -n "$delegate" ]; then
-          echo "TB_WALL_SIGNER_DELEGATE_KEY=$delegate" >> "$GITHUB_ENV"
-        fi
+        case "$delegate" in
+          *[!A-Za-z0-9+/=]*|"")
+            if [ -n "$delegate" ]; then
+              echo "REFUSED: wall begin wrote something other than a single base64 value to stdout." >&2
+              exit 1
+            fi
+            ;;
+        esac
+        printf 'signer-delegate=%s\n' "$delegate" >> "$GITHUB_OUTPUT"
 
     # A consumer's own per-runner provisioning, run once before the bucket's test
     # command. Passed through the environment and executed as a bash block (never
@@ -362,6 +410,10 @@ runs:
       run: |
         set -euo pipefail
         if [ -n "$TB_WALL_DIR" ]; then
+          # NO --wrapper-chain: this is the CONSUMER'S command. `wall run`
+          # strips every wall-time secret and account selector from its child,
+          # so caller-supplied code never runs holding the signer delegate or
+          # anything else that could decide whose evidence a run admits.
           testbucket wall run --dir "$TB_WALL_DIR" -- bash -eo pipefail -c "$TB_SETUP_COMMAND"
         else
           bash -eo pipefail -c "$TB_SETUP_COMMAND"
@@ -390,10 +442,19 @@ runs:
         # boundary was established, and the row is recorded in full and
         # reported INELIGIBLE rather than scored.
         TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
-        # The bucket script's own account. The wrapper delegates the script
-        # containment to it and drops to it before starting the script, so the
-        # measured script is not the credential owning what contains it.
+        # The bucket script's own account. The wrapper drops to it before
+        # starting the script, so the measured script is not the credential
+        # owning what contains it; the invocation containments beneath it are
+        # created by the wrapper's controller rather than by the script.
         TB_WALL_SCRIPT_USER: ${{ inputs.script-user }}
+        # THE SIGNER DELEGATE, NAMED BY THE ONE STEP THAT NEEDS IT.
+        #
+        # This is the only step that references the begin step's output, so it
+        # is the only step whose environment carries the capability. The
+        # consumer-supplied setup step above does not name it, and `wall run`
+        # strips it from that child's environment as well — two independent
+        # reasons caller-controlled code cannot hold it.
+        TB_WALL_SIGNER_DELEGATE_KEY: ${{ steps.begin.outputs.signer-delegate }}
         TB_SCORED: ${{ inputs.scored }}
         TB_VERSION: ${{ inputs.version }}
       run: |
@@ -425,7 +486,11 @@ runs:
         # anywhere. Dead wiring that reads like a boundary is worse than none.
         if [ -n "$TB_WALL_DIR" ]; then
           set +e
-          testbucket wall run --dir "$TB_WALL_DIR" -- bash -euo pipefail -c '
+          # --wrapper-chain: this child IS the wrapper chain. The script-level
+          # wrapper it starts registers its own producers and its controller
+          # registers the invocation ones, so it needs the capabilities the
+          # setup command must not have.
+          testbucket wall run --dir "$TB_WALL_DIR" --wrapper-chain -- bash -euo pipefail -c '
             # Delivery identity, checked INSIDE the envelope so a refusal is
             # retained as a terminal record. The installer resolves `local`, a
             # moving alias or an exact tag and nothing else; there is no

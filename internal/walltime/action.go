@@ -427,6 +427,32 @@ func endObserver(o *observerProc) string {
 // script envelope would misname it. Its duration lands in the physical action
 // prologue, where the Aeta registry forecasts it.
 func RunInAction(dir string, argv []string, cwd string, stdout, stderr *os.File) (int, error) {
+	return RunInActionWith(RunInActionOptions{Dir: dir, Argv: argv, Cwd: cwd, Stdout: stdout, Stderr: stderr})
+}
+
+// RunInActionOptions is one action-owned command and whether it CONTINUES THE
+// WRAPPER CHAIN.
+//
+// That distinction is a capability boundary, not a convenience. Two very
+// different commands run through this path: the bucket command, which is this
+// tool's own wrapper starting the measured script and therefore needs the
+// wall-time capabilities to do it, and the consumer-supplied SETUP command,
+// which is somebody else's code and needs none of them.
+type RunInActionOptions struct {
+	Dir            string
+	Argv           []string
+	Cwd            string
+	Stdout, Stderr *os.File
+	// WrapperChain says this child is the wrapper chain continuing. It is
+	// false by default, so a caller that does not think about it gets the
+	// scrubbed environment.
+	WrapperChain bool
+}
+
+// RunInActionWith is RunInAction with the wrapper-chain distinction made
+// explicit.
+func RunInActionWith(o RunInActionOptions) (int, error) {
+	dir, argv, cwd, stdout, stderr := o.Dir, o.Argv, o.Cwd, o.Stdout, o.Stderr
 	if len(argv) == 0 {
 		return 1, fmt.Errorf("walltime: no command to run")
 	}
@@ -452,6 +478,21 @@ func RunInAction(dir string, argv []string, cwd string, stdout, stderr *os.File)
 		stderr = os.Stderr
 	}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
+	// THE CAPABILITIES DO NOT TRAVEL INTO CONSUMER-CONTROLLED CODE.
+	//
+	// `Cmd.Env` was nil here, which makes Go pass this process's whole
+	// environment through — and the consumer-supplied setup command runs on
+	// exactly this path. The signer delegate reached it, so caller-controlled
+	// code ran holding the capability that decides which keys may attest a
+	// run's evidence. The account selectors reached it too, and this path
+	// performs no credential drop.
+	//
+	// The bucket command is the wrapper chain continuing and does need them:
+	// the script-level wrapper it starts registers its own producers and its
+	// controller registers the invocation ones. That case says so.
+	if !o.WrapperChain {
+		cmd.Env = scrubSecrets(nil)
+	}
 	// EVERY ACTION-OWNED CHILD is retained, because the contract requires
 	// containment proof before every one of them and RunInAction may be called
 	// more than once. The record is appended to the action stream with the

@@ -144,3 +144,72 @@ func TestTheKeyLogIsWrittenOnlyByTheWrapper(t *testing.T) {
 		t.Errorf("the client measures at %d before asking at %d, so it would write the ledgers itself", measure, ask)
 	}
 }
+
+// TestTheProvisioningRecipeIsRunnable is the F4 regression.
+//
+// Two commands in the documented setup could never work, and both fail
+// silently in ways that look like something else:
+//
+//   - `sudo install -d -m 2775 -g <group> <parent>` without `-o` leaves the
+//     parent owned by ROOT. The wrapper is not in the script group, so mode
+//     2775 gives it only the other-class bits, and `BeginAction`'s own
+//     `MkdirAll` fails with permission denied before the explanatory refusal
+//     can run.
+//   - `usermod -aG` does not change a process that already exists.
+//     Supplementary groups are fixed at process creation, so the running
+//     GitHub runner and every step it starts never acquire the group; the
+//     cgroup root stays unwritable however correct /etc/group looks.
+func TestTheProvisioningRecipeIsRunnable(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", ".github", "actions", "run-bucket", "action.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	yml := string(b)
+
+	// The evidence parent is created WITH AN EXPLICIT OWNER.
+	install := strings.Index(yml, "install -d -m 2775")
+	if install < 0 {
+		t.Fatal("the provisioning example no longer creates a setgid evidence parent")
+	}
+	line := yml[install:]
+	if end := strings.IndexByte(line, '\n'); end > 0 {
+		line = line[:end]
+	}
+	if !strings.Contains(line, "-o ") {
+		t.Errorf("the evidence parent is created without an explicit owner, so it belongs to root and the wrapper cannot create the wall directory inside it: %s", strings.TrimSpace(line))
+	}
+	if !strings.Contains(line, "-g ") {
+		t.Errorf("the evidence parent carries no group for the setgid inheritance to apply: %s", strings.TrimSpace(line))
+	}
+
+	// The cgroup root is OWNED by the wrapper rather than granted through a
+	// group the live runner cannot join.
+	for _, line := range strings.Split(yml, "\n") {
+		code, _, _ := strings.Cut(line, "#")
+		if strings.Contains(code, "usermod -aG") {
+			t.Errorf("the provisioning still adds the live runner to a group, which does not affect the already-running process: %s", strings.TrimSpace(line))
+		}
+		if strings.Contains(code, "chown root:tb-wrapper") {
+			t.Errorf("the cgroup root is given to a group the running wrapper does not hold: %s", strings.TrimSpace(line))
+		}
+	}
+	if !strings.Contains(yml, `sudo chown "$(id -un)" /sys/fs/cgroup/testbucket`) {
+		t.Error("the cgroup root is not owned by the wrapper's own user, which is the only form that needs no group refresh")
+	}
+	// And the reason is written down where the next person will read it.
+	for _, want := range []string{
+		"does NOT change a process that is already running",
+		"membership must be established BEFORE the",
+		"without an explicit owner the parent belongs to",
+	} {
+		if !strings.Contains(yml, want) {
+			t.Errorf("the provisioning does not explain %q", want)
+		}
+	}
+
+	// The wrapper's own diagnostic names the same fix, including the -o.
+	prep := productionFunc(t, "contain_linux.go", "func prepareEvidenceDir(")
+	if !strings.Contains(prep, `-o \"$(id -un)\"`) {
+		t.Error("the refusal recommends an install without an explicit owner, which cannot work")
+	}
+}

@@ -273,3 +273,67 @@ func mustDecode(t *testing.T, encoded string) ed25519.PrivateKey {
 	}
 	return k
 }
+
+// TestADelegationIsBoundToTheWholeRunIdentity is the F5 regression.
+//
+// The delegation says it authorizes one run, and Verify compared RunID alone.
+// Every bucket of a matrix shares one GitHub run id and every retry attempt
+// keeps it — so a delegate minted for one bucket authorized the signers of
+// every other bucket and of every later attempt, a replay across exactly the
+// boundaries the identity exists to separate.
+func TestADelegationIsBoundToTheWholeRunIdentity(t *testing.T) {
+	runKey := mustSigningKey()
+	want := RunIdentity{
+		CampaignID: "ewj2", RunID: "shared-run", AttemptID: "1", BucketID: "bucket-0",
+		Repository: "invakid404/testbucket", WorkflowRun: "100", Job: "test",
+		Step: "run-bucket", StepAttempt: "1",
+		Stage1: "sha256:s1", Stage2: "sha256:s2",
+		ComponentRegistry: "sha256:registry", VerifierID: "ewj2-verifier",
+	}
+	d := SignerDelegation{
+		Kind: SignerDelegationKind, Run: want, PublicKey: PublicKeyOf(mustSigningKey()),
+		Scopes: []DelegationScope{{Level: LevelInvocation, MinSeq: 0}}, Binary: SelfDigest(),
+	}
+	if err := d.Sign(runKey); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{PublicKeyOf(runKey)}
+	if _, err := d.Verify(want, keys); err != nil {
+		t.Fatalf("the run it was minted for was refused: %v", err)
+	}
+
+	// EVERY FIELD IS A BOUNDARY. Each of these keeps the same RunID.
+	for _, tc := range []struct {
+		name string
+		edit func(*RunIdentity)
+	}{
+		{"another bucket of the same matrix", func(r *RunIdentity) { r.BucketID = "bucket-7" }},
+		{"a later attempt of the same run", func(r *RunIdentity) { r.AttemptID = "2" }},
+		{"another campaign", func(r *RunIdentity) { r.CampaignID = "somebody-elses" }},
+		{"another repository", func(r *RunIdentity) { r.Repository = "someone/else" }},
+		{"another job", func(r *RunIdentity) { r.Job = "other-job" }},
+		{"another step attempt", func(r *RunIdentity) { r.StepAttempt = "3" }},
+		{"another Stage-1 manifest", func(r *RunIdentity) { r.Stage1 = "sha256:other" }},
+		{"another Stage-2 receipt", func(r *RunIdentity) { r.Stage2 = "sha256:other" }},
+		{"another component registry", func(r *RunIdentity) { r.ComponentRegistry = "sha256:other" }},
+		{"another verifier", func(r *RunIdentity) { r.VerifierID = "other-verifier" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			other := want
+			tc.edit(&other)
+			if other.RunID != want.RunID {
+				t.Fatal("this case must keep the RunID, or it proves nothing about the old comparison")
+			}
+			if _, err := d.Verify(other, keys); err == nil {
+				t.Errorf("a delegation minted for %s was accepted for %s solely because the run id matched", want.BucketID, tc.name)
+			}
+		})
+	}
+
+	// A caller with no run loaded asks only for the document's own claims to
+	// be validated, which is how the delegation is checked before a run
+	// identity is known.
+	if _, err := d.Verify(RunIdentity{}, keys); err != nil {
+		t.Errorf("validating the document alone was refused: %v", err)
+	}
+}

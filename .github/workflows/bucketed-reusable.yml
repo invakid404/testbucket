@@ -154,10 +154,11 @@ on:
         description: >-
           The account the measured BUCKET SCRIPT runs under, distinct both from
           the wrapper's account and from workload-user. There are two measured
-          parties: the harness-generated bucket script, which starts the nested
-          invocation wrappers and therefore needs the delegated script subtree,
-          and the test code, which must have none of it. Running the script as
-          the wrapper made that level unscorable by the wrapper's own rule.
+          parties: the harness-generated bucket script, which starts the
+          nested invocation wrappers that ASK the script-level wrapper to
+          create and measure each invocation, and the test code, which holds
+          less still. Running the script as the wrapper made that level
+          unscorable by the wrapper's own rule.
           Establish the account alongside workload-user in a PRIOR step of the
           calling job; left empty the script level is recorded in full and
           reported INELIGIBLE rather than scored.
@@ -174,8 +175,10 @@ on:
 
           This input cannot create that boundary and is not trusted to: the
           wrapper's own uid always counts as the workload's. A scored arm needs
-          a privileged supervisor owning the subtree, which does not ship
-          here.
+          the subtree owned by a credential the measured work does not run as,
+          which is what workload-user and script-user establish; the nesting
+          beneath the script containment is done by the script-level wrapper
+          on request rather than by the measured script.
         type: string
         default: ""
       campaign-id:

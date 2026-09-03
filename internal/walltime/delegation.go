@@ -101,8 +101,22 @@ func (d SignerDelegation) Verify(run RunIdentity, keys []string) (string, error)
 	if strings.TrimSpace(d.PublicKey) == "" {
 		return "", fmt.Errorf("the signer delegation names no delegate key")
 	}
-	if run.RunID != "" && d.Run.RunID != run.RunID {
-		return "", fmt.Errorf("the signer delegation is for run %q, not %q", d.Run.RunID, run.RunID)
+	// THE WHOLE RUN IDENTITY, not one field of it.
+	//
+	// This compared RunID alone. Every bucket of a matrix shares one GitHub
+	// run id and every retry attempt keeps it, so a delegation minted for one
+	// bucket authorized the signers of every other bucket and of every later
+	// attempt — a replay across exactly the boundaries the identity exists to
+	// separate. The signature already covers the delegation's own Run; what
+	// was missing was checking it against the run asking.
+	//
+	// An empty request means "no run to check against", which is how a caller
+	// that has not loaded one asks for the document's own claims to be
+	// validated; a request that names a run must match it in full.
+	if (run != RunIdentity{}) {
+		if diff := runIdentityDiff(d.Run, run); diff != "" {
+			return "", fmt.Errorf("the signer delegation is bound to another run: %s", diff)
+		}
 	}
 	for _, sc := range d.Scopes {
 		// THE ACTION ENVELOPE'S OWN SIGNERS ARE THE ROSTER'S.
@@ -228,5 +242,22 @@ func delegateKeyFromEnv() (ed25519.PrivateKey, error) {
 	if v == "" {
 		return nil, nil
 	}
+	// ONE LINE, AND IT SAYS SO WHEN IT IS NOT.
+	//
+	// The caller exports what `wall begin` printed on stdout. When that
+	// carried a masking directive as well, the exported value was two lines
+	// and the failure surfaced as `illegal base64 data at input byte 0` — a
+	// message about encoding for a defect about channels. Naming the actual
+	// shape is the difference between a diagnosable refusal and an afternoon.
+	if strings.ContainsAny(v, "\r\n") {
+		return nil, fmt.Errorf(
+			"%s holds %d lines; it must be exactly the one base64 value `wall begin` writes to stdout — a workflow command or diagnostic captured alongside it is not part of the key",
+			SignerDelegateKeyEnv, strings.Count(v, "\n")+1)
+	}
 	return DecodeKey(v)
 }
+
+// LoadDelegateKeyForTest exposes the delegate reader so a command-level test
+// can check the value the action exports through the same code production
+// uses. Production reads it through RegisterKeyFor.
+func LoadDelegateKeyForTest() (ed25519.PrivateKey, error) { return delegateKeyFromEnv() }

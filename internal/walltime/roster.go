@@ -507,7 +507,7 @@ func verifySignerSet(v *Verdict, opt VerifyOptions, declared []string, recs []Re
 			if !unauthorized[e.PublicKey] {
 				unauthorized[e.PublicKey] = true
 				v.add("WT-032", SeverityIneligible, fmt.Sprintf(
-					"the key log registers %s/%s signer %s %v; the log is written during the measured step, so a self-registered lower-level key is the measured work choosing who attests it. Admitting one needs a producer path holding a capability the workload does not — a different workload uid, or a privileged supervisor — which this wrapper does not ship: see README, blockers to an eligible scored row",
+					"the key log registers %s/%s signer %s %v; the log is written during the measured step, so a self-registered lower-level key is the measured work choosing who attests it. Admitting one needs a party holding a capability the measured work does not: the run key, which `wall begin` and `wall end` hold, or the signer delegation `wall begin` opens for the lower levels and hands to the measured step alone. Neither reached this entry",
 					e.Producer, e.Level, e.PublicKey, err))
 			}
 			continue
