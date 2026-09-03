@@ -256,8 +256,8 @@ func Exec(opt ExecOptions) (int, error) {
 	}
 	trace, err := startObserver(ProducerTrace, opt, cont.Identity(), deadline, false)
 	if err != nil {
-		peer.abandon()
-		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "start trace collector: "+err.Error())
+		reason := joinReason("start trace collector: "+err.Error(), abandonReason(peer.abandon()))
+		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, reason)
 	}
 
 	// No child may start before the peer's admission receipt exists, and the
@@ -269,18 +269,18 @@ func Exec(opt ExecOptions) (int, error) {
 	// already started, it is watching the containment, and the wrapper is
 	// about to return a terminal record saying the lifecycle never opened.
 	if err := peer.admit(deadline); err != nil {
-		peer.abandon()
-		trace.abandon()
-		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
+		reason := joinReason(err.Error(), abandonReason(peer.abandon()))
+		reason = joinReason(reason, abandonReason(trace.abandon()))
+		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, reason)
 	}
 	if err := trace.admit(deadline); err != nil {
-		trace.abandon()
+		reason := joinReason(err.Error(), abandonReason(trace.abandon()))
 		// The peer admitted, so it is given the chance to close cleanly and
 		// leave a closing record; abandon is the fallback when it will not.
 		if closeErr := peer.close(deadline); closeErr != nil {
-			peer.abandon()
+			reason = joinReason(reason, abandonReason(peer.abandon()))
 		}
-		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
+		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, reason)
 	}
 
 	code, proc, termState, reason := runChild(opt, cont, deadline, w, clock)
@@ -602,6 +602,16 @@ func awaitChild(cont Containment, sigs <-chan os.Signal, done <-chan error, dead
 	case <-reapTimer.C:
 		return cancelled, escalation, errUnreaped
 	}
+}
+
+// abandonReason renders a refusal to signal as text for the record. An
+// observer that could not be ended safely is part of what happened, so it
+// travels with the terminal reason rather than being dropped on the floor.
+func abandonReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func joinReason(a, b string) string {
@@ -951,6 +961,22 @@ type observerProc struct {
 	start  string
 	ctl    control
 	stream string
+	// pin and identify override the two KERNEL FACILITIES this handle's
+	// authority rests on: pinned-handle signalling, and reading who is at a
+	// pid. Production leaves both nil and gets the platform implementations.
+	//
+	// They exist so the refusal path can be exercised on every host. That
+	// path only runs where a handle is authenticated but no stable kernel
+	// handle can be obtained — a combination no machine this suite runs on
+	// produces, because Linux supplies pidfd and hosts without process
+	// identities fail authentication earlier. It decides whether the wrapper
+	// signals a pid it cannot pin, so leaving it to whichever host happens to
+	// reach it is how it went unchecked in the first place.
+	//
+	// They are per-observer rather than package variables so that tests
+	// installing them cannot race each other.
+	pin      func(int, string, syscall.Signal) bool
+	identify func(int) string
 	// pub is the observer's signing identity, kept so the wrapper can declare
 	// it in the roster or register it in the key log. The PRIVATE half never
 	// comes back here — it goes down a pipe into the child and nowhere else.
@@ -1232,11 +1258,16 @@ func (o *observerProc) close(deadline time.Time) error {
 		// The observer never learned to stop. Returning here left it running
 		// for its whole timeout with the caller holding an error and no
 		// intention of trying again.
-		o.abandon()
+		abandonErr := o.abandon()
+		if abandonErr != nil {
+			return fmt.Errorf("signal %s close: %w; %s", o.producer, err, abandonErr)
+		}
 		return fmt.Errorf("signal %s close: %w", o.producer, err)
 	}
 	if err := o.awaitBoundary("end", deadline); err != nil {
-		o.abandon()
+		if abandonErr := o.abandon(); abandonErr != nil {
+			return fmt.Errorf("%w; %s", err, abandonErr)
+		}
 		return err
 	}
 	if o.cmd == nil {
@@ -1348,7 +1379,16 @@ func (o *observerProc) ownsPID() bool {
 		// honest record.
 		return false
 	}
-	return processStartID(o.pid) == o.start
+	return o.identityOf(o.pid) == o.start
+}
+
+// identityOf reads who is at a pid, through the platform unless a test has
+// installed a stand-in.
+func (o *observerProc) identityOf(pid int) string {
+	if o.identify != nil {
+		return o.identify(pid)
+	}
+	return processStartID(pid)
 }
 
 func (o *observerProc) stillRunning() bool {
@@ -1381,7 +1421,7 @@ func (o *observerProc) stillRunning() bool {
 		// see ownsPID.
 		return true
 	}
-	return processStartID(o.pid) == o.start
+	return o.identityOf(o.pid) == o.start
 }
 
 // reapExitedChild collects an exited child without blocking, and reports
@@ -1406,11 +1446,11 @@ func reapExitedChild(pid int) bool {
 // abandon kills an observer whose lifecycle cannot be completed. Its partial
 // stream stays on disk: a truncated observation is evidence, and deleting it
 // would turn an ineligible row into a missing one.
-func (o *observerProc) abandon() {
+func (o *observerProc) abandon() error {
 	if o.cmd != nil && o.cmd.Process != nil {
 		_ = o.cmd.Process.Kill()
 		_ = o.cmd.Wait()
-		return
+		return nil
 	}
 	// A DETACHED observer reconstructed from the action state has no cmd, and
 	// a lifecycle that cannot be completed still has to end. It is not this
@@ -1438,7 +1478,7 @@ func (o *observerProc) abandon() {
 	// The observer's own timeout still ends it, and the lifecycle stays
 	// incomplete, which is the honest record.
 	if !o.ownsPID() {
-		return
+		return nil
 	}
 	// THROUGH A HANDLE WHERE ONE EXISTS, because ownsPID answering yes and the
 	// signal landing are two moments, and the pid may change hands between
@@ -1447,17 +1487,41 @@ func (o *observerProc) abandon() {
 		// Our own unreaped child: the handle cannot be redirected, and the
 		// kernel cannot reuse the number while we hold it.
 		_ = o.proc.Signal(syscall.SIGKILL)
-		return
+		return nil
 	}
-	if signalByIdentity(o.pid, o.start, syscall.SIGKILL) {
-		return
+	if o.pinnedSignal()(o.pid, o.start, syscall.SIGKILL) {
+		return nil
 	}
-	// No handle available on this platform. The identity was checked and the
-	// signal is sent by number, which is the older, racier path and the reason
-	// the two above are preferred.
-	if o.stillRunning() {
-		_ = syscall.Kill(o.pid, syscall.SIGKILL)
+	// NO STABLE HANDLE, SO NO SIGNAL.
+	//
+	// What used to be here was a last-resort kill by number, guarded by one
+	// more identity check. That guard cannot work: the check and the signal
+	// are two syscalls with a scheduling point between them, so the process
+	// can exit and the kernel can hand its pid to something else in the gap —
+	// and the signal then lands on whatever now holds the number. The check
+	// makes the window narrow, not absent, and the thing on the other side of
+	// it is the runner's unrelated work.
+	//
+	// The observer is left to its own timeout, which ends it without anyone
+	// having to guess. That leaves the lifecycle incomplete, which is a fact
+	// the caller records rather than a failure to act: an incomplete lifecycle
+	// is recoverable, and killing an unrelated process is not.
+	return fmt.Errorf("the %s observer (pid %d) could not be ended safely: no stable kernel handle for it was available, and signalling the bare number could reach a process that has since taken it; the observer's own timeout must end it", o.producer, o.pid)
+}
+
+// pinnedSignal is the platform's pinned-handle signalling, or the override a
+// test installs to exercise a host WITHOUT one.
+//
+// The override exists because the refusal above is unreachable on the hosts
+// this suite runs on: Linux supplies pidfd, and where pidfd is missing the
+// only handles that reach this point already failed ownsPID. A branch that
+// cannot be exercised is a branch nobody has checked, and this one decides
+// whether the wrapper signals a pid it cannot pin.
+func (o *observerProc) pinnedSignal() func(int, string, syscall.Signal) bool {
+	if o.pin != nil {
+		return o.pin
 	}
+	return signalByIdentity
 }
 
 func (o *observerProc) awaitBoundary(boundary string, deadline time.Time) error {

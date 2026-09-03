@@ -411,9 +411,21 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 // because "the cleanup ran" and "the cleanup worked" are different facts, and
 // only the second one may be asserted.
 func endObserver(o *observerProc) string {
-	o.abandon()
+	// A REFUSAL IS PART OF WHAT HAPPENED. When no stable handle for the
+	// observer was available, abandon signals nothing at all rather than
+	// guessing at a pid, and the note has to say so — "the cleanup ran" and
+	// "the cleanup was declined for safety" are different facts, and a reader
+	// deciding whether anything is still watching the containment needs the
+	// second one.
+	refused := o.abandon()
 	if o.stillRunning() {
+		if refused != nil {
+			return fmt.Sprintf("the %s observer (pid %d) is still running and was NOT signalled: %s", o.producer, o.pid, refused)
+		}
 		return fmt.Sprintf("the %s observer (pid %d) was signalled but had NOT exited", o.producer, o.pid)
+	}
+	if refused != nil {
+		return fmt.Sprintf("the %s observer is gone, though it was not signalled: %s", o.producer, refused)
 	}
 	return fmt.Sprintf("the %s observer exited and was reaped", o.producer)
 }

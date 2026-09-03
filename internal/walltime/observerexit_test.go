@@ -3,6 +3,7 @@ package walltime
 import (
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -253,5 +254,69 @@ func TestTheRegistryReleasesAPIDOnceItIsReaped(t *testing.T) {
 	bare := &observerProc{producer: ProducerPeer, pid: pid, proc: recallObserver(pid)}
 	if bare.ownsPID() {
 		t.Error("a reaped pid still claimed ownership; the number is the kernel's again")
+	}
+}
+
+// WITHOUT A STABLE HANDLE, NOTHING IS SIGNALLED — and this runs everywhere.
+//
+// A cross-process reconstruction holds an OBSERVATION: this pid carried this
+// start identity when it was last looked at. Turning that into a kill takes
+// two syscalls, and between them the process can exit and the kernel can give
+// its pid to something else. The old fallback checked the identity once more
+// and then killed by number, which narrows that window without closing it —
+// and what is on the other side of it is the runner's unrelated work.
+//
+// The branch only runs where a handle authenticates but no stable kernel
+// handle can be had: Linux supplies pidfd, and hosts with no process
+// identities fail authentication earlier, so no machine this suite runs on
+// reaches it by itself. That is exactly how it went unguarded — the committed
+// pidfd test skips when pidfd is missing. Both kernel facilities are stood in
+// for here so the decision is exercised on every host rather than on whichever
+// one happens to qualify.
+func TestWithoutAPinnedHandleNothingIsSignalledByNumber(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+
+	const recorded = "the-identity-the-opening-step-recorded"
+	pinAsked := false
+	o := &observerProc{
+		producer: ProducerPeer,
+		pid:      cmd.Process.Pid,
+		start:    recorded,
+		// The identity matches, so this handle IS authenticated: the refusal
+		// under test is about the missing handle, not a failed check.
+		identify: func(int) string { return recorded },
+		// A host whose kernel cannot pin a process: an old kernel, seccomp, or
+		// a pidfd_open that simply failed.
+		pin: func(int, string, syscall.Signal) bool { pinAsked = true; return false },
+	}
+
+	if !o.ownsPID() {
+		t.Fatal("the handle under test is not authenticated, so it never reaches the branch this guards")
+	}
+
+	err := o.abandon()
+	if !pinAsked {
+		t.Error("abandon did not try for a stable handle before deciding")
+	}
+	// Reported, not merely declined: an unreported refusal is not recorded
+	// anywhere either. Checked with Error rather than Fatal so that the
+	// liveness assertion below still runs and names what actually happened.
+	if err == nil {
+		t.Error("abandon reported success without a stable handle; a refusal that is not reported is not recorded either")
+	} else if !strings.Contains(err.Error(), "could not be ended safely") {
+		t.Errorf("the refusal %q does not say the observer could not be ended safely", err)
+	}
+
+	// THE POINT: the process is still alive. A by-number kill would have
+	// reached it — and would reach whatever else had taken the number.
+	if sig, died := diedFromWithin(t, cmd, 500*time.Millisecond); died {
+		t.Fatalf("no stable handle was available, but abandon signalled pid %d anyway (%v); "+
+			"the identity check and the signal are two syscalls with a gap between them", o.pid, sig)
 	}
 }
