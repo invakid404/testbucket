@@ -228,38 +228,57 @@ func TestTheMembershipDecisionCountsThisProcesssOwnCredential(t *testing.T) {
 		name     string
 		owner    uint32
 		widened  bool
+		resolved int
 		declared []int
 		want     string
 	}{
 		// The single-credential runner: nothing declared, so the workload is
 		// taken to share this process's credential and owns what it could
 		// write. This is the shape that cannot be scored.
-		{"owned by this process, nothing declared", self, false, nil, MembershipWorkloadWritable},
-		// A DECLARED workload account that differs from the owner is the
-		// supervised shape. The declaration is not taken on trust: the wrapper
-		// SPAWNS the measured command as that account, so a false one fails
-		// the measurement rather than minting a scored row, and the verifier
-		// separately requires the measured process's own uid to differ from
-		// the containment owner's.
-		{"owned by the wrapper with a distinct workload declared", self, false, []int{self + 1}, MembershipSupervisorOwned},
-		{"owned by a declared workload uid among several", self, false, []int{4, self}, MembershipWorkloadWritable},
+		{"owned by this process, nothing declared", self, false, 0, nil, MembershipWorkloadWritable},
+
+		// A RESOLVED workload account that differs from the owner is the
+		// supervised shape, and the only thing that may replace this process's
+		// uid in the decision. TB_WALL_WORKLOAD_USER is a NAME looked up in
+		// the accounts database, so a uid that comes back and differs from
+		// this process's is a second credential that demonstrably exists — and
+		// it is not taken on trust either: the wrapper spawns the measured
+		// command as that account, so a false one fails the measurement, and
+		// the verifier separately requires the measured process's own uid to
+		// differ from the containment owner's.
+		{"owned by the wrapper with a distinct workload account resolved", self, false, self + 1, []int{self + 1}, MembershipSupervisorOwned},
+
+		// A BARE DECLARED NUMBER MAY NOT. TB_WALL_WORKLOAD_UID is an integer
+		// list from the caller that nothing verifies, and treating it as a
+		// replacement let a caller mint the boundary by naming any uid at all:
+		// a file this very process owns then reported supervisor-owned, which
+		// is the one answer that scores. On Linux that is exactly what CI
+		// caught; on a platform with no accounts database to read it was
+		// invisible.
+		{"owned by this process with a distinct uid merely declared", self, false, 0, []int{self + 1}, MembershipWorkloadWritable},
+		{"owned by a declared workload uid among several", self, false, 0, []int{4, self}, MembershipWorkloadWritable},
+		// Root is not a resolution: zero is the safe zero value, so a caller
+		// that sets nothing gets the conservative answer.
+		{"owned by this process with root named as the workload", self, false, 0, []int{self + 1}, MembershipWorkloadWritable},
 
 		// A declaration WIDENS: another uid, declared as the workload's.
-		{"owned by a declared workload uid", 4242, false, []int{4242}, MembershipWorkloadWritable},
-		{"owned by one of several declared uids", 4242, false, []int{7, 4242}, MembershipWorkloadWritable},
-		{"world-writable however it is owned", 4242, true, []int{7}, MembershipWorkloadWritable},
+		{"owned by a declared workload uid", 4242, false, 0, []int{4242}, MembershipWorkloadWritable},
+		{"owned by one of several declared uids", 4242, false, 0, []int{7, 4242}, MembershipWorkloadWritable},
+		{"world-writable however it is owned", 4242, true, 0, []int{7}, MembershipWorkloadWritable},
+		// And widening still applies alongside a resolved account.
+		{"owned by a uid widened beside a resolved account", 4242, false, self + 1, []int{self + 1, 4242}, MembershipWorkloadWritable},
 
 		// The only scorable shape.
-		{"owned by a credential nobody here runs as", 4242, false, []int{7}, MembershipSupervisorOwned},
+		{"owned by a credential nobody here runs as", 4242, false, 0, []int{7}, MembershipSupervisorOwned},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := membershipModelFor(MembershipFacts{
 				OwnerUID: tc.owner, OtherWritable: tc.widened,
-				SelfUID: self, WorkloadUIDs: tc.declared,
+				SelfUID: self, WorkloadUID: tc.resolved, WorkloadUIDs: tc.declared,
 			})
 			if got != tc.want {
-				t.Errorf("membershipModelFor(owner=%d widened=%v self=%d declared=%v) = %q, want %q",
-					tc.owner, tc.widened, self, tc.declared, got, tc.want)
+				t.Errorf("membershipModelFor(owner=%d widened=%v self=%d resolved=%d declared=%v) = %q, want %q",
+					tc.owner, tc.widened, self, tc.resolved, tc.declared, got, tc.want)
 			}
 		})
 	}

@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -65,4 +66,25 @@ func processGroupsOf(pid int) (int, []int) {
 		}
 	}
 	return gid, groups
+}
+
+// processIsZombie reports whether a pid names a process that has EXITED and is
+// waiting to be reaped.
+//
+// A zombie answers signal 0 like a live process, so "the pid resolves" is not
+// "the process is running". `/proc/<pid>/stat` states it directly, and the
+// state field is the third — after the pid and the comm, which is parenthesised
+// and may itself contain spaces or a closing parenthesis, so it is read from
+// the LAST ')' rather than by splitting the line.
+func processIsZombie(pid int) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	i := strings.LastIndexByte(string(b), ')')
+	if i < 0 {
+		return false
+	}
+	fields := strings.Fields(string(b[i+1:]))
+	return len(fields) > 0 && fields[0] == "Z"
 }

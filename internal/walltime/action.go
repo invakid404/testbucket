@@ -764,11 +764,19 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 	peer := &observerProc{producer: ProducerPeer, ctl: control{base: st.PeerControl},
 		pid: st.PeerPID, start: st.PeerStart,
 		stream: filepath.Join(dir, streamName(ProducerPeer, LevelAction, 0))}
-	if err := trace.close(deadline); err != nil && terminal == TerminalPassed {
-		terminal, reason = TerminalWrapperError, err.Error()
-	}
-	if err := peer.close(deadline); err != nil && terminal == TerminalPassed {
-		terminal, reason = TerminalWrapperError, err.Error()
+	// EACH OBSERVER GETS ITS OWN BOUNDED SHARE OF THE CLOSING BUDGET.
+	//
+	// Both teardowns used the one deadline, so the first could spend all of
+	// it: the second was then asked to close with nothing left, its closing
+	// record was never collected, and the envelope went terminal for a missing
+	// endpoint belonging to the observer that had not been given a chance.
+	// Bounding each separately reports a stuck observer as itself and still
+	// proves the other. The overall deadline continues to bound the whole
+	// close — this only stops one step from consuming it.
+	for _, o := range []*observerProc{trace, peer} {
+		if err := o.close(observerCloseBy(deadline)); err != nil && terminal == TerminalPassed {
+			terminal, reason = TerminalWrapperError, err.Error()
+		}
 	}
 
 	// The DRAINED read, after the containment empties.

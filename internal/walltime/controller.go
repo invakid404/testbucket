@@ -3,11 +3,13 @@ package walltime
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // THE INVOCATION CONTROLLER, and why it has to exist.
@@ -87,6 +89,27 @@ type controllerReply struct {
 
 // controllerRequestKind identifies the one request this channel accepts.
 const controllerRequestKind = "tb.walltime.invocation-request/v1"
+
+// maxRequestBytes bounds what an unauthenticated peer can make this process
+// hold. A request names a sequence number and a path; anything larger is not
+// one.
+const maxRequestBytes = 64 << 10
+
+// drainRequest reads and discards whatever the caller sent, so the reply can
+// be delivered before the connection closes. It is bounded for the same reason
+// the decoder is.
+func drainRequest(conn net.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(controllerDrainGrace))
+	_, _ = io.Copy(io.Discard, io.LimitReader(conn, maxRequestBytes))
+	_ = conn.SetReadDeadline(time.Time{})
+}
+
+// controllerDrainGrace bounds that drain. It is short on purpose: a
+// well-behaved caller half-closes as soon as it has asked, so the drain ends
+// at EOF and never waits: this budget is only ever spent on a caller that
+// asked and then held its write side open, and the channel is serial, so
+// waiting longer on that caller would delay every other one.
+const controllerDrainGrace = 250 * time.Millisecond
 
 // StartInvocationController opens the channel for one script envelope.
 //
@@ -200,6 +223,7 @@ func (c *InvocationController) handle(conn net.Conn) {
 	// invocations.
 	uid, err := c.peer(conn)
 	if err != nil {
+		drainRequest(conn)
 		reply(controllerReply{Exit: 1, Error: "the requester's credential could not be read: " + err.Error()})
 		return
 	}
@@ -210,17 +234,28 @@ func (c *InvocationController) handle(conn net.Conn) {
 		}
 	}
 	if !allowed {
+		// THE REFUSAL HAS TO REACH THE CALLER.
+		//
+		// Closing with the request still unread makes the kernel discard the
+		// connection abruptly — on Linux the client's own write then fails
+		// with EPIPE and it never reads why it was refused, so a decision this
+		// controller made deliberately arrives as a broken pipe and is
+		// indistinguishable from a crash. Draining first lets the reply be
+		// delivered, and the read is bounded because an unauthenticated peer
+		// must not be able to make this process hold anything large.
+		drainRequest(conn)
 		reply(controllerReply{Exit: 1, Error: fmt.Sprintf(
 			"uid %d asked for an invocation envelope; only the declared script account may (%v)", uid, c.allowUID)})
 		return
 	}
 
 	var req controllerRequest
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(conn, maxRequestBytes)).Decode(&req); err != nil {
 		reply(controllerReply{Exit: 1, Error: "unreadable invocation request: " + err.Error()})
 		return
 	}
 	if req.Kind != controllerRequestKind {
+		drainRequest(conn)
 		reply(controllerReply{Exit: 1, Error: fmt.Sprintf("invocation request names kind %q, want %q", req.Kind, controllerRequestKind)})
 		return
 	}
@@ -299,6 +334,12 @@ func RequestInvocation(dir string, seq int, specPath string) (int, bool, error) 
 	}
 	if _, err := conn.Write(append(b, '\n')); err != nil {
 		return 1, true, fmt.Errorf("walltime: send the invocation request: %w", err)
+	}
+	// HALF-CLOSE, so the controller sees a clean end of request rather than
+	// having to guess where it stopped, and so a refusal written back reaches
+	// this side instead of racing an abrupt close.
+	if half, ok := conn.(*net.UnixConn); ok {
+		_ = half.CloseWrite()
 	}
 	var reply controllerReply
 	if err := json.NewDecoder(conn).Decode(&reply); err != nil {

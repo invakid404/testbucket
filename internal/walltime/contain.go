@@ -113,22 +113,32 @@ func membershipModelFor(f MembershipFacts) string {
 	if f.OtherWritable {
 		return MembershipWorkloadWritable
 	}
-	// THE WORKLOAD'S OWN CREDENTIAL. When the caller declares none, the
-	// workload is taken to share this process's — the single-credential
-	// runner, and the shape that cannot be scored. When it DOES declare one,
-	// the declared set replaces this process's uid rather than widening it,
-	// because the whole point of a declared workload account is that the
-	// wrapper is no longer the workload.
+	// THE WORKLOAD'S OWN CREDENTIAL, AND WHAT MAY ESTABLISH IT.
 	//
-	// An earlier comment said self always widened the set while the code
-	// replaced it. Both cannot be true, and the code was right: a boundary
-	// where the wrapper owns the containment and the workload does not is
-	// exactly the arrangement a scored row needs, and counting the wrapper as
-	// the workload would refuse it. What keeps a declaration from minting that
-	// on its own is elsewhere — the verifier reruns this rule over the
-	// measured process's OWN uid and group vector, as the kernel reported
-	// them.
-	workload := f.WorkloadUIDs
+	// A RESOLVED ACCOUNT replaces this process's uid: TB_WALL_WORKLOAD_USER is
+	// a name looked up in the accounts database, so a uid that comes back from
+	// that lookup and differs from this process's is a second credential that
+	// demonstrably exists. That is the arrangement a scored row needs — the
+	// wrapper owns the containment and the measured work runs as somebody
+	// else — and counting the wrapper as the workload would refuse it.
+	//
+	// A DECLARED NUMBER may only widen. TB_WALL_WORKLOAD_UID is a bare integer
+	// list from the caller and nothing verifies it, so treating it as a
+	// replacement let a caller mint the boundary by naming any uid at all: a
+	// file this very process owns then reported supervisor-owned, which is the
+	// one answer that scores. Self stays in the set whenever no account was
+	// resolved, so a declaration can add credentials known to lack the
+	// boundary and can never remove the one credential we know has it.
+	// A RESOLVED uid is a POSITIVE one, which is also the convention the
+	// retained containment identity uses. Zero is root, and a measured
+	// workload running as root holds every capability this boundary exists to
+	// deny, so it can never be the credential a scored row rests on; reading
+	// the zero value as a resolution would let a fact nobody established
+	// replace the one credential we know about.
+	workload := append([]int(nil), f.WorkloadUIDs...)
+	if f.WorkloadUID <= 0 {
+		workload = append(workload, f.SelfUID)
+	}
 	if len(workload) == 0 {
 		workload = []int{f.SelfUID}
 	}
@@ -168,6 +178,16 @@ type MembershipFacts struct {
 	GroupWritable, OtherWritable bool
 	// SelfUID is this process's credential.
 	SelfUID int
+	// WorkloadUID is the uid of an account RESOLVED from the accounts
+	// database, or a non-positive value when none was — which is also the
+	// safe zero value, so a caller that does not set it gets the conservative
+	// answer rather than an unestablished boundary.
+	//
+	// It is what separates a second credential that demonstrably exists from a
+	// caller's bare assertion that one does. Only the first may replace this
+	// process's uid in the decision below; a declared number may widen the set
+	// and never narrow it.
+	WorkloadUID int
 	// WorkloadUIDs and WorkloadGIDs are the measured workload's credential and
 	// its groups, as the caller declared them.
 	WorkloadUIDs []int

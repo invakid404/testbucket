@@ -45,6 +45,18 @@ const (
 	// what it killed, which is itself terminal and must be recorded rather
 	// than waited on.
 	ReapGrace = 10 * time.Second
+	// ObserverCloseGrace bounds the wait for ONE observer to stop and exit,
+	// so a single stuck observer cannot spend the whole closing budget.
+	//
+	// The closer tears down the trace collector and then the containment peer
+	// against one shared deadline, and the first one took all of it: the
+	// second was then asked to close with no time left, its closing record was
+	// never collected, and the envelope was terminal for a missing endpoint
+	// that had nothing to do with it. Bounding each teardown separately means
+	// a stuck observer is reported as a stuck observer while the other is
+	// still proved. The overall deadline still bounds the whole close; this
+	// only stops one step consuming it.
+	ObserverCloseGrace = 15 * time.Second
 )
 
 // CancellationPolicyID is the frozen policy Stage 1 declares. It is derived
@@ -59,8 +71,9 @@ var CancellationPolicyID = fmt.Sprintf(
 // assignment in the tree is in a _test file, exactly as the probe hooks below
 // are.
 var (
-	cancellationGrace = CancellationGrace
-	reapGrace         = ReapGrace
+	cancellationGrace  = CancellationGrace
+	reapGrace          = ReapGrace
+	observerCloseGrace = ObserverCloseGrace
 )
 
 // ExecOptions describes one physical wrapper: the exact command it starts, the
@@ -1255,12 +1268,43 @@ func (o *observerProc) awaitExit(deadline time.Time) error {
 // stillRunning reports whether the process THIS handle launched is still
 // there. A pid that resolves to a different start identity is a reused number
 // and is not our observer.
+// stillRunning reports whether the observer process is ALIVE — not merely
+// whether its pid still resolves.
+//
+// A process that has exited but has not been reaped is a ZOMBIE, and a zombie
+// answers signal 0 exactly like a running process: the pid entry survives to
+// hold an exit status nobody has collected. The exit proof read that as "still
+// running" and waited out the entire deadline, which is not a slow observer,
+// it is a finished one nobody buried.
+//
+// In production the observer is not this process's child — `wall begin`
+// returns and init reaps it — so its pid stops resolving and the old check was
+// right by accident. Whenever the opening and closing steps run in ONE process,
+// which is what the test suites and CI do, the observer stays this process's
+// child and nothing reaps it, so the closer burned its whole budget on the
+// first observer and left the second none: the peer's closing record was then
+// missing and the envelope was terminal WT-004.
+//
+// So the answer is taken from what the process IS: reap it if it is ours,
+// which turns an exited child into the disappearance the proof looks for, and
+// otherwise ask the kernel for its state rather than for its existence.
 func (o *observerProc) stillRunning() bool {
 	if o.pid <= 0 {
 		return false
 	}
+	// OURS AND FINISHED: collect it. A reaped child is gone, which is the
+	// strongest form of the exit proof and costs nothing when it is still
+	// running (WNOHANG) or was never ours (ECHILD).
+	if reapExitedChild(o.pid) {
+		return false
+	}
 	// signal 0 probes for existence without delivering anything.
 	if err := syscall.Kill(o.pid, syscall.Signal(0)); err != nil {
+		return false
+	}
+	// EXISTS, BUT AS WHAT. A zombie exists and has exited; where the platform
+	// can say so, that is the answer.
+	if processIsZombie(o.pid) {
 		return false
 	}
 	if o.start == "" {
@@ -1269,6 +1313,18 @@ func (o *observerProc) stillRunning() bool {
 		return true
 	}
 	return processStartID(o.pid) == o.start
+}
+
+// reapExitedChild collects an exited child without blocking, and reports
+// whether this pid is now gone because of it.
+//
+// WNOHANG means a live child costs one syscall and answers false; a pid that
+// is not our child answers ECHILD and also false, which leaves the callers
+// that rely on init having reaped it exactly as they were.
+func reapExitedChild(pid int) bool {
+	var status syscall.WaitStatus
+	got, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+	return err == nil && got == pid
 }
 
 // abandon kills an observer whose lifecycle cannot be completed. Its partial
@@ -1490,4 +1546,14 @@ func mustDigest(v any) Digest {
 		return ""
 	}
 	return d
+}
+
+// observerCloseBy is one observer's share of the closing budget: a bounded
+// grace, never beyond the envelope's own deadline.
+func observerCloseBy(deadline time.Time) time.Time {
+	grace := time.Now().Add(observerCloseGrace)
+	if grace.After(deadline) {
+		return deadline
+	}
+	return grace
 }

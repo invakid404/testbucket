@@ -385,7 +385,11 @@ func rederiveMembership(v *Verdict, label string, e Envelope, r Record) {
 	rederived := membershipModelFor(MembershipFacts{
 		OwnerUID: uint32(c.OwnerUID), OwnerGID: uint32(c.OwnerGID),
 		GroupWritable: c.Mode&0o020 != 0, OtherWritable: c.Mode&0o002 != 0,
-		SelfUID:      p.UID,
+		SelfUID: p.UID,
+		// The RETAINED resolved account, so the rerun makes the same
+		// distinction the producer did between an account that exists and a
+		// number a caller wrote down.
+		WorkloadUID:  c.WorkloadUID,
 		WorkloadUIDs: uids, WorkloadGIDs: gids,
 	})
 	if rederived != c.MembershipControl {

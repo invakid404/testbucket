@@ -37,6 +37,7 @@ func membershipControl(dir string, w WorkloadCredential) string {
 		return MembershipUnknown
 	}
 	facts.SelfUID = os.Getuid()
+	facts.WorkloadUID = w.UID
 	facts.WorkloadUIDs, facts.WorkloadGIDs = w.UIDs, w.GIDs
 	return membershipModelFor(facts)
 }
