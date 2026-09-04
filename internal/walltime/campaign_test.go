@@ -1487,3 +1487,109 @@ func TestOneMeasurementCannotPopulateManyCampaignRows(t *testing.T) {
 			"with a row that named no bucket")
 	})
 }
+
+// AN ARM IS ONE RUN OF THE WORKFLOW, not a selection made across several.
+//
+// Every other check on a row is row-local: that the verdict is genuine, that
+// the approved verifier signed it, that no other row is this same measurement.
+// None of them says the eight rows are eight buckets OF ONE RUN.
+//
+// GitHub supplies the gap itself. GITHUB_RUN_ID does not change when a
+// workflow is rerun; GITHUB_RUN_ATTEMPT starts at 1 and increments. So eight
+// verdicts can share a run id, name eight distinct buckets, and carry eight
+// different attempts — each genuinely produced and signed by the approved
+// verifier. Assembling them keeps the favourable bucket from attempt 1, the
+// favourable bucket from attempt 2, and so on: the post-hoc retry the frozen
+// population forbids, wearing the shape of one clean run.
+//
+// Each case re-signs the mutated body with the fixture's approved verdict key,
+// so a signature failure cannot stand in for the aggregation rule and make an
+// absent check look present.
+func TestAnArmMustBeOneRunOfTheWorkflow(t *testing.T) {
+	// The authentic fixture passes, so the refusals below are refusals of
+	// drift rather than of measurement.
+	t.Run("the authentic five-pair population passes", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		if !campaignPasses(t, idx, loader, keys) {
+			t.Fatal("the genuine fixture no longer passes; the arm-identity rule must reject reruns, not runs")
+		}
+	})
+
+	// EVERY NON-BUCKET FIELD of the signed run identity. The bucket is the one
+	// thing that is supposed to vary across an arm; drift in anything else
+	// describes a different execution.
+	for _, tc := range []struct {
+		field string
+		drift func(*RunIdentity)
+		want  string
+	}{
+		// The reported defect: a rerun of the same workflow run.
+		{"attempt", func(r *RunIdentity) { r.AttemptID = "7" }, "not the same run of the workflow"},
+		// The same rerun seen through the step, which the production action
+		// also fills from GITHUB_RUN_ATTEMPT.
+		{"step attempt", func(r *RunIdentity) { r.StepAttempt = "7" }, "not the same run of the workflow"},
+		{"repository", func(r *RunIdentity) { r.Repository = "someone/else" }, "not the same run of the workflow"},
+		{"workflow run", func(r *RunIdentity) { r.WorkflowRun = "999" }, "not the same run of the workflow"},
+		{"job", func(r *RunIdentity) { r.Job = "another-job" }, "not the same run of the workflow"},
+		{"step", func(r *RunIdentity) { r.Step = "another-step" }, "not the same run of the workflow"},
+		// Stage-2 is in the set, so an arm is also bound to ONE derived plan
+		// rather than to eight.
+		{"Stage-2", func(r *RunIdentity) { r.Stage2 = Digest("sha256:" + strings.Repeat("b", 64)) }, "not the same run of the workflow"},
+		{"component registry", func(r *RunIdentity) { r.ComponentRegistry = Digest("sha256:" + strings.Repeat("c", 64)) }, "not the same run of the workflow"},
+		{"campaign", func(r *RunIdentity) { r.CampaignID = "another-campaign" }, "not the same run of the workflow"},
+		{"run", func(r *RunIdentity) { r.RunID = "another-run" }, "not the same run of the workflow"},
+		{"Stage-1", func(r *RunIdentity) { r.Stage1 = Digest("sha256:" + strings.Repeat("d", 64)) }, "not the same run of the workflow"},
+		// The verifier identity is refused one check earlier, by the rule that
+		// the identity which judged a row must be the identity that signed the
+		// verdict. Asserted here for completeness of the field set, with the
+		// message that rule actually produces.
+		{"verifier", func(r *RunIdentity) { r.VerifierID = "another-verifier" }, "the identity that judged a row must be the identity that signed the verdict"},
+	} {
+		t.Run("an arm whose rows disagree about the "+tc.field+" is refused", func(t *testing.T) {
+			idx, loader, keys, _ := campaignFixture(t)
+			arm := &idx.Pairs[0].Baseline
+			drifted := *loader.verdicts[arm.VerdictPaths[1]]
+			tc.drift(&drifted.Run)
+			// RE-SIGNED by the approved verdict signer: the mutated body is as
+			// authentic as any other row, so only the aggregation rule can
+			// refuse it.
+			drifted.Signature = nil
+			if err := drifted.Sign(testVerdictIdentity, testVerdictAuthority); err != nil {
+				t.Fatal(err)
+			}
+			loader.verdicts["baseline-1-drifted.json"] = &drifted
+			arm.VerdictPaths[1] = "baseline-1-drifted.json"
+			refusedBecause(t, idx, loader, keys, tc.want,
+				"while one of its rows named a different "+tc.field)
+		})
+	}
+
+	// AND THE BUCKET STILL VARIES. The rule must not collapse into "every row
+	// must be identical", which would reject every genuine arm.
+	t.Run("rows differing only in their bucket are accepted", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		arm := idx.Pairs[0].Baseline
+		first := loader.verdicts[arm.VerdictPaths[0]].Run
+		var buckets []string
+		for _, p := range arm.VerdictPaths {
+			got := loader.verdicts[p].Run
+			buckets = append(buckets, got.BucketID)
+			if got.RunID != first.RunID || got.AttemptID != first.AttemptID {
+				t.Fatalf("the fixture's own rows disagree about the run, so this subtest proves nothing")
+			}
+		}
+		if len(buckets) != BucketsPerRun {
+			t.Fatalf("the arm has %d rows, want %d", len(buckets), BucketsPerRun)
+		}
+		distinct := map[string]bool{}
+		for _, b := range buckets {
+			distinct[b] = true
+		}
+		if len(distinct) != BucketsPerRun {
+			t.Errorf("the arm's rows cover %d distinct buckets, want %d", len(distinct), BucketsPerRun)
+		}
+		if !campaignPasses(t, idx, loader, keys) {
+			t.Fatal("an arm whose rows differ only in their bucket was refused; the bucket is the one field that must vary")
+		}
+	})
+}

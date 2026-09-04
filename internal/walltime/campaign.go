@@ -248,6 +248,10 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 	// facts authenticated. They are derived from the verdicts below and the
 	// index's own claims are checked against them.
 	run := CampaignRun{RunID: arm.RunID}
+	// THE ARM'S OWN WORKFLOW ATTEMPT, established by its first admissible row
+	// and required of every row after it. See armIdentityFields.
+	var armID []identityField
+	var armRow string
 
 	var manifest *Stage1Manifest
 	var manifestDigest Digest
@@ -386,6 +390,35 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 		// measurement appearing twice, under whatever names.
 		if dup := seen.claim(row, v, vd); dup != "" {
 			problems = append(problems, dup)
+			continue
+		}
+		// ONE ARM IS ONE ATTEMPT.
+		//
+		// Every check above is row-local: it proves this verdict is genuine
+		// and that no other row is this same measurement. None of them says
+		// the eight rows are eight buckets OF ONE RUN OF THE WORKFLOW.
+		//
+		// GitHub supplies the difference itself. GITHUB_RUN_ID does not change
+		// when a workflow is rerun; GITHUB_RUN_ATTEMPT starts at 1 and
+		// increments. So eight verdicts can share a run id, name eight
+		// distinct buckets, and carry eight different attempts — each one
+		// genuinely produced and signed by the approved verifier. Assembling
+		// them keeps the favourable bucket from attempt 1, the favourable
+		// bucket from attempt 2, and so on: a post-hoc retry, which is exactly
+		// what the frozen population forbids, wearing the shape of one clean
+		// run.
+		//
+		// The first admissible row fixes the arm's identity and the rest must
+		// match it in every field except the bucket, which is the one thing
+		// that is supposed to vary. Stage-2 is in that set, so the rows are
+		// also bound to a single derived plan rather than to eight.
+		id := armIdentityFields(v.Run)
+		if armID == nil {
+			armID, armRow = id, row
+		} else if drift := identityDrift(armID, id); drift != "" {
+			problems = append(problems, fmt.Sprintf(
+				"%s and %s are not the same run of the workflow: %s; an arm is one attempt, and rows gathered from several are retries",
+				row, armRow, drift))
 			continue
 		}
 		run.ActionNs = append(run.ActionNs, v.ActionNs)
@@ -669,5 +702,50 @@ func (c *campaignIdentities) claim(row string, v *Verdict, vd Digest) string {
 	c.verdict[vd] = row
 	c.records[v.RecordsDigest] = row
 	c.observation[obs] = row
+	return ""
+}
+
+// identityField is one named component of a signed run identity, kept as a
+// pair so a mismatch can say WHICH component drifted. "these rows differ" sends
+// the reader back to the JSON; "they name attempts 1 and 3" does not.
+type identityField struct {
+	name  string
+	value string
+}
+
+// armIdentityFields is the signed run identity an arm's rows must share: all
+// of it except the bucket.
+//
+// The bucket is the only field that is SUPPOSED to vary across an arm — it is
+// what distinguishes the eight rows. Everything else describes the one
+// execution they claim to come from: which campaign, which run and attempt of
+// it, which repository, workflow run, job and step, which frozen planning
+// inputs and derived plan, which component registry, and which delivery
+// verifier judged them.
+func armIdentityFields(r RunIdentity) []identityField {
+	return []identityField{
+		{"campaign", r.CampaignID},
+		{"run", r.RunID},
+		{"attempt", r.AttemptID},
+		{"repository", r.Repository},
+		{"workflow run", r.WorkflowRun},
+		{"job", r.Job},
+		{"step", r.Step},
+		{"step attempt", r.StepAttempt},
+		{"Stage-1", string(r.Stage1)},
+		{"Stage-2", string(r.Stage2)},
+		{"component registry", string(r.ComponentRegistry)},
+		{"verifier", r.VerifierID},
+	}
+}
+
+// identityDrift reports the first component in which two rows of one arm
+// disagree, or "" when they describe the same execution.
+func identityDrift(want, got []identityField) string {
+	for i := range want {
+		if want[i].value != got[i].value {
+			return fmt.Sprintf("they name %s %q and %q", want[i].name, got[i].value, want[i].value)
+		}
+	}
 	return ""
 }
