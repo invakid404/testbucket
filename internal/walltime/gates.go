@@ -179,34 +179,24 @@ func EvaluatePredictor(samples []PredictorSample) []GateResult {
 			Observed: "no sample", Detail: "no frozen projection was paired with an observed invocation",
 		}}
 	}
-	var sum, worst int64
-	byBucket := map[int][]int64{}
+	invMAE, worst := invocationErrors(samples)
+	// ONE ROW PER BUCKET OF THIS MEASUREMENT. In row context every sample
+	// belongs to the same scored row, so the bucket index separates nothing
+	// and the whole set is one bucket total — which is exactly the quantity
+	// the gate is about.
+	byBucket := map[int][]PredictorSample{}
+	var order []int
 	for _, s := range samples {
-		e := abs64(s.PredictedNs - s.ObservedNs)
-		sum += e
-		if e > worst {
-			worst = e
+		if _, seen := byBucket[s.BucketIndex]; !seen {
+			order = append(order, s.BucketIndex)
 		}
-		byBucket[s.BucketIndex] = append(byBucket[s.BucketIndex], e)
+		byBucket[s.BucketIndex] = append(byBucket[s.BucketIndex], s)
 	}
-	invMAE := sum / int64(len(samples))
-
-	var bucketErrs []int64
-	for _, errs := range byBucket {
-		var bs int64
-		for _, e := range errs {
-			bs += e
-		}
-		bucketErrs = append(bucketErrs, bs/int64(len(errs)))
+	groups := make([][]PredictorSample, 0, len(order))
+	for _, b := range order {
+		groups = append(groups, byBucket[b])
 	}
-	var bucketSum int64
-	for _, e := range bucketErrs {
-		bucketSum += e
-	}
-	bucketMAE := int64(0)
-	if len(bucketErrs) > 0 {
-		bucketMAE = bucketSum / int64(len(bucketErrs))
-	}
+	bucketMAE, bucketRows := bucketMeanAbsoluteError(groups)
 
 	return []GateResult{
 		{
@@ -219,9 +209,71 @@ func EvaluatePredictor(samples []PredictorSample) []GateResult {
 		},
 		{
 			Name: "predictor:bucket-mae", Scope: ScopeRow, Required: "<= " + dur(PcheckBucketMAELimit),
-			Observed: dur(bucketMAE), Population: len(bucketErrs), Pass: bucketMAE <= PcheckBucketMAELimit,
+			Observed: dur(bucketMAE), Population: bucketRows, Expected: bucketRows, Pass: bucketMAE <= PcheckBucketMAELimit,
 		},
 	}
+}
+
+// invocationErrors is the INVOCATION population: the mean absolute error over
+// every paired projection and observation, and the worst single one. Both are
+// unchanged by the bucket rule below; they answer a different question and the
+// contract names them separately.
+func invocationErrors(samples []PredictorSample) (mae, worst int64) {
+	var sum int64
+	for _, s := range samples {
+		e := abs64(s.PredictedNs - s.ObservedNs)
+		sum += e
+		if e > worst {
+			worst = e
+		}
+	}
+	if len(samples) == 0 {
+		return 0, 0
+	}
+	return sum / int64(len(samples)), worst
+}
+
+// bucketMeanAbsoluteError is the frozen bucket statistic: for each scored
+// (run, bucket) row, the error of that row's AGGREGATE projection against its
+// aggregate observation, averaged over the rows.
+//
+// SUMMATION PRECEDES THE ABSOLUTE VALUE, and that is the whole content of the
+// gate. What used to be computed took the absolute value of each invocation
+// error first, grouped those by bucket ordinal and averaged twice — which is
+// an invocation-error statistic wearing a bucket's name. With equal invocation
+// counts it reproduces the invocation MAE exactly, so the contract's third
+// independent gate silently duplicated its first.
+//
+// The difference is not academic. Six invocations each under-predicted by one
+// second give an invocation MAE of one second and a maximum of one second,
+// both comfortably inside their limits, while the bucket they belong to is
+// wrong by six. Averaging absolute invocation errors reports one second; the
+// bucket's projection is out by six, and it is the bucket total the contract
+// bounds. A systematic small under-prediction is enough to authorize a release
+// whose genuine campaign misses every one of its eighty bucket totals.
+func bucketMeanAbsoluteError(groups [][]PredictorSample) (mae int64, rows int) {
+	var sum int64
+	for _, g := range groups {
+		if len(g) == 0 {
+			// A row that retains no sample is not a bucket error of zero; it
+			// is an absent observation, which the coverage gate reports.
+			continue
+		}
+		var predicted, observed int64
+		for _, s := range g {
+			// SIGNED, both of them, all the way to the row total. Discarding
+			// the sign per invocation is what turned this into a different
+			// statistic.
+			predicted += s.PredictedNs
+			observed += s.ObservedNs
+		}
+		sum += abs64(predicted - observed)
+		rows++
+	}
+	if rows == 0 {
+		return 0, 0
+	}
+	return sum / int64(rows), rows
 }
 
 // RowScope selects the gates one verified row decides for itself. The rest are
@@ -422,12 +474,22 @@ func EvaluateCampaign(pairs []CampaignPair) []GateResult {
 	// mean, and if the campaign did not compute one nothing would.
 	var aeta []AetaSample
 	var predictor []PredictorSample
+	// ONE GROUP PER SCORED ROW, kept apart from the flat sample list.
+	//
+	// Flattening lost the only thing that distinguishes the eighty bucket
+	// rows: which RUN each came from. Every arm re-keys its samples to the
+	// bucket ordinals 0..7, so ten runs share eight ordinals and grouping by
+	// ordinal produced eight groups where the contract names eighty rows. The
+	// grouping is built here, where the run is still known, rather than
+	// recovered afterwards from numbers that no longer identify anything.
+	var predictorRows [][]PredictorSample
 	var recon []Reconciliation
 	invocations, rowsWithCoverage, rows := 0, 0, 0
 	for _, p := range pairs {
 		for _, r := range []CampaignRun{p.Baseline, p.Candidate} {
 			aeta = append(aeta, r.AetaSamples...)
 			predictor = append(predictor, r.PredictorSamples...)
+			predictorRows = append(predictorRows, r.predictorRows()...)
 			recon = append(recon, r.Recon...)
 			// Coverage is counted PER ROW against that row's own measured
 			// invocation count, so a population cannot be padded by one
@@ -467,7 +529,7 @@ func EvaluateCampaign(pairs []CampaignPair) []GateResult {
 	// EvaluateAeta is given the frozen expected row count, so a short
 	// population cannot pass it either.
 	out = append(out, campaignScoped(EvaluateAeta(aeta, ScoredActionRows))...)
-	out = append(out, EvaluateCampaignPredictor(predictor, invocations, rows, rowsWithCoverage)...)
+	out = append(out, EvaluateCampaignPredictor(predictor, predictorRows, invocations, rows, rowsWithCoverage)...)
 	out = append(out, EvaluateCampaignRecon(recon, invocations)...)
 
 	if !full {
@@ -648,6 +710,20 @@ func dur(ns int64) string {
 // perBucketSamples counts this run's retained predictor samples per bucket, in
 // bucket order. It is derived rather than stored so it cannot disagree with the
 // samples themselves.
+// predictorRows splits this run's samples into one group per scored bucket
+// row, in bucket order. Within a run the bucket ordinal does identify a row —
+// it is only across runs that it stops doing so — which is why the split
+// happens here, per run, and the groups are kept separate afterwards.
+func (r CampaignRun) predictorRows() [][]PredictorSample {
+	out := make([][]PredictorSample, len(r.Invocations))
+	for _, s := range r.PredictorSamples {
+		if s.BucketIndex >= 0 && s.BucketIndex < len(out) {
+			out[s.BucketIndex] = append(out[s.BucketIndex], s)
+		}
+	}
+	return out
+}
+
 func (r CampaignRun) perBucketSamples() []int {
 	out := make([]int, len(r.Invocations))
 	for _, s := range r.PredictorSamples {
@@ -668,7 +744,7 @@ func (r CampaignRun) perBucketSamples() []int {
 // a failure, and it has to be distinguishable from a row that legitimately
 // measured no invocations, which is why each row carries its own invocation
 // count.
-func EvaluateCampaignPredictor(samples []PredictorSample, invocations, rows, covered int) []GateResult {
+func EvaluateCampaignPredictor(samples []PredictorSample, predictorRows [][]PredictorSample, invocations, rows, covered int) []GateResult {
 	coverage := GateResult{
 		Name: "predictor:coverage", Scope: ScopeCampaign,
 		Required:   "one Pcheck/observed-V sample per scored invocation, in every row",
@@ -696,7 +772,23 @@ func EvaluateCampaignPredictor(samples []PredictorSample, invocations, rows, cov
 		// states invocation MAE, individual invocation error and bucket MAE
 		// over the campaign population, and a row-scope copy of them would be
 		// filtered out of a campaign verdict.
-		g.Scope, g.Expected = ScopeCampaign, invocations
+		g.Scope = ScopeCampaign
+		// THE BUCKET GATE COUNTS BUCKET ROWS, not invocations. Overwriting its
+		// expected population with the invocation count reported that eighty
+		// bucket totals were four hundred and eighty of something, which is
+		// how a population of eight passed a gate the contract sizes at
+		// eighty.
+		if g.Name == "predictor:bucket-mae" {
+			bucketMAE, populated := bucketMeanAbsoluteError(predictorRows)
+			g.Observed, g.Population, g.Expected = dur(bucketMAE), populated, rows
+			g.Pass = bucketMAE <= PcheckBucketMAELimit && populated == rows
+			if populated != rows {
+				g.Detail = fmt.Sprintf(
+					"%d of %d scored bucket row(s) retain a projection to compare; a bucket mean over fewer rows is not the frozen statistic", populated, rows)
+			}
+		} else {
+			g.Expected = invocations
+		}
 		if !coverage.Pass {
 			g.Pass = false
 			g.Detail = firstNonEmptyStr(g.Detail, "predictor coverage is incomplete, so this statistic answers a different question than the frozen gate")

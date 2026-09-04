@@ -248,8 +248,12 @@ func TestTheRegistryReleasesAPIDOnceItIsReaped(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// However the child was collected — by the reap above, or by anything else
+	// that got there first — the registry must have stopped answering for the
+	// number. Asserting only the "we reaped it" route made this depend on who
+	// won that race rather than on the invariant.
 	if p := recallObserver(pid); p != nil {
-		t.Error("the registry still vouches for a pid that has been reaped and released for reuse")
+		t.Error("the registry still vouches for a pid whose process is gone and whose number the kernel may reuse")
 	}
 	bare := &observerProc{producer: ProducerPeer, pid: pid, proc: recallObserver(pid)}
 	if bare.ownsPID() {

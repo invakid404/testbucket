@@ -1408,6 +1408,15 @@ func (o *observerProc) stillRunning() bool {
 	}
 	// signal 0 probes for existence without delivering anything.
 	if err := syscall.Kill(o.pid, syscall.Signal(0)); err != nil {
+		// GONE, AND NOT BY OUR HAND. The retained handle stops vouching here
+		// too, not only where this function did the reaping: the registry's
+		// promise is that the kernel cannot reuse a pid while we hold an
+		// unreaped child at it, and that promise ends the moment the process
+		// is gone however it went. Releasing only on our own reap left an
+		// entry behind whenever something else collected the child first, and
+		// a stale entry is the bare-pid authority the registry exists to
+		// replace.
+		o.release()
 		return false
 	}
 	// EXISTS, BUT AS WHAT. A zombie exists and has exited; where the platform
@@ -1421,7 +1430,22 @@ func (o *observerProc) stillRunning() bool {
 		// see ownsPID.
 		return true
 	}
-	return o.identityOf(o.pid) == o.start
+	if o.identityOf(o.pid) == o.start {
+		return true
+	}
+	// The number now names something else, so our observer is gone and the
+	// registry must not go on answering for the pid.
+	o.release()
+	return false
+}
+
+// release drops this observer's retained handle. It is called wherever the
+// process is established to be gone, so the registry's answer and the kernel's
+// are never allowed to drift apart.
+func (o *observerProc) release() {
+	if o.proc != nil {
+		forgetObserver(o.pid)
+	}
 }
 
 // reapExitedChild collects an exited child without blocking, and reports

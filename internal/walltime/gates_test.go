@@ -306,3 +306,157 @@ func TestMedianIsConventional(t *testing.T) {
 		t.Errorf("median of 1,3,5 = %d, want 3", got)
 	}
 }
+
+// THE BUCKET GATE BOUNDS BUCKET TOTALS, not invocation errors.
+//
+// `Pcheck[b,j]` is a per-invocation projection, and the contract names three
+// independent predictor gates over it: invocation MAE, worst single invocation
+// error, and BUCKET MAE. The third is the error of each bucket's aggregate
+// projection against its aggregate observation —
+// abs(sum_j Pcheck[b,j] - sum_j V[b,j]) — averaged over the scored rows.
+//
+// Summation precedes the absolute value, and that is the entire content of it.
+// Taking the absolute value per invocation first and averaging by bucket is an
+// invocation-error statistic wearing a bucket's name: with equal invocation
+// counts it reproduces the invocation MAE exactly, so the contract's third
+// gate silently duplicated its first and bounded nothing new.
+func TestBucketMAEIsTheErrorOfTheBucketTotal(t *testing.T) {
+	bucket := func(b int, pairs ...[2]int64) []PredictorSample {
+		var out []PredictorSample
+		for i, p := range pairs {
+			out = append(out, PredictorSample{InvocationSeq: i, BucketIndex: b, PredictedNs: p[0], ObservedNs: p[1]})
+		}
+		return out
+	}
+	gate := func(t *testing.T, samples []PredictorSample) GateResult {
+		t.Helper()
+		for _, g := range EvaluatePredictor(samples) {
+			if g.Name == "predictor:bucket-mae" {
+				return g
+			}
+		}
+		t.Fatal("predictor:bucket-mae was not emitted")
+		return GateResult{}
+	}
+
+	// ACCUMULATION. Six one-second misses in one direction are a six-second
+	// bucket, however small each one is.
+	t.Run("same-direction misses accumulate into the bucket total", func(t *testing.T) {
+		var s []PredictorSample
+		for i := 0; i < 6; i++ {
+			s = append(s, PredictorSample{InvocationSeq: i, BucketIndex: 0, PredictedNs: 1 * second, ObservedNs: 2 * second})
+		}
+		g := gate(t, s)
+		if g.Pass {
+			t.Errorf("a bucket whose total is out by 6s passed as %s", g.Observed)
+		}
+		if g.Observed != dur(6*second) {
+			t.Errorf("bucket error is %s, want %s", g.Observed, dur(6*second))
+		}
+		// And the invocation gates, which bound a different quantity, are
+		// untouched: each individual miss really is only one second.
+		for _, other := range EvaluatePredictor(s) {
+			if other.Name != "predictor:bucket-mae" && !other.Pass {
+				t.Errorf("%s failed on one-second invocation errors: %s", other.Name, other.Observed)
+			}
+		}
+	})
+
+	// SIGN. Opposing errors genuinely cancel in the aggregate, because the
+	// bucket's total projection is then correct. This is the case the frozen
+	// definition chooses, and asserting it stops the rule being "re-derive the
+	// invocation statistic more expensively".
+	t.Run("opposing invocation errors cancel in the bucket total", func(t *testing.T) {
+		g := gate(t, bucket(0, [2]int64{10 * second, 4 * second}, [2]int64{1 * second, 7 * second}))
+		if !g.Pass || g.Observed != dur(0) {
+			t.Errorf("a bucket whose over- and under-prediction cancel reported %s, want 0", g.Observed)
+		}
+	})
+
+	// THRESHOLD EDGE, both sides of it.
+	for _, tc := range []struct {
+		name  string
+		error int64
+		pass  bool
+	}{
+		{"exactly at the limit", PcheckBucketMAELimit, true},
+		{"one nanosecond past the limit", PcheckBucketMAELimit + 1, false},
+	} {
+		t.Run("a bucket "+tc.name, func(t *testing.T) {
+			g := gate(t, bucket(0, [2]int64{0, tc.error}))
+			if g.Pass != tc.pass {
+				t.Errorf("bucket error %s: pass=%v, want %v", g.Observed, g.Pass, tc.pass)
+			}
+		})
+	}
+
+	// UNEQUAL COUNTS. A row with more invocations must not be diluted: the
+	// statistic is the row's total error, not its per-invocation average.
+	t.Run("a bucket with more invocations is not diluted", func(t *testing.T) {
+		var s []PredictorSample
+		for i := 0; i < 12; i++ {
+			s = append(s, PredictorSample{InvocationSeq: i, BucketIndex: 0, PredictedNs: 1 * second, ObservedNs: 1*second + 500*millisecond})
+		}
+		g := gate(t, s)
+		if g.Pass {
+			t.Errorf("twelve half-second misses (6s total) passed as %s", g.Observed)
+		}
+	})
+
+	// ABSENCE. No sample is not a bucket error of zero.
+	t.Run("no population is not a passing bucket", func(t *testing.T) {
+		for _, g := range EvaluatePredictor(nil) {
+			if g.Name == "predictor:bucket-mae" {
+				t.Error("an empty population emitted a bucket verdict")
+			}
+		}
+	})
+}
+
+// AND EIGHTY ROWS ARE EIGHTY ROWS, not eight ordinals.
+//
+// Every arm re-keys its samples to the bucket ordinals 0..7, so across ten
+// runs the ordinals repeat. Grouping the campaign's samples by ordinal
+// produced eight groups where the contract names eighty scored rows — and the
+// gate reported an expected population of 480 invocations, which is neither.
+// Two distinct rows that share ordinal 0 must be two bucket errors.
+func TestTheCampaignBucketPopulationIsScoredRowsNotOrdinals(t *testing.T) {
+	// Two rows, both ordinal 0, from two different runs. Each is out by 6s.
+	row := func() []PredictorSample {
+		var out []PredictorSample
+		for i := 0; i < 6; i++ {
+			out = append(out, PredictorSample{InvocationSeq: i, BucketIndex: 0, PredictedNs: 1 * second, ObservedNs: 2 * second})
+		}
+		return out
+	}
+	flat := append(row(), row()...)
+	rows := [][]PredictorSample{row(), row()}
+
+	var found bool
+	for _, g := range EvaluateCampaignPredictor(flat, rows, 12, 2, 2) {
+		if g.Name != "predictor:bucket-mae" {
+			continue
+		}
+		found = true
+		if g.Population != 2 || g.Expected != 2 {
+			t.Errorf("the bucket gate counted population %d of %d, want 2 of 2; two distinct rows sharing an ordinal are two rows",
+				g.Population, g.Expected)
+		}
+		if g.Pass {
+			t.Errorf("two rows each out by 6s passed as %s", g.Observed)
+		}
+	}
+	if !found {
+		t.Fatal("predictor:bucket-mae was not emitted at campaign scope")
+	}
+
+	// A SHORT POPULATION cannot pass by averaging the rows it does have.
+	t.Run("a bucket mean over fewer rows than the population is not the frozen statistic", func(t *testing.T) {
+		good := [][]PredictorSample{{{BucketIndex: 0, PredictedNs: second, ObservedNs: second}}}
+		for _, g := range EvaluateCampaignPredictor(good[0], good, 1, 2, 1) {
+			if g.Name == "predictor:bucket-mae" && g.Pass {
+				t.Errorf("a bucket mean over 1 of 2 scored rows passed as %s", g.Observed)
+			}
+		}
+	})
+}
