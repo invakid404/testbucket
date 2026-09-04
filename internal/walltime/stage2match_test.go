@@ -7,6 +7,14 @@ import (
 
 // matchableReceipt is a complete, valid Stage-2 receipt — every field the
 // replay comparison has to reach.
+// matchableReceipt deliberately carries NO planner claim: a receipt that
+// records none must not validate, and that refusal is exercised directly.
+// Tests that need a well-formed receipt call claimed() on it.
+func claimed(r Stage2Receipt) Stage2Receipt {
+	r.PlannerClaim = fixtureClaim(r.Stage1Digest, r.BundleDigest)
+	return r
+}
+
 func matchableReceipt() Stage2Receipt {
 	r := Stage2Receipt{
 		Kind:         Stage2Kind,
@@ -48,12 +56,12 @@ func matchableReceipt() Stage2Receipt {
 // different derivation whose plan digest happens to match; and a verifier
 // result nobody compares is a sentence in a file.
 func TestTheReplayComparesEveryStage2DerivationClaim(t *testing.T) {
-	issued := matchableReceipt()
+	issued := claimed(matchableReceipt())
 	if err := issued.Validate(); err != nil {
 		t.Fatalf("the control receipt is invalid: %v", err)
 	}
 	// The positive control: a replay that recomputed the same thing agrees.
-	if err := issued.Matches(matchableReceipt()); err != nil {
+	if err := issued.Matches(claimed(matchableReceipt())); err != nil {
 		t.Fatalf("an identical replay was rejected: %v", err)
 	}
 
@@ -97,7 +105,7 @@ func TestTheReplayComparesEveryStage2DerivationClaim(t *testing.T) {
 		}, "renderer verifier result mismatch"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			recomputed := matchableReceipt()
+			recomputed := claimed(matchableReceipt())
 			tc.edit(&recomputed)
 			err := issued.Matches(recomputed)
 			if err == nil {
@@ -118,7 +126,7 @@ func TestTheReplayComparesEveryStage2DerivationClaim(t *testing.T) {
 // TestTheReplayStillComparesWhatItAlreadyDid: the fields added above are in
 // addition to the ones that were compared, not instead of them.
 func TestTheReplayStillComparesWhatItAlreadyDid(t *testing.T) {
-	issued := matchableReceipt()
+	issued := claimed(matchableReceipt())
 	for _, tc := range []struct {
 		name string
 		edit func(*Stage2Receipt)
@@ -133,7 +141,7 @@ func TestTheReplayStillComparesWhatItAlreadyDid(t *testing.T) {
 		}, "derived document"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			recomputed := matchableReceipt()
+			recomputed := claimed(matchableReceipt())
 			tc.edit(&recomputed)
 			if err := issued.Matches(recomputed); err == nil {
 				t.Fatalf("the replay accepted %s", tc.name)
@@ -141,5 +149,19 @@ func TestTheReplayStillComparesWhatItAlreadyDid(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// fixtureClaim is the one-shot planner claim a derivation is performed under.
+//
+// A Stage-2 receipt that records none cannot be told apart from one produced
+// by a second attempt, so the schema requires it and these fixtures carry one
+// like any real derivation does. A REAL store's durability is attested by the
+// campaign authority and checked where the claim is taken; here the point is
+// only that the receipt names the claim its own parents belong to.
+func fixtureClaim(stage1, bundle Digest) *PlannerClaimReceipt {
+	return &PlannerClaimReceipt{
+		Store: "authority/durable-claims", Durable: true,
+		Key: "fixture", Stage1: stage1, Bundle: bundle,
 	}
 }

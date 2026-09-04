@@ -96,7 +96,7 @@ func testResolver(argv []string) (map[string]string, map[string]walltime.ToolIde
 
 func plan(t *testing.T, b *walltime.PlanningInputBundle) *Result {
 	t.Helper()
-	res, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestTheTwoDigestsAnswerDifferentQuestions(t *testing.T) {
 func TestAmbientInputsAreRefused(t *testing.T) {
 	root := t.TempDir()
 	b := acquire(t, root, func(o *AcquireOptions) { o.Runnables = nil })
-	_, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
 	if err == nil {
 		t.Fatalf("planning succeeded with no frozen listing for a name-sliced target")
 	}
@@ -200,7 +200,7 @@ func TestBundleTamperingIsCaught(t *testing.T) {
 	if err := b.Validate(); err == nil {
 		t.Fatalf("a rewritten discovery snapshot validated")
 	}
-	if _, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"}); err == nil {
+	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"})); err == nil {
 		t.Fatalf("a rewritten discovery snapshot was planned from")
 	}
 }
@@ -244,7 +244,7 @@ func TestColdStartIsBoundAsAColdStart(t *testing.T) {
 func TestWallRenderedScriptCarriesItsSpecs(t *testing.T) {
 	root := t.TempDir()
 	b := acquire(t, root, func(o *AcquireOptions) { o.WallDir = "/tmp/wall" })
-	res, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestFrozenPlanRefusesAStaleStore(t *testing.T) {
 		// instant well past the frozen 14-day policy.
 		o.Instant = time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	})
-	_, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
 	if err == nil {
 		t.Fatalf("the frozen path planned from a stale store")
 	}
@@ -294,7 +294,7 @@ func TestFrozenPlanRefusesAStaleStore(t *testing.T) {
 	fresh := acquire(t, root, func(o *AcquireOptions) {
 		o.Instant = time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 	})
-	if _, err := Plan(context.Background(), PlanOptions{Bundle: fresh, Stage1: "sha256:stage1"}); err != nil {
+	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: fresh, Stage1: "sha256:stage1"})); err != nil {
 		t.Errorf("a store inside the stale policy was refused: %v", err)
 	}
 }
@@ -372,7 +372,7 @@ func TestAColdStartCannotCarryAWarmStore(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "is not a cold start") {
 		t.Errorf("error %q does not name the contradiction", err)
 	}
-	if _, err := Plan(context.Background(), PlanOptions{Bundle: &forged, Stage1: "sha256:stage1"}); err == nil {
+	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: &forged, Stage1: "sha256:stage1"})); err == nil {
 		t.Errorf("a bundle declaring a cold start over warm bytes was planned")
 	}
 
@@ -466,4 +466,30 @@ func TestAnUnreportedAcquisitionInvocationIsRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "nobody ran") {
 		t.Errorf("error %q does not say the recorded command would be fictional", err)
 	}
+}
+
+// withClaim supplies the one-shot planner claim a derivation is performed
+// under.
+//
+// The claim is an input to planning, not a decoration: a Stage-2 receipt that
+// records none cannot be told apart from one produced by a second attempt, so
+// the schema requires it and these fixtures have to carry one like any real
+// derivation does. The store is named as durable because that is what a
+// scored derivation is required to run under; the durability of a REAL store
+// is attested by the campaign authority, which is checked where the claim is
+// taken rather than here.
+func withClaim(t *testing.T, opt PlanOptions) PlanOptions {
+	t.Helper()
+	if opt.PlannerClaim != nil || opt.Bundle == nil {
+		return opt
+	}
+	d, err := opt.Bundle.DigestOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	opt.PlannerClaim = &walltime.PlannerClaimReceipt{
+		Store: "authority/durable-claims", Durable: true,
+		Key: "fixture", Stage1: opt.Stage1, Bundle: d,
+	}
+	return opt
 }

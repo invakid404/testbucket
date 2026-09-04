@@ -653,6 +653,9 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 func testReceipt(stage1, bundle Digest) Stage2Receipt {
 	r := Stage2Receipt{
 		Kind: Stage2Kind, Stage1Digest: stage1, BundleDigest: bundle,
+		// Every real derivation is performed under a one-shot claim, so the
+		// fixture that stands in for one carries it too.
+		PlannerClaim:     fixtureClaim(stage1, bundle),
 		InputAccess:      []InputAccess{{Field: "discovery[0]", Digest: "sha256:disc"}},
 		PlanDigest:       "sha256:plan-full",
 		SemanticDigest:   "sha256:plan-semantic",

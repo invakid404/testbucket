@@ -36,7 +36,7 @@ func TestPallocAllocatesWithoutTouchingTheMatrix(t *testing.T) {
 	b := acquire(t, root, nil)
 
 	plain := plan(t, b)
-	scored, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: frozenScorer()})
+	scored, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: frozenScorer()}))
 	if err != nil {
 		t.Fatalf("Plan with a frozen scorer: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestAllocationFailsClosed(t *testing.T) {
 	b := acquire(t, root, nil)
 	sc := frozenScorer()
 	sc.FeatureSchema = append(sc.FeatureSchema, "previous_run_seconds")
-	_, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: sc})
+	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: sc}))
 	if err == nil {
 		t.Fatalf("a plan succeeded with a scorer whose schema the builder cannot satisfy")
 	}
@@ -112,7 +112,7 @@ func TestAllocationFailsClosed(t *testing.T) {
 func TestFeatureVectorsCarryOnlyPreplanProvenance(t *testing.T) {
 	root := t.TempDir()
 	b := acquire(t, root, nil)
-	res, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: frozenScorer()})
+	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: frozenScorer()}))
 	if err != nil {
 		t.Fatal(err)
 	}

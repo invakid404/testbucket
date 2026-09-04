@@ -424,7 +424,17 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     permissions:
+      # contents: write uploads the release. actions: read is what lets this
+      # job DOWNLOAD the campaign evidence artifact it gates on.
+      #
+      # Declaring any permission makes every undeclared one `none`, so the
+      # `gh run download` below was relying on this repository being public:
+      # public artifacts can be read unauthenticated, which masks the omission
+      # here and fails on a private or protected installation. A handoff that
+      # only works because the repository happens to be public is not the
+      # authenticated handoff the gate claims to perform.
       contents: write
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

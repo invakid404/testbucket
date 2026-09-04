@@ -24,7 +24,7 @@ func TestThePlannerRefusesInventedImplementationIdentities(t *testing.T) {
 		t.Fatalf("Acquire: %v", err)
 	}
 	// The genuine bundle plans.
-	if _, err := Plan(context.Background(), PlanOptions{Bundle: good, Stage1: "sha256:stage1"}); err != nil {
+	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: good, Stage1: "sha256:stage1"})); err != nil {
 		t.Fatalf("the genuine bundle does not plan: %v", err)
 	}
 
@@ -78,7 +78,7 @@ func TestThePlannerRefusesInventedImplementationIdentities(t *testing.T) {
 				t.Fatal(err)
 			}
 			tc.edit(b)
-			_, err = Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+			_, err = Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
 			if err == nil {
 				t.Fatalf("the production planner executed under %s", tc.name)
 			}
@@ -136,7 +136,7 @@ func TestARealReceiptIsComparedByEveryClaimItCarries(t *testing.T) {
 	}
 	plan := func(t *testing.T) walltime.Stage2Receipt {
 		t.Helper()
-		res, err := Plan(context.Background(), PlanOptions{Bundle: bundle, Stage1: "sha256:stage1"})
+		res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: bundle, Stage1: "sha256:stage1"}))
 		if err != nil {
 			t.Fatalf("Plan: %v", err)
 		}
@@ -195,7 +195,7 @@ func TestStage2RecordsTheImplementationsThatRan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := Plan(context.Background(), PlanOptions{Bundle: b, Stage1: "sha256:stage1"})
+	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

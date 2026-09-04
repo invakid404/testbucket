@@ -17,7 +17,7 @@ import (
 // authenticates the contradiction.
 func TestEverySignedReplayClaimIsChecked(t *testing.T) {
 	const verifierID = "independent-verifier"
-	issued := matchableReceipt()
+	issued := claimed(matchableReceipt())
 	issuedDigest, err := issued.DigestOf()
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +30,7 @@ func TestEverySignedReplayClaimIsChecked(t *testing.T) {
 			Stage1Digest:   issued.Stage1Digest,
 			Stage2Digest:   issuedDigest,
 			BundleDigest:   issued.BundleDigest,
-			Recomputed:     matchableReceipt(),
+			Recomputed:     claimed(matchableReceipt()),
 			VerifierID:     verifierID,
 			VerifierBinary: "sha256:verifier",
 			Signature:      &Signature{Authority: verifierID},
@@ -86,7 +86,7 @@ func TestEverySignedReplayClaimIsChecked(t *testing.T) {
 func TestAValidlySignedContradictionIsStillRefused(t *testing.T) {
 	const verifierID = "independent-verifier"
 	key := mustSigningKey()
-	issued := matchableReceipt()
+	issued := claimed(matchableReceipt())
 	issuedDigest, err := issued.DigestOf()
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +94,7 @@ func TestAValidlySignedContradictionIsStillRefused(t *testing.T) {
 	a := ReplayAttestation{
 		Kind: ReplayKind, Stage1Digest: issued.Stage1Digest, Stage2Digest: issuedDigest,
 		BundleDigest: "sha256:a-bundle-this-replay-never-read",
-		Recomputed:   matchableReceipt(), VerifierID: verifierID,
+		Recomputed:   claimed(matchableReceipt()), VerifierID: verifierID,
 	}
 	d, err := a.DigestOf()
 	if err != nil {

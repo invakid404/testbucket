@@ -271,7 +271,17 @@ type Result struct {
 
 // PlanOptions configures the replay.
 type PlanOptions struct {
-	Bundle *walltime.PlanningInputBundle
+	// PlannerClaim is the one-shot execution claim this derivation is being
+	// performed under.
+	//
+	// It is an INPUT rather than something stamped on afterwards: the receipt
+	// is validated as it is built, and a receipt whose claim arrives later is
+	// a receipt that was complete without one. The caller takes the claim
+	// before calling here — that is the whole point of a pre-plan claim — so
+	// passing it in costs nothing and makes the derivation and its claim one
+	// object.
+	PlannerClaim *walltime.PlannerClaimReceipt
+	Bundle       *walltime.PlanningInputBundle
 	// Stage1 is the parent manifest digest the receipt records.
 	Stage1 walltime.Digest
 	// Scorer, when set, makes the frozen pre-plan score the ALLOCATION input:
@@ -365,7 +375,7 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 		return nil, err
 	}
 
-	receipt, err := deriveReceipt(opt.Stage1, b, doc, live)
+	receipt, err := deriveReceipt(opt.Stage1, opt.PlannerClaim, b, doc, live)
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +388,7 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 
 // deriveReceipt computes every digest the Stage-2 receipt carries, plus the
 // input-access record of what the planner actually consumed.
-func deriveReceipt(stage1 walltime.Digest, b *walltime.PlanningInputBundle, doc *core.PlanDocument, live []runner.LivePackage) (*walltime.Stage2Receipt, error) {
+func deriveReceipt(stage1 walltime.Digest, claim *walltime.PlannerClaimReceipt, b *walltime.PlanningInputBundle, doc *core.PlanDocument, live []runner.LivePackage) (*walltime.Stage2Receipt, error) {
 	bundleDigest, err := b.DigestOf()
 	if err != nil {
 		return nil, err
@@ -415,6 +425,7 @@ func deriveReceipt(stage1 walltime.Digest, b *walltime.PlanningInputBundle, doc 
 
 	r := &walltime.Stage2Receipt{
 		Kind:             walltime.Stage2Kind,
+		PlannerClaim:     claim,
 		Stage1Digest:     stage1,
 		BundleDigest:     bundleDigest,
 		InputAccess:      inputAccess(b),

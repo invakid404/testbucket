@@ -39,6 +39,12 @@ func currentPlan(t *testing.T) (walltime.PlanningInputBundle, walltime.Stage2Rec
 		TopologyDigest: d('8'), MembershipDigest: d('9'), InvocationDigest: d('a'),
 		ScriptDigest: d('b'), MatrixDigest: d('c'),
 		PlannerResult: "pass", RendererResult: "pass",
+		// Every real derivation is performed under a one-shot claim naming its
+		// own parents, so the fixture that stands in for one carries it.
+		PlannerClaim: &walltime.PlannerClaimReceipt{
+			Store: "authority/durable-claims", Durable: true,
+			Key: "fixture", Stage1: d('1'), Bundle: bundleDigest,
+		},
 	}
 	issued.Algorithms.FullPlan = walltime.AlgorithmIdentity{
 		Name: walltime.FullPlanDigestAlgorithm, Canonicalizer: "rfc8785/v1", Implementation: "sha256:test"}

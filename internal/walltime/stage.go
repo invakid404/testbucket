@@ -1720,6 +1720,20 @@ func (r Stage2Receipt) Validate() error {
 	if r.Stage1Digest == "" || r.BundleDigest == "" {
 		return fmt.Errorf("stage-2 receipt does not name its parent Stage-1 manifest and input bundle")
 	}
+	// THE ONE-SHOT CLAIM IS PART OF THE RECEIPT, and it is checked here.
+	//
+	// Carrying the claim inside the Stage-2 digest protects the SPELLING of an
+	// assertion once the receipt is signed; it does not prove the external
+	// one-shot event happened, and nothing required the field to be present or
+	// compared it with anything. A receipt with no claim validated, which is
+	// the state a derivation that never took one produces.
+	//
+	// So the claim must exist, must be durable, and must name THIS
+	// derivation: a claim whose parents are some other Stage-1 or bundle is a
+	// claim on a different plan, and a receipt is not entitled to borrow it.
+	if err := r.PlannerClaim.validateFor(r.Stage1Digest, r.BundleDigest); err != nil {
+		return fmt.Errorf("stage-2 receipt %w", err)
+	}
 	if r.PlanDigest == "" || r.SemanticDigest == "" {
 		return fmt.Errorf("stage-2 receipt must carry BOTH the full-document and semantic-projection digests")
 	}
@@ -1769,6 +1783,11 @@ func (r Stage2Receipt) Matches(other Stage2Receipt) error {
 		{"invocations", r.InvocationDigest, other.InvocationDigest},
 		{"generated script", r.ScriptDigest, other.ScriptDigest},
 		{"matrix", r.MatrixDigest, other.MatrixDigest},
+		// The claim is compared as an identity, not merely carried. Independent
+		// replay deliberately takes no second claim — it re-derives the same
+		// plan on purpose — so what replay must show is that it is talking
+		// about the SAME issued claim, not that it minted one of its own.
+		{"planner claim", r.PlannerClaim.identity(), other.PlannerClaim.identity()},
 		{"stage-1 parent", r.Stage1Digest, other.Stage1Digest},
 		{"input bundle", r.BundleDigest, other.BundleDigest},
 	}
@@ -2105,4 +2124,39 @@ type PlannerClaimReceipt struct {
 	Stage1    Digest `json:"stage1_digest"`
 	Bundle    Digest `json:"bundle_digest"`
 	ClaimedAt string `json:"claimed_at,omitempty"`
+}
+
+// validateFor requires a claim that exists, is durable, and belongs to this
+// derivation.
+//
+// It is a method on the pointer so the nil case is stated here rather than at
+// every call site: no claim is not "nothing to check", it is the absence of
+// the guard the contract requires, and a scored receipt that never took one
+// must not validate.
+func (c *PlannerClaimReceipt) validateFor(stage1, bundle Digest) error {
+	if c == nil {
+		return fmt.Errorf("carries no planner claim; the contract permits one planner execution and refuses a retry, and a receipt that records no claim cannot be told apart from a second attempt")
+	}
+	if strings.TrimSpace(c.Store) == "" || strings.TrimSpace(c.Key) == "" {
+		return fmt.Errorf("carries a planner claim that names no store or no derivation key, so it identifies no one-shot event")
+	}
+	if !c.Durable {
+		return fmt.Errorf("carries a planner claim taken in %q, which is not durable across workflow attempts; a claim a rerun cannot see does not establish that the planner ran once", c.Store)
+	}
+	if c.Stage1 != stage1 || c.Bundle != bundle {
+		return fmt.Errorf("carries a planner claim for Stage-1 %s over bundle %s, but the receipt derives Stage-1 %s over bundle %s; a claim on another derivation is not a claim on this one",
+			c.Stage1, c.Bundle, stage1, bundle)
+	}
+	return nil
+}
+
+// identity is the claim's canonical identity for comparison, and "" when there
+// is no claim — so a receipt that has one and a receipt that does not are
+// never equal.
+func (c *PlannerClaimReceipt) identity() Digest {
+	if c == nil {
+		return ""
+	}
+	return DigestBytes([]byte(fmt.Sprintf("%s\x00%s\x00%t\x00%s\x00%s",
+		c.Store, c.Key, c.Durable, c.Stage1, c.Bundle)))
 }

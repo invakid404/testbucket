@@ -1120,23 +1120,32 @@ func planFromBundle(o frozenPlanOptions) error {
 			return err
 		}
 	}
-	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{Bundle: &bundle, Stage1: stage1, Scorer: scorer})
+	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{
+		Bundle: &bundle, Stage1: stage1, Scorer: scorer,
+		// The claim travels INTO the derivation, so the receipt is complete
+		// when it is validated rather than completed afterwards.
+		PlannerClaim: claim.receipt,
+	})
 	if err != nil {
-		// The derivation did not happen, so the claim must not stand: a failed
-		// planner that kept one would refuse the authorised run's own retry.
-		claim.release()
-		return err
+		// THE CLAIM STANDS. It used to be released here, on the reasoning that
+		// a failed derivation should be retryable — but the contract permits
+		// exactly one planner execution and rejects a retry, and "it failed"
+		// is a claim the planner makes about itself. A planner that could
+		// release its own claim could take one, fail on purpose, and try
+		// again, which is the retry the rule forbids.
+		//
+		// Releasing is an AUTHORITY decision, not a planner one: the campaign
+		// authority voids a claim explicitly, through its own separately
+		// authenticated path, when it decides a derivation may be attempted
+		// again. Until then the attempt is recorded and the next one is
+		// refused.
+		return fmt.Errorf("%w\n\nthe one-shot claim for this derivation stands: the contract permits one planner execution and refuses a retry, so a new attempt needs the campaign authority to void %s explicitly",
+			err, strings.Join(claim.paths, ", "))
 	}
 	// The approval as the PLANNER saw it. Stage-1's digest excludes the
 	// detached signature, so a manifest signed after this point carries the
 	// same digest — this is the field that says the approval came first.
 	res.Receipt.Stage1Approval = approval
-	// THE CLAIM TRAVELS IN THE RECEIPT. A Stage-2 document that carried no
-	// claim could not be told apart from one produced by a second attempt on a
-	// fresh runner, which is the case a job rerun creates — so the claim's
-	// store, its durability and the derivation it names are part of what the
-	// receipt asserts rather than a file on whichever machine ran.
-	res.Receipt.PlannerClaim = claim.receipt
 	// The derived documents are written BEFORE the receipt, because the
 	// receipt binds them: a per-bucket projection or forecast that the one
 	// authorised plan does not name is a document anybody could have written,
@@ -1306,6 +1315,20 @@ func deriveDocuments(res *planbind.Result, registryPath, outDir string) error {
 // it was supposed to exclude.
 const plannerClaimStoreEnv = "TB_WALL_PLANNER_CLAIM_STORE"
 
+// plannerClaimAttestationEnv carries the campaign authority's signature over
+// the claim store's identity. Without it a store is not durable, whatever its
+// pathname suggests.
+const plannerClaimAttestationEnv = "TB_WALL_PLANNER_CLAIM_STORE_ATTESTATION"
+
+// plannerStoreSubject namespaces what that signature is over, so a signature
+// taken for some other purpose cannot be replayed as a durability attestation.
+const plannerStoreSubject = "tb.walltime.planner-claim-store/v1\x00"
+
+// plannerClaimAuthorityKeysEnv carries the predeclared campaign-authority
+// public keys the store attestation is verified against. A signature checked
+// against whatever signed it is one anybody can mint.
+const plannerClaimAuthorityKeysEnv = "TB_WALL_CAMPAIGN_AUTHORITY_KEYS"
+
 // plannerClaim is a taken one-shot claim on one derivation.
 type plannerClaim struct {
 	paths   []string
@@ -1359,13 +1382,45 @@ func plannerClaimStores(configured string) (stores []string, durable bool, err e
 	if external == "" {
 		external = strings.TrimSpace(os.Getenv(plannerClaimStoreEnv))
 	}
-	if external != "" {
-		durable = true
-		if external != machine {
-			stores = append(stores, external)
-		}
+	if external != "" && external != machine {
+		stores = append(stores, external)
 	}
+	// A PATHNAME IS NOT A GUARANTEE.
+	//
+	// Durability used to be inferred from "someone configured a path", which
+	// is a claim the planner makes about itself: an arbitrary directory on a
+	// fresh hosted runner satisfied it exactly as well as a shared store, and
+	// nothing could tell the two apart. The property that matters is that the
+	// store is the SAME one every attempt of the job resolves, and only the
+	// party that provisioned it can say so — so durability is now attested by
+	// the protected campaign authority and verified here, and a store nobody
+	// vouched for is not durable however it is spelled.
+	durable = external != "" && plannerStoreAttested(external)
 	return stores, durable, nil
+}
+
+// plannerStoreAttested reports whether the campaign authority has attested
+// that this store is shared across workflow attempts.
+//
+// The attestation is a signature by the predeclared authority over the store's
+// identity, supplied through the environment beside the store itself. It is
+// deliberately not something the planner can mint: the planner is the party
+// whose one-shot behaviour is being constrained, so it may not also be the
+// party that certifies the constraint is enforceable.
+func plannerStoreAttested(store string) bool {
+	sig := strings.TrimSpace(os.Getenv(plannerClaimAttestationEnv))
+	// The PREDECLARED authority public keys, the same set every other
+	// authority check in this binary is made against.
+	keys := splitList(os.Getenv(plannerClaimAuthorityKeysEnv))
+	if sig == "" || len(keys) == 0 {
+		return false
+	}
+	return walltime.VerifySigned(&walltime.Signature{
+		Authority: walltime.CampaignAuthority,
+		KeyID:     keys[0],
+		Digest:    walltime.DigestBytes([]byte(plannerStoreSubject + store)),
+		Value:     sig,
+	}, walltime.DigestBytes([]byte(plannerStoreSubject+store)), keys) == nil
 }
 
 // claimPlannerExecution takes an exclusive claim on deriving the plan
@@ -1432,7 +1487,14 @@ func claimPlannerExecution(configured string, stage1, bundle walltime.Digest) (p
 // Refusing here — before any planner work and before any derived write — is
 // what makes the one-shot rule mechanical rather than aspirational.
 func requireDurablePlannerClaim(c plannerClaim) error {
-	if c.receipt == nil || c.receipt.Durable {
+	// FAIL CLOSED ON ABSENCE. A nil receipt is not "no problem found"; it is
+	// no claim at all, which is precisely the state the guard exists to
+	// refuse. Reading it as success made the scored path pass whenever the
+	// claim machinery had not run.
+	if c.receipt == nil {
+		return fmt.Errorf("a scored derivation needs a durable one-shot claim and none was taken; refusing to plan rather than deriving without the guard the contract requires")
+	}
+	if c.receipt.Durable {
 		return nil
 	}
 	return fmt.Errorf(

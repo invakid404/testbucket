@@ -103,22 +103,60 @@ if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
   trap 'rm -rf "$work"' EXIT
   echo "downloading candidate artifact $cand_artifact from run $cand_run"
   gh run download "$cand_run" --repo "$TB_REPO" --name "$cand_artifact" --dir "$work"
-  archive=$(find "$work" -type f -name '*.tar.gz' | head -n1)
-  if [ -z "$archive" ]; then
-    echo "install-testbucket: candidate artifact $cand_artifact holds no .tar.gz" >&2
+  # EXACTLY ONE ARCHIVE, AND NOTHING BESIDE IT IS TRUSTED.
+  #
+  # Choosing the first .tar.gz found anywhere under the download, digesting
+  # only that, and then searching the WHOLE download for something named
+  # testbucket meant the digest authenticated one file while an unrelated
+  # sibling executable was the thing that got installed. The digest has to
+  # govern the bytes that run, so: the artifact must contain exactly one
+  # archive, that archive is what the digest is checked against, and the
+  # binary is taken from a FRESH directory holding only that archive's
+  # contents.
+  archive_count=$(find "$work" -type f -name '*.tar.gz' | wc -l | tr -d ' ')
+  if [ "$archive_count" -ne 1 ]; then
+    echo "install-testbucket: candidate artifact $cand_artifact holds $archive_count .tar.gz members; a candidate artifact carries exactly one, for one platform" >&2
+    echo "Publish a per-platform candidate artifact so the delivery names one archive and cannot be ambiguous." >&2
     exit 1
   fi
+  archive=$(find "$work" -type f -name '*.tar.gz')
   got="sha256:$(sha256sum "$archive" | cut -d' ' -f1)"
   if [ "$got" != "$cand_digest" ]; then
     echo "install-testbucket: candidate archive digests to $got, not the demanded $cand_digest" >&2
     echo "A pre-publication artifact is trusted only because its bytes were named in advance." >&2
     exit 1
   fi
-  tar -xzf "$archive" -C "$work"
-  cand_bin=$(find "$work" -type f -name testbucket -perm -u+x | head -n1)
-  if [ -z "$cand_bin" ]; then
-    echo "install-testbucket: candidate archive holds no testbucket binary" >&2
+  # A FRESH directory, so nothing that arrived beside the archive can be
+  # mistaken for something the archive contained.
+  pinned="$work/pinned"
+  mkdir -p "$pinned"
+  tar -xzf "$archive" -C "$pinned"
+  # A FIXED member, not a search. `testbucket` at the archive root is the
+  # member the release archives carry, and asking for it by name means an
+  # archive that does not contain it is refused rather than fallen back from.
+  cand_bin="$pinned/testbucket"
+  if [ ! -f "$cand_bin" ]; then
+    echo "install-testbucket: the pinned candidate archive holds no testbucket member at its root" >&2
     exit 1
+  fi
+  # And nothing else executable travelled inside it either: a second binary in
+  # the archive is the same ambiguity one level in.
+  extra=$(find "$pinned" -type f -perm -u+x ! -path "$cand_bin" | head -n1)
+  if [ -n "$extra" ]; then
+    echo "install-testbucket: the pinned candidate archive also holds executable $extra; a candidate archive carries one binary" >&2
+    exit 1
+  fi
+  # THE INSTALLED BYTES ARE RE-DIGESTED when the caller states what the
+  # builder and verifier attested. The archive digest says which archive; this
+  # says which binary, and Stage 1 binds the second.
+  if [ -n "${TB_CANDIDATE_BINARY_DIGEST:-}" ]; then
+    bin_got="sha256:$(sha256sum "$cand_bin" | cut -d' ' -f1)"
+    if [ "$bin_got" != "$TB_CANDIDATE_BINARY_DIGEST" ]; then
+      echo "install-testbucket: the installed candidate binary digests to $bin_got, not the attested $TB_CANDIDATE_BINARY_DIGEST" >&2
+      echo "The archive digest names which archive; this names which binary, and Stage 1 binds the second." >&2
+      exit 1
+    fi
+    echo "candidate binary digest matches the attested $bin_got"
   fi
   mv "$cand_bin" "$bin"
   chmod +x "$bin"

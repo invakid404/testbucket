@@ -366,6 +366,11 @@ func TestAnAblationMustProveItsRealizedTopology(t *testing.T) {
 		{"a plan derived from another Stage-1", func(idx *CampaignIndex, l memoryLoader) {
 			r := *l.stage2[idx.Ablations[0].Stage2Path]
 			r.Stage1Digest = "sha256:elsewhere"
+			// The receipt's own claim follows its parents, so that this case
+			// exercises the ablation's Stage-1 binding rather than tripping
+			// the schema's separate claim-parent rule first. Two defects in
+			// one fixture would leave neither of them actually asserted.
+			r.PlannerClaim = fixtureClaim(r.Stage1Digest, r.BundleDigest)
 			l.stage2[idx.Ablations[0].Stage2Path] = &r
 		}, "not the"},
 

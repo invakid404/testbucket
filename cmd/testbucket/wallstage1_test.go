@@ -575,13 +575,46 @@ func TestAScoredDerivationRequiresADurableClaim(t *testing.T) {
 	if err == nil {
 		t.Fatal("a scored derivation was allowed to plan on a machine-local claim")
 	}
+
 	if !strings.Contains(err.Error(), "DURABLE") {
 		t.Errorf("the refusal does not say a durable claim is required: %v", err)
 	}
 
-	// WITH ONE CONFIGURED, the scored path proceeds and the receipt says so —
-	// so a reader of the Stage-2 receipt can tell which guarantee was given.
-	durable, err := claimPlannerExecution(t.TempDir(), walltime.Digest("sha256:s2"), walltime.Digest("sha256:b2"))
+	// AND A NIL CLAIM IS THE ABSENCE OF THE GUARD, not a pass. This returned
+	// success, so the scored path was satisfied whenever the claim machinery
+	// had not run at all.
+	if err := requireDurablePlannerClaim(plannerClaim{}); err == nil {
+		t.Error("the scored guard accepted a claim that was never taken")
+	}
+
+	// A PATHNAME ALONE DOES NOT CERTIFY DURABILITY. An arbitrary directory is
+	// exactly what a fresh hosted runner also has.
+	unattested, uerr := claimPlannerExecution(t.TempDir(), walltime.Digest("sha256:s3"), walltime.Digest("sha256:b3"))
+	if uerr != nil {
+		t.Fatal(uerr)
+	}
+	if unattested.receipt.Durable {
+		t.Error("an unattested directory self-certified as durable")
+	}
+
+	// WITH ONE ATTESTED, the scored path proceeds and the receipt says so — so
+	// a reader of the Stage-2 receipt can tell which guarantee was given.
+	//
+	// The attestation, not the pathname, is what makes a store durable. A path
+	// is something the planner can choose for itself, and the planner is the
+	// party whose one-shot behaviour is being constrained; only the authority
+	// that provisioned the store can say it is the same one every attempt of
+	// the job resolves.
+	store := t.TempDir()
+	key, err := walltime.NewSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject := walltime.DigestBytes([]byte(plannerStoreSubject + store))
+	t.Setenv(plannerClaimAttestationEnv, walltime.SignApproval(walltime.CampaignAuthority, key, subject))
+	t.Setenv(plannerClaimAuthorityKeysEnv, walltime.PublicKeyOf(key))
+
+	durable, err := claimPlannerExecution(store, walltime.Digest("sha256:s2"), walltime.Digest("sha256:b2"))
 	if err != nil {
 		t.Fatal(err)
 	}
