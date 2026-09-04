@@ -193,3 +193,71 @@ func hostOSArch(t *testing.T) string {
 		return osName + "_" + arch
 	}
 }
+
+// A RELEASE CANNOT CONTAIN ITS OWN DIGEST, AND DOES NOT HAVE TO.
+//
+// GoReleaser embeds the tag commit and its timestamp in the binary, so the
+// bytes do not exist until the tag does and a pin committed beforehand would
+// have to predict its own hash. The colocated file pins releases published
+// before the commit it lives in; the newest release is pinned by the commit
+// that comes AFTER it, named as a full 40-hex commit SHA — immutable, and
+// therefore still a root the release cannot move.
+func TestALaterCommitMaySupplyAReleasePin(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", ".github", "actions", "install-testbucket.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh := string(b)
+	for _, want := range []string{
+		"TB_RELEASE_PINS_REF",
+		"not a full 40-hex commit SHA",
+		"A pin fetched through a branch or a tag is a pin whoever can move that ref controls.",
+		"Two reviewed roots disagreeing about one release's bytes is not a tie to break.",
+	} {
+		if !strings.Contains(sh, want) {
+			t.Errorf("the installer is missing %q", want)
+		}
+	}
+	// Only a full commit SHA: a branch or tag would put the pin back under the
+	// control of whoever can move that ref.
+	if !strings.Contains(sh, `grep -Eq '^[0-9a-f]{40}$'`) {
+		t.Error("the pins ref is not constrained to a full commit SHA")
+	}
+
+	// EVERY PUBLIC ACTION CAN CARRY IT, or the supported route cannot use it.
+	for _, a := range publicActions {
+		body, err := os.ReadFile(filepath.Join("..", "..", ".github", "actions", a, "action.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(body)
+		if !strings.Contains(text, "release-pins-ref:") {
+			t.Errorf("the %s action has no release-pins-ref input", a)
+		}
+		if !strings.Contains(text, "TB_RELEASE_PINS_REF: ${{ inputs.release-pins-ref }}") {
+			t.Errorf("the %s action never exports TB_RELEASE_PINS_REF", a)
+		}
+	}
+
+	// AND THE SECOND PHASE EXISTS, proposes rather than commits, and holds a
+	// read-only token.
+	pin, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "pin-release.yml"))
+	if err != nil {
+		t.Fatal("the two-phase pin workflow is missing: a release published after the action's commit could never be pinned")
+	}
+	text := string(pin)
+	for _, want := range []string{
+		"contents: read",
+		"in a reviewed change",
+		"already pinned",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the pin workflow is missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"git push", "gh pr create", "contents: write"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("the pin workflow contains %q; the pin's value is that a person reviewed it, so this job proposes and does not write", forbidden)
+		}
+	}
+}

@@ -555,6 +555,23 @@ type Stage1Manifest struct {
 	// authority decides which experiment a run belongs to, and it decides it
 	// before the run.
 	AblationStratum string `json:"ablation_stratum,omitempty"`
+	// RunnerAttestation is the FLEET'S signed statement that the host which
+	// executes this arm was booted from the image bound above, and
+	// RunnerAuthorityKeys are the keys allowed to make it.
+	//
+	// The runner image was caller-supplied text compared only with itself:
+	// nothing tied it to a machine, so two arms could run on different hosts
+	// while both manifests claimed one identity, and a digest-shaped
+	// self-hosted label could name an image the host is not. Refusing an alias
+	// made the assertion unambiguous, not true.
+	//
+	// A SCORED ARM REQUIRES BOTH. GitHub's runner context does not report the
+	// selected image digest, so a hosted-runner lane cannot produce this and
+	// is unsupported for a scored arm — which is the honest outcome and the one
+	// enforced here rather than disclosed. An ablation is not a pair and does
+	// not carry the requirement.
+	RunnerAttestation   *RunnerAttestation `json:"runner_attestation,omitempty"`
+	RunnerAuthorityKeys []string           `json:"runner_authority_keys,omitempty"`
 	// Schedule is the authority-frozen campaign identity and pair order. The
 	// contract requires Stage 1 to bind campaign/pair order before planning
 	// and role assignment, and to freeze that order before the first candidate
@@ -1346,6 +1363,21 @@ func (m Stage1Manifest) Validate() error {
 	}
 	if !isImmutableImage(m.Consumer.RunnerImage) {
 		return fmt.Errorf("stage-1 manifest: runner image %q is an alias, not an immutable identity; two arms resolved through an alias are not proven to have run on the same image", m.Consumer.RunnerImage)
+	}
+	// AND THE IMAGE IS ATTESTED BY THE FLEET, for a scored arm.
+	//
+	// An immutable spelling is not an observation. A scored arm must carry the
+	// fleet's signed statement that the host executing it was booted from that
+	// exact image, verified against keys this manifest predeclares — and a
+	// lane that cannot produce one is unsupported for scoring rather than
+	// scored on an assertion. An ablation is not a pair and is exempt.
+	if m.AblationStratum == "" {
+		if m.RunnerAttestation == nil {
+			return fmt.Errorf("stage-1 manifest: a scored arm binds runner image %s but carries no fleet attestation that the executing host was booted from it; the image would be caller-supplied text compared only with itself. A lane that cannot attest its runners is unsupported for scoring", m.Consumer.RunnerImage)
+		}
+		if err := m.RunnerAttestation.VerifyDocument(m.Consumer.RunnerImage, m.RunnerAuthorityKeys); err != nil {
+			return fmt.Errorf("stage-1 manifest: %w", err)
+		}
 	}
 
 	if err := m.SourceProfile.Validate(); err != nil {

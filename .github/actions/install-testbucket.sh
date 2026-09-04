@@ -28,6 +28,8 @@
 #   TB_BINDIR    directory to install the binary into   (created if missing)
 # Optional env:
 #   GH_TOKEN     token for `gh release list`            (only the alias path needs it)
+#   TB_RELEASE_PINS_REF  full 40-hex commit SHA carrying the pin for a release
+#                published after this action's own commit (see below)
 #   TB_CANDIDATE_BINARY_DIGEST  sha256:<64-hex> of the binary Stage 1 authorised
 #                (MANDATORY on the candidate path; derive it with
 #                `testbucket wall stage1-binary --file stage1.json` from a
@@ -329,9 +331,51 @@ if [ ! -f "$pins" ]; then
   exit 1
 fi
 pinned=$(awk -F'\t' -v t="$tag" -v p="${os}_${arch}" '$1 == t && $2 == p { print $3; exit }' "$pins")
+
+# A RELEASE CANNOT CONTAIN ITS OWN DIGEST, AND DOES NOT HAVE TO.
+#
+# GoReleaser embeds the tag commit and its timestamp in the binary, so the
+# digest of a release's own bytes cannot exist before the tag that produces
+# them — a pin committed beforehand would have to predict its own hash. The
+# colocated file above therefore pins releases published BEFORE the commit it
+# lives in, and the newest release is pinned by the commit that comes after it.
+#
+# TB_RELEASE_PINS_REF is that later commit, named as a FULL 40-hex commit SHA
+# and nothing else. A commit SHA is immutable and addresses one reviewed tree,
+# so the pin still comes from a root the release cannot move — a branch or a
+# tag would put the pin back under the control of whoever can move it, which is
+# the property this whole check exists for.
+if [ -n "${TB_RELEASE_PINS_REF:-}" ]; then
+  if ! printf '%s' "$TB_RELEASE_PINS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "install-testbucket: TB_RELEASE_PINS_REF is '$TB_RELEASE_PINS_REF', not a full 40-hex commit SHA" >&2
+    echo "A pin fetched through a branch or a tag is a pin whoever can move that ref controls." >&2
+    exit 1
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "install-testbucket: fetching pins from commit $TB_RELEASE_PINS_REF needs the gh CLI" >&2
+    exit 1
+  fi
+  later="$work/pins-at-ref.tsv"
+  if ! gh api "repos/${TB_REPO}/contents/.github/actions/released-binary-digests.tsv?ref=${TB_RELEASE_PINS_REF}"         -H "Accept: application/vnd.github.raw" > "$later" 2>/dev/null; then
+    echo "install-testbucket: could not read the pin file at commit $TB_RELEASE_PINS_REF in $TB_REPO" >&2
+    exit 1
+  fi
+  at_ref=$(awk -F'\t' -v t="$tag" -v p="${os}_${arch}" '$1 == t && $2 == p { print $3; exit }' "$later")
+  if [ -n "$at_ref" ]; then
+    if [ -n "$pinned" ] && [ "$pinned" != "$at_ref" ]; then
+      echo "install-testbucket: the colocated pin for $tag ${os}_${arch} is $pinned but commit $TB_RELEASE_PINS_REF says $at_ref" >&2
+      echo "Two reviewed roots disagreeing about one release's bytes is not a tie to break." >&2
+      exit 1
+    fi
+    pinned="$at_ref"
+    echo "pin for $tag ${os}_${arch} taken from commit $TB_RELEASE_PINS_REF"
+  fi
+fi
+
 if [ -z "$pinned" ]; then
   echo "install-testbucket: no precommitted binary digest for $tag ${os}_${arch} in $pins" >&2
-  echo "The release archive and its checksums.txt are both mutable assets of the same release, so they cannot authenticate each other. Commit the digest for this release and platform, then install it." >&2
+  echo "The release archive and its checksums.txt are both mutable assets of the same release, so they cannot authenticate each other." >&2
+  echo "A release published AFTER this action's commit is pinned by a later commit: run the pin-release workflow, review and merge the four lines it proposes, then pass that commit as release-pins-ref (TB_RELEASE_PINS_REF)." >&2
   exit 1
 fi
 if ! printf '%s' "$pinned" | grep -Eq '^sha256:[0-9a-f]{64}$'; then

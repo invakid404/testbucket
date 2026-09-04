@@ -76,6 +76,9 @@ usage:
   testbucket wall countersign [flags]  the VERIFIER'S independent signature
                                     over a builder attestation, after
                                     re-deriving the artifact's digest
+  testbucket wall attest-runner [flags]  the FLEET'S signed statement that a
+                                    host was booted from a named image, scoped
+                                    to one run; a scored arm requires it
   testbucket wall attest   [flags]  produce the builder's SIGNED build
                                    attestation for one exact artifact: its
                                    subject digest, source, builder, issuer,
@@ -140,6 +143,8 @@ func runWall(args []string) error {
 		return runWallCountersign(args[1:])
 	case "attest":
 		return runWallAttest(args[1:])
+	case "attest-runner":
+		return runWallAttestRunner(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, wallUsage)
 		return nil

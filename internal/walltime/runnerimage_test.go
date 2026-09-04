@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -160,5 +161,70 @@ func TestTheScoredLaneRefusesAnAliasRunner(t *testing.T) {
 	// image it selected, so the binding stays asserted.
 	if !strings.Contains(body, "does not report the image it actually") {
 		t.Error("the runtime binding gap is not disclosed where a consumer reads the input")
+	}
+}
+
+// THE SHELL PRE-GATE AND THE GO CHECK MUST AGREE.
+//
+// The workflow gate that refuses a scored request BEFORE the matrix exists is
+// a second, independent implementation of the same rule, and it used to accept
+// anything containing "@sha256:" or "@sha512:" — so empty, one-character and
+// non-hex suffixes passed the pre-plan gate while the Go validator would later
+// refuse the same value. A gate that accepts more than the check it stands in
+// for is not a gate, it is a delay: by the time the Go check runs, the matrix
+// it was meant to prevent already exists.
+//
+// This drives the SHIPPED shell pattern, extracted from the workflow, over the
+// same table `isImmutableImage` is held to, and requires the two answers to be
+// identical.
+func TestTheWorkflowPreGateAgreesWithTheManifestCheck(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "bucketed-reusable.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The exact pattern the workflow applies, taken from the workflow.
+	const marker = `grep -Eq '`
+	at := strings.Index(string(body), marker+"^[^[:space:]]+@(sha256:")
+	if at < 0 {
+		t.Fatal("the pre-plan runner gate no longer uses an anchored digest pattern; it would accept values the manifest refuses")
+	}
+	rest := string(body)[at+len(marker):]
+	pattern, _, ok := strings.Cut(rest, "'")
+	if !ok {
+		t.Fatal("could not extract the pre-plan pattern from the workflow")
+	}
+
+	sha256Hex := strings.Repeat("a1b2c3d4", 8)
+	sha512Hex := strings.Repeat("a1b2c3d4", 16)
+	for _, v := range []string{
+		"ubuntu-24.04@sha256:" + sha256Hex,
+		"ubuntu-24.04@sha512:" + sha512Hex,
+		"ghcr.io/owner/image@sha256:" + sha256Hex,
+		"ubuntu-latest",
+		"ubuntu-latest@sha256:",
+		"ubuntu-latest@sha256:x",
+		"ubuntu-latest@sha512:not-a-digest",
+		"ubuntu-24.04@sha256:" + sha256Hex[:63],
+		"ubuntu-24.04@sha256:" + sha256Hex + "a",
+		"ubuntu-24.04@sha256:" + strings.ToUpper(sha256Hex),
+		"ubuntu-24.04@sha512:" + sha256Hex,
+		"ubuntu-24.04@sha256:" + sha512Hex,
+		"@sha256:" + sha256Hex,
+		"ubuntu-latest@md5:" + sha256Hex,
+		"",
+	} {
+		want := isImmutableImage(v)
+		cmd := exec.Command("grep", "-Eq", pattern)
+		cmd.Stdin = strings.NewReader(v)
+		got := cmd.Run() == nil
+		if got != want {
+			t.Errorf("%q: the workflow pre-gate says %v and the manifest check says %v; the gate stands in for the check and must not accept more", v, got, want)
+		}
+	}
+
+	// AND WHITESPACE IS REFUSED BEFORE THE PATTERN IS EVEN APPLIED, because
+	// grep is line-oriented and a second line could otherwise satisfy it.
+	if !strings.Contains(string(body), "needs a single-line immutable runs-on") {
+		t.Error("the pre-plan gate does not refuse a multi-line or padded runner value")
 	}
 }

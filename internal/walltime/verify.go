@@ -1284,6 +1284,18 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 	if stage1 != nil && parsed != nil {
 		verifyPrePlanApproval(v, *stage1, *parsed)
 	}
+	// THE FLEET ATTESTATION IS SCOPED TO THIS RUN, and only the verifier can
+	// check that half: the manifest is signed before any run exists, so what
+	// it can establish is the shape, the image and the signature. Which run
+	// the statement is about is decided here, against the records.
+	if stage1 != nil && stage1.AblationStratum == "" {
+		if stage1.RunnerAttestation == nil {
+			v.add("WT-018", SeverityIneligible,
+				fmt.Sprintf("the Stage-1 manifest binds runner image %s but carries no fleet attestation that the executing host was booted from it; the image is caller-supplied text compared only with itself", stage1.Consumer.RunnerImage))
+		} else if err := stage1.RunnerAttestation.Verify(stage1.Consumer.RunnerImage, v.Run, stage1.RunnerAuthorityKeys); err != nil {
+			v.add("WT-018", SeverityIneligible, fmt.Sprintf("runner attestation: %v", err))
+		}
+	}
 	if stage1 != nil {
 		verifyProducerBinaries(v, stage1.Instrumentation, recs)
 		// Stage 1 is where the run-key signer set is DECLARED. Taking it from

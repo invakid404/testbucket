@@ -165,3 +165,67 @@ func TestTheDelegateHandoffStillUsesTheStepOutput(t *testing.T) {
 		t.Error("the setup-command contract does not say the GitHub file channels are stripped under measurement")
 	}
 }
+
+// THE CURRENT OFFICIAL SET, AND THE SHAPE BEHIND IT.
+//
+// actions/runner v2.337.0 exports `artifacts` and `artifacts_list` as
+// GITHUB_ARTIFACTS and GITHUB_ARTIFACTS_LIST, and its FileCommandManager gives
+// every extension ONE SHARED GUID SUFFIX — including `set_output_`. So an
+// observer holding either artifacts path holds the suffix that names the
+// output file the signer delegate is appended to, whether or not artifact
+// processing is enabled. A denylist of the five obvious names left both
+// inherited.
+//
+// Enumerating names cannot keep up with a runner that adds an extension, so
+// the sibling SHAPE is refused too: any other variable whose value is a file
+// in a directory a named channel lives in.
+func TestTheScrubRemovesTheCurrentRunnerChannelsAndTheirSiblings(t *testing.T) {
+	const suffix = "3f1a5b6c-0000-4000-8000-abcdefabcdef"
+	dir := "/home/runner/work/_temp/_runner_file_commands"
+	env := []string{
+		"GITHUB_OUTPUT=" + dir + "/set_output_" + suffix,
+		"GITHUB_ENV=" + dir + "/set_env_" + suffix,
+		"GITHUB_PATH=" + dir + "/add_path_" + suffix,
+		"GITHUB_STEP_SUMMARY=" + dir + "/step_summary_" + suffix,
+		"GITHUB_STATE=" + dir + "/save_state_" + suffix,
+		// The two v2.337.0 additions the first list missed.
+		"GITHUB_ARTIFACTS=" + dir + "/artifacts_" + suffix,
+		"GITHUB_ARTIFACTS_LIST=" + dir + "/artifacts_list_" + suffix,
+		// A future extension nobody has enumerated: same directory, same
+		// suffix, therefore the same channel.
+		"GITHUB_SOMETHING_NEW=" + dir + "/something_new_" + suffix,
+		// Run identity and workspace paths, which live elsewhere and must
+		// survive: the records bind them.
+		"GITHUB_REPOSITORY=invakid404/testbucket",
+		"GITHUB_RUN_ID=42",
+		"GITHUB_WORKSPACE=/home/runner/work/testbucket/testbucket",
+		"GITHUB_EVENT_PATH=/home/runner/work/_temp/_github_workflow/event.json",
+		"RUNNER_TEMP=/home/runner/work/_temp",
+		"PATH=/usr/bin",
+	}
+	kept := map[string]string{}
+	for _, kv := range scrubSecrets(env) {
+		k, v, _ := strings.Cut(kv, "=")
+		kept[k] = v
+	}
+	for _, gone := range []string{
+		"GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE",
+		"GITHUB_ARTIFACTS", "GITHUB_ARTIFACTS_LIST", "GITHUB_SOMETHING_NEW",
+	} {
+		if v, present := kept[gone]; present {
+			t.Errorf("scrubSecrets kept %s=%q; the shared suffix in it names the output file the delegate is written to", gone, v)
+		}
+	}
+	for _, stay := range []string{"GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_WORKSPACE", "GITHUB_EVENT_PATH", "RUNNER_TEMP", "PATH"} {
+		if _, present := kept[stay]; !present {
+			t.Errorf("scrubSecrets removed %s, which is not a file-command channel", stay)
+		}
+	}
+
+	// WITH NO CHANNEL PRESENT the sibling rule removes nothing, so an ordinary
+	// environment is not quietly emptied by a directory coincidence.
+	plain := []string{"A=/home/runner/work/_temp/_runner_file_commands/x", "B=/usr/bin/thing"}
+	if got := len(scrubSecrets(plain)); got != len(plain) {
+		t.Errorf("with no named channel present the scrub removed %d of %d variables", len(plain)-got, len(plain))
+	}
+}

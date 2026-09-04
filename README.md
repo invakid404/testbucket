@@ -760,6 +760,39 @@ default — and until a release implementing `wall stage1-binary` is published
 there is no capable resolver, so a scored candidate delivery is refused rather
 than resolved by the candidate.
 
+**Released binaries are pinned outside the release.** The archive and its
+`checksums.txt` are both assets of the same release and cannot authenticate
+each other, so `.github/actions/released-binary-digests.tsv` — committed to
+this repository, under review — names the digest of the binary inside each
+published archive, and the installer refuses a mismatch or an unpinned tag.
+
+A release cannot contain its own digest: GoReleaser embeds the tag commit and
+its timestamp in the binary, so the bytes do not exist until the tag does. The
+lifecycle is two phases. `release.yml` publishes; the `pin-release` workflow
+then reads the published assets, prints the four lines, and commits nothing —
+a person reviews and merges them. Until that commit is colocated with the
+action you use, pass it explicitly:
+
+```yaml
+with:
+  version: v0.3.0
+  release-pins-ref: <full 40-hex commit SHA carrying the v0.3.0 pin>
+```
+
+Only a full commit SHA is accepted. A branch or a tag would put the pin back
+under the control of whoever can move that ref, which is the property the pin
+exists for.
+
+**A scored arm needs its runner attested.** Stage 1 binds a runner image and
+the pair equality check compares it, but `--runner-image` is text until someone
+says the host was booted from it. A scored arm must carry a fleet attestation
+(`testbucket wall attest-runner`, signed with `TB_WALL_RUNNER_KEY` by whoever
+provisions the runners) naming the image, the host, and the exact run — verified
+against keys the manifest predeclares. GitHub's runner context does not report
+the selected image, so **a hosted-runner lane cannot produce one and is
+unsupported for scoring**; it is refused rather than scored on an assertion.
+Unscored lanes are unaffected.
+
 **On `version`:** every action defaults to the moving `v0` alias, which
 resolves to the highest published 0.x release — this project is deliberately
 pre-1.0. A scored arm *must* pin an exact `vX.Y.Z`: an alias is descriptive

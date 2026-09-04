@@ -378,6 +378,29 @@ var testVerdictAuthority = mustSigningKey()
 
 func testVerdictSigners() []string { return []string{PublicKeyOf(testVerdictAuthority)} }
 
+// testFleetAuthority signs runner attestations. It is the party that PROVISIONS
+// the hosts, and it is nobody else in this file: the campaign authority
+// approves inputs, the builder builds, the delivery verifier countersigns, the
+// verdict authority judges, and the fleet says which image a machine was
+// booted from. A scored arm cannot attest its own runner.
+var testFleetAuthority = mustSigningKey()
+
+func testRunnerKeys() []string { return []string{PublicKeyOf(testFleetAuthority)} }
+
+// testRunnerAttestation is the fleet's signed statement about the host a run
+// executes on, scoped to that run.
+func testRunnerAttestation(image, repository, workflowRun, attempt string) *RunnerAttestation {
+	a := &RunnerAttestation{
+		Image: image, Runner: "fleet-runner-7", OS: "Linux", Arch: "X64",
+		Repository: repository, WorkflowRun: workflowRun, RunAttempt: attempt,
+		AttestedAt: "2026-09-01T00:00:00Z",
+	}
+	if err := a.Sign("ewj2-fleet", testFleetAuthority); err != nil {
+		panic(err)
+	}
+	return a
+}
+
 // testVerdictIdentity is the delivery-bound verifier that judges a row. A
 // verdict must be signed UNDER it: the body names who judged, the signature
 // names who signed, and a verdict where those differ is a judgement
@@ -615,6 +638,11 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	m.Consumer.WorkflowSHA = testWorkflowSHA
 	m.Consumer.DownstreamRef = "refs/heads/main@" + testConsumerCommit
 	m.Consumer.RunnerImage = "ubuntu-24.04@sha256:" + strings.Repeat("cd", 32)
+	// A scored arm carries the FLEET'S statement that the executing host was
+	// booted from that image, verified against keys this manifest predeclares.
+	// An immutable spelling is not an observation.
+	m.RunnerAuthorityKeys = testRunnerKeys()
+	m.RunnerAttestation = testRunnerAttestation(m.Consumer.RunnerImage, "example/mandel", "run-1", "1")
 	profile := testSourceProfile()
 	m.Consumer.Facade = profile.Facade
 	m.Consumer.Config = profile.Config

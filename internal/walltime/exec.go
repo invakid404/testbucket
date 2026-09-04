@@ -1202,6 +1202,13 @@ const (
 	// bound to one run and may authorize only the lower levels, so holding it
 	// cannot register an action-level signer or vouch for another run.
 	SignerDelegateKeyEnv = "TB_WALL_SIGNER_DELEGATE_KEY"
+
+	// RunnerKeyEnv is the FLEET'S key: it signs the statement that a host was
+	// booted from a named image. The fleet provisions runners; the job does
+	// not, and a measured process holding this key could attest the host it is
+	// running on — which is exactly the assertion the attestation exists to
+	// replace.
+	RunnerKeyEnv = "TB_WALL_RUNNER_KEY"
 )
 
 // WallTimeSecretEnv is every environment variable this package treats as a
@@ -1233,6 +1240,9 @@ var WallTimeSecretEnv = []string{
 	// chain needs it; an observer does not, and an observer able to authorize
 	// its own signer would be vouching for itself.
 	SignerDelegateKeyEnv,
+	// The fleet key attests which image a host was booted from. A measured
+	// process that holds it can attest its own runner.
+	RunnerKeyEnv,
 }
 
 // GitHubFileCommandEnv names the writable file channels an Actions step is
@@ -1253,12 +1263,61 @@ var WallTimeSecretEnv = []string{
 // So the channels go too. The handoff itself is untouched: the append happens
 // in the composite step's OWN shell, which is not a scrubbed child, so the
 // step output still reaches the measured step by the same narrow route.
+// It is the CURRENT official set, not a plausible one. actions/runner v2.337.0
+// (commit 397b032cbf865e9c3ddfab89d533ec19325e1273) exports `artifacts` and
+// `artifacts_list` as GITHUB_ARTIFACTS and GITHUB_ARTIFACTS_LIST, and its
+// FileCommandManager gives EVERY extension one shared GUID suffix — including
+// `set_output_`. So an observer holding either artifacts path holds the suffix
+// that names the output file, whether or not artifact processing is enabled.
+// Listing the five obvious names and stopping was a defence against the
+// channel one happens to think of.
 var GitHubFileCommandEnv = []string{
 	"GITHUB_OUTPUT",
 	"GITHUB_ENV",
 	"GITHUB_PATH",
 	"GITHUB_STEP_SUMMARY",
 	"GITHUB_STATE",
+	"GITHUB_ARTIFACTS",
+	"GITHUB_ARTIFACTS_LIST",
+}
+
+// scrubFileCommandSiblings removes any OTHER variable whose value is a file in
+// the same directory as one of the named channels.
+//
+// The runner puts every file command in one directory and gives them one
+// shared suffix, so a sibling path is the whole channel: from
+// `.../_runner_file_commands/artifacts_<suffix>` the output file is
+// `set_output_<suffix>` in the same directory. Enumerating names cannot keep
+// up with a runner that adds an extension — v2.337.0 added two since this
+// denylist was written — so the SHAPE is refused as well as the names.
+//
+// It is deliberately narrow: only variables whose value is a path in a
+// directory some named channel also lives in. GITHUB_WORKSPACE,
+// GITHUB_EVENT_PATH and the rest of the run identity live elsewhere and are
+// untouched, and with no channel present it removes nothing at all.
+func scrubFileCommandSiblings(env []string) []string {
+	dirs := map[string]bool{}
+	for _, kv := range env {
+		name, value, _ := strings.Cut(kv, "=")
+		if !slices.Contains(GitHubFileCommandEnv, name) {
+			continue
+		}
+		if d := filepath.Dir(value); filepath.IsAbs(value) && d != "." && d != string(filepath.Separator) {
+			dirs[d] = true
+		}
+	}
+	if len(dirs) == 0 {
+		return env
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, value, _ := strings.Cut(kv, "=")
+		if !slices.Contains(GitHubFileCommandEnv, name) && filepath.IsAbs(value) && dirs[filepath.Dir(value)] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // scrubSecrets removes every wall-time secret from an environment.
@@ -1279,6 +1338,9 @@ func scrubSecrets(env []string) []string {
 	if env == nil {
 		env = os.Environ()
 	}
+	// The siblings are removed FIRST, while the named channels are still
+	// present to say which directory they live in.
+	env = scrubFileCommandSiblings(env)
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")

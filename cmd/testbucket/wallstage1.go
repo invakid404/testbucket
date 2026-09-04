@@ -38,6 +38,9 @@ func runWallStage1(args []string) error {
 	releaseSHA := fs.String("release-sha", "", "the SHA the release ref resolves to; it must equal the reviewed tip. A local binary cannot deliver a scored row")
 	binary := fs.String("binary", "", "path to the exact binary asset being delivered")
 	attestation := fs.String("build-attestation", "", "the builder's SIGNED build attestation for that binary (JSON, from `wall attest`). It is verified here against the delivered binary digest and the reviewed tip; a sentence about the build is not evidence about it")
+	runnerAttestation := fs.String("runner-attestation", "", "the FLEET'S signed statement (JSON, from `wall attest-runner`) that the host executing this arm was booted from --runner-image. Required for a scored arm: the image is otherwise caller-supplied text compared only with itself, and a lane that cannot attest its runners is unsupported for scoring rather than scored on an assertion")
+	var runnerKeys stringList
+	fs.Var(&runnerKeys, "runner-authority-key", "a PREDECLARED public key (hex) allowed to sign the runner attestation; repeatable and required for a scored arm. It is the fleet that provisions the hosts, and it must not be the arm itself")
 	var builderKeys stringList
 	fs.Var(&builderKeys, "builder-key", "a PREDECLARED public key (hex) allowed to sign the build attestation; repeatable and required. An attestation verified against whatever signed it is one anybody can mint")
 	sourceProfile := fs.String("source-profile", "", "source-profile receipt JSON (required): the resolved Vitest closure")
@@ -149,6 +152,18 @@ func runWallStage1(args []string) error {
 	m.BuilderKeys = builderKeys
 	if err := walltime.ReadJSONFile(*attestation, &m.Source.BuildAttestation); err != nil {
 		return fmt.Errorf("read the build attestation: %w", err)
+	}
+	// THE FLEET'S STATEMENT ABOUT THE HOST, for a scored arm. An ablation is
+	// not a pair and does not carry the requirement.
+	m.RunnerAuthorityKeys = runnerKeys
+	if strings.TrimSpace(*runnerAttestation) != "" {
+		var ra walltime.RunnerAttestation
+		if err := walltime.ReadJSONFile(*runnerAttestation, &ra); err != nil {
+			return fmt.Errorf("read the runner attestation: %w", err)
+		}
+		m.RunnerAttestation = &ra
+	} else if strings.TrimSpace(*ablationStratum) == "" {
+		return fmt.Errorf("--runner-attestation is required for a scored arm: %s is caller-supplied text until a fleet says the executing host was booted from it, and a lane that cannot attest its runners is unsupported for scoring", *runnerImage)
 	}
 	binaryDigest, err := walltime.FileDigest(*binary)
 	if err != nil {

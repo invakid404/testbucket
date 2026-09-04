@@ -571,10 +571,27 @@ jobs:
           # not report the image it actually selected back to the job, so the
           # binding stays asserted rather than mechanically verified. What it
           # removes is the ambiguity — a scored arm names one immutable image.
+          # THE SAME RULE THE MANIFEST APPLIES, NOT A WEAKER SPELLING OF IT.
+          #
+          # This used to accept anything CONTAINING "@sha256:" or "@sha512:",
+          # so an empty, one-character or non-hex suffix passed the pre-plan
+          # gate while the Go validator would later refuse the same value. A
+          # gate that accepts more than the check it stands in for is not a
+          # gate; it is a delay. The pattern below is `isImmutableImage`:
+          # a non-empty image with no whitespace, then a terminal
+          # sha256/64-hex or sha512/128-hex digest in lower case.
+          #
+          # `grep -q` is line-oriented, so a value spanning two lines is
+          # refused outright rather than allowed to satisfy the pattern on a
+          # second line.
           case "$TB_RUNS_ON" in
-            *@sha256:*|*@sha512:*) ;;
+            *[[:space:]]*)
+              say "needs a single-line immutable runs-on for a scored arm; '$TB_RUNS_ON' carries whitespace."
+              ;;
             *)
-              say "needs an immutable runs-on for a scored arm, not the moving alias '$TB_RUNS_ON'. Stage 1 binds a runner image and the pair equality check compares it; two arms resolved through an alias can run on two different images while both manifests claim the same identity."
+              if ! printf '%s' "$TB_RUNS_ON" | grep -Eq '^[^[:space:]]+@(sha256:[0-9a-f]{64}|sha512:[0-9a-f]{128})$'; then
+                say "needs an immutable runs-on for a scored arm, not '$TB_RUNS_ON'. Stage 1 binds a runner image and the pair equality check compares it; two arms resolved through an alias — or through an alias with a decorative digest suffix — can run on two different images while both manifests claim the same identity."
+              fi
               ;;
           esac
           [ "$fail" -eq 0 ] || exit 1

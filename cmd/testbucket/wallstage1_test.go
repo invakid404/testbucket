@@ -171,6 +171,8 @@ func stage1Inputs(t *testing.T, extra ...string) []string {
 			}},
 		}),
 		"--runner-image", "ubuntu-24.04@sha256:" + strings.Repeat("a", 64),
+		"--runner-attestation", fleetAttestation(t, "ubuntu-24.04@sha256:"+strings.Repeat("a", 64)),
+		"--runner-authority-key", walltime.PublicKeyOf(fleetKey),
 		"--consumer-repository", walltime.FrozenProfileRepository,
 		"--consumer-commit", walltime.FrozenProfileCommit,
 		"--caller-workflow-sha", "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
@@ -726,4 +728,35 @@ func TestThePublishGateRequiresAddressedCampaignEvidence(t *testing.T) {
 			t.Errorf("the addressed evidence was refused for a missing digest: %v", err)
 		}
 	})
+}
+
+// fleetKey signs runner attestations in these fixtures. The fleet is the party
+// that PROVISIONS the hosts: a scored arm cannot attest its own runner, so
+// this is a separate key from the campaign authority, the builder and the
+// verdict signer.
+var fleetKey = func() ed25519.PrivateKey {
+	k, err := walltime.NewSigningKey()
+	if err != nil {
+		panic(err)
+	}
+	return k
+}()
+
+// fleetAttestation writes the fleet's signed statement that the host executing
+// this run was booted from the given image, and returns its path.
+func fleetAttestation(t *testing.T, image string) string {
+	t.Helper()
+	a := walltime.RunnerAttestation{
+		Image: image, Runner: "fleet-runner-1", OS: "Linux", Arch: "X64",
+		Repository: "mandel-ai/mandel", WorkflowRun: "run-1", RunAttempt: "1",
+		AttestedAt: "2026-09-01T00:00:00Z",
+	}
+	if err := a.Sign("ewj2-fleet", fleetKey); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "runner-attestation.json")
+	if err := walltime.WriteJSONFile(p, a); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
