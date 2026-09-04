@@ -238,14 +238,18 @@ func TestTheActionLevelIsNotJudgedAsAMeasuredChild(t *testing.T) {
 func TestTheProductionLaunchPathAppliesTheCredentialDrop(t *testing.T) {
 	body := productionFunc(t, "exec.go", "func runChild(")
 	drop := strings.Index(body, "workloadArgv(opt.Level, opt.Argv)")
-	spawn := strings.Index(body, "exec.Command(")
+	// The command is now built by the shared held-child launcher — the child
+	// is this binary at a barrier, which execs the measured argv in place —
+	// so the construction to order against is the launcher call, not a bare
+	// exec.Command.
+	spawn := strings.Index(body, "HeldChildLauncher(argv)")
 	if drop < 0 {
 		t.Fatal("runChild builds its command without the credential drop; the measured work runs as the wrapper")
 	}
 	if spawn < 0 || drop > spawn {
 		t.Errorf("the drop at %d does not precede the command construction at %d", drop, spawn)
 	}
-	if strings.Contains(body, "exec.Command(opt.Argv[0], opt.Argv[1:]...)") {
+	if strings.Contains(body, "opt.Argv[0], opt.Argv[1:]...") || strings.Contains(body, "HeldChildLauncher(opt.Argv)") {
 		t.Error("runChild still constructs the measured command from the raw argv, bypassing the drop")
 	}
 }

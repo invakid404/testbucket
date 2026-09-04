@@ -199,13 +199,39 @@ func TestTheReusableWorkflowDeliversTheAttestedCandidateBinaryDigest(t *testing.
 		{"a typed candidate-resolver-version input", "\n      candidate-resolver-version:\n"},
 		{"a plan-job output carrying the derived digest", "\n      candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}\n"},
 		{"a derivation step", "- name: Resolve the attested candidate binary digest"},
-		{"the derivation reading the signed Stage-1 manifest", "wall stage1-binary"},
-		{"the derivation refusing a disagreeing caller value", "but Stage 1 authorises"},
-		{"a PUBLISHED resolver, not the candidate itself", "version: ${{ inputs.candidate-resolver-version }}"},
-		{"the resolver refusing to be a candidate", "a candidate cannot authenticate its own approval"},
+		{"the derivation delegated to the reviewed resolver action", "uses: $/.github/actions/candidate-digest"},
+		{"the resolver named by the caller", "resolver-version: ${{ inputs.candidate-resolver-version }}"},
+		{"the caller's value passed as a declaration to check", "expect: ${{ inputs.candidate-binary-digest }}"},
 	} {
 		if !strings.Contains(body, want.text) {
 			t.Errorf("the reusable workflow has no %s (looked for %q)", want.what, want.text)
+		}
+	}
+
+	// NO DEFAULT RESOLVER. It used to default to the moving `v0` alias, which
+	// resolves to a published release with no wall-time implementation at all,
+	// so the advertised route failed with `unknown subcommand "wall"`. A
+	// default that cannot do the job reads as one that can.
+	resolverInput := body[strings.Index(body, "      candidate-resolver-version:"):]
+	resolverInput = resolverInput[:strings.Index(resolverInput, "\n      go-version:")]
+	if !strings.Contains(resolverInput, `default: ""`) {
+		t.Errorf("candidate-resolver-version has a default resolver:\n%s", resolverInput)
+	}
+
+	// And the action it delegates to reads the manifest and refuses a
+	// disagreeing declaration.
+	act, err := os.ReadFile(filepath.Join("..", "..", ".github", "actions", "candidate-digest", "action.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"wall stage1-binary",
+		"but Stage 1 authorises",
+		"candidate-resolver.sh",
+		"has no 'wall stage1-binary'",
+	} {
+		if !strings.Contains(string(act), want) {
+			t.Errorf("the candidate-digest action is missing %q", want)
 		}
 	}
 

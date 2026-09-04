@@ -16,7 +16,7 @@ func claimed(r Stage2Receipt) Stage2Receipt {
 	// identifies its algorithm implementations by content rather than label.
 	if r.Stage1Approval.Authority == "" {
 		r.Stage1Approval = Stage1Approval{
-			Authority: CampaignAuthority, KeyID: "fixture-authority",
+			Authority: CampaignAuthority, KeyID: PublicKeyOf(fixtureAuthorityKey),
 			SignatureDigest: DigestBytes([]byte("stage1-approval")),
 		}
 	}

@@ -527,7 +527,7 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 		_ = hold.Close()
 		_ = release.Close()
 	}()
-	cmd, err := ActionChildLauncher(argv)
+	cmd, err := HeldChildLauncher(argv)
 	if err != nil {
 		return 1, fmt.Errorf("walltime: build the action-owned child: %w", err)
 	}
@@ -639,13 +639,14 @@ type actionChild struct {
 // 0, 1 and 2 are the standard streams and ExtraFiles starts at 3.
 const ActionChildHoldFD = 3
 
-// ActionChildLauncher builds the command that starts one action-owned child.
+// HeldChildLauncher builds the command that starts one held child — an
+// action-owned child, or the measured child of an envelope.
 //
 // Production re-executes THIS binary at a barrier — the same reason the
 // observers do: the process that holds and then becomes the child is bytes
 // Stage 1 bound, not something found on PATH. It is a variable so a test
 // binary, which is not the CLI, can dispatch the barrier to itself.
-var ActionChildLauncher = func(argv []string) (*exec.Cmd, error) {
+var HeldChildLauncher = func(argv []string) (*exec.Cmd, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, err

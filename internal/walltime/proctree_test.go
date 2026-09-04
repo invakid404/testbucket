@@ -393,50 +393,64 @@ func TestTheProcessTreeEventBytesAreRederived(t *testing.T) {
 	}
 }
 
-// TestTheAdmissionReadIsTakenUnderAFreeze is the race-free half of F2.
+// TestTheAdmissionReadIsTakenWhileTheChildIsHeld is the race-free half of F2.
 //
 // Clone-into-cgroup puts the child in the containment at birth, but the child
 // runs from its first instruction — so a membership read taken afterwards
 // races a child that may already have forked, and "exactly one member" was an
-// assertion the protocol never established. The containment is frozen before
-// the spawn, so the child is created stopped and the read observes what was
-// admitted. Asserted from the production source, because it is an ordering the
-// type system cannot express.
-func TestTheAdmissionReadIsTakenUnderAFreeze(t *testing.T) {
+// assertion the protocol never established.
+//
+// This used to be arranged by FREEZING the containment before the spawn, and
+// on a real cgroup-v2 kernel that deadlocks: Go's `Start` waits for the child
+// to report over its close-on-exec error pipe, a child born frozen never gets
+// there, and the parent is blocked inside `Start` and can never thaw. The
+// child is HELD instead — born unfrozen inside the containment as this binary
+// at a barrier, which reads one byte and then execs the measured command in
+// place. The read therefore still observes a containment holding exactly one
+// process that has not run the measured command and cannot have forked.
+//
+// Asserted from the production source, because it is an ordering the type
+// system cannot express.
+func TestTheAdmissionReadIsTakenWhileTheChildIsHeld(t *testing.T) {
 	body := productionFunc(t, "exec.go", "func runChild(")
-	freeze := strings.Index(body, "cont.Freeze(true)")
+	barrier := strings.Index(body, "hold, release, err := os.Pipe()")
 	start := strings.Index(body, "cmd.Start()")
 	read := strings.Index(body, `admittedEvent, _, admittedErr := cont.Observe(string(ProducerPhysical))`)
-	thaw := strings.Index(body, "cont.Freeze(false); err != nil")
-	if freeze < 0 || start < 0 || read < 0 || thaw < 0 {
-		t.Fatalf("the admission protocol is no longer recognisable: freeze=%d start=%d read=%d thaw=%d", freeze, start, read, thaw)
+	released := strings.Index(body, "release.Write([]byte{1})")
+	if barrier < 0 || start < 0 || read < 0 || released < 0 {
+		t.Fatalf("the admission protocol is no longer recognisable: barrier=%d start=%d read=%d released=%d", barrier, start, read, released)
 	}
-	if !(freeze < start && start < read && read < thaw) {
-		t.Errorf("the admission read is not taken under the freeze: freeze=%d start=%d read=%d thaw=%d; a child that is running when the read is taken may already have forked",
-			freeze, start, read, thaw)
+	if !(barrier < start && start < read && read < released) {
+		t.Errorf("the admission read is not taken while the child is held: barrier=%d start=%d read=%d released=%d; a child that is running when the read is taken may already have forked",
+			barrier, start, read, released)
+	}
+	// AND THE FREEZE IS NOT BACK. It deadlocks across Go's synchronous Start
+	// handshake on every real cgroup-v2 kernel, which is why the barrier
+	// exists.
+	if strings.Contains(body, "cont.Freeze(true)") {
+		t.Error("runChild freezes the containment before Start again; the child cannot complete Go's exec handshake and the wrapper blocks in Start for ever")
 	}
 }
 
 // TestTheAdmittedIdentityIsSampledAfterTheDrop is the F1 regression.
 //
 // The two halves of the admission record are read at DIFFERENT instants, and
-// they have to be. The membership must be read while the containment is
-// frozen, or "exactly one member" is a race; the credential can only be read
-// after the thaw, because a frozen child has not executed one instruction — it
-// has not run `sudo`, has not changed credentials and has not exec'd the
-// workload. Sampling the uid before the thaw read the WRAPPER's credential on
-// every run, and that uid is the fact the whole credential separation is
-// decided from.
+// they have to be. The membership must be read while the child is still held,
+// or "exactly one member" is a race; the credential can only be read after the
+// release, because a held child has not run `sudo`, has not changed
+// credentials and has not exec'd the workload. Sampling the uid before the
+// release read the WRAPPER's credential on every run, and that uid is the fact
+// the whole credential separation is decided from.
 func TestTheAdmittedIdentityIsSampledAfterTheDrop(t *testing.T) {
 	body := productionFunc(t, "exec.go", "func runChild(")
-	thaw := strings.Index(body, "// THAWED")
+	thaw := strings.Index(body, "// RELEASED,")
 	await := strings.Index(body, "awaitWorkloadCredential(cmd.Process.Pid, expectedWorkloadUID(opt.Level))")
 	uid := strings.Index(body, "UID:       processUIDOf(cmd.Process.Pid)")
 	if thaw < 0 || await < 0 || uid < 0 {
-		t.Fatalf("the credential sampling is no longer recognisable: thaw=%d await=%d uid=%d", thaw, await, uid)
+		t.Fatalf("the credential sampling is no longer recognisable: release=%d await=%d uid=%d", thaw, await, uid)
 	}
 	if !(thaw < await && await < uid) {
-		t.Errorf("the identity is sampled at %d, before the thaw at %d lets the drop happen (await=%d); the retained admission identity would be the wrapper's, not the measured workload's",
+		t.Errorf("the identity is sampled at %d, before the release at %d lets the drop happen (await=%d); the retained admission identity would be the wrapper's, not the measured workload's",
 			uid, thaw, await)
 	}
 }

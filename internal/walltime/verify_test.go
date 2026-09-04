@@ -676,7 +676,7 @@ func testReceipt(stage1, bundle Digest) Stage2Receipt {
 	// before the plan, so a fixture that left it blank stood for a receipt no
 	// authority had approved.
 	r.Stage1Approval = Stage1Approval{
-		Authority: CampaignAuthority, KeyID: "fixture-authority",
+		Authority: CampaignAuthority, KeyID: PublicKeyOf(fixtureAuthorityKey),
 		SignatureDigest: DigestBytes([]byte("stage1-approval")),
 	}
 	return r

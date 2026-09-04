@@ -46,8 +46,8 @@ func TestMain(m *testing.M) {
 		cmd.Env = append(os.Environ(), cliObserverEnv+"=1")
 		return cmd, nil
 	}
-	originalHold := walltime.ActionChildLauncher
-	walltime.ActionChildLauncher = func(argv []string) (*exec.Cmd, error) {
+	originalHold := walltime.HeldChildLauncher
+	walltime.HeldChildLauncher = func(argv []string) (*exec.Cmd, error) {
 		self, err := os.Executable()
 		if err != nil {
 			return nil, err
@@ -57,7 +57,7 @@ func TestMain(m *testing.M) {
 		return cmd, nil
 	}
 	code := m.Run()
-	walltime.ActionChildLauncher = originalHold
+	walltime.HeldChildLauncher = originalHold
 	walltime.ObserverLauncher = original
 	os.Exit(code)
 }

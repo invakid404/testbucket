@@ -35,6 +35,23 @@ func TestEveryNestedIdentityInAStage2ReceiptIsValidated(t *testing.T) {
 			want: "records no well-formed Stage-1 approval",
 		},
 		{
+			// A SIGNER IDENTITY IS A KEY, NOT A NAME. The KeyID was checked
+			// only for non-emptiness, so a receipt could name its approver
+			// with a sentence: signed, complete, and attributable to nobody.
+			// Direct validation and ablation ingestion both accepted it, long
+			// before any downstream replay comparison could notice.
+			name: "an approval whose signer is prose",
+			edit: func(r *Stage2Receipt) {
+				r.Stage1Approval.KeyID = "this-is-prose-not-an-ed25519-public-key"
+			},
+			want: "records no well-formed Stage-1 approval",
+		},
+		{
+			name: "an approval whose signer is hex of the wrong length",
+			edit: func(r *Stage2Receipt) { r.Stage1Approval.KeyID = "abcdef" },
+			want: "records no well-formed Stage-1 approval",
+		},
+		{
 			name: "an input access with no field",
 			edit: func(r *Stage2Receipt) { r.InputAccess[0].Field = "" },
 			want: "input-access record",
@@ -84,6 +101,33 @@ func TestEveryNestedIdentityInAStage2ReceiptIsValidated(t *testing.T) {
 // claim: the store's durability was asserted by the document asserting it.
 // The keys now come from the deployment's predeclared registration, and the
 // claim's own list may only be a subset of it.
+// AND THE PARSER IS THE ONE SIGNATURE VERIFICATION USES.
+//
+// Two checks of the same identity that disagree are one check: whichever is
+// laxer decides. ParseSignerKey is the single parser, so a key id validation
+// accepts is a key id a signature check can decode, and the reverse.
+func TestOneParserDecidesWhatASignerIdentityIs(t *testing.T) {
+	good := PublicKeyOf(mustSigningKey())
+	if _, err := ParseSignerKey(good); err != nil {
+		t.Fatalf("a real public key was rejected: %v", err)
+	}
+	for _, bad := range []string{"", "   ", "fixture-authority", "abcdef", good + "00", "zz" + good[2:]} {
+		if _, err := ParseSignerKey(bad); err == nil {
+			t.Errorf("%q was accepted as a signer identity", bad)
+		}
+	}
+	// The receipt's nested approval and a real signature check agree.
+	r := claimed(matchableReceipt())
+	r.Stage1Approval.KeyID = good
+	if err := r.Validate(); err != nil {
+		t.Fatalf("a receipt whose approval names a real key was refused: %v", err)
+	}
+	sig := &Signature{Authority: CampaignAuthority, KeyID: "fixture-authority", Digest: r.PlanDigest, Value: "AAAA"}
+	if err := VerifySigned(sig, r.PlanDigest, nil); err == nil {
+		t.Error("signature verification accepted a prose key id, so the two checks would disagree")
+	}
+}
+
 func TestAPlannerClaimIsCheckedAgainstPredeclaredAuthorityKeys(t *testing.T) {
 	r := claimed(matchableReceipt())
 	if err := r.Validate(); err != nil {

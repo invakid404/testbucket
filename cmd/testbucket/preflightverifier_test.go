@@ -47,7 +47,7 @@ func currentPlan(t *testing.T) (walltime.PlanningInputBundle, walltime.Stage2Rec
 		// The approval the planner SAW, recorded as an identity rather than
 		// left blank: it is what says the authorisation came before the plan.
 		Stage1Approval: walltime.Stage1Approval{
-			Authority: walltime.CampaignAuthority, KeyID: "fixture-authority",
+			Authority: walltime.CampaignAuthority, KeyID: fixtureApprovalKeyID,
 			SignatureDigest: d('e'),
 		},
 	}
@@ -310,3 +310,15 @@ func TestTheReplayCommandRunsBothIdentityComparators(t *testing.T) {
 		t.Error("the two comparators are not both inside the expectation guard, so a request can reach one and not the other")
 	}
 }
+
+// fixtureApprovalKeyID is a REAL signer identity — the hex rendering of an
+// ed25519 public key — because that is what a signer identity is. A label like
+// "fixture-authority" is a sentence, and a fixture that used one stood for a
+// receipt naming nobody.
+var fixtureApprovalKeyID = func() string {
+	k, err := walltime.NewSigningKey()
+	if err != nil {
+		panic(err)
+	}
+	return walltime.PublicKeyOf(k)
+}()

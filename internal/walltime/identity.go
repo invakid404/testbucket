@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -109,20 +110,37 @@ func PublicKeyOf(k ed25519.PrivateKey) string {
 	return hex.EncodeToString(k.Public().(ed25519.PublicKey))
 }
 
+// ParseSignerKey is THE parser for a signer identity, and the only one.
+//
+// In this protocol a signer id is the hex rendering of a 32-byte Ed25519
+// public key — that is what PublicKeyOf produces and what every signature
+// check decodes. Anywhere a signer identity was merely checked for
+// non-emptiness, a sentence passed as an identity: a signed document naming
+// "the campaign authority" as its signer is signed, complete, and names
+// nobody. Callers that verify a signature and callers that only validate a
+// record now ask the same question of the same bytes.
+func ParseSignerKey(id string) (ed25519.PublicKey, error) {
+	pub, err := hex.DecodeString(strings.TrimSpace(id))
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("signer id %q is not the hex rendering of a %d-byte ed25519 public key", id, ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(pub), nil
+}
+
 // VerifySignature checks a record's detached signature against its hash.
 func VerifySignature(r Record) error {
 	if r.Signature == "" || r.SignerID == "" {
 		return fmt.Errorf("record %d is unsigned", r.Seq)
 	}
-	pub, err := hex.DecodeString(r.SignerID)
-	if err != nil || len(pub) != ed25519.PublicKeySize {
+	pub, err := ParseSignerKey(r.SignerID)
+	if err != nil {
 		return fmt.Errorf("record %d has a malformed signer id", r.Seq)
 	}
 	sig, err := base64.StdEncoding.DecodeString(r.Signature)
 	if err != nil {
 		return fmt.Errorf("record %d has a malformed signature", r.Seq)
 	}
-	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(r.Hash), sig) {
+	if !ed25519.Verify(pub, []byte(r.Hash), sig) {
 		return fmt.Errorf("record %d signature does not verify", r.Seq)
 	}
 	return nil

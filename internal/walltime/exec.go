@@ -359,7 +359,44 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	// chain keeps its own, because it has containments to create and evidence
 	// to write that the workload must not be able to touch.
 	argv := workloadArgv(opt.Level, opt.Argv)
-	cmd := exec.Command(argv[0], argv[1:]...)
+	// RESOLVED HERE, so a command that does not exist is still this wrapper's
+	// spawn error rather than an exit status from the held child below.
+	if _, lookErr := exec.LookPath(argv[0]); lookErr != nil {
+		return 1, ProcIdentity{}, TerminalSpawnError, lookErr.Error()
+	}
+	// THE CHILD IS HELD, NOT FROZEN.
+	//
+	// Admission has to be race-free: a child that has already run can have
+	// forked, and "exactly one member" would then be an assertion the protocol
+	// never established. The previous answer was to FREEZE the containment
+	// before `Start`, so the child was created stopped — and on a real
+	// cgroup-v2 kernel that deadlocks. Go's `Start` waits for the child to
+	// report back over its close-on-exec error pipe, and a child born frozen
+	// never reaches that point; the parent is blocked inside `Start` and can
+	// never reach the thaw. `wall exec` hung, with the child parked in
+	// do_freezer_trap, and no cancellation could repair the ordering.
+	//
+	// So the child is born unfrozen INSIDE the containment (clone-into-cgroup,
+	// unchanged) as this binary at a barrier: it reads one byte from an
+	// inherited pipe and then execs the measured command in place. `Start`
+	// completes, because the barrier does reach its exec. The membership read
+	// below then observes a containment holding exactly that one process,
+	// which is our own reviewed bytes and has done nothing but block on a
+	// read — it has not run the measured command and cannot have forked. The
+	// measured work begins when the barrier is released, after the reading.
+	hold, release, err := os.Pipe()
+	if err != nil {
+		return 1, ProcIdentity{}, TerminalSpawnError, "open the measured-child barrier: " + err.Error()
+	}
+	defer func() {
+		_ = hold.Close()
+		_ = release.Close()
+	}()
+	cmd, err := HeldChildLauncher(argv)
+	if err != nil {
+		return 1, ProcIdentity{}, TerminalSpawnError, "build the measured child: " + err.Error()
+	}
+	cmd.ExtraFiles = []*os.File{hold}
 	cmd.Dir = opt.Cwd
 	// Assign the concrete *os.File values, not the struct fields directly: a
 	// nil *os.File stored in an io.Writer is a NON-nil interface holding a nil
@@ -378,7 +415,10 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	// A later credential drop is not a substitute: it is not a filter applied
 	// before the child is created, and it does not run at all when no account
 	// is configured. The boundary the contract asks for is the launch itself.
-	cmd.Env = scrubSecrets(nil)
+	// Scrubbed from the LAUNCHER's environment rather than replacing it: the
+	// barrier is started by re-executing this binary, and the launcher is the
+	// only thing that can tell that process it is the barrier.
+	cmd.Env = scrubSecrets(cmd.Env)
 	stdout, stderr := opt.Stdout, opt.Stderr
 	if stdout == nil {
 		stdout = os.Stdout
@@ -403,41 +443,21 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigs)
 
-	// THE ADMISSION IS RACE-FREE, because the containment is frozen before the
-	// child exists.
-	//
-	// Clone-into-cgroup puts the child in the containment at birth, but the
-	// child runs from its first instruction — so the membership read that
-	// followed raced a child that may already have forked, and "exactly one
-	// member" was an assertion the protocol never established. A child cloned
-	// into a FROZEN containment is created stopped. The read below therefore
-	// observes what was admitted rather than whatever happened to be there.
-	frozen := cont.Identity().Primitive == PrimitiveCgroup2
-	if frozen {
-		if err := cont.Freeze(true); err != nil {
-			return 1, ProcIdentity{}, TerminalSpawnError, "freeze the containment before admission: " + err.Error()
-		}
-	}
 	if err := cmd.Start(); err != nil {
-		if frozen {
-			_ = cont.Freeze(false)
-		}
 		return 1, ProcIdentity{}, TerminalSpawnError, err.Error()
 	}
 	if err := postSpawnAdmit(cont, cmd.Process.Pid); err != nil {
 		// The child is running but is not in the containment, so nothing
 		// downstream can account for it — and returning here abandoned it
 		// with no handle for anyone else to reap. A child that cannot be
-		// admitted is a child that must not run.
+		// admitted is a child that must not run. It is still held, so it has
+		// not executed the measured command and never will.
 		pid := cmd.Process.Pid
-		if frozen {
-			_ = cont.Freeze(false)
-		}
 		err = reapStarted(ProducerPhysical, cmd, fmt.Errorf("admit child: %w", err))
 		return 1, ProcIdentity{PID: pid}, TerminalSpawnError, err.Error()
 	}
 
-	// THE MEMBERSHIP, READ WHILE THE CONTAINMENT IS STILL FROZEN.
+	// THE MEMBERSHIP, READ WHILE THE ONLY MEMBER IS THE HELD BARRIER.
 	//
 	// The only process-tree record this wrapper used to write was taken after
 	// the containment had been drained and the child reaped, so its membership
@@ -450,24 +470,27 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	// kernel bytes and a digest binding them to this observer's own read.
 	admittedEvent, _, admittedErr := cont.Observe(string(ProducerPhysical))
 
-	// THAWED, and only now does the measured work begin.
-	if frozen {
-		if err := cont.Freeze(false); err != nil {
-			_ = reapStarted(ProducerPhysical, cmd, err)
-			return 1, ProcIdentity{PID: cmd.Process.Pid}, TerminalWrapperError, "thaw the containment after admission: " + err.Error()
-		}
+	// RELEASED, and only now does the measured work begin. Writing the byte
+	// AND closing the pipe means a barrier this wrapper never reaches sees an
+	// EOF and refuses to run the command, rather than waiting for ever.
+	if _, err := release.Write([]byte{1}); err != nil {
+		_ = reapStarted(ProducerPhysical, cmd, err)
+		return 1, ProcIdentity{PID: cmd.Process.Pid}, TerminalWrapperError, "release the measured-child barrier: " + err.Error()
+	}
+	if err := release.Close(); err != nil {
+		_ = reapStarted(ProducerPhysical, cmd, err)
+		return 1, ProcIdentity{PID: cmd.Process.Pid}, TerminalWrapperError, "close the measured-child barrier: " + err.Error()
 	}
 
 	// THE CREDENTIAL DROP, AWAITED — THEN the identity is sampled.
 	//
 	// This is the ordering the whole boundary turns on, and it used to run the
-	// other way round. The child is CREATED FROZEN so that the admission read
-	// is race-free, and a frozen child has not executed one instruction: it
-	// has not run `sudo`, has not changed credentials and has not exec'd the
-	// workload. Sampling its uid before the thaw therefore read the WRAPPER's
-	// credential every time, and the record then stated that the measured
-	// process ran as an account it never ran as — the one fact the credential
-	// separation is decided from.
+	// other way round. The child is HELD so that the admission read is
+	// race-free, and a held child has not run `sudo`, has not changed
+	// credentials and has not exec'd the workload. Sampling its uid before the
+	// release therefore read the WRAPPER's credential every time, and the
+	// record then stated that the measured process ran as an account it never
+	// ran as — the one fact the credential separation is decided from.
 	//
 	// So the sample waits for the drop to be observable on the measured pid,
 	// and it never fabricates it: when the credential does not arrive — the
@@ -486,7 +509,7 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	}
 	proc.GID, proc.Groups = processGroupsOf(cmd.Process.Pid)
 	appendProcessTree(w, opt, clock, cont, proc, "start", admittedEvent, admittedErr,
-		joinReason("membership read while the containment was frozen, before the child could run; identity read after the thaw, when the credential drop is observable", dropNote))
+		joinReason("membership read while the containment held only the held barrier, before the measured command could run; identity read after the release, when the credential drop is observable", dropNote))
 
 	// An INDEPENDENT sampler runs beside the child: it re-reads the child's
 	// identity and the containment's membership while the process exists, and

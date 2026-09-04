@@ -496,7 +496,7 @@ func withClaim(t *testing.T, opt PlanOptions) PlanOptions {
 	// The approval the planner saw, recorded as an identity: it is what says
 	// the authorisation came before the plan.
 	opt.Stage1Approval = walltime.Stage1Approval{
-		Authority: walltime.CampaignAuthority, KeyID: "fixture-authority",
+		Authority: walltime.CampaignAuthority, KeyID: fixtureApprovalKeyID,
 		SignatureDigest: walltime.DigestBytes([]byte("stage1-approval")),
 	}
 	opt.PlannerClaim = &walltime.PlannerClaimReceipt{
@@ -520,4 +520,16 @@ var fixtureAuthorityKey = func() ed25519.PrivateKey {
 		panic(err)
 	}
 	return k
+}()
+
+// fixtureApprovalKeyID is a REAL signer identity — the hex rendering of an
+// ed25519 public key — because that is what a signer identity is. A label like
+// "fixture-authority" is a sentence, and a fixture that used one stood for a
+// receipt naming nobody.
+var fixtureApprovalKeyID = func() string {
+	k, err := walltime.NewSigningKey()
+	if err != nil {
+		panic(err)
+	}
+	return walltime.PublicKeyOf(k)
 }()

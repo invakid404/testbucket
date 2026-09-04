@@ -5,7 +5,6 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1201,8 +1200,8 @@ func VerifySigned(sig *Signature, digest Digest, allowedKeys []string) error {
 			return fmt.Errorf("signer %s is not an authorised authority key", sig.KeyID)
 		}
 	}
-	pub, err := hex.DecodeString(sig.KeyID)
-	if err != nil || len(pub) != ed25519.PublicKeySize {
+	pub, err := ParseSignerKey(sig.KeyID)
+	if err != nil {
 		return fmt.Errorf("malformed authority key id")
 	}
 	raw, err := base64.StdEncoding.DecodeString(sig.Value)
@@ -1213,7 +1212,7 @@ func VerifySigned(sig *Signature, digest Digest, allowedKeys []string) error {
 	// valid approval cannot be relabelled as coming from a different protected
 	// environment. Documents signed before this binding existed do not verify,
 	// which is the correct outcome: their label was never attested.
-	if !ed25519.Verify(ed25519.PublicKey(pub), approvalMessage(sig.Authority, digest), raw) {
+	if !ed25519.Verify(pub, approvalMessage(sig.Authority, digest), raw) {
 		return fmt.Errorf("signature does not verify for authority %q; a signature is bound to the authority label recorded beside it, so relabelling one does not carry its approval", sig.Authority)
 	}
 	return nil
@@ -1764,8 +1763,16 @@ func (r Stage2Receipt) Validate() error {
 	// the label; it does not turn it into a content identity, so a receipt
 	// could be signed, complete and still name its inputs with strings that
 	// address nothing.
+	//
+	// The signer id is parsed with the SAME parser signature verification
+	// uses, not merely checked for non-emptiness. A key id is the hex
+	// rendering of an ed25519 public key; "the campaign authority" is a
+	// sentence, and a receipt naming one was accepted by direct validation and
+	// by ablation ingestion, both of which run before any downstream replay
+	// comparison could notice.
+	_, keyErr := ParseSignerKey(r.Stage1Approval.KeyID)
 	if strings.TrimSpace(r.Stage1Approval.Authority) == "" ||
-		strings.TrimSpace(r.Stage1Approval.KeyID) == "" ||
+		keyErr != nil ||
 		!r.Stage1Approval.SignatureDigest.Valid() {
 		return fmt.Errorf("stage-2 receipt records no well-formed Stage-1 approval (authority %q, key %q, signature digest %q); the approval the planner saw is what says the authorisation came first",
 			r.Stage1Approval.Authority, r.Stage1Approval.KeyID, r.Stage1Approval.SignatureDigest)

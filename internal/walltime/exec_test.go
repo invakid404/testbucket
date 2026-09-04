@@ -47,7 +47,7 @@ func TestMain(m *testing.M) {
 	// The action-owned child's barrier is a separate process for the same
 	// reason, and a test binary is not the CLI — so it dispatches to itself
 	// and runs the SHIPPED barrier, rather than stubbing the race away.
-	ActionChildLauncher = func(argv []string) (*exec.Cmd, error) {
+	HeldChildLauncher = func(argv []string) (*exec.Cmd, error) {
 		self, err := os.Executable()
 		if err != nil {
 			return nil, err

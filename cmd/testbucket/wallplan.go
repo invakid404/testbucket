@@ -1490,6 +1490,17 @@ func claimPlannerExecution(configured string, stage1, bundle walltime.Digest) (p
 			}
 			return plannerClaim{}, err
 		}
+		// REGISTERED THE MOMENT IT EXISTS, not once it is fully committed.
+		//
+		// The path used to be appended after the directory sync below, so a
+		// failure to commit the directory entry ran release() without this
+		// file in the list: every earlier store was rolled back and this one
+		// kept its claim file. The function then reported failure while a
+		// later attempt would find that file, read it as "already derived",
+		// and refuse to plan at all — a permanent refusal produced by a
+		// failed acquisition. A claim is rolled back from the moment it can be
+		// observed by anyone else, and O_EXCL above is that moment.
+		claim.paths = append(claim.paths, path)
 		enc := json.NewEncoder(f)
 		enc.SetIndent("", "  ")
 		encErr := enc.Encode(claim.receipt)
@@ -1514,7 +1525,6 @@ func claimPlannerExecution(configured string, stage1, bundle walltime.Digest) (p
 			claim.release()
 			return plannerClaim{}, fmt.Errorf("commit the planner claim's directory entry in %s: %w", dir, derr)
 		}
-		claim.paths = append(claim.paths, path)
 		for _, e := range []error{encErr, syncErr, closeErr} {
 			if e != nil {
 				claim.release()

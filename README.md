@@ -732,6 +732,34 @@ releases state the requirement as advice instead; on those, a caller granting
 only `contents: read` loses A_GH, the collector says so and exits 0, and the
 verifier reports the row ineligible.
 
+**Delivering a pre-publication candidate.** A scored arm has to run the exact
+binary being proposed, which by definition has no release yet. It is delivered
+as an immutable, digest-pinned build artifact:
+
+```yaml
+with:
+  testbucket-version: candidate:<run-id>/<artifact-name>@sha256:<64-hex>
+  candidate-resolver-version: v0.3.0   # an exact PUBLISHED release
+```
+
+The installer refuses a candidate whose *binary* digest nobody attested — the
+archive digest says which archive was downloaded, the binary digest says which
+bytes are about to execute, and Stage 1 binds the second. That value is
+**derived, not typed**: the plan job installs `candidate-resolver-version` and
+runs `testbucket wall stage1-binary` against the signed Stage-1 manifest, so it
+comes from the builder's attestation, the verifier's countersignature and the
+campaign authority's signature. Pass `candidate-binary-digest` if you want to
+declare what you expect; it is checked against the derived value and may not
+replace it.
+
+The resolver must be an exact published `vMAJOR.MINOR.PATCH`. `local`,
+`source`, a `candidate:` pin and a moving `vX`/`vX.Y` alias are refused: the
+first three build or fetch the candidate, so the delivery would authenticate
+itself, and an alias lets whoever may move it choose the resolver. There is no
+default — and until a release implementing `wall stage1-binary` is published
+there is no capable resolver, so a scored candidate delivery is refused rather
+than resolved by the candidate.
+
 **On `version`:** every action defaults to the moving `v0` alias, which
 resolves to the highest published 0.x release — this project is deliberately
 pre-1.0. A scored arm *must* pin an exact `vX.Y.Z`: an alias is descriptive

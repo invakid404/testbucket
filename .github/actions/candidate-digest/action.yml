@@ -1,0 +1,109 @@
+name: testbucket candidate binary digest
+description: >-
+  Read the binary digest a signed Stage-1 manifest AUTHORISES, using a
+  published immutable release, and hand it to the installer's mandatory
+  candidate check.
+
+  The installer refuses a `candidate:` delivery whose binary digest nobody
+  attested. A digest the caller types names the bytes the caller wanted; this
+  names the bytes the campaign authority approved, because validating the
+  manifest verifies the builder's attestation, the verifier's countersignature
+  and the authority's own signature.
+
+  The reading is done by a PUBLISHED release, never by the candidate. A
+  candidate that resolves its own approval has authenticated nothing.
+
+inputs:
+  resolver-version:
+    description: >-
+      The published release that reads the manifest: an exact `vMAJOR.MINOR.PATCH`.
+      `local`, `source`, a `candidate:` pin and a moving `vX`/`vX.Y` alias are
+      all refused — the first three because they are the candidate, the last
+      because whoever may move an alias chooses the resolver. There is no
+      default: a resolver nobody named is not one anybody vouched for.
+    required: true
+  stage1-file:
+    description: 'The signed Stage-1 manifest that authorises the delivered binary.'
+    required: true
+  authority:
+    description: 'Protected environment the manifest must name.'
+    required: true
+  authority-key:
+    description: 'PREDECLARED authority public key (hex) the manifest must be signed by.'
+    required: true
+  expect:
+    description: >-
+      A digest the caller believes is correct. It is a declaration to be
+      checked, never a substitute: it may agree with what Stage 1 authorises
+      and may not replace it. Empty means the derived value stands alone.
+    default: ""
+
+outputs:
+  digest:
+    description: 'The `sha256:<64-hex>` binary digest Stage 1 authorises.'
+    value: ${{ steps.resolve.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    # THE RESOLVER IS JUDGED BEFORE IT IS INSTALLED.
+    - name: Refuse a resolver that is not a published immutable release
+      shell: bash
+      env:
+        TB_RESOLVER_VERSION: ${{ inputs.resolver-version }}
+      run: bash "${{ github.action_path }}/../candidate-resolver.sh"
+
+    # Into its OWN directory, and NOT onto PATH: the candidate is installed
+    # later by the actions that measure with it, and the two must not be
+    # confusable. Clearing GITHUB_PATH makes the installer's PATH append go to
+    # /dev/null instead.
+    - name: Install the published resolver
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.resolver-version }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-resolver
+        GH_TOKEN: ${{ github.token }}
+        GITHUB_PATH: ""
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    - name: Resolve the attested candidate binary digest
+      id: resolve
+      shell: bash
+      env:
+        TB_RESOLVER: ${{ runner.temp }}/testbucket-resolver/testbucket
+        TB_STAGE1: ${{ inputs.stage1-file }}
+        TB_AUTHORITY: ${{ inputs.authority }}
+        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_EXPECT: ${{ inputs.expect }}
+        TB_RESOLVER_VERSION: ${{ inputs.resolver-version }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$TB_STAGE1" ]; then
+          echo "candidate delivery: a candidate: pin needs the signed Stage-1 manifest that authorises its binary, and none was supplied at $TB_STAGE1" >&2
+          echo "The installer's binary-digest check is what makes a pre-publication delivery evidence; without the manifest there is nothing to derive it from." >&2
+          exit 1
+        fi
+        # THE RESOLVER MUST BE ABLE TO DO THE JOB.
+        #
+        # A published release that predates `wall stage1-binary` cannot read a
+        # manifest at all — it exits with `unknown subcommand "wall"` — and the
+        # default used to point at exactly such a release, so the advertised
+        # route failed with a message about a subcommand rather than about the
+        # delivery. Ask first, and say what is missing.
+        if ! "$TB_RESOLVER" wall stage1-binary -h >/dev/null 2>&1; then
+          echo "candidate delivery: the published release $TB_RESOLVER_VERSION has no 'wall stage1-binary', so it cannot read the Stage-1 manifest that authorises this candidate." >&2
+          echo "Name a published release that implements it. Until one is published there is no capable resolver, and a scored candidate delivery is refused rather than resolved by the candidate itself." >&2
+          exit 1
+        fi
+        digest=$("$TB_RESOLVER" wall stage1-binary \
+          --file "$TB_STAGE1" \
+          --authority "$TB_AUTHORITY" \
+          --authority-key "$TB_AUTHORITY_KEY")
+        # A SUPPLIED VALUE IS A DECLARATION, NOT A CHOICE.
+        if [ -n "$TB_EXPECT" ] && [ "$TB_EXPECT" != "$digest" ]; then
+          echo "candidate delivery: candidate-binary-digest was given as $TB_EXPECT, but Stage 1 authorises $digest" >&2
+          exit 1
+        fi
+        printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
+        echo "candidate delivery: Stage 1 authorises binary $digest"

@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -36,22 +35,9 @@ import (
 //	sudo chown -R "$(id -un)" "/sys/fs/cgroup${own}/testbucket"
 //	TB_WALL_CGROUP_ROOT="/sys/fs/cgroup${own}/testbucket" go test ./cmd/testbucket/ -run TestTheCLIActionLifecycle
 func TestTheCLIActionLifecycleRunsInARealDelegatedCgroup(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("cgroup-v2 containment is a Linux property")
-	}
-	root := strings.TrimSpace(os.Getenv(walltime.CgroupRootEnv))
-	if root == "" {
-		t.Skipf("%s is unset: no delegated subtree to exercise the published procedure against", walltime.CgroupRootEnv)
-	}
-	if err := walltime.CheckCgroupDelegation(root); err != nil {
-		t.Skipf("%s is not a usable delegation, so the CLI lifecycle cannot be exercised here: %v", root, err)
-	}
+	_ = requireDelegatedRoot(t)
 
-	bin := filepath.Join(t.TempDir(), "testbucket")
-	build := exec.Command("go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build the CLI under test: %v\n%s", err, out)
-	}
+	bin := buildCLI(t)
 
 	dir := filepath.Join(t.TempDir(), "wall")
 	cli := func(args ...string) (string, error) {

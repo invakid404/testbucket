@@ -134,12 +134,25 @@ on:
         default: ""
       candidate-resolver-version:
         description: >-
-          The PUBLISHED testbucket release used to READ the Stage-1 manifest
-          when `testbucket-version` is a `candidate:` pin. It must not itself
-          be a candidate: resolving a candidate's own approval with the
-          candidate would be the delivery vouching for itself.
+          The PUBLISHED, IMMUTABLE testbucket release that READS the Stage-1
+          manifest when `testbucket-version` is a `candidate:` pin — an exact
+          `vMAJOR.MINOR.PATCH`.
+
+          There is deliberately NO DEFAULT. It used to default to the moving
+          `v0` alias, which resolves to a published release that has no
+          wall-time implementation at all: the advertised route failed with
+          `unknown subcommand "wall"`, so the check the installer insists on
+          could not be satisfied through it. A default that cannot do the job
+          is worse than no default, because it reads as one that can.
+
+          `local`, `source`, a `candidate:` pin and a moving `vX`/`vX.Y` alias
+          are all refused — the first three because on a candidate run they ARE
+          the candidate, and the last because whoever may move an alias chooses
+          the resolver. Until a release implementing `wall stage1-binary` is
+          published there is no capable resolver, and a scored candidate
+          delivery is refused rather than resolved by the candidate itself.
         type: string
-        default: v0
+        default: ""
       go-version:
         description: 'Go toolchain version (runner: go).'
         type: string
@@ -547,45 +560,22 @@ jobs:
       # It is read by a PUBLISHED release installed for that purpose. Asking
       # the candidate to produce its own approval would be the delivery
       # vouching for itself.
-      - name: Install a published testbucket to resolve the candidate delivery
-        if: startsWith(inputs.testbucket-version, 'candidate:')
-        uses: $/.github/actions/install
-        with:
-          version: ${{ inputs.candidate-resolver-version }}
-
+      # The resolution is its OWN action, so the shell that decides which
+      # resolver may be trusted is a reviewed, tested file rather than an
+      # inline block. The previous inline guard rejected only a `candidate:`
+      # spelling and let `local` through — and `local` BUILDS THE CHECKED-OUT
+      # TREE, which on a candidate run is the candidate, so the delivery
+      # authenticated itself through the one route the guard existed to close.
       - name: Resolve the attested candidate binary digest
         id: candidate-binary
         if: startsWith(inputs.testbucket-version, 'candidate:')
-        shell: bash
-        env:
-          TB_STAGE1: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
-          TB_AUTHORITY: ${{ inputs.authority }}
-          TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
-          TB_SUPPLIED: ${{ inputs.candidate-binary-digest }}
-          TB_RESOLVER: ${{ inputs.candidate-resolver-version }}
-        run: |
-          set -euo pipefail
-          if printf '%s' "$TB_RESOLVER" | grep -q '^candidate:'; then
-            echo "candidate delivery: candidate-resolver-version is '$TB_RESOLVER'. It must be a PUBLISHED release: a candidate cannot authenticate its own approval." >&2
-            exit 1
-          fi
-          if [ ! -f "$TB_STAGE1" ]; then
-            echo "candidate delivery: a candidate: pin needs the signed Stage-1 manifest that authorises its binary, and frozen-inputs-artifact delivered none." >&2
-            echo "The installer's binary-digest check is what makes a pre-publication delivery evidence; without the manifest there is nothing to derive it from." >&2
-            exit 1
-          fi
-          digest=$(testbucket wall stage1-binary \
-            --file "$TB_STAGE1" \
-            --authority "$TB_AUTHORITY" \
-            --authority-key "$TB_AUTHORITY_KEY")
-          # A SUPPLIED VALUE IS A DECLARATION, NOT A CHOICE. It may agree with
-          # what Stage 1 authorises; it may not replace it.
-          if [ -n "$TB_SUPPLIED" ] && [ "$TB_SUPPLIED" != "$digest" ]; then
-            echo "candidate delivery: candidate-binary-digest was given as $TB_SUPPLIED, but Stage 1 authorises $digest" >&2
-            exit 1
-          fi
-          printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
-          echo "candidate delivery: Stage 1 authorises binary $digest"
+        uses: $/.github/actions/candidate-digest
+        with:
+          resolver-version: ${{ inputs.candidate-resolver-version }}
+          stage1-file: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
+          authority: ${{ inputs.authority }}
+          authority-key: ${{ inputs.authority-key }}
+          expect: ${{ inputs.candidate-binary-digest }}
 
       - name: Plan the buckets
         id: plan
