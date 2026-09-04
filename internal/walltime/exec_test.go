@@ -874,3 +874,38 @@ func TestScrubSecretsResolvesNilAndRemovesEverySecret(t *testing.T) {
 		})
 	}
 }
+
+// The bound runnable parser, as this package's tests see it.
+//
+// Bundle validation re-derives every runnable snapshot's names from its own
+// frozen bytes, and the real parser lives in the runner package — which
+// imports this one, so these tests cannot link it. Production registers the
+// real parser from the planning package; here the schema's own fixtures need
+// something to be compared against, so this reads the same reporter shape the
+// fixtures carry.
+//
+// It is deliberately a stand-in and is not the thing under test: the real
+// parser is exercised where it lives and through the planning package's own
+// bundle-validation regressions.
+func init() {
+	RegisterRunnableNameParser(func(_, targetID string, raw []byte) ([]string, error) {
+		var rows []struct {
+			Name *string `json:"name"`
+			File string  `json:"file"`
+		}
+		if err := json.Unmarshal(raw, &rows); err != nil {
+			return nil, fmt.Errorf("parse the frozen runnable listing: %w", err)
+		}
+		var names []string
+		for _, r := range rows {
+			if r.File != targetID {
+				continue
+			}
+			if r.Name == nil {
+				return nil, fmt.Errorf("a row for %s has no name field", targetID)
+			}
+			names = append(names, *r.Name)
+		}
+		return names, nil
+	})
+}

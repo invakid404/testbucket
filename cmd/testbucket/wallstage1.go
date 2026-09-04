@@ -56,6 +56,8 @@ func runWallStage1(args []string) error {
 	schedulePath := fs.String("campaign-schedule", "", "the authority-frozen campaign schedule JSON (required for a scored arm): the five predeclared pairs, which run is each arm, the randomisation seed and the UTC date each pair runs on. The contract freezes pair order before the first candidate run, and an order chosen afterwards from whatever ran is a selection nobody predeclared")
 	signers := fs.String("record-signers", "", "comma-separated PUBLIC halves of the run keys allowed to sign a measurement's roster and closing seal (required for a scored row): the wrapper mints its per-producer keys at run time, so what a manifest can bind is the key that attests to them — and without it the records authenticate only themselves")
 	replaySigners := fs.String("replay-signers", "", "comma-separated PUBLIC keys allowed to sign an independent Stage-2 replay attestation. They must not include the authority key: a replay signed by the party that authorised the plan is the planner checking its own work")
+	verdictSigners := fs.String("verdict-signers", "", "comma-separated PUBLIC keys allowed to sign a verifier verdict (required). They must not include the authority key: the party that judges a row may not approve what it judges. Validate has always refused a manifest without these — until now there was no flag to supply them, so no scored arm could be authored through the shipped interface at all")
+	ablationStratum := fs.String("ablation-stratum", "", "the topology stratum this run is authorised as, for an ABLATION manifest: one of "+strings.Join(walltime.AblationStrata, ", ")+". The campaign index label is unsigned, so this is the only signed statement of which of the four strata a mandatory ablation belongs to. Leave empty for a scored campaign arm")
 	var allowed stringList
 	fs.Var(&allowed, "allow-difference", "an enumerated permitted difference between the two arms of a pair; repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -65,6 +67,17 @@ func runWallStage1(args []string) error {
 	// either arm plans. Making them optional here would move the check to
 	// `Validate`, where a campaign discovers at verification time that the
 	// manifest it already signed cannot be used.
+	// A SCORED ARM AND AN ABLATION ARE DIFFERENT DOCUMENTS.
+	//
+	// The campaign schedule, the record signers and the replay signers belong
+	// to a scored arm: they freeze the pair order, the keys that attest to a
+	// measurement's run keys, and the independent replay identity. An ablation
+	// is a controlled prerequisite that no pair schedules, so requiring them
+	// there would make the twelve mandatory ablations unauthorable — while
+	// leaving them optional for a scored arm moves the check to Validate,
+	// where a campaign discovers at verification time that the manifest it
+	// already signed cannot be used.
+	scored := strings.TrimSpace(*ablationStratum) == ""
 	required := map[string]string{
 		"--bundle": *bundlePath, "--out": *out, "--role": *role,
 		"--action-commit": *actionCommit, "--review-tip": *reviewTip,
@@ -76,6 +89,14 @@ func runWallStage1(args []string) error {
 		"--runner-image": *runnerImage, "--consumer-repository": *consumerRepo,
 		"--consumer-commit": *consumerCommit, "--caller-workflow-sha": *workflowSHA,
 		"--downstream-ref": *downstreamRef,
+		// Validate refuses a manifest without predeclared verdict signers, so
+		// this is required for every mode.
+		"--verdict-signers": *verdictSigners,
+	}
+	if scored {
+		required["--campaign-schedule"] = *schedulePath
+		required["--record-signers"] = *signers
+		required["--replay-signers"] = *replaySigners
 	}
 	names := make([]string, 0, len(required))
 	for name := range required {
@@ -248,11 +269,27 @@ func runWallStage1(args []string) error {
 		m.Schedule = schedule
 		fmt.Fprintf(os.Stderr, "testbucket wall: frozen pair order %s over %v\n", order, schedule.SortedDates())
 	}
+	// THE TWO FIELDS THE CONSUMERS REQUIRE AND THE PRODUCER NEVER SET.
+	//
+	// Validate refuses a manifest with no predeclared verdict signer, and the
+	// ablation gate refuses one that declares no stratum. Neither was ever
+	// assigned here and neither had a flag, so `wall stage1` could not emit a
+	// document that its own validator accepts: every otherwise complete
+	// invocation terminated at the Validate call below, and the twelve
+	// mandatory ablations had no authoring path at all.
+	m.VerdictSigners = splitList(*verdictSigners)
+	m.AblationStratum = strings.TrimSpace(*ablationStratum)
+	if m.AblationStratum != "" && !walltime.ValidStratum(m.AblationStratum) {
+		return fmt.Errorf("--ablation-stratum %q is not one of the four the contract fixes: %s",
+			m.AblationStratum, strings.Join(walltime.AblationStrata, ", "))
+	}
 	m.AllowedDifferences = allowed
 	if len(allowed) == 0 {
 		m.AllowedDifferences = []string{"the enumerated candidate testbucket source/action/binary tuple and its schema-versioned wrappers"}
 	}
 
+	// Checked before signing, so an unusable manifest is refused before a key
+	// is ever touched.
 	if err := m.Validate(); err != nil {
 		return err
 	}
@@ -263,6 +300,18 @@ func runWallStage1(args []string) error {
 	}
 	if err := m.Sign(*authority, key); err != nil {
 		return err
+	}
+	// AND CHECKED AGAIN AFTER SIGNING, because some of the rules are about the
+	// signature.
+	//
+	// Authority/verdict-key disjointness can only be decided once the manifest
+	// carries the key that approved it, so validating solely while unsigned
+	// skipped it — and Sign does not revalidate. The producer could therefore
+	// emit a signed artifact that its consumer refuses, with the party judging
+	// a row also holding the key that approved the inputs it judges. The
+	// document that gets written is the document that gets checked.
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("the signed manifest is not one its consumer will accept: %w", err)
 	}
 	if err := walltime.WriteJSONFile(*out, m); err != nil {
 		return err

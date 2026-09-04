@@ -1283,7 +1283,12 @@ func (o *observerProc) close(deadline time.Time) error {
 		// disappearance IS the exit proof, and waiting for it is honest.
 		return o.awaitExit(deadline)
 	}
-	return o.cmd.Wait()
+	// A COMPLETED WAIT IS A REAP. The registry's promise is that the kernel
+	// cannot reuse this pid while we hold an unreaped child at it, and that
+	// promise ends here, so the entry goes with it.
+	err := o.cmd.Wait()
+	o.release()
+	return err
 }
 
 // awaitExit waits for a detached observer to actually be gone.
@@ -1362,8 +1367,13 @@ func (o *observerProc) ownsPID() bool {
 	}
 	if o.proc != nil {
 		// The OS handle for a child we have not reaped. The kernel cannot
-		// recycle this pid while it is held, so the number is still ours.
-		return true
+		// recycle this pid while it is held, so the number is still ours —
+		// but ONLY while the registry still holds it. Every path that
+		// completes a wait calls release, so a handle whose entry is gone has
+		// been reaped and is no longer authority over anything; treating a
+		// stale struct field as ownership is the bare-pid authority this whole
+		// rule removes, one indirection further along.
+		return recallObserver(o.pid) != nil
 	}
 	if o.start == "" {
 		// DETACHED, WITH NOTHING TO AUTHENTICATE IT — on any platform.
@@ -1422,6 +1432,18 @@ func (o *observerProc) stillRunning() bool {
 	// EXISTS, BUT AS WHAT. A zombie exists and has exited; where the platform
 	// can say so, that is the answer.
 	if processIsZombie(o.pid) {
+		// THE WINDOW BETWEEN THE TWO QUESTIONS. The non-blocking wait above
+		// asked "has it finished" while the process was still running, and it
+		// finished before this line. Reporting "not running" and stopping
+		// there left an exited child unreaped and its registry entry standing,
+		// so a pid the kernel was free to reuse kept its ownership handle.
+		// Ask once more now that we know it has exited, and let the number go
+		// either way: it is not running, and this handle no longer speaks for
+		// it.
+		if o.ownsPID() {
+			reapExitedChild(o.pid)
+		}
+		o.release()
 		return false
 	}
 	if o.start == "" {
@@ -1443,7 +1465,14 @@ func (o *observerProc) stillRunning() bool {
 // process is established to be gone, so the registry's answer and the kernel's
 // are never allowed to drift apart.
 func (o *observerProc) release() {
-	if o.proc != nil {
+	// IDEMPOTENT, AND NOT CONDITIONAL ON THIS HANDLE HOLDING THE PROCESS.
+	//
+	// An attached observer reaps through its cmd and never populates proc, so
+	// gating on proc left exactly the paths that DO reap unable to release.
+	// Forgetting a pid the registry does not hold costs nothing, and being
+	// safe to call twice is what lets every cleanup branch call it without
+	// anyone having to reason about which one got there first.
+	if o.pid > 0 {
 		forgetObserver(o.pid)
 	}
 }
@@ -1474,6 +1503,8 @@ func (o *observerProc) abandon() error {
 	if o.cmd != nil && o.cmd.Process != nil {
 		_ = o.cmd.Process.Kill()
 		_ = o.cmd.Wait()
+		// Killed AND reaped, so the number is the kernel's again.
+		o.release()
 		return nil
 	}
 	// A DETACHED observer reconstructed from the action state has no cmd, and

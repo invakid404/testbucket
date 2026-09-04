@@ -179,12 +179,51 @@ func TestCompletenessFindsUnforecastMaterialTime(t *testing.T) {
 		t.Errorf("the finding does not name the phase: %s", findings[0].Detail)
 	}
 
-	// A sub-materiality phase is absorbed by the residual allowance instead.
+	// AND A SHORT UNMAPPED PHASE IS STILL UNMAPPED.
+	//
+	// This used to assert the opposite: a 1 ms interval carrying no registered
+	// component produced no finding, absorbed into the residual accumulator by
+	// a materiality test. The frozen contract says an unmapped interval fails
+	// A eligibility and that U is "a named bounded residual, never a
+	// catch-all", so that expectation made the registry a list of the parts
+	// somebody happened to name rather than an exhaustive taxonomy. The caps
+	// bound magnitude; they cannot restore the id, parent, owner, formula,
+	// permitted inputs and bound that Stage 1 was supposed to freeze before
+	// the action ran.
 	small := []Phase{
 		{ComponentID: "action_containment_bootstrap", Parent: "action", StartNs: 0, EndNs: Nanos(20 * millisecond)},
 		{ComponentID: "tiny_gap", Parent: "action", StartNs: Nanos(20 * millisecond), EndNs: Nanos(21 * millisecond)},
 	}
-	if got := reg.CheckCompleteness(small, aeta); len(got) != 0 {
-		t.Errorf("a 1 ms unnamed gap produced findings: %+v", got)
+	got := reg.CheckCompleteness(small, aeta)
+	if len(got) == 0 {
+		t.Fatal("a 1 ms interval absent from the frozen registry produced no finding; an unmapped interval is not residual time")
+	}
+	if !strings.Contains(got[0].Detail, "tiny_gap") || !strings.Contains(got[0].Detail, "not in the frozen component registry") {
+		t.Errorf("the finding does not name the unmapped phase: %s", got[0].Detail)
+	}
+
+	// RESIDUAL TIME STILL WORKS — it is a class a component was REGISTERED as.
+	// The rule refuses a catch-all, not the mechanism.
+	named := []Phase{
+		{ComponentID: "action_containment_bootstrap", Parent: "action", StartNs: 0, EndNs: Nanos(20 * millisecond)},
+		{ComponentID: "unnamed_overhead", Parent: "action", StartNs: Nanos(20 * millisecond), EndNs: Nanos(21 * millisecond)},
+	}
+	if findings := reg.CheckCompleteness(named, aeta); len(findings) != 0 {
+		t.Errorf("a registered residual component produced findings: %+v", findings)
+	}
+
+	// AND ITS OWN BOUND IS ENFORCED: unnamed_overhead is bounded at 200 ms.
+	over := []Phase{
+		{ComponentID: "unnamed_overhead", Parent: "action", StartNs: 0, EndNs: Nanos(300 * millisecond)},
+	}
+	overFindings := reg.CheckCompleteness(over, aeta)
+	var bounded bool
+	for _, f := range overFindings {
+		if strings.Contains(f.Detail, "above its") {
+			bounded = true
+		}
+	}
+	if !bounded {
+		t.Errorf("a residual component past its declared bound was accepted: %+v", overFindings)
 	}
 }

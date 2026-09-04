@@ -299,24 +299,44 @@ func (r AetaRegistry) CheckCompleteness(phases []Phase, aeta *AetaInstance) []Fi
 	for _, p := range phases {
 		c, ok := r.Component(p.ComponentID)
 		if !ok {
-			if p.Duration() > MaterialThreshold {
-				out = append(out, Finding{
-					Code: "WT-017", Severity: SeverityIneligible,
-					Detail: fmt.Sprintf("material phase %s (%s) is not in the frozen component registry", p.Name(), dur(p.Duration())),
-				})
-			} else {
-				residual += p.Duration()
-			}
+			// AN UNMAPPED INTERVAL IS NOT RESIDUAL TIME, at any duration.
+			//
+			// The frozen contract is explicit that U is "a named bounded
+			// residual, never a catch-all", and that an unmapped interval
+			// fails A eligibility. What used to happen instead was a
+			// materiality test: a phase carrying no registered component was
+			// refused only if it alone exceeded 500 ms, and anything smaller
+			// was quietly added to the residual accumulator and passed if the
+			// aggregate stayed inside its caps.
+			//
+			// Those caps bound MAGNITUDE. They do not restore what is missing,
+			// which is the pre-action provenance: an immutable id, a parent, an
+			// owner, a formula, permitted inputs and a bound, all frozen in
+			// Stage 1 before the action ran. A row could be declared
+			// Aeta-complete while observed physical work had none of it, so the
+			// registry stopped being exhaustive and became a list of the parts
+			// somebody happened to name.
+			out = append(out, Finding{
+				Code: "WT-017", Severity: SeverityIneligible,
+				Detail: fmt.Sprintf("phase %s (%s) is not in the frozen component registry; an unmapped interval is not residual time, however short",
+					p.Name(), dur(p.Duration())),
+			})
 			continue
 		}
+		// RESIDUAL IS A CLASS SOMETHING WAS REGISTERED AS, not a place to put
+		// what did not fit.
 		if c.Class == ClassResidual {
 			residual += p.Duration()
-			if p.Duration() > c.BoundNs {
-				out = append(out, Finding{
-					Code: "WT-017", Severity: SeverityIneligible,
-					Detail: fmt.Sprintf("residual phase %s observed at %s, above its %s bound", p.Name(), dur(p.Duration()), dur(c.BoundNs)),
-				})
-			}
+		}
+		// EVERY COMPONENT'S OWN BOUND, not only a residual one. The registry
+		// declares a bound per component and the contract makes an exceeded
+		// bound ineligible; checking it for one class left the others declared
+		// and unenforced.
+		if c.BoundNs > 0 && p.Duration() > c.BoundNs {
+			out = append(out, Finding{
+				Code: "WT-017", Severity: SeverityIneligible,
+				Detail: fmt.Sprintf("phase %s observed at %s, above its %s bound", p.Name(), dur(p.Duration()), dur(c.BoundNs)),
+			})
 		}
 	}
 	if residual > ResidualTotalLimit {

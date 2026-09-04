@@ -103,8 +103,28 @@ inputs:
     default: ""
   stage2-out:
     description: >-
-      Where to write the Stage-2 derived-plan receipt. It is written O_EXCL, so
-      the exactly-once rule is mechanical rather than procedural.
+      Where to write the Stage-2 derived-plan receipt. It is written O_EXCL.
+      That is an OUTPUT-collision check, not an execution guard: on its own it
+      only says this file does not already exist, and it is consulted after the
+      planner has run. `claim-dir` is what makes the one-shot rule mechanical.
+    default: ""
+  claim-dir:
+    description: >-
+      DURABLE directory holding the one-shot planner claim. The contract allows
+      one planner execution and refuses a replan, retry or second invocation;
+      the claim is keyed by the Stage-1 and bundle digests and is taken BEFORE
+      the planner runs, so a second invocation is refused rather than performed
+      and rejected afterwards.
+
+      It must outlive one runner. A job rerun gets a fresh runner and a fresh
+      filesystem, so a claim written only to the runner's disk cannot see that
+      an earlier attempt already derived this plan — which is exactly the case
+      the rule exists for. Point this at the shared frozen-documents location
+      the campaign persists, not at the workspace. Left empty, the derivation
+      is guarded only by the Stage-2 write and the command says so on stderr.
+
+      Independent verifier replay does not take this claim: re-deriving the
+      same plan on purpose is not a second authorised execution.
     default: ""
   scorer:
     description: >-
@@ -197,6 +217,7 @@ runs:
         TB_SCORER: ${{ inputs.scorer }}
         TB_REGISTRY: ${{ inputs.registry }}
         TB_DERIVED_OUT: ${{ inputs.derived-out }}
+        TB_CLAIM_DIR: ${{ inputs.claim-dir }}
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
         TB_AUTHORITY: ${{ inputs.authority }}
       run: |
@@ -227,6 +248,7 @@ runs:
           if [ -n "$TB_SCORER" ]; then frozen+=(--palloc-scorer "$TB_SCORER"); fi
           if [ -n "$TB_REGISTRY" ]; then frozen+=(--wall-registry "$TB_REGISTRY"); fi
           if [ -n "$TB_DERIVED_OUT" ]; then frozen+=(--wall-out-dir "$TB_DERIVED_OUT"); fi
+          if [ -n "$TB_CLAIM_DIR" ]; then frozen+=(--wall-claim-dir "$TB_CLAIM_DIR"); fi
           matrix=$(testbucket plan "${frozen[@]}" --json)
           printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
           exit 0

@@ -679,3 +679,16 @@ func firstNonEmpty(vals ...string) string {
 	}
 	return ""
 }
+
+// The canonical runnable parser is registered here, at the one place that
+// links both the parser and the bundle schema.
+//
+// Bundle validation re-derives every snapshot's names from its own frozen
+// bytes and requires exact equality, which it cannot do by importing the
+// parser directly: the parser lives in the runner package and that package
+// imports the schema. Registering it from this package's init means every
+// production path — the planner, the verifier, replay — has it, because they
+// all go through here.
+func init() {
+	walltime.RegisterRunnableNameParser(vitestrunner.ParseRunnableNames)
+}

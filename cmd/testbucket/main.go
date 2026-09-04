@@ -324,6 +324,7 @@ func runPlan(args []string) error {
 	pallocScorer := fs.String("palloc-scorer", "", "frozen pre-plan scorer (--wall-bundle): KK then packs by Palloc while est_seconds keeps reporting the store's measured weights. Without it the partition uses the store weights, which is not campaign eligible")
 	wallRegistry := fs.String("wall-registry", "", "frozen Aeta component-registry template (--wall-bundle), instantiated per bucket into --wall-out-dir")
 	wallOutDir := fs.String("wall-out-dir", "", "write the per-bucket derived documents (Palloc, Pcheck, Aeta) here (--wall-bundle)")
+	wallClaimDir := fs.String("wall-claim-dir", "", "DURABLE directory holding the one-shot planner claim (--wall-bundle). The contract allows one planner execution and refuses a replan, retry or second invocation; the claim is keyed by the Stage-1 and bundle digests and is taken BEFORE planning, so a second invocation is refused rather than performed and then rejected. Point this at storage that outlives one runner — a rerun gets a fresh filesystem, and a claim written only to the runner's disk cannot see the earlier attempt. Independent verifier replay does not claim")
 	wallAuthority := fs.String("wall-authority", "", "the EXACT protected environment the Stage-1 manifest must name, e.g. "+walltime.CampaignAuthority+". REQUIRED with --wall-bundle: the contract puts the protected authority's approval BEFORE either role plans, and a key can sign under any label — so a key check alone lets a manifest approved elsewhere drive the frozen planner")
 	var wallAuthorityKeys stringList
 	fs.Var(&wallAuthorityKeys, "wall-authority-key", "a PREDECLARED authority public key (hex); repeatable. REQUIRED with --wall-bundle: the contract puts an owner-authority signature on the planning inputs BEFORE the plan exists, and a post-run verifier can refuse a row but cannot un-run an action or restore an approval that never happened")
@@ -353,6 +354,11 @@ func runPlan(args []string) error {
 			bundlePath: *wallBundle, stage1Path: *wallStage1, stage2Path: *wallStage2,
 			shardPlan: *shardPlan, asJSON: *asJSON,
 			scorerPath: *pallocScorer, registryPath: *wallRegistry, outDir: *wallOutDir,
+			// The claim lives beside the derived documents, which is the
+			// location the action persists and reuses across attempts of the
+			// same job. A claim on the runner's own disk would be a fresh file
+			// on every rerun and could never see the earlier execution.
+			claimDir:      *wallClaimDir,
 			authorityKeys: wallAuthorityKeys, authority: *wallAuthority,
 		})
 	}
@@ -749,9 +755,21 @@ func runRender(args []string) error {
 	return nil
 }
 
+// writeJSONFile writes a derived artifact WITHOUT truncating an existing one.
+//
+// It used to be os.Create, which truncates. On the frozen planner path that
+// meant a second invocation could overwrite the shard plan before anything
+// discovered it was not allowed to run at all — the derived outputs were
+// replaced and only then was the exactly-once rule consulted. Refusing here
+// keeps the outputs of the one authorised derivation intact even if a later
+// guard is bypassed, and the planner claim now refuses the second invocation
+// before any of this is reached.
 func writeJSONFile(path string, v any) (err error) {
-	f, cerr := os.Create(path)
+	f, cerr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if cerr != nil {
+		if os.IsExist(cerr) {
+			return fmt.Errorf("%s already exists; a derived artifact is the output of one authorised derivation and is not overwritten", path)
+		}
 		return fmt.Errorf("create %s: %w", path, cerr)
 	}
 	// The close error is the one that matters here: a buffered short write

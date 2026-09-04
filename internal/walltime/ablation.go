@@ -185,6 +185,11 @@ func verifyAblations(index CampaignIndex, loader CampaignLoader, authorityKeys [
 	return problems
 }
 
+// ValidStratum reports whether s is one of the four topology strata the
+// contract fixes. It is exported so the producer can refuse a bad stratum at
+// the point it is typed, rather than letting the campaign discover it.
+func ValidStratum(s string) bool { return validStratum(s) }
+
 func validStratum(s string) bool {
 	for _, want := range AblationStrata {
 		if s == want {

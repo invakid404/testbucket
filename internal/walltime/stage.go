@@ -352,6 +352,23 @@ func (b PlanningInputBundle) Validate() error {
 		); err != nil {
 			return fmt.Errorf("planning-input bundle: %w", err)
 		}
+		// AND THE NAMES MUST BE THE ONES THE BYTES PARSE TO.
+		//
+		// The digest above proves the raw listing is the frozen one; it says
+		// nothing about the convenience field beside it. Names is derived from
+		// those bytes by the bound parser at freeze time and is then read as
+		// authoritative — the planner selects units from the real raw listing
+		// while the Palloc feature builder took its runnable_count from this
+		// field, so an authority-signed bundle could allocate the units it
+		// selected using an invented count. Independent replay reproduced the
+		// same number because it consumed the same unchecked field.
+		//
+		// So the parse is run again here and compared exactly: values, order
+		// and duplicates. The parser is registered rather than imported
+		// because it lives in the runner package, which imports this one.
+		if err := checkRunnableNames(s); err != nil {
+			return fmt.Errorf("planning-input bundle: %w", err)
+		}
 	}
 	if b.Store.Digest != DigestBytes(b.Store.Bytes) {
 		return fmt.Errorf("planning-input bundle: the store snapshot does not match its digest")
@@ -2004,6 +2021,57 @@ func endOfJSON(dec *json.Decoder) error {
 			return fmt.Errorf("trailing content after the document: %w", err)
 		}
 		return fmt.Errorf("a second JSON value follows the document; only the first is covered by its signature")
+	}
+	return nil
+}
+
+// runnableNameParser is the bound parser that turns a frozen runnable listing
+// into its canonical names.
+//
+// It is REGISTERED rather than imported: the parser belongs to the runner
+// package, which imports this one, so a direct call would be a cycle. Every
+// production path that builds or consumes a bundle links the planning package,
+// whose init registers it.
+var runnableNameParser func(root, targetID string, raw []byte) ([]string, error)
+
+// RegisterRunnableNameParser installs the canonical parser. It is called from
+// package init and is not safe to call concurrently with validation.
+func RegisterRunnableNameParser(parse func(root, targetID string, raw []byte) ([]string, error)) {
+	runnableNameParser = parse
+}
+
+// checkRunnableNames re-derives a snapshot's names from its own frozen bytes
+// and requires exact canonical equality.
+//
+// When no parser is registered the comparison cannot be made. That is reported
+// as a refusal rather than skipped: a bundle whose convenience field nobody
+// can check is not a bundle that has been checked, and the alternative is the
+// fail-open branch this whole rule exists to close. Nothing in production
+// reaches it — the planning package registers the parser — so the refusal is
+// the honest answer for a caller that has not linked one.
+func checkRunnableNames(s RunnableSnapshot) error {
+	if len(s.Bytes) == 0 {
+		if len(s.Names) != 0 {
+			return fmt.Errorf("runnable snapshot %q has no bytes but names %v; a listing that was never captured cannot have parsed to anything", s.TargetID, s.Names)
+		}
+		return nil
+	}
+	if runnableNameParser == nil {
+		return fmt.Errorf("runnable snapshot %q cannot be checked against its own bytes: no canonical runnable parser is registered", s.TargetID)
+	}
+	parsed, err := runnableNameParser(s.Cwd, s.TargetID, s.Bytes)
+	if err != nil {
+		return fmt.Errorf("runnable snapshot %q: re-parse the frozen listing: %w", s.TargetID, err)
+	}
+	if len(parsed) != len(s.Names) {
+		return fmt.Errorf("runnable snapshot %q states %d name(s) but its frozen bytes parse to %d; the listing and the field beside it are two different universes",
+			s.TargetID, len(s.Names), len(parsed))
+	}
+	for i := range parsed {
+		if parsed[i] != s.Names[i] {
+			return fmt.Errorf("runnable snapshot %q states name %d as %q but its frozen bytes parse to %q",
+				s.TargetID, i, s.Names[i], parsed[i])
+		}
 	}
 	return nil
 }

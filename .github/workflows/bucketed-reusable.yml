@@ -186,6 +186,19 @@ on:
           to it.
         type: string
         default: ""
+      planner-claim-dir:
+        description: >-
+          DURABLE directory for the one-shot planner claim. The contract allows
+          one planner execution and refuses a replan, retry or second
+          invocation. The claim is keyed by the Stage-1 and bundle digests and
+          taken before the planner runs.
+
+          Point this at storage that survives a job rerun. Left empty the claim
+          is written to the runner-local derived directory, which refuses a
+          second invocation within one runner but cannot see an earlier attempt
+          on a different one.
+        type: string
+        default: ""
       campaign-id:
         description: 'Campaign identity stamped on every wall-time record.'
         type: string
@@ -466,6 +479,18 @@ jobs:
           scorer: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
           registry: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-frozen-inputs/registry.json', runner.temp) || '' }}
           derived-out: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived', runner.temp) || '' }}
+          # The one-shot planner claim. Taken BEFORE the planner runs and keyed
+          # by the Stage-1 and bundle digests, so a second invocation is
+          # refused rather than performed and rejected afterwards.
+          #
+          # planner-claim-dir must name storage that OUTLIVES one runner for
+          # the guard to reach a job rerun, which gets a fresh filesystem. Left
+          # empty it falls back to the runner-local derived directory, which
+          # guards a second invocation within one runner and cannot see an
+          # earlier attempt; the command says so on stderr. A cross-runner
+          # claim needs the same durable external channel the campaign
+          # evidence handoff needs.
+          claim-dir: ${{ inputs.frozen-inputs-artifact != '' && (inputs.planner-claim-dir != '' && inputs.planner-claim-dir || format('{0}/testbucket-derived', runner.temp)) || '' }}
           authority-key: ${{ inputs.authority-key }}
           authority: ${{ inputs.authority }}
 

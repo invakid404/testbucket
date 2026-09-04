@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -983,6 +985,14 @@ func writeReplayAttestation(path, verifierID string, issued walltime.Stage2Recei
 // replaced the first receipt would be indistinguishable from the first.
 // frozenPlanOptions is what the frozen `plan` path needs beyond the bundle.
 type frozenPlanOptions struct {
+	// claimDir is where the one-shot planner claim lives. It is a directory
+	// rather than a file so the claim can be keyed by the derivation's own
+	// identity, and it should be given a location that OUTLIVES one runner:
+	// a fresh GitHub runner gets a fresh filesystem, so a local-only claim
+	// cannot see that an earlier attempt of the same job already derived this
+	// plan. See the action, which points it at the shared frozen-documents
+	// location for exactly that reason.
+	claimDir   string
 	bundlePath string
 	stage1Path string
 	stage2Path string
@@ -1075,8 +1085,35 @@ func planFromBundle(o frozenPlanOptions) error {
 		scorer = &sc
 	}
 
+	// THE ONE-SHOT CLAIM IS TAKEN BEFORE THE PLANNER RUNS.
+	//
+	// The exactly-once rule used to be the O_EXCL write of the Stage-2 receipt
+	// at the END of this function. By then the planner had already executed and
+	// the derived documents and the shard plan had already been written — the
+	// shard plan through a truncating create — so a second invocation did the
+	// work, overwrote outputs, and only then discovered the receipt it was not
+	// allowed to replace. That is an output-collision check, not an execution
+	// guard, and the contract asks for the second invocation to be refused.
+	//
+	// The claim is keyed by what identifies this derivation — the Stage-1
+	// manifest and the planning-input bundle — rather than by an output path,
+	// so it means "this plan has been derived" and not "this file exists". It
+	// is taken only on the AUTHORISED planner path: independent verifier
+	// replay re-derives the same plan on purpose and must not be mistaken for
+	// a second authorised execution.
+	planBundleDigest, err := bundle.DigestOf()
+	if err != nil {
+		return err
+	}
+	claim, err := claimPlannerExecution(o.claimDir, stage1, planBundleDigest)
+	if err != nil {
+		return err
+	}
 	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{Bundle: &bundle, Stage1: stage1, Scorer: scorer})
 	if err != nil {
+		// The derivation did not happen, so the claim must not stand: a failed
+		// planner that kept one would refuse the authorised run's own retry.
+		claim.release()
 		return err
 	}
 	// The approval as the PLANNER saw it. Stage-1's digest excludes the
@@ -1242,4 +1279,69 @@ func deriveDocuments(res *planbind.Result, registryPath, outDir string) error {
 		}
 	}
 	return nil
+}
+
+// plannerClaim is a taken one-shot claim on one derivation.
+type plannerClaim struct{ path string }
+
+// release drops a claim whose derivation did not happen.
+func (c plannerClaim) release() {
+	if c.path != "" {
+		_ = os.Remove(c.path)
+	}
+}
+
+// claimPlannerExecution takes an exclusive claim on deriving the plan
+// authorised by this Stage-1 manifest over this planning-input bundle.
+//
+// The claim is the EXECUTION guard the contract asks for: one planner run, and
+// a replan, retry or second invocation refused. It is keyed by the pair of
+// digests that identify the derivation, so it survives being asked for under a
+// different output path — which is what a rerun with a fresh working directory
+// looks like — and it is taken before any planning happens, so a second
+// invocation is refused instead of doing the work and discovering afterwards
+// that it was not allowed to keep it.
+//
+// With no claim directory there is nothing durable to write to and the guard
+// degrades to the Stage-2 O_EXCL write alone. That is stated rather than
+// silently accepted: the caller is told what it is not getting.
+func claimPlannerExecution(dir string, stage1, bundle walltime.Digest) (plannerClaim, error) {
+	if strings.TrimSpace(dir) == "" {
+		fmt.Fprintf(os.Stderr,
+			"testbucket wall: no --claim-dir, so this derivation is guarded only by the Stage-2 receipt write; a rerun on a fresh runner cannot be detected\n")
+		return plannerClaim{}, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return plannerClaim{}, err
+	}
+	// The two digests, in a fixed order, are the derivation's identity.
+	sum := sha256.Sum256([]byte(string(stage1) + "\x00" + string(bundle)))
+	path := filepath.Join(dir, fmt.Sprintf("planner-claim-%x.json", sum))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return plannerClaim{}, fmt.Errorf(
+				"this plan has already been derived: Stage-1 %s over bundle %s was claimed at %s. The contract allows one planner execution and refuses a replan, retry or second invocation; independent verifier replay is a different path and does not take this claim",
+				stage1, bundle, path)
+		}
+		return plannerClaim{}, err
+	}
+	defer f.Close()
+	// What was claimed, so a reader of the claim can tell which derivation it
+	// belongs to rather than only that something happened here.
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(map[string]string{
+		"kind":          "tb.walltime.planner-claim/v1",
+		"stage1_digest": string(stage1),
+		"bundle_digest": string(bundle),
+		"claimed_by":    "wall plan --frozen",
+		"claim_is_for":  "one authorised planner execution; verifier replay does not claim",
+	}); err != nil {
+		return plannerClaim{}, err
+	}
+	if err := f.Sync(); err != nil {
+		return plannerClaim{}, err
+	}
+	return plannerClaim{path: path}, nil
 }
