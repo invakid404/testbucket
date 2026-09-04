@@ -1235,6 +1235,32 @@ var WallTimeSecretEnv = []string{
 	SignerDelegateKeyEnv,
 }
 
+// GitHubFileCommandEnv names the writable file channels an Actions step is
+// handed. They are not secrets; they are something worse to inherit — paths to
+// files a later step's capability is DELIVERED THROUGH.
+//
+// `wall begin` mints the signer delegate, returns it on stdout, and the
+// composite step then appends it to $GITHUB_OUTPUT so exactly the measured
+// step can name it. The two action observers are started BEFORE that append
+// and are deliberately detached, so they outlive the step — and they were
+// inheriting $GITHUB_OUTPUT. Scrubbing the delegate VALUE out of their
+// environment while leaving them holding the path of the file it is about to
+// be written to secures nothing: each observer kept same-uid read access to
+// the exact channel, and an observer that can obtain the delegate can
+// authorize a lower signer and vouch for itself, which is the one thing the
+// delegation scope exists to prevent.
+//
+// So the channels go too. The handoff itself is untouched: the append happens
+// in the composite step's OWN shell, which is not a scrubbed child, so the
+// step output still reaches the measured step by the same narrow route.
+var GitHubFileCommandEnv = []string{
+	"GITHUB_OUTPUT",
+	"GITHUB_ENV",
+	"GITHUB_PATH",
+	"GITHUB_STEP_SUMMARY",
+	"GITHUB_STATE",
+}
+
 // scrubSecrets removes every wall-time secret from an environment.
 //
 // A nil env means "inherit", which is what exec.Cmd does by default, so nil is
@@ -1247,7 +1273,8 @@ var WallTimeSecretEnv = []string{
 // needs the ambient environment — PATH, HOME, the cgroup root, the runner's
 // own variables — and an allowlist would silently break on the first runner
 // that requires something nobody enumerated. What must not travel is
-// enumerable and short.
+// enumerable and short: the wall-time capabilities, and the GitHub file
+// command channels a later step's capability is delivered through.
 func scrubSecrets(env []string) []string {
 	if env == nil {
 		env = os.Environ()
@@ -1255,7 +1282,7 @@ func scrubSecrets(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")
-		if slices.Contains(WallTimeSecretEnv, name) {
+		if slices.Contains(WallTimeSecretEnv, name) || slices.Contains(GitHubFileCommandEnv, name) {
 			continue
 		}
 		out = append(out, kv)

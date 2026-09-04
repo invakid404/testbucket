@@ -842,6 +842,36 @@ jobs:
           fi
           major="${TAG%%.*}"   # v1
 
+          # THE v0 ALIAS IS FROZEN, AND THIS JOB IS WHERE THAT PROMISE IS KEPT.
+          #
+          # The reusable workflow's jobs now declare their own least-privilege
+          # tokens, which REQUIRES a caller to grant `actions: read` as well as
+          # `contents: read`. That is a breaking change for a caller, and the
+          # compatibility contract handles it by versioning the boundary: the
+          # reusable workflow and the README both promise that `v0` stays at
+          # v0.2.2, so an existing `@v0` consumer receives the new requirement
+          # only after a deliberate re-pin.
+          #
+          # This job would have broken that promise on the first successful
+          # v0.3.x publish: it derives the alias from the tag and force-moves it
+          # to the highest published release of that major, so `v0` would have
+          # delivered the held-back requirement to every `@v0` consumer at once.
+          # The absence of v0.3.0 today means the bug had not fired, not that
+          # the source preserved the boundary.
+          #
+          # So the freeze is executable rather than documentary. While a 0.x
+          # release carries the breaking caller-permission requirement, `v0` is
+          # not moved by this workflow at all; the release still publishes, and
+          # the exact vMAJOR.MINOR.PATCH tag is the delivery identity a consumer
+          # re-pins to. Lifting this is a deliberate edit here, made together
+          # with the README and the reusable workflow's compatibility text —
+          # never a side effect of publishing.
+          if [ "$major" = "v0" ]; then
+            echo "alias v0 is FROZEN at v0.2.2 across the caller-permission breaking boundary; $TAG published, v0 deliberately not moved"
+            echo "Consumers adopt this release by pinning ${TAG} explicitly. See the compatibility note in .github/workflows/bucketed-reusable.yml and README.md."
+            exit 0
+          fi
+
           compute_target() {
             # The highest stable vMAJOR.*.* release that has actually PUBLISHED —
             # not the highest git TAG. A tag ref exists the instant it is pushed,

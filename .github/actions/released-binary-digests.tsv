@@ -1,0 +1,56 @@
+# released-binary-digests.tsv — the digest of every published testbucket
+# binary, committed to THIS REPOSITORY.
+#
+# WHY IT EXISTS. For an exact release tag the installer downloads the platform
+# archive and `checksums.txt` FROM THE SAME RELEASE and verifies one against
+# the other. Both are release assets, `gh release upload --clobber` can replace
+# them together, and the Releases API reports every current testbucket release
+# as `immutable: false` — so an actor able to publish assets can replace the
+# archive and its checksum in one step and the installer's check still passes.
+# A tag name is metadata; that check authenticated an archive against metadata
+# that moves with it.
+#
+# This file is the root outside the release. It lives in the repository, so it
+# is covered by review and by branch protection rather than by the release
+# asset store, and the installer refuses any released binary whose bytes do not
+# match the line for its exact tag and platform.
+#
+# WHAT IT PROVES, EXACTLY. Each line pins the bytes as published at the moment
+# the line was committed. It does not, by itself, say those bytes are the ones
+# built from the reviewed tip — the build attestation in the Stage-1 manifest
+# is what says that, and it is verified separately. What this closes is the
+# replacement: bytes swapped after the line was reviewed no longer install.
+#
+# FORMAT: <tag>\t<os>_<arch>\tsha256:<64 lower-case hex>, of the `testbucket`
+# binary INSIDE the archive — not of the archive. The archive digest says which
+# archive was downloaded; this says which binary is about to execute, which is
+# the thing Stage 1 binds.
+#
+# ADDING A RELEASE. Publish, then compute the digest of the extracted binary
+# for each platform and commit the four lines in a reviewed change. A release
+# with no lines here cannot be installed by this action: that is deliberate and
+# fails closed.
+v0.1.0	darwin_amd64	sha256:8db15e9af25caec5aec8a2d8ff85138ee2faa80abe991d48b3c8503e8af8f40c
+v0.1.0	darwin_arm64	sha256:f960accbfc82a769aed8ab8f644f0cde5bbbd664c60f9e7db0a02c8df45bdb7a
+v0.1.0	linux_amd64	sha256:bfd7e6adae7ccf7ea677456acda99e0c65cbd497fc6dcf93da12a109d1e47607
+v0.1.0	linux_arm64	sha256:29cd82a5f3d35597ed9bf9ee55654d239184b70844a1af6105fc472df21b0e38
+v0.1.1	darwin_amd64	sha256:02a81c21742adfcd3c3df476a9765fa3969a26958049be5f67cdee34ef85fac7
+v0.1.1	darwin_arm64	sha256:b403ce58d47843c803560fe8466cf88028ca0b8aa6382ec38c2e97d6dc448d63
+v0.1.1	linux_amd64	sha256:2dc8d85c86386d8834f81459f87ffb261e93d8f6a110a0661dbbac7591f978cc
+v0.1.1	linux_arm64	sha256:d0bb8275832ca4c511f8b9369a52beca15722beae10c7e935b641b1c894c863e
+v0.1.2	darwin_amd64	sha256:593dfafdcd5dd3a7790faf2331be16340c2c264e525eaa80444c68e9ab1b5a2c
+v0.1.2	darwin_arm64	sha256:de44eb86a2bfe4f63c34a95637345d21ed444f6f8404117ec562e35b68fba3c0
+v0.1.2	linux_amd64	sha256:022e0c8fcb00c7ae31927f2a76c907f1a143473673695b49a0a0a772607ee239
+v0.1.2	linux_arm64	sha256:bc169239ac4acb697d1b232635efab075d12685768287da6f8613fd5e1096a75
+v0.2.0	darwin_amd64	sha256:9c6df1fe5607d94635c76a957d5840acb18361bb8a46ef7a0d9ff96882a46bca
+v0.2.0	darwin_arm64	sha256:90848dc0341c7e43942924c37dc4169ec7a3b398d26f5d57dd6e6c26bc5d29b0
+v0.2.0	linux_amd64	sha256:cdbad3cf0d0570dc6a0936495a510402a4689145de4df27f126056d88e51c4c2
+v0.2.0	linux_arm64	sha256:f86c4954a556b526249aa774fd9a2b205c97c75d62e1563e2b814fcfeb2f7d45
+v0.2.1	darwin_amd64	sha256:6c2e6128dd77a45c3248ea187f68a8188e76926bfb6c7d7ee2aba6c50197f633
+v0.2.1	darwin_arm64	sha256:5935d9a68981ec352e5419a654c40605a72ec08691c54b75c2c34d587a1ec091
+v0.2.1	linux_amd64	sha256:4b59b6e42ab6bd36c224bbb2f79065ef870b166e08dbbe93ec6739f3db149bf9
+v0.2.1	linux_arm64	sha256:ed355f621e651c08f8107a13d3bbabd8b2288c8f9d5137214ebb458eb6a12d90
+v0.2.2	darwin_amd64	sha256:5a8c21a588eb3c63c705cb959c969d33be9481b4ac31e1475af8cf0e55c4d394
+v0.2.2	darwin_arm64	sha256:9b579b501a9a7597e895466b64a9753a745793b2828d231815fb884dd37771c4
+v0.2.2	linux_amd64	sha256:a987439ae2db4b3ceb9717f66bf0d7f3d848673f200028b6397c8fbef91b8454
+v0.2.2	linux_arm64	sha256:70cea383d40ab08cc8b9e164408e88059628a74cb16809a11b02cd5402994659

@@ -923,8 +923,42 @@ func requireSet(fields map[string]string) error {
 // whatever GitHub rebuilt this morning; two arms of a pair resolved through it
 // are not proven to have run on the same image, which is the entire point of
 // binding it.
+//
+// A SUBSTRING IS NOT A DIGEST. This asked only whether "@sha256:" or
+// "@sha512:" appeared anywhere in the value, so `ubuntu-latest@sha256:`,
+// `ubuntu-latest@sha256:x` and `ubuntu-latest@sha512:not-a-digest` all counted
+// as immutable — an alias with a decorative suffix passed the one check that
+// exists to refuse an alias. The value must now end in a complete digest: a
+// non-empty repository part, then `@`, then a supported algorithm, then
+// exactly the number of lower-case hex characters that algorithm produces.
 func isImmutableImage(v string) bool {
-	return strings.Contains(v, "@sha256:") || strings.Contains(v, "@sha512:")
+	for algo, hexLen := range map[string]int{"sha256": 64, "sha512": 128} {
+		marker := "@" + algo + ":"
+		name, digest, ok := strings.Cut(v, marker)
+		if !ok || name == "" || len(digest) != hexLen {
+			continue
+		}
+		if isLowerHex(digest) {
+			return true
+		}
+	}
+	return false
+}
+
+// isLowerHex reports whether every byte is 0-9 or a-f. Upper case is not
+// accepted for the same reason a signer identity does not accept it: two
+// spellings of one digest are two different strings, and what is compared is
+// the string.
+func isLowerHex(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // StoreReceipt is the admitted timing store's provenance.
@@ -1071,8 +1105,15 @@ func (r StoreReceipt) validateFields(now time.Time) error {
 		"the store digest":        string(r.Digest),
 		"the migration id":        r.MigrationID,
 		"the comparability token": r.Token,
-		"the restore method":      r.RestoreMethod,
-		"the stale instant":       r.StaleAt,
+		// THE SELECTED EXACT KEY. The contract freezes which key the admitted
+		// copy came from, and the field existed for it while validation asked
+		// for everything around it — so a receipt with correct bytes, a
+		// restore method and a stale instant validated with `cache_key: ""`,
+		// losing the one fact that says WHICH store was admitted. The restore
+		// method says how the copy was obtained; this says what it was.
+		"the selected exact cache key": r.CacheKey,
+		"the restore method":           r.RestoreMethod,
+		"the stale instant":            r.StaleAt,
 	}); err != nil {
 		return fmt.Errorf("store receipt %w", err)
 	}

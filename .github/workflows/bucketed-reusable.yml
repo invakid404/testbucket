@@ -404,7 +404,24 @@ on:
         type: string
         default: ""
       runs-on:
-        description: 'Runner label for every job.'
+        description: >-
+          Runner label for every job. The default `ubuntu-latest` is a MOVING
+          ALIAS and is fine for an unscored lane.
+
+          A SCORED arm must name an immutable image instead — a value ending in
+          a complete `@sha256:<64 hex>` or `@sha512:<128 hex>` digest — because
+          the Stage-1 manifest binds a runner image and the pair's equality
+          check compares that binding. Two arms scheduled through
+          `ubuntu-latest` can execute on two different physical images while
+          both signed manifests claim the same identity. The plan job refuses a
+          scored request whose runner is an alias, before anything is planned.
+
+          RESIDUAL, DISCLOSED: GitHub does not report the image it actually
+          selected back to the job, so nothing inside the run can compare the
+          executing runner with `Consumer.RunnerImage`. Refusing an alias makes
+          the asserted identity at least unambiguous and immutable; it does not
+          make it mechanically verified. Closing that needs an attested runner
+          identity GitHub does not currently expose.
         type: string
         default: ubuntu-latest
 
@@ -517,6 +534,7 @@ jobs:
           TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
           TB_FROZEN_INPUTS: ${{ inputs.frozen-inputs-artifact }}
           TB_VERIFY_REQUIRE: ${{ inputs.verify-require }}
+          TB_RUNS_ON: ${{ inputs.runs-on }}
         run: |
           set -euo pipefail
           fail=0
@@ -539,6 +557,26 @@ jobs:
           if [ "$TB_AUTHORITY" != "ewj2-campaign" ]; then
             say "needs authority=ewj2-campaign. The frozen contract names exactly one protected environment that may approve Stage-1 inputs before either role plans. A key signs under any label it is given, so checking the key alone lets a manifest approved elsewhere drive the frozen planner — and a downstream refusal cannot un-derive the matrix this job is about to produce."
           fi
+          # THE RUNNER IMAGE IS PART OF THE PAIR'S IDENTITY.
+          #
+          # Stage 1 binds a runner image and the pair's allowed-difference check
+          # compares that binding, but every job here is scheduled from one
+          # `runs-on` input whose default is the moving `ubuntu-latest`. Two
+          # arms resolved through an alias can execute on two different physical
+          # images while both signed manifests claim the same identity, and
+          # nothing downstream can tell. Refuse the alias here, before the
+          # matrix exists.
+          #
+          # This does not close the gap, and does not pretend to: GitHub does
+          # not report the image it actually selected back to the job, so the
+          # binding stays asserted rather than mechanically verified. What it
+          # removes is the ambiguity — a scored arm names one immutable image.
+          case "$TB_RUNS_ON" in
+            *@sha256:*|*@sha512:*) ;;
+            *)
+              say "needs an immutable runs-on for a scored arm, not the moving alias '$TB_RUNS_ON'. Stage 1 binds a runner image and the pair equality check compares it; two arms resolved through an alias can run on two different images while both manifests claim the same identity."
+              ;;
+          esac
           [ "$fail" -eq 0 ] || exit 1
           echo "frozen plan: the frozen inputs, the protected authority and its key are all bound before planning"
 

@@ -302,6 +302,54 @@ curl -fsSL -o "$work/checksums.txt" "$base/checksums.txt"
   fi )
 
 tar -xzf "$work/$asset" -C "$work" testbucket
+
+# THE BYTES ARE CHECKED AGAINST A ROOT OUTSIDE THE RELEASE.
+#
+# The verification above compares the archive with `checksums.txt` — and both
+# are assets of the SAME release. `gh release upload --clobber` can replace
+# them together, and the Releases API reports every current testbucket release
+# as `immutable: false`, so an actor able to publish assets can swap the
+# archive and its checksum in one step and that check still passes. A tag name
+# is metadata, and this authenticated an archive against metadata that moves
+# with it.
+#
+# `released-binary-digests.tsv` is the root that does not move with the
+# release: it lives in this repository, under review and branch protection, and
+# it names the digest of the BINARY inside each published archive. The archive
+# digest says which archive was downloaded; this says which binary is about to
+# execute, which is what Stage 1 binds.
+#
+# A tag with no line here is REFUSED rather than installed on the strength of
+# the co-mutable pair. That is deliberate: publishing a release includes
+# committing its digests in a reviewed change, and a release nobody pinned is a
+# release nobody vouched for outside its own asset store.
+pins="$(dirname "${BASH_SOURCE[0]}")/released-binary-digests.tsv"
+if [ ! -f "$pins" ]; then
+  echo "install-testbucket: $pins is missing; a released binary is verified against a digest committed to the repository, and there is none to check against" >&2
+  exit 1
+fi
+pinned=$(awk -F'\t' -v t="$tag" -v p="${os}_${arch}" '$1 == t && $2 == p { print $3; exit }' "$pins")
+if [ -z "$pinned" ]; then
+  echo "install-testbucket: no precommitted binary digest for $tag ${os}_${arch} in $pins" >&2
+  echo "The release archive and its checksums.txt are both mutable assets of the same release, so they cannot authenticate each other. Commit the digest for this release and platform, then install it." >&2
+  exit 1
+fi
+if ! printf '%s' "$pinned" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+  echo "install-testbucket: the precommitted digest for $tag ${os}_${arch} is '$pinned', not sha256:<64 lower-case hex>" >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  got="sha256:$(sha256sum "$work/testbucket" | cut -d' ' -f1)"
+else
+  got="sha256:$(shasum -a 256 "$work/testbucket" | cut -d' ' -f1)"
+fi
+if [ "$got" != "$pinned" ]; then
+  echo "install-testbucket: the $tag ${os}_${arch} binary digests to $got, not the precommitted $pinned" >&2
+  echo "The release assets were replaced after that digest was reviewed, or this is not the release it claims to be." >&2
+  exit 1
+fi
+echo "released binary matches the precommitted digest $pinned"
+
 install -m 0755 "$work/testbucket" "$bin"
 printf '%s\n' "$TB_BINDIR" >>"${GITHUB_PATH:-/dev/null}"
 "$bin" version

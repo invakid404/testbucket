@@ -58,6 +58,15 @@ inputs:
       per-runner provisioning (DB binaries, codegen, toolchains). Runs as a bash
       block; a failure fails the bucket before any test runs. Empty = no setup
       step ⇒ unchanged behavior.
+
+      UNDER MEASUREMENT it runs through `wall run`, which strips both the
+      wall-time capabilities and the GitHub file-command channels
+      ($GITHUB_OUTPUT, $GITHUB_ENV, $GITHUB_PATH, $GITHUB_STEP_SUMMARY,
+      $GITHUB_STATE) from its environment. A setup command that sets step
+      outputs or job-wide variables therefore has no effect on a measured
+      bucket: those channels are how the signer delegate reaches the measured
+      step, and consumer-supplied code must not be able to read or write them.
+      Do that provisioning in a prior step of the caller's own job instead.
     default: ""
   wall-time-dir:
     description: >-
