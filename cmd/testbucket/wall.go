@@ -42,6 +42,9 @@ usage:
                                    containment, with no envelope of its own (a
                                    per-bucket setup command)
   testbucket wall observe [flags]  INTERNAL: the peer/collector process itself
+  testbucket wall hold    -- cmd...  INTERNAL: the action-owned child's barrier;
+                                   it waits for the wrapper's containment proof
+                                   and then execs the command in place
   testbucket wall verify  [flags]  verify a records directory and report
                                    eligibility, reconciliation and every gate
   testbucket wall bundle  [flags]  freeze a planning-input bundle: the canonical
@@ -54,6 +57,13 @@ usage:
                                    that authorises a bundle (the signing key
                                    comes from TB_WALL_AUTHORITY_KEY, never a
                                    flag)
+  testbucket wall stage1-binary [flags]  print the binary digest a signed
+                                   Stage-1 manifest AUTHORISES, for the
+                                   installer's mandatory candidate check
+  testbucket wall check-delegation [flags]  verify that a cgroup-v2 subtree is
+                                   really delegated — that this credential can
+                                   create containments under it AND migrate
+                                   into them
   testbucket wall digest  [flags]  print the canonical digest of a manifest,
                                    receipt, bundle, registry or scorer — the
                                    identity every record has to bind to
@@ -102,6 +112,8 @@ func runWall(args []string) error {
 		return runWallRun(args[1:])
 	case "observe":
 		return runWallObserve(args[1:])
+	case "hold":
+		return runWallHold(args[1:])
 	case "verify":
 		return runWallVerify(args[1:])
 	case "bundle":
@@ -110,6 +122,10 @@ func runWall(args []string) error {
 		return runWallReplay(args[1:])
 	case "stage1":
 		return runWallStage1(args[1:])
+	case "stage1-binary":
+		return runWallStage1Binary(args[1:])
+	case "check-delegation":
+		return runWallCheckDelegation(args[1:])
 	case "digest":
 		return runWallDigest(args[1:])
 	case "train":
@@ -848,6 +864,12 @@ func runWallCampaign(args []string) error {
 	if *releaseSHA != "" && strings.TrimSpace(*indexDigest) == "" {
 		return fmt.Errorf("--release-sha authorises a delivery, so --index-digest is required: the publisher must say which exact campaign-index bytes it is gating on, or a substituted index would be evaluated as though it were the produced evidence")
 	}
+	// THE PREDECLARED AUTHORITY, registered before anything is validated.
+	//
+	// A planner claim's durability attestation is verified against the keys
+	// this process was configured with, never against keys the claim carries —
+	// a document does not get to nominate who vouches for it.
+	walltime.RegisterCampaignAuthorityKeys(authorityKeys)
 	if (*index == "") == (*in == "") {
 		return fmt.Errorf("pass exactly one of --index (a campaign) or --in (the calculator)")
 	}
@@ -987,6 +1009,10 @@ func runWallVerify(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// The predeclared authority, registered before any Stage-2 receipt is
+	// validated: a planner claim's durability attestation is verified against
+	// these keys and never against the ones the claim carries.
+	walltime.RegisterCampaignAuthorityKeys(authorityKeys)
 	if *dir == "" {
 		return fmt.Errorf("--dir is required")
 	}

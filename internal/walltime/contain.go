@@ -206,7 +206,12 @@ type MembershipFacts struct {
 // cgroupRootEnv names the delegated cgroup-v2 subtree testbucket may create
 // containments under. It is required: guessing a path and writing to it is how
 // an action ends up moving processes it does not own.
-const cgroupRootEnv = "TB_WALL_CGROUP_ROOT"
+const cgroupRootEnv = CgroupRootEnv
+
+// CgroupRootEnv is that variable's name, exported so a caller — and the
+// delegation check a caller runs before trusting a subtree — names the same
+// variable the wrapper reads rather than a copy of the string.
+const CgroupRootEnv = "TB_WALL_CGROUP_ROOT"
 
 // Containment primitives. Only PrimitiveCgroup2 can delimit a SCORED
 // lifecycle: it is the one primitive here whose membership the workload cannot

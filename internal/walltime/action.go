@@ -279,6 +279,28 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 		return nil, fmt.Errorf("walltime: %s: %w", reason, cause)
 	}
 
+	// THE DELEGATION IS CHECKED BEFORE THE FIRST MIGRATION, NOT DISCOVERED BY
+	// IT.
+	//
+	// Creating the containment succeeds whenever the root is writable; the
+	// migration below then needs the COMMON ANCESTOR's membership file, which
+	// a root the operator merely owns does not give. The failure surfaced as
+	// `admit the action root .../cgroup.procs: permission denied` — accurate,
+	// and silent about which permission was missing or how to grant it. Ask
+	// first, so the answer names the delegation.
+	// Only when the root really IS a cgroup-v2 directory: a root that is
+	// absent, or that names something else entirely, is the unscored fallback
+	// the wrapper has always taken — recorded in full and reported ineligible.
+	// What must not happen is the middle case, where the directory is real,
+	// the containment is created, and only the migration fails.
+	if root := strings.TrimSpace(os.Getenv(cgroupRootEnv)); root != "" {
+		if _, statErr := os.Stat(filepath.Join(root, "cgroup.procs")); statErr == nil {
+			if err := CheckCgroupDelegation(root); err != nil {
+				return fail("the delegated cgroup-v2 subtree cannot contain this action", err)
+			}
+		}
+	}
+
 	cont, err := NewContainmentAt(LevelAction, containmentName(ExecOptions{Level: LevelAction, Run: run}), nil)
 	if err != nil {
 		return fail("create the action containment", err)
@@ -481,7 +503,35 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 		return 1, fmt.Errorf("walltime: join action containment: %w", err)
 	}
 	probe(atContainmentJoin, dir)
-	cmd := exec.Command(argv[0], argv[1:]...)
+	// THE CHILD IS HELD UNTIL ITS MEMBERSHIP HAS BEEN READ.
+	//
+	// Starting the command and then reading `cgroup.procs` is a race the
+	// kernel always wins for a short one: a setup command that exits
+	// immediately is gone before the read, its pid is absent from the
+	// membership, and the verifier reports a terminal WT-033 saying an
+	// action-owned child ran outside the containment it was in fact inside.
+	// The first end-to-end run of the CLI lifecycle on a real cgroup-v2 kernel
+	// produced exactly that, from `/bin/sh -c "exit 0"`.
+	//
+	// So the direct child is THIS binary at a barrier. It does nothing but
+	// wait for one byte on an inherited pipe and then exec the real command in
+	// place, so the pid whose membership is read is the pid that runs the
+	// command, and it is alive for the read by construction rather than by
+	// luck. The containment proof stays a kernel reading; only the moment it
+	// is taken stops being a race.
+	hold, release, err := os.Pipe()
+	if err != nil {
+		return 1, fmt.Errorf("walltime: open the action-child barrier: %w", err)
+	}
+	defer func() {
+		_ = hold.Close()
+		_ = release.Close()
+	}()
+	cmd, err := ActionChildLauncher(argv)
+	if err != nil {
+		return 1, fmt.Errorf("walltime: build the action-owned child: %w", err)
+	}
+	cmd.ExtraFiles = []*os.File{hold}
 	cmd.Dir = cwd
 	if stdout == nil {
 		stdout = os.Stdout
@@ -503,7 +553,12 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 	// the script-level wrapper it starts registers its own producers and its
 	// controller registers the invocation ones. That case says so.
 	if !o.WrapperChain {
-		cmd.Env = scrubSecrets(nil)
+		// Scrub what the LAUNCHER set, rather than replacing it: the barrier
+		// process is started by re-executing this binary, and the launcher is
+		// the only thing that can tell that process it is the barrier.
+		// Replacing the environment wholesale removed that and turned the
+		// child into an ordinary invocation of the wrapper.
+		cmd.Env = scrubSecrets(cmd.Env)
 	}
 	// EVERY ACTION-OWNED CHILD is retained, because the contract requires
 	// containment proof before every one of them and RunInAction may be called
@@ -538,6 +593,21 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 		_ = cmd.Wait()
 		return 1, fmt.Errorf("walltime: retain the identity of an action-owned child: %w", err)
 	}
+	// The proof is committed; the command may run. Releasing on the write end
+	// AND closing it means a barrier that never hears from us is an EOF rather
+	// than a hang.
+	if _, err := release.Write([]byte{1}); err != nil {
+		child.close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return 1, fmt.Errorf("walltime: release the action-child barrier: %w", err)
+	}
+	if err := release.Close(); err != nil {
+		child.close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return 1, fmt.Errorf("walltime: close the action-child barrier: %w", err)
+	}
 	if err := child.close(); err != nil {
 		// THE CHILD IS ALREADY RUNNING. Returning here left a started process
 		// unreaped whenever the ledger close reported a real error — the one
@@ -563,6 +633,24 @@ type actionChild struct {
 	st   *ActionState
 	cont Containment
 	seq  int
+}
+
+// ActionChildHoldFD is the descriptor the held child reads its go-ahead from.
+// 0, 1 and 2 are the standard streams and ExtraFiles starts at 3.
+const ActionChildHoldFD = 3
+
+// ActionChildLauncher builds the command that starts one action-owned child.
+//
+// Production re-executes THIS binary at a barrier — the same reason the
+// observers do: the process that holds and then becomes the child is bytes
+// Stage 1 bound, not something found on PATH. It is a variable so a test
+// binary, which is not the CLI, can dispatch the barrier to itself.
+var ActionChildLauncher = func(argv []string) (*exec.Cmd, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	return exec.Command(self, append([]string{"wall", "hold", "--"}, argv...)...), nil
 }
 
 // openActionChild opens that ledger and writes the containment proof that must

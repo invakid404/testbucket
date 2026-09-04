@@ -144,8 +144,23 @@ func TestConsumerSetupNeverInheritsTheSignerDelegate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(action), "if !o.WrapperChain {\n\t\tcmd.Env = scrubSecrets(nil)\n\t}") {
+	// The SCRUB, not one spelling of it. The argument became the launcher's
+	// own environment rather than nil — the barrier process is started by
+	// re-executing this binary and has to be told it is the barrier, which a
+	// wholesale replacement removed — and the property under test is that
+	// every wall-time secret is stripped from a child that is not the wrapper
+	// chain, which `scrubSecrets` is what does.
+	guard := "if !o.WrapperChain {"
+	at := strings.Index(string(action), guard)
+	if at < 0 {
+		t.Fatal("RunInAction no longer distinguishes the wrapper chain from consumer code")
+	}
+	block := string(action)[at : at+600]
+	if !strings.Contains(block, "cmd.Env = scrubSecrets(") {
 		t.Error("an action-owned child that is not the wrapper chain still inherits this process's environment")
+	}
+	if strings.Contains(block, "cmd.Env = os.Environ()") {
+		t.Error("the consumer-supplied child is handed this process's environment unscrubbed")
 	}
 
 	// 2. THE WORKFLOW. The capability is a step OUTPUT, named by the one step

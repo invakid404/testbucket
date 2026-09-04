@@ -607,6 +607,10 @@ func runWallReplay(args []string) error {
 	if err := walltime.ReadJSONFile(*bundlePath, &bundle); err != nil {
 		return err
 	}
+	// The predeclared authority, registered before any receipt is validated:
+	// the planner claim's durability attestation is checked against these keys
+	// and never against keys the claim itself carries.
+	walltime.RegisterCampaignAuthorityKeys(authorityKeys)
 	var issued walltime.Stage2Receipt
 	if err := walltime.ReadJSONFile(*receiptPath, &issued); err != nil {
 		return err
@@ -705,14 +709,15 @@ func runWallReplay(args []string) error {
 	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{
 		Bundle: &bundle, Stage1: stage1, Scorer: scorer,
 		PlannerClaim: issued.PlannerClaim,
+		// The approval an INDEPENDENT party derives from the supplied Stage-1
+		// manifest, not the one the issued receipt states. Passing the issued
+		// value would let a receipt claim an approval nobody re-derived; this
+		// is the value Matches then compares against it.
+		Stage1Approval: replayApproval,
 	})
 	if err != nil {
 		return err
 	}
-	// The replay re-derives the approval too: it is a field of the receipt it
-	// is checking, so leaving it out would let a receipt claim an approval no
-	// independent party ever saw.
-	res.Receipt.Stage1Approval = replayApproval
 	// The replay re-derives the PER-BUCKET documents too. Comparing only the
 	// aggregate digests would leave the Pcheck projections, forecasts and
 	// invocation manifests — the documents the buckets actually run against —
@@ -1029,6 +1034,11 @@ type frozenPlanOptions struct {
 }
 
 func planFromBundle(o frozenPlanOptions) error {
+	// The predeclared authority this plan was configured with. The receipt it
+	// derives carries a durability attestation, and that attestation is
+	// verified against these keys rather than against the ones travelling
+	// beside it.
+	walltime.RegisterCampaignAuthorityKeys(o.authorityKeys)
 	bundlePath, stage1Path, stage2Path, shardPlan, asJSON := o.bundlePath, o.stage1Path, o.stage2Path, o.shardPlan, o.asJSON
 
 	// AUTHORISATION BEFORE PLANNING — and before reading anything. The
@@ -1139,6 +1149,9 @@ func planFromBundle(o frozenPlanOptions) error {
 		// The claim travels INTO the derivation, so the receipt is complete
 		// when it is validated rather than completed afterwards.
 		PlannerClaim: claim.receipt,
+		// The approval the planner SAW travels into the derivation for the
+		// same reason the claim does: the receipt is validated as it is built.
+		Stage1Approval: approval,
 	})
 	if err != nil {
 		// THE CLAIM STANDS. It used to be released here, on the reasoning that
@@ -1159,7 +1172,6 @@ func planFromBundle(o frozenPlanOptions) error {
 	// The approval as the PLANNER saw it. Stage-1's digest excludes the
 	// detached signature, so a manifest signed after this point carries the
 	// same digest — this is the field that says the approval came first.
-	res.Receipt.Stage1Approval = approval
 	// The derived documents are written BEFORE the receipt, because the
 	// receipt binds them: a per-bucket projection or forecast that the one
 	// authorised plan does not name is a document anybody could have written,
@@ -1488,9 +1500,19 @@ func claimPlannerExecution(configured string, stage1, bundle walltime.Digest) (p
 		// directory, and a crash between the two leaves a claim nobody can
 		// see — which is exactly the state a second attempt would read as
 		// "not yet claimed".
-		if dh, derr := os.Open(dir); derr == nil {
-			_ = dh.Sync()
-			_ = dh.Close()
+		// AND THE FAILURE IS REPORTED. Discarding these errors while claiming
+		// the entry is durable is the same self-assertion the durability flag
+		// was: a claim reported as committed whose name was never persisted is
+		// exactly the state a second attempt reads as "not yet claimed".
+		dh, derr := os.Open(dir)
+		if derr == nil {
+			syncErr := dh.Sync()
+			closeErr := dh.Close()
+			derr = firstErr(syncErr, closeErr)
+		}
+		if derr != nil {
+			claim.release()
+			return plannerClaim{}, fmt.Errorf("commit the planner claim's directory entry in %s: %w", dir, derr)
 		}
 		claim.paths = append(claim.paths, path)
 		for _, e := range []error{encErr, syncErr, closeErr} {
@@ -1525,4 +1547,15 @@ func requireDurablePlannerClaim(c plannerClaim) error {
 	return fmt.Errorf(
 		"a scored derivation needs a DURABLE one-shot claim and this one was taken only in the machine store %s: a job rerun would get a fresh runner, see no claim and derive the plan a second time. Set %s (or --wall-claim-store) to a store every attempt of the job resolves",
 		c.receipt.Store, plannerClaimStoreEnv)
+}
+
+// firstErr returns the first non-nil error, so a caller can fold several
+// close-shaped failures into one without losing the first one that happened.
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }

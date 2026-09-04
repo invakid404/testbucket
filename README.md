@@ -628,8 +628,34 @@ uses: invakid404/testbucket/.github/workflows/bucketed-reusable.yml@<sha>
 with:
   runner: vitest
   wall-time-dir: /tmp/testbucket-wall
-  cgroup-root: /sys/fs/cgroup/testbucket   # create it in a prior step
+  cgroup-root: ${{ env.TB_WALL_CGROUP_ROOT }}   # delegated in a prior step
 ```
+
+**The cgroup root must be *delegated*, not merely owned.** cgroup-v2 moves a
+process between cgroups only if it can write the *common ancestor's*
+`cgroup.procs`, so `/sys/fs/cgroup/testbucket` chowned to the runner user does
+not work: its common ancestor with the runner's own cgroup is the root cgroup,
+which belongs to root, and even the action root cannot be admitted. Hang the
+root off the runner's own cgroup in a prior step:
+
+```yaml
+- name: Delegate a cgroup-v2 subtree
+  run: |
+    own=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+    sudo mkdir -p "/sys/fs/cgroup${own}/testbucket"
+    sudo chown "$(id -un)" "/sys/fs/cgroup${own}" "/sys/fs/cgroup${own}/cgroup.procs"
+    sudo chown -R "$(id -un)" "/sys/fs/cgroup${own}/testbucket"
+    echo "TB_WALL_CGROUP_ROOT=/sys/fs/cgroup${own}/testbucket" >>"$GITHUB_ENV"
+- name: Check it before relying on it
+  run: testbucket wall check-delegation --root "$TB_WALL_CGROUP_ROOT"
+```
+
+On a self-hosted runner the durable form is supervisor delegation — a systemd
+drop-in with `Delegate=yes` on the runner service — which gives the service its
+own delegated subtree and needs no per-job chown. Either way,
+`wall check-delegation` answers whether it worked, and `wall begin` runs the
+same check before opening an envelope rather than failing later with a bare
+permission error.
 
 Each bucket's records are uploaded as their own artifact, because the records
 are the evidence: a row whose records went away with the runner cannot be
@@ -656,7 +682,7 @@ refuses that before it plans.
 with:
   runner: vitest
   wall-time-dir: /tmp/testbucket-wall
-  cgroup-root: /sys/fs/cgroup/testbucket
+  cgroup-root: ${{ env.TB_WALL_CGROUP_ROOT }}
   verify-require: eligible          # refuses an unmeasured or mutably-delivered row
   testbucket-version: v0.3.0        # an EXACT published tag; never an alias
   campaign-id: ewj2
@@ -682,18 +708,28 @@ before any bucket runs rather than finishing green having proven nothing.
 
 A_GH is not in that artifact and cannot be: `step-attempt.json` describes the
 bucket step, which has not finished when the artifact is built. The workflow
-reads it back from the Actions API after the run and hands it to the verifier —
-so a scored caller must grant `actions: read` alongside `contents: read`:
+reads it back from the Actions API after the run and hands it to the verifier,
+which is why the `test` job needs `actions: read`.
+
+**Every caller grants both scopes:**
 
 ```yaml
 permissions:
   contents: read
-  actions: read      # only needed for a scored arm, to collect A_GH
+  actions: read
 ```
 
-The workflow cannot request that for you: a called reusable workflow may only
-narrow its caller's permissions, so declaring it here would break every caller
-that grants less. Without it the collector says so and exits 0, and the
+The called jobs declare their own least-privilege tokens — `contents: read` for
+`plan` and `record`, `contents: read` plus `actions: read` for `test` — and a
+called workflow may only retain or reduce what its caller granted. A caller
+granting less therefore fails at startup rather than running on whatever the
+repository default happens to be.
+
+That is a deliberate break, and it is versioned: the moving `v0` alias stays
+pinned at v0.2.2, so a consumer on `@v0`, `@v0.2.2` or any full SHA is
+unaffected until it re-pins to a release that carries the declarations. Earlier
+releases state the requirement as advice instead; on those, a caller granting
+only `contents: read` loses A_GH, the collector says so and exits 0, and the
 verifier reports the row ineligible.
 
 **On `version`:** every action defaults to the moving `v0` alias, which

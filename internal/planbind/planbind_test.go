@@ -489,7 +489,16 @@ func withClaim(t *testing.T, opt PlanOptions) PlanOptions {
 		t.Fatal(err)
 	}
 	const store = "authority/durable-claims"
+	// The authority that signed this claim is the predeclared one, registered
+	// here so the pairing does not depend on which test ran first.
+	walltime.RegisterCampaignAuthorityKeys([]string{walltime.PublicKeyOf(fixtureAuthorityKey)})
 	subject := walltime.PlannerClaimStoreSubject(store)
+	// The approval the planner saw, recorded as an identity: it is what says
+	// the authorisation came before the plan.
+	opt.Stage1Approval = walltime.Stage1Approval{
+		Authority: walltime.CampaignAuthority, KeyID: "fixture-authority",
+		SignatureDigest: walltime.DigestBytes([]byte("stage1-approval")),
+	}
 	opt.PlannerClaim = &walltime.PlannerClaimReceipt{
 		Store: store, Durable: true,
 		// The CANONICAL key, which any checker recomputes from the two

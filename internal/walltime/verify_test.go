@@ -667,8 +667,18 @@ func testReceipt(stage1, bundle Digest) Stage2Receipt {
 		MatrixDigest:     "sha256:6e00cd562cc2d88e238dfb81d9439de7ec843ee9d0c9879d549cb1436786f975",
 		PlannerResult:    "ok", RendererResult: "ok",
 	}
-	r.Algorithms.FullPlan = AlgorithmIdentity{Name: FullPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: "testbucket"}
-	r.Algorithms.SemanticPlan = AlgorithmIdentity{Name: SemanticPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: "testbucket"}
+	// The implementation is a CONTENT identity, not a label: an algorithm
+	// identified by a name is one any build may claim.
+	impl := string(SelfDigest())
+	r.Algorithms.FullPlan = AlgorithmIdentity{Name: FullPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: impl}
+	r.Algorithms.SemanticPlan = AlgorithmIdentity{Name: SemanticPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: impl}
+	// The approval the planner SAW: it is what says the authorisation came
+	// before the plan, so a fixture that left it blank stood for a receipt no
+	// authority had approved.
+	r.Stage1Approval = Stage1Approval{
+		Authority: CampaignAuthority, KeyID: "fixture-authority",
+		SignatureDigest: DigestBytes([]byte("stage1-approval")),
+	}
 	return r
 }
 

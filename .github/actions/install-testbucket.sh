@@ -28,10 +28,28 @@
 #   TB_BINDIR    directory to install the binary into   (created if missing)
 # Optional env:
 #   GH_TOKEN     token for `gh release list`            (only the alias path needs it)
+#   TB_CANDIDATE_BINARY_DIGEST  sha256:<64-hex> of the binary Stage 1 authorised
+#                (MANDATORY on the candidate path; derive it with
+#                `testbucket wall stage1-binary --file stage1.json` from a
+#                PUBLISHED release, never by typing a digest in)
 set -euo pipefail
 
 : "${TB_VERSION:?TB_VERSION is required (local | vX | vX.Y | vX.Y.Z)}"
 : "${TB_BINDIR:?TB_BINDIR is required}"
+
+# A CANDIDATE BINARY DIGEST IS A CANDIDATE'S DIGEST.
+#
+# The value names the exact pre-publication binary Stage 1 authorised, and it
+# is checked only on the candidate path below. Supplied beside a `local` build
+# or a published release it would be silently ignored, and a caller who set it
+# would believe a delivery was being checked that nothing checks. Refused here
+# rather than dropped: the six composite actions take one `version` and one
+# digest, so the pair disagreeing is a wiring mistake worth failing on.
+if [ -n "${TB_CANDIDATE_BINARY_DIGEST:-}" ] && ! printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
+  echo "install-testbucket: TB_CANDIDATE_BINARY_DIGEST is set but TB_VERSION is '$TB_VERSION', which is not a candidate pin" >&2
+  echo "An attested candidate binary digest checks a pre-publication delivery; a released binary is verified against the release checksums instead." >&2
+  exit 1
+fi
 mkdir -p "$TB_BINDIR"
 bin="$TB_BINDIR/testbucket"
 

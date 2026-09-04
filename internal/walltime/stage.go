@@ -1755,6 +1755,38 @@ func (r Stage2Receipt) Validate() error {
 	if err := r.PlannerClaim.validateFor(r.Stage1Digest, r.BundleDigest); err != nil {
 		return fmt.Errorf("stage-2 receipt %w", err)
 	}
+	// AND THE NESTED IDENTITIES TOO.
+	//
+	// Ten top-level digests were checked while the records BESIDE them were
+	// not: the Stage-1 approval the planner saw, the digest inside each
+	// input-access record, each per-bucket sidecar, and the algorithm
+	// implementation identity. A signature over a malformed label preserves
+	// the label; it does not turn it into a content identity, so a receipt
+	// could be signed, complete and still name its inputs with strings that
+	// address nothing.
+	if strings.TrimSpace(r.Stage1Approval.Authority) == "" ||
+		strings.TrimSpace(r.Stage1Approval.KeyID) == "" ||
+		!r.Stage1Approval.SignatureDigest.Valid() {
+		return fmt.Errorf("stage-2 receipt records no well-formed Stage-1 approval (authority %q, key %q, signature digest %q); the approval the planner saw is what says the authorisation came first",
+			r.Stage1Approval.Authority, r.Stage1Approval.KeyID, r.Stage1Approval.SignatureDigest)
+	}
+	for i, a := range r.InputAccess {
+		if strings.TrimSpace(a.Field) == "" || !a.Digest.Valid() {
+			return fmt.Errorf("stage-2 receipt input-access record %d names field %q at %q, which is not a content identity", i, a.Field, a.Digest)
+		}
+	}
+	for _, name := range sortedDigestKeys(r.Sidecars) {
+		if !r.Sidecars[name].Valid() {
+			return fmt.Errorf("stage-2 receipt binds derived document %q at %q, which is not a content identity", name, r.Sidecars[name])
+		}
+	}
+	for label, a := range map[string]AlgorithmIdentity{
+		"full-plan": r.Algorithms.FullPlan, "semantic-plan": r.Algorithms.SemanticPlan,
+	} {
+		if !Digest(a.Implementation).Valid() {
+			return fmt.Errorf("stage-2 receipt names the %s implementation as %q, which is not a content identity; an algorithm identified by a label is one any build may claim", label, a.Implementation)
+		}
+	}
 	if r.PlanDigest == "" || r.SemanticDigest == "" {
 		return fmt.Errorf("stage-2 receipt must carry BOTH the full-document and semantic-projection digests")
 	}
@@ -2207,12 +2239,34 @@ func (c *PlannerClaimReceipt) validateFor(stage1, bundle Digest) error {
 	if strings.TrimSpace(c.Attestation) == "" || len(c.AuthorityKeys) == 0 {
 		return fmt.Errorf("carries a planner claim asserting durability with no authority attestation for store %q; a durability flag the producer set is not evidence that the store outlives a runner", c.Store)
 	}
+	// THE KEYS COME FROM THE VERIFIER, NEVER FROM THE CLAIM.
+	//
+	// The attestation used to be checked against AuthorityKeys carried by the
+	// claim itself, which authenticates nothing: an attacker generates a key,
+	// signs their own store identity, puts the public half in the field beside
+	// the signature, and the check passes. A document cannot supply the
+	// authority that vouches for it.
+	//
+	// So the signature is verified against the PREDECLARED set this verifier
+	// was configured with, and the keys the claim names must be inside that
+	// set — a claim naming a key nobody trusts is refused rather than quietly
+	// checked against a different one. With no set registered there is nothing
+	// to trust and the claim is refused: fail closed, not fall back.
+	trusted := campaignAuthorityKeys()
+	if len(trusted) == 0 {
+		return fmt.Errorf("carries a planner claim for store %q that cannot be authenticated: no predeclared campaign-authority key set is registered, and a claim may not supply the authority that vouches for it", c.Store)
+	}
+	for _, k := range c.AuthorityKeys {
+		if !containsString(trusted, k) {
+			return fmt.Errorf("carries a planner claim naming authority key %s, which is not one of the predeclared campaign-authority keys; a document does not get to nominate who vouches for it", k)
+		}
+	}
 	subject := PlannerClaimStoreSubject(c.Store)
 	if err := VerifySigned(&Signature{
 		Authority: CampaignAuthority, KeyID: c.AuthorityKeys[0],
 		Digest: subject, Value: c.Attestation,
-	}, subject, c.AuthorityKeys); err != nil {
-		return fmt.Errorf("carries a planner claim whose durability attestation for store %q does not verify: %w", c.Store, err)
+	}, subject, trusted); err != nil {
+		return fmt.Errorf("carries a planner claim whose durability attestation for store %q does not verify under the predeclared campaign authority: %w", c.Store, err)
 	}
 	if c.Stage1 != stage1 || c.Bundle != bundle {
 		return fmt.Errorf("carries a planner claim for Stage-1 %s over bundle %s, but the receipt derives Stage-1 %s over bundle %s; a claim on another derivation is not a claim on this one",
@@ -2228,6 +2282,49 @@ func (c *PlannerClaimReceipt) identity() Digest {
 	if c == nil {
 		return ""
 	}
-	return DigestBytes([]byte(fmt.Sprintf("%s\x00%s\x00%t\x00%s\x00%s",
-		c.Store, c.Key, c.Durable, c.Stage1, c.Bundle)))
+	// The ATTESTATION AND KEYS ARE PART OF THE IDENTITY. Leaving them out made
+	// two claims compare equal while one was vouched for and the other was
+	// not, so a replay could substitute the unattested one and match.
+	return DigestBytes([]byte(fmt.Sprintf("%s\x00%s\x00%t\x00%s\x00%s\x00%s\x00%s",
+		c.Store, c.Key, c.Durable, c.Stage1, c.Bundle,
+		c.Attestation, strings.Join(c.AuthorityKeys, ","))))
+}
+
+// trustedCampaignAuthorityKeys is the PREDECLARED campaign-authority key set
+// this process was configured with.
+//
+// It is registered rather than read out of the documents being checked,
+// because the whole point is that a document may not nominate the authority
+// that vouches for it. Every entry point that already accepts
+// `--authority-key` registers what it was given; a process that registers
+// nothing cannot authenticate a durability attestation and refuses one.
+var trustedCampaignAuthorityKeys []string
+
+// RegisterCampaignAuthorityKeys installs the predeclared authority key set.
+// It is called from command entry points after flag parsing and is not safe to
+// call concurrently with validation.
+func RegisterCampaignAuthorityKeys(keys []string) {
+	trustedCampaignAuthorityKeys = append([]string(nil), keys...)
+}
+
+func campaignAuthorityKeys() []string { return trustedCampaignAuthorityKeys }
+
+func containsString(haystack []string, want string) bool {
+	for _, h := range haystack {
+		if h == want {
+			return true
+		}
+	}
+	return false
+}
+
+// sortedDigestKeys orders a digest map's names so a refusal names the same
+// record every time rather than whichever the map happened to yield first.
+func sortedDigestKeys(m map[string]Digest) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

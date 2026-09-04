@@ -17,7 +17,17 @@ import (
 // life is production code.
 const observerEnv = "TB_WALLTIME_TEST_OBSERVER"
 
+// holdEnv dispatches this test binary to the action-child barrier.
+const holdEnv = "TB_WALLTIME_TEST_HOLD"
+
 func TestMain(m *testing.M) {
+	if os.Getenv(holdEnv) != "" {
+		if err := HoldActionChild(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if os.Getenv(observerEnv) != "" {
 		if err := observerFromArgs(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -32,6 +42,18 @@ func TestMain(m *testing.M) {
 		}
 		cmd := exec.Command(self, args...)
 		cmd.Env = append(os.Environ(), observerEnv+"=1")
+		return cmd, nil
+	}
+	// The action-owned child's barrier is a separate process for the same
+	// reason, and a test binary is not the CLI — so it dispatches to itself
+	// and runs the SHIPPED barrier, rather than stubbing the race away.
+	ActionChildLauncher = func(argv []string) (*exec.Cmd, error) {
+		self, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+		cmd := exec.Command(self, append([]string{"--"}, argv...)...)
+		cmd.Env = append(os.Environ(), holdEnv+"=1")
 		return cmd, nil
 	}
 	os.Exit(m.Run())

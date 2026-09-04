@@ -46,6 +46,20 @@ inputs:
       exact `vX.Y.Z` instead: an alias is descriptive metadata, not a delivery
       identity.
     default: v0
+  candidate-binary-digest:
+    description: >-
+      The `sha256:<64-hex>` of the testbucket BINARY the campaign authorised,
+      as the signed Stage-1 manifest binds it. REQUIRED whenever `version` is a
+      `candidate:<run-id>/<artifact>@sha256:<64-hex>` pin: the archive digest
+      says which archive was downloaded, this says which binary is about to
+      execute, and Stage 1 binds the second. Do not type it in. Derive it with
+      `testbucket wall stage1-binary --file stage1.json` run from a PUBLISHED
+      release — that command validates the manifest, so the value comes from
+      the builder's attestation, the verifier's countersignature and the
+      campaign authority's own signature rather than from whoever wired the
+      job. Empty for a published release, whose bytes are checksum-verified
+      against the release manifest instead.
+    default: ""
   working-directory:
     description: 'Directory to plan in (where the tests live).'
     default: "."
@@ -203,6 +217,7 @@ runs:
       shell: bash
       env:
         TB_VERSION: ${{ inputs.version }}
+        TB_CANDIDATE_BINARY_DIGEST: ${{ inputs.candidate-binary-digest }}
         TB_REPO: invakid404/testbucket
         TB_BINDIR: ${{ runner.temp }}/testbucket-bin
         GH_TOKEN: ${{ github.token }}

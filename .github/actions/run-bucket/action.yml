@@ -34,6 +34,20 @@ inputs:
       identity. A scored row requires an
       exact `vX.Y.Z`.
     default: v0
+  candidate-binary-digest:
+    description: >-
+      The `sha256:<64-hex>` of the testbucket BINARY the campaign authorised,
+      as the signed Stage-1 manifest binds it. REQUIRED whenever `version` is a
+      `candidate:<run-id>/<artifact>@sha256:<64-hex>` pin: the archive digest
+      says which archive was downloaded, this says which binary is about to
+      execute, and Stage 1 binds the second. Do not type it in. Derive it with
+      `testbucket wall stage1-binary --file stage1.json` run from a PUBLISHED
+      release — that command validates the manifest, so the value comes from
+      the builder's attestation, the verifier's countersignature and the
+      campaign authority's own signature rather than from whoever wired the
+      job. Empty for a published release, whose bytes are checksum-verified
+      against the release manifest instead.
+    default: ""
   working-directory:
     description: 'Directory to run the bucket in.'
     default: "."
@@ -62,8 +76,45 @@ inputs:
       INELIGIBLE rather than scored — a process group cannot prove that no
       descendant escaped.
 
-      For an UNSCORED measurement, any subtree the wrapper can write will do:
-      `sudo mkdir -p /sys/fs/cgroup/testbucket && sudo chown -R "$(id -u)" /sys/fs/cgroup/testbucket`.
+      IT MUST BE DELEGATED, NOT MERELY OWNED. On cgroup-v2 a process moves
+      between cgroups only if it can write the COMMON ANCESTOR's
+      `cgroup.procs`, so a root created beside the runner's own cgroup —
+      `/sys/fs/cgroup/testbucket`, chowned to the runner user — has the ROOT
+      cgroup as that ancestor, and the root cgroup belongs to root. Owning the
+      destination does not admit the action root into it, and the first
+      migration fails with `admit the action root .../cgroup.procs: permission
+      denied`. Put the root INSIDE a subtree this credential may migrate
+      within:
+
+          # The runner's own cgroup is the ancestor every containment will
+          # share with it, so delegate THAT and hang the root off it.
+          own=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+          sudo mkdir -p "/sys/fs/cgroup${own}/testbucket"
+          sudo chown "$(id -un)" "/sys/fs/cgroup${own}" "/sys/fs/cgroup${own}/cgroup.procs"
+          sudo chown -R "$(id -un)" "/sys/fs/cgroup${own}/testbucket"
+          echo "TB_WALL_CGROUP_ROOT=/sys/fs/cgroup${own}/testbucket" >>"$GITHUB_ENV"
+
+      On a SELF-HOSTED runner the durable form is supervisor delegation, which
+      needs no per-job chown at all — a systemd drop-in for the runner service:
+
+          # /etc/systemd/system/actions.runner.<name>.service.d/delegate.conf
+          [Service]
+          Delegate=yes
+
+      `Delegate=yes` gives the service its own delegated subtree, chowned to
+      the service user, so the runner and every containment it creates already
+      share a writable ancestor.
+
+      VERIFY IT RATHER THAN ASSUME IT. After testbucket is installed and before
+      any measured action:
+
+          testbucket wall check-delegation --root "$TB_WALL_CGROUP_ROOT"
+
+      It creates a containment under the root, removes it, and checks the
+      common ancestor's membership file — the two capabilities the envelope
+      actually needs — and exits non-zero naming the missing one. `wall begin`
+      runs the same check before it opens an envelope, so a misconfigured
+      delegation is refused with the reason instead of a bare permission error.
 
       That setup is NOT sufficient for a scored row, and the verifier now says
       so instead of trusting Stage 1's word for it. On cgroup-v2 `cgroup.procs`
@@ -120,9 +171,17 @@ inputs:
           # runner process starts — a self-hosted image built with it — or each
           # wrapper invocation must enter it in a NEW process, e.g.
           # `sg tb-wrapper -c '...'`. A `usermod` in a setup step cannot do it.)
-          sudo mkdir -p /sys/fs/cgroup/testbucket
-          sudo chown "$(id -un)" /sys/fs/cgroup/testbucket
-          sudo chmod 0755 /sys/fs/cgroup/testbucket
+          # AND IT MUST BE A DELEGATED SUBTREE, NOT A DIRECTORY THE RUNNER
+          # HAPPENS TO OWN. See `cgroup-root` above: cgroup-v2 migration needs
+          # the common ancestor's `cgroup.procs`, so the root goes underneath
+          # the runner's own cgroup — otherwise that ancestor is the root
+          # cgroup and even the action root cannot be admitted.
+          own=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+          sudo mkdir -p "/sys/fs/cgroup${own}/testbucket"
+          sudo chown "$(id -un)" "/sys/fs/cgroup${own}" "/sys/fs/cgroup${own}/cgroup.procs"
+          sudo chown "$(id -un)" "/sys/fs/cgroup${own}/testbucket"
+          sudo chmod 0755 "/sys/fs/cgroup${own}/testbucket"
+          echo "TB_WALL_CGROUP_ROOT=/sys/fs/cgroup${own}/testbucket" >>"$GITHUB_ENV"
 
           # THE EVIDENCE PARENT IS OWNED BY THE WRAPPER AND setgid TO THE
           # SCRIPT GROUP.
@@ -304,6 +363,7 @@ runs:
       shell: bash
       env:
         TB_VERSION: ${{ inputs.version }}
+        TB_CANDIDATE_BINARY_DIGEST: ${{ inputs.candidate-binary-digest }}
         TB_REPO: invakid404/testbucket
         TB_BINDIR: ${{ runner.temp }}/testbucket-bin
         GH_TOKEN: ${{ github.token }}

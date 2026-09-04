@@ -44,6 +44,12 @@ func currentPlan(t *testing.T) (walltime.PlanningInputBundle, walltime.Stage2Rec
 		// Every real derivation is performed under a one-shot claim naming its
 		// own parents, so the fixture that stands in for one carries it.
 		PlannerClaim: fixtureClaim(d('1'), bundleDigest),
+		// The approval the planner SAW, recorded as an identity rather than
+		// left blank: it is what says the authorisation came before the plan.
+		Stage1Approval: walltime.Stage1Approval{
+			Authority: walltime.CampaignAuthority, KeyID: "fixture-authority",
+			SignatureDigest: d('e'),
+		},
 	}
 	issued.Algorithms.FullPlan = walltime.AlgorithmIdentity{
 		Name: walltime.FullPlanDigestAlgorithm, Canonicalizer: "rfc8785/v1", Implementation: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}

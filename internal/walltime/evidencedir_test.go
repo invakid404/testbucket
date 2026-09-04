@@ -193,8 +193,25 @@ func TestTheProvisioningRecipeIsRunnable(t *testing.T) {
 			t.Errorf("the cgroup root is given to a group the running wrapper does not hold: %s", strings.TrimSpace(line))
 		}
 	}
-	if !strings.Contains(yml, `sudo chown "$(id -un)" /sys/fs/cgroup/testbucket`) {
-		t.Error("the cgroup root is not owned by the wrapper's own user, which is the only form that needs no group refresh")
+	// AND IT IS A DELEGATED SUBTREE, NOT A DIRECTORY BESIDE THE RUNNER'S OWN
+	// CGROUP.
+	//
+	// Owning `/sys/fs/cgroup/testbucket` was the published recipe and could
+	// never admit even the action root: cgroup-v2 authorises a migration at
+	// the COMMON ANCESTOR of source and destination, which for that path is
+	// the root cgroup. The root has to hang off the runner's own cgroup, and
+	// that cgroup's membership file has to be given to the same credential.
+	for _, want := range []string{
+		`awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup`,
+		`sudo chown "$(id -un)" "/sys/fs/cgroup${own}" "/sys/fs/cgroup${own}/cgroup.procs"`,
+		`"/sys/fs/cgroup${own}/testbucket"`,
+	} {
+		if !strings.Contains(yml, want) {
+			t.Errorf("the provisioning does not delegate a usable subtree; it is missing %s", want)
+		}
+	}
+	if strings.Contains(yml, `sudo chown "$(id -un)" /sys/fs/cgroup/testbucket`) {
+		t.Error("the provisioning still gives the runner a cgroup root beside its own, whose common ancestor is the root cgroup — the first migration fails with permission denied")
 	}
 	// And the reason is written down where the next person will read it.
 	for _, want := range []string{

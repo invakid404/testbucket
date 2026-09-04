@@ -12,6 +12,19 @@ import (
 // Tests that need a well-formed receipt call claimed() on it.
 func claimed(r Stage2Receipt) Stage2Receipt {
 	r.PlannerClaim = fixtureClaim(r.Stage1Digest, r.BundleDigest)
+	// A well-formed receipt also records the approval the planner SAW and
+	// identifies its algorithm implementations by content rather than label.
+	if r.Stage1Approval.Authority == "" {
+		r.Stage1Approval = Stage1Approval{
+			Authority: CampaignAuthority, KeyID: "fixture-authority",
+			SignatureDigest: DigestBytes([]byte("stage1-approval")),
+		}
+	}
+	if !Digest(r.Algorithms.FullPlan.Implementation).Valid() {
+		impl := string(SelfDigest())
+		r.Algorithms.FullPlan.Implementation = impl
+		r.Algorithms.SemanticPlan.Implementation = impl
+	}
 	return r
 }
 
@@ -168,6 +181,11 @@ func TestTheReplayStillComparesWhatItAlreadyDid(t *testing.T) {
 // one.
 func fixtureClaim(stage1, bundle Digest) *PlannerClaimReceipt {
 	const store = "authority/durable-claims"
+	// The authority that signed this claim is the predeclared one. Registering
+	// here rather than in an init keeps the pairing independent of which test
+	// ran first: a command test that registers its own set would otherwise
+	// leave a fixture claim vouched for by nobody.
+	RegisterCampaignAuthorityKeys([]string{PublicKeyOf(fixtureAuthorityKey)})
 	subject := PlannerClaimStoreSubject(store)
 	return &PlannerClaimReceipt{
 		Store: store, Durable: true,

@@ -33,24 +33,26 @@ name: testbucket bucketed (reusable)
 # this file in .github/actionlint.yaml, with the same reasoning written there.
 
 on:
-  # CALLER PERMISSIONS.
+  # CALLER PERMISSIONS — REQUIRED, not advisory.
   #
-  # This workflow's jobs download artifacts and, for a scored arm, read this
-  # job's own step timestamps back, both of which need `actions: read` on the
-  # CALLER's token. A reusable workflow cannot request more than its caller
-  # granted — it can only narrow — so the requirement is stated here rather
-  # than declared in the jobs, where declaring it would break every caller that
-  # grants only `contents: read` and does not use wall time at all.
-  #
-  # A caller that wants a scored row grants:
+  # Each job below declares its own least-privilege token, and a called
+  # workflow may only retain or reduce what its caller granted. So a caller
+  # grants exactly:
   #
   #     permissions:
   #       contents: read
   #       actions: read
   #
-  # A caller that grants less is not silently downgraded: the A_GH collector
-  # says it could not read the step attempt and exits 0, and the verifier
-  # reports the row INELIGIBLE. That is the fail-closed path.
+  # `contents: read` is what checkout and the same-run artifact steps need.
+  # `actions: read` is what the `test` job's A_GH collector needs to read that
+  # job's own step timestamps back, and it is the ONLY thing in this workflow
+  # that needs more than `contents`.
+  #
+  # A caller that grants less no longer merely loses A_GH: the `test` job
+  # declares the permission, so the run fails at startup instead of proceeding
+  # with a token nobody bounded. That is a deliberate, versioned break — see
+  # EXPLICIT, EXECUTABLE JOB PERMISSIONS below, which says who it reaches and
+  # when.
   workflow_call:
     secrets:
       planner-claim-store-attestation:
@@ -115,6 +117,27 @@ on:
           (the default — this project is deliberately pre-1.0), an exact
           `vX.Y.Z`, or "local" to build from the checked-out source. A scored
           arm must pin an exact `vX.Y.Z`.
+        type: string
+        default: v0
+      candidate-binary-digest:
+        description: >-
+          The `sha256:<64-hex>` of the testbucket BINARY a `candidate:` pin
+          delivers. The installer refuses a pre-publication candidate whose
+          binary digest nobody stated in advance, and this is the typed input
+          that states it — so the supported scored route can actually deliver
+          one. It is NOT taken on trust: the plan job derives the same value
+          from the signed Stage-1 manifest and refuses a caller-supplied digest
+          that disagrees, so supplying it is a declaration to be checked rather
+          than a way to choose which bytes run. Leave empty and the derived
+          value is used on its own.
+        type: string
+        default: ""
+      candidate-resolver-version:
+        description: >-
+          The PUBLISHED testbucket release used to READ the Stage-1 manifest
+          when `testbucket-version` is a `candidate:` pin. It must not itself
+          be a candidate: resolving a candidate's own approval with the
+          candidate would be the delivery vouching for itself.
         type: string
         default: v0
       go-version:
@@ -372,33 +395,55 @@ on:
         type: string
         default: ubuntu-latest
 
-# NO workflow-level `permissions:` block, deliberately, and both alternatives
-# are wrong for a reusable workflow:
+# EXPLICIT, EXECUTABLE JOB PERMISSIONS — and a versioned boundary.
 #
-#   permissions: {contents: read}   sets every unspecified permission to NONE,
-#     including `actions` — so a scored caller that correctly grants
-#     `actions: read` has it taken away again, the A_GH collector below gets a
-#     403, and NO invocation can produce an eligible row.
+# There is no workflow-level block, because the three jobs do not need the same
+# token and a single block would give the widest of them to all three:
 #
-#   permissions: {contents: read, actions: read}   is an elevation. A called
-#     workflow may only retain or reduce what its caller granted, so every
-#     caller granting less fails at startup. That regression was shipped once
-#     and caught by CI at a127cb5e; it broke consumers not using wall-time at
-#     all.
+#   plan     contents: read
+#   test     contents: read, actions: read
+#   record   contents: read
 #
-# Declaring nothing lets the caller's own grant through unchanged, which is
-# where least privilege belongs for a reusable workflow: the caller knows
-# whether it wants a scored row. An unscored caller granting only
-# `contents: read` loses A_GH and nothing else — the collector says so and
-# exits 0, and the verifier reports the row ineligible. A scored caller grants
-# `actions: read` itself; the README and the `verify-require` input say so.
+# Only `test` needs `actions: read`, for the A_GH collector that reads this
+# job's own step timestamps back through the Actions API. `plan` and `record`
+# check out and move same-run artifacts, which the artifact service scopes for
+# itself; neither reads the Actions API.
+#
+# THIS IS A BREAKING CHANGE FOR CALLERS, ON PURPOSE.
+#
+# A called workflow may only retain or reduce what its caller granted, so a
+# `test` job declaring `actions: read` fails at startup for a caller that
+# grants less. That regression shipped once, at a127cb5e, and CI caught it —
+# and the answer then was to declare nothing at all and write the requirement
+# in a comment. That answer does not bound anything: with no declaration these
+# jobs inherit whatever the caller's repository default is, which on many
+# repositories is a write-scoped token. A comment asking for two read scopes is
+# not a permissions boundary, and "the consumer might grant too much" is the
+# case the declaration exists to prevent.
+#
+# So the boundary is VERSIONED rather than left unenforced. The moving `v0`
+# alias does not move — it stays pinned at v0.2.2 — so no consumer resolving
+# `@v0`, `@v0.2.2` or any full SHA sees this change; it reaches a consumer only
+# when that consumer deliberately re-pins to a release carrying it, and that
+# release's notes state the new caller requirement. Every caller inside THIS
+# repository is migrated in the same commit, and a test refuses a caller that
+# grants less than a called job declares, so the two halves cannot drift apart
+# again.
 
 jobs:
   # 1/3 — PLAN. Cheap, and the gate for everything downstream.
   plan:
     runs-on: ${{ inputs.runs-on }}
+    # Checkout, the timing-store cache and same-run artifacts. It never reads
+    # the Actions API, so `actions` stays none.
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      # Derived ONCE, here, from the signed Stage-1 manifest, and consumed by
+      # every downstream job that installs the candidate. One derivation is the
+      # point: a value each job resolved for itself could differ between them.
+      candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -484,6 +529,64 @@ jobs:
           [ "$fail" -eq 0 ] || exit 1
           echo "frozen plan: the frozen inputs, the protected authority and its key are all bound before planning"
 
+      # THE MANDATORY CANDIDATE BINARY DIGEST IS DERIVED, NOT TYPED.
+      #
+      # The installer refuses a `candidate:` pin whose binary digest nobody
+      # stated in advance. That rule was unusable through the supported route:
+      # nothing produced the value, so the only way to supply it was to type
+      # one in — and a digest the caller typed names the bytes the caller
+      # wanted to run, not the bytes an authority approved.
+      #
+      # So it is read out of the signed Stage-1 manifest, which is already the
+      # authority on it: validating that manifest verifies the builder's
+      # attestation for the delivered binary against the manifest's own
+      # predeclared builder keys, requires the verifier's countersignature over
+      # the same subject, and requires the delivered binary, the attested
+      # subject and the approved physical wrapper to be one digest.
+      #
+      # It is read by a PUBLISHED release installed for that purpose. Asking
+      # the candidate to produce its own approval would be the delivery
+      # vouching for itself.
+      - name: Install a published testbucket to resolve the candidate delivery
+        if: startsWith(inputs.testbucket-version, 'candidate:')
+        uses: $/.github/actions/install
+        with:
+          version: ${{ inputs.candidate-resolver-version }}
+
+      - name: Resolve the attested candidate binary digest
+        id: candidate-binary
+        if: startsWith(inputs.testbucket-version, 'candidate:')
+        shell: bash
+        env:
+          TB_STAGE1: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
+          TB_AUTHORITY: ${{ inputs.authority }}
+          TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+          TB_SUPPLIED: ${{ inputs.candidate-binary-digest }}
+          TB_RESOLVER: ${{ inputs.candidate-resolver-version }}
+        run: |
+          set -euo pipefail
+          if printf '%s' "$TB_RESOLVER" | grep -q '^candidate:'; then
+            echo "candidate delivery: candidate-resolver-version is '$TB_RESOLVER'. It must be a PUBLISHED release: a candidate cannot authenticate its own approval." >&2
+            exit 1
+          fi
+          if [ ! -f "$TB_STAGE1" ]; then
+            echo "candidate delivery: a candidate: pin needs the signed Stage-1 manifest that authorises its binary, and frozen-inputs-artifact delivered none." >&2
+            echo "The installer's binary-digest check is what makes a pre-publication delivery evidence; without the manifest there is nothing to derive it from." >&2
+            exit 1
+          fi
+          digest=$(testbucket wall stage1-binary \
+            --file "$TB_STAGE1" \
+            --authority "$TB_AUTHORITY" \
+            --authority-key "$TB_AUTHORITY_KEY")
+          # A SUPPLIED VALUE IS A DECLARATION, NOT A CHOICE. It may agree with
+          # what Stage 1 authorises; it may not replace it.
+          if [ -n "$TB_SUPPLIED" ] && [ "$TB_SUPPLIED" != "$digest" ]; then
+            echo "candidate delivery: candidate-binary-digest was given as $TB_SUPPLIED, but Stage 1 authorises $digest" >&2
+            exit 1
+          fi
+          printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
+          echo "candidate delivery: Stage 1 authorises binary $digest"
+
       - name: Plan the buckets
         id: plan
         uses: $/.github/actions/plan
@@ -496,6 +599,7 @@ jobs:
           events-dir: /tmp/testbucket-events
           shard-plan: ${{ runner.temp }}/shard-plan.json
           version: ${{ inputs.testbucket-version }}
+          candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
           node-prefixes: ${{ inputs.node-prefixes }}
@@ -560,21 +664,13 @@ jobs:
   test:
     needs: plan
     runs-on: ${{ inputs.runs-on }}
-    # No `permissions:` block here on purpose, and the requirement is stated
-    # in the workflow_call contract instead — see CALLER PERMISSIONS above.
-    #
-    # A called reusable workflow can only NARROW what its caller granted, never
-    # request more, so declaring `actions: read` here would make every existing
-    # caller that grants only `contents: read` fail at startup — a break for
-    # consumers who do not use wall-time at all. Declaring it would therefore
-    # not make the permission explicit; it would make the workflow unusable for
-    # callers that legitimately do not need it.
-    #
-    # The A_GH collector needs `actions: read` to read this job's own step
-    # timestamps back. A caller that wants a scored row grants it; a caller
-    # that does not simply gets no A_GH, the collector says so and exits 0, and
-    # the verifier reports the row ineligible. That is the fail-closed path
-    # already, and it costs an unmeasured consumer nothing.
+    # The ONE job that reads the Actions API: the A_GH collector reads this
+    # job's own step timestamps back, and without `actions: read` it gets a 403
+    # and no invocation can ever produce an eligible row. Everything else this
+    # job does needs `contents: read` and nothing more.
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -752,6 +848,7 @@ jobs:
         uses: $/.github/actions/preflight
         with:
           version: ${{ inputs.testbucket-version }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           bundle: ${{ runner.temp }}/testbucket-frozen-inputs/bundle.json
           stage1: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
           stage2: ${{ runner.temp }}/testbucket-derived/stage2.json
@@ -785,6 +882,7 @@ jobs:
         uses: $/.github/actions/install
         with:
           version: ${{ inputs.testbucket-version }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
 
       - name: Run bucket ${{ matrix.bucket }}
         id: run-bucket
@@ -804,6 +902,7 @@ jobs:
           est-seconds: ${{ matrix.est_seconds }}
           events-dir: /tmp/testbucket-events
           version: ${{ inputs.testbucket-version }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           working-directory: ${{ inputs.working-directory }}
           setup-command: ${{ inputs.setup-command }}
           wall-time-dir: ${{ inputs.wall-time-dir }}
@@ -881,6 +980,7 @@ jobs:
           wall-time-dir: ${{ inputs.wall-time-dir }}
           require: ${{ inputs.verify-require }}
           version: ${{ inputs.testbucket-version }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           authority: ${{ inputs.authority }}
           authority-key: ${{ inputs.authority-key }}
           records-artifact: testbucket-wall-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
@@ -943,6 +1043,11 @@ jobs:
     # consumer's default branch is authoritative for the shared store.
     if: ${{ !cancelled() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ${{ inputs.runs-on }}
+    # Checkout, same-run artifacts and the timing-store cache. The store is
+    # written back through the cache, not through the repository, so `contents`
+    # stays read and nothing here needs the Actions API.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -998,6 +1103,7 @@ jobs:
           events-dir: /tmp/testbucket-events
           shard-plan: ${{ runner.temp }}/plan/shard-plan.json
           version: ${{ inputs.testbucket-version }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
           exclude-module: ${{ inputs.exclude-module }}

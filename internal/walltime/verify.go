@@ -1198,6 +1198,9 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 	var bound boundIdentities
 	var stage1 *Stage1Manifest
 	var stage2 *Stage2Receipt
+	// parsed is the receipt as written, validated or not; stage2 is only ever
+	// the validated one.
+	var parsed *Stage2Receipt
 	if opt.Stage1Path != "" {
 		var m Stage1Manifest
 		if err := ReadJSONFile(opt.Stage1Path, &m); err != nil {
@@ -1214,10 +1217,17 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 		var r Stage2Receipt
 		if err := ReadJSONFile(opt.Stage2Path, &r); err != nil {
 			v.add("WT-018", SeverityIneligible, fmt.Sprintf("stage-2 receipt: %v", err))
-		} else if err := r.Validate(); err != nil {
-			v.add("WT-018", SeverityIneligible, fmt.Sprintf("stage-2 receipt: %v", err))
 		} else {
-			stage2 = &r
+			// A receipt that parses but does not validate is still worth
+			// diagnosing: structural refusal says the document is malformed,
+			// and the specific checks below say WHICH guarantee it fails.
+			// Only the validated receipt is ever used as a binding.
+			parsed = &r
+			if err := r.Validate(); err != nil {
+				v.add("WT-018", SeverityIneligible, fmt.Sprintf("stage-2 receipt: %v", err))
+			} else {
+				stage2 = &r
+			}
 		}
 	} else {
 		v.add("WT-018", SeverityIneligible, "no Stage-2 derived-plan receipt was supplied; the records are not bound to one authorised plan")
@@ -1271,8 +1281,8 @@ func verifyStageBinding(v *Verdict, opt VerifyOptions, recs []Record) boundIdent
 			}
 		}
 	}
-	if stage1 != nil && stage2 != nil {
-		verifyPrePlanApproval(v, *stage1, *stage2)
+	if stage1 != nil && parsed != nil {
+		verifyPrePlanApproval(v, *stage1, *parsed)
 	}
 	if stage1 != nil {
 		verifyProducerBinaries(v, stage1.Instrumentation, recs)

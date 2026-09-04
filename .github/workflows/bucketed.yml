@@ -57,8 +57,16 @@ jobs:
   # single K knob is `k`; a real consumer suite runs it at 6+.
   bucketed:
     uses: ./.github/workflows/bucketed-reusable.yml
+    # THE CALLER GRANTS WHAT THE CALLED JOBS DECLARE.
+    #
+    # The reusable workflow's `test` job now declares `actions: read` for its
+    # A_GH collector, and a called workflow may only retain or reduce what its
+    # caller granted — so a caller granting less fails at startup. This is the
+    # in-repository half of that versioned migration; a test refuses the pair
+    # if they drift apart again.
     permissions:
       contents: read
+      actions: read
     with:
       runner: go
       k: "2"
@@ -77,8 +85,10 @@ jobs:
   # valid sweep).
   bucketed-vitest:
     uses: ./.github/workflows/bucketed-reusable.yml
+    # Same grant, same reason: see the `bucketed` job above.
     permissions:
       contents: read
+      actions: read
     with:
       runner: vitest
       k: "2"

@@ -260,6 +260,9 @@ var fixtureAuthorityKey = func() ed25519.PrivateKey {
 // Stage 2 could not tell an earned claim from a declared one.
 func fixtureClaim(stage1, bundle walltime.Digest) *walltime.PlannerClaimReceipt {
 	const store = "authority/durable-claims"
+	// The authority that signed this claim is the predeclared one, registered
+	// here so the pairing does not depend on which test ran first.
+	walltime.RegisterCampaignAuthorityKeys([]string{walltime.PublicKeyOf(fixtureAuthorityKey)})
 	subject := walltime.PlannerClaimStoreSubject(store)
 	return &walltime.PlannerClaimReceipt{
 		Store: store, Durable: true,

@@ -281,7 +281,12 @@ type PlanOptions struct {
 	// passing it in costs nothing and makes the derivation and its claim one
 	// object.
 	PlannerClaim *walltime.PlannerClaimReceipt
-	Bundle       *walltime.PlanningInputBundle
+	// Stage1Approval is the authority approval the planner SAW, for the same
+	// reason the claim is an input: the receipt is validated as it is built,
+	// and an approval stamped on afterwards is an approval the validated
+	// document did not have.
+	Stage1Approval walltime.Stage1Approval
+	Bundle         *walltime.PlanningInputBundle
 	// Stage1 is the parent manifest digest the receipt records.
 	Stage1 walltime.Digest
 	// Scorer, when set, makes the frozen pre-plan score the ALLOCATION input:
@@ -375,7 +380,7 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 		return nil, err
 	}
 
-	receipt, err := deriveReceipt(opt.Stage1, opt.PlannerClaim, b, doc, live)
+	receipt, err := deriveReceipt(opt.Stage1, opt.PlannerClaim, opt.Stage1Approval, b, doc, live)
 	if err != nil {
 		return nil, err
 	}
@@ -388,7 +393,7 @@ func Plan(ctx context.Context, opt PlanOptions) (*Result, error) {
 
 // deriveReceipt computes every digest the Stage-2 receipt carries, plus the
 // input-access record of what the planner actually consumed.
-func deriveReceipt(stage1 walltime.Digest, claim *walltime.PlannerClaimReceipt, b *walltime.PlanningInputBundle, doc *core.PlanDocument, live []runner.LivePackage) (*walltime.Stage2Receipt, error) {
+func deriveReceipt(stage1 walltime.Digest, claim *walltime.PlannerClaimReceipt, approval walltime.Stage1Approval, b *walltime.PlanningInputBundle, doc *core.PlanDocument, live []runner.LivePackage) (*walltime.Stage2Receipt, error) {
 	bundleDigest, err := b.DigestOf()
 	if err != nil {
 		return nil, err
@@ -426,6 +431,7 @@ func deriveReceipt(stage1 walltime.Digest, claim *walltime.PlannerClaimReceipt, 
 	r := &walltime.Stage2Receipt{
 		Kind:             walltime.Stage2Kind,
 		PlannerClaim:     claim,
+		Stage1Approval:   approval,
 		Stage1Digest:     stage1,
 		BundleDigest:     bundleDigest,
 		InputAccess:      inputAccess(b),
