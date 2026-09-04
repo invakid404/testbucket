@@ -43,6 +43,18 @@ func TestOnlyAPublishedImmutableReleaseMayResolveACandidate(t *testing.T) {
 		{"main", "a branch is not a release"},
 		{"693a19981fb6e0061d3fab62e59d75dc1c01ff3f", "a commit has no published asset"},
 		{"  local  ", "whitespace does not make it published"},
+		// THE RAW VALUE IS WHAT IS JUDGED. The guard used to delete every
+		// space before matching, so it announced "pinned to the published
+		// release v0.2.2" for values that are not that tag — while handing
+		// the untouched string to the installer, which then could not resolve
+		// it. A guard and a delivery that disagree about which release was
+		// named is a guard that reports on something else.
+		{" v0.2.2 ", "padding is not part of a tag"},
+		{"v0. 2.2", "an embedded space is not a tag at all"},
+		{"v0.2.2\n", "a trailing newline is not part of a tag"},
+		{"\tv0.2.2", "a leading tab is not part of a tag"},
+		{"v0.2.2\nv0.2.2", "a second line must not satisfy a line-oriented match"},
+		{"   ", "whitespace is not a release"},
 	} {
 		t.Run("refuses "+fmt.Sprintf("%q", tc.value), func(t *testing.T) {
 			out, err := run(tc.value)

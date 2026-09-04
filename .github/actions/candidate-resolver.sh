@@ -26,8 +26,15 @@
 #   TB_RESOLVER_VERSION   the value to judge
 set -euo pipefail
 
+# THE RAW VALUE, JUDGED AS WRITTEN.
+#
+# This used to strip whitespace before the regex, so `v0. 2.2`, ` v0.2.2 ` and
+# a trailing newline were all reported as "pinned to the published release
+# v0.2.2" — a guard announcing acceptance of a value outside the language it
+# claims to enforce. The unmodified string is what the installer is handed, so
+# the unmodified string is what has to be judged; repairing it here would mean
+# the guard and the delivery disagreed about which release was named.
 v="${TB_RESOLVER_VERSION-}"
-v="$(printf '%s' "$v" | tr -d '[:space:]')"
 
 refuse() {
   echo "candidate delivery: candidate-resolver-version $1" >&2
@@ -44,6 +51,14 @@ case "$v" in
     ;;
   candidate:*)
     refuse "is '$v', a candidate pin; a candidate cannot authenticate its own approval"
+    ;;
+esac
+# `grep -q` is line-oriented, so an embedded newline would let a second line
+# satisfy the pattern on its own: the value is rejected outright if it is not a
+# single line.
+case "$v" in
+  *[[:space:]]*)
+    refuse "is '$v', which carries whitespace; an exact tag has none, and normalising it here would mean this guard and the installer disagreed about which release was named"
     ;;
 esac
 if ! printf '%s' "$v" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 )
 
@@ -120,9 +119,34 @@ func PublicKeyOf(k ed25519.PrivateKey) string {
 // nobody. Callers that verify a signature and callers that only validate a
 // record now ask the same question of the same bytes.
 func ParseSignerKey(id string) (ed25519.PublicKey, error) {
-	pub, err := hex.DecodeString(strings.TrimSpace(id))
-	if err != nil || len(pub) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("signer id %q is not the hex rendering of a %d-byte ed25519 public key", id, ed25519.PublicKeySize)
+	// CANONICAL, NOT NORMALISED.
+	//
+	// The grammar is exactly what PublicKeyOf emits: 64 characters, each of
+	// them 0-9 or a-f. Nothing here trims, lowercases or otherwise repairs the
+	// input, because an identity that had to be repaired to be recognised is
+	// not the identity that was written down.
+	//
+	// This used to decode `strings.TrimSpace(id)`, and `hex.DecodeString`
+	// accepts upper case — so " KEY", "KEY\t\n" and the upper-case spelling of
+	// a key all parsed, at the parser AND at every caller that trusts it,
+	// including the nested Stage-1 approval. Four spellings of one key are
+	// four different strings: they compare unequal to the predeclared key
+	// sets, they digest differently, and a document is bound by the bytes it
+	// carries rather than by what those bytes could be turned into. Accepting
+	// them meant a receipt could name an approver that no key-set membership
+	// test would ever match.
+	const want = ed25519.PublicKeySize * 2
+	if len(id) != want {
+		return nil, fmt.Errorf("signer id %q is %d characters, not the %d of a canonical %d-byte ed25519 public key", id, len(id), want, ed25519.PublicKeySize)
+	}
+	for i := 0; i < len(id); i++ {
+		if c := id[i]; !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return nil, fmt.Errorf("signer id %q is not canonical: byte %d is %q, and a signer id is exactly %d lower-case hex characters with no padding", id, i, string(c), want)
+		}
+	}
+	pub, err := hex.DecodeString(id)
+	if err != nil {
+		return nil, fmt.Errorf("signer id %q is not the hex rendering of a %d-byte ed25519 public key: %w", id, ed25519.PublicKeySize, err)
 	}
 	return ed25519.PublicKey(pub), nil
 }
