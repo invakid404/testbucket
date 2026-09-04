@@ -985,14 +985,15 @@ func writeReplayAttestation(path, verifierID string, issued walltime.Stage2Recei
 // replaced the first receipt would be indistinguishable from the first.
 // frozenPlanOptions is what the frozen `plan` path needs beyond the bundle.
 type frozenPlanOptions struct {
-	// claimDir is where the one-shot planner claim lives. It is a directory
-	// rather than a file so the claim can be keyed by the derivation's own
-	// identity, and it should be given a location that OUTLIVES one runner:
-	// a fresh GitHub runner gets a fresh filesystem, so a local-only claim
-	// cannot see that an earlier attempt of the same job already derived this
-	// plan. See the action, which points it at the shared frozen-documents
-	// location for exactly that reason.
-	claimDir   string
+	// claimStore overrides where the one-shot planner claim is taken. It is a
+	// STORE rather than an output directory: keying the claim to the place the
+	// derivation writes meant a fresh working directory saw no claim, which is
+	// exactly what a job rerun looks like. Anything set here is treated as a
+	// store the deployment provides and every attempt of the job resolves.
+	claimStore string
+	// scored says this derivation is for an eligible/scored arm, where a
+	// durable claim is mandatory rather than advisory.
+	scored     bool
 	bundlePath string
 	stage1Path string
 	stage2Path string
@@ -1105,9 +1106,19 @@ func planFromBundle(o frozenPlanOptions) error {
 	if err != nil {
 		return err
 	}
-	claim, err := claimPlannerExecution(o.claimDir, stage1, planBundleDigest)
+	claim, err := claimPlannerExecution(o.claimStore, stage1, planBundleDigest)
 	if err != nil {
 		return err
+	}
+	// SCORED PLANNING NEEDS A DURABLE CLAIM, and the refusal happens here —
+	// before planbind.Plan, before any derived write. A local claim would let
+	// a fresh workflow attempt derive the plan a second time, which is the
+	// retry the contract refuses.
+	if o.scored {
+		if err := requireDurablePlannerClaim(claim); err != nil {
+			claim.release()
+			return err
+		}
 	}
 	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{Bundle: &bundle, Stage1: stage1, Scorer: scorer})
 	if err != nil {
@@ -1120,6 +1131,12 @@ func planFromBundle(o frozenPlanOptions) error {
 	// detached signature, so a manifest signed after this point carries the
 	// same digest — this is the field that says the approval came first.
 	res.Receipt.Stage1Approval = approval
+	// THE CLAIM TRAVELS IN THE RECEIPT. A Stage-2 document that carried no
+	// claim could not be told apart from one produced by a second attempt on a
+	// fresh runner, which is the case a job rerun creates — so the claim's
+	// store, its durability and the derivation it names are part of what the
+	// receipt asserts rather than a file on whichever machine ran.
+	res.Receipt.PlannerClaim = claim.receipt
 	// The derived documents are written BEFORE the receipt, because the
 	// receipt binds them: a per-bucket projection or forecast that the one
 	// authorised plan does not name is a document anybody could have written,
@@ -1281,14 +1298,74 @@ func deriveDocuments(res *planbind.Result, registryPath, outDir string) error {
 	return nil
 }
 
-// plannerClaim is a taken one-shot claim on one derivation.
-type plannerClaim struct{ path string }
+// plannerClaimStoreEnv names the DURABLE claim store.
+//
+// It is an environment variable rather than only a flag because the store is a
+// property of the deployment, not of one invocation: every attempt of a job
+// must resolve the same store, or the claim proves nothing about the attempts
+// it was supposed to exclude.
+const plannerClaimStoreEnv = "TB_WALL_PLANNER_CLAIM_STORE"
 
-// release drops a claim whose derivation did not happen.
+// plannerClaim is a taken one-shot claim on one derivation.
+type plannerClaim struct {
+	paths   []string
+	receipt *walltime.PlannerClaimReceipt
+}
+
+// release drops a claim whose derivation did not happen, in every store it was
+// taken in. It is idempotent and safe on a partly-taken claim, which is what
+// lets the taking path roll itself back.
 func (c plannerClaim) release() {
-	if c.path != "" {
-		_ = os.Remove(c.path)
+	for _, p := range c.paths {
+		_ = os.Remove(p)
 	}
+}
+
+// machineClaimStore is a stable location that does not move with the working
+// directory. It is still one machine's disk, which is why holding a claim
+// there is not durable across runners.
+func machineClaimStore() (string, error) {
+	base := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve the machine planner claim store: %w", err)
+		}
+		base = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(base, "testbucket", "planner-claims"), nil
+}
+
+// plannerClaimStores resolves EVERY store a claim must be taken in, and says
+// whether the set includes one that outlives a runner.
+//
+// The machine store ALWAYS participates and a configured durable store is
+// added when the deployment provides one. Claiming in both makes the guard
+// additive: failing to configure a durable store weakens the cross-runner
+// guarantee, it does not remove the same-machine one.
+//
+// Neither store is the caller's output directory, and that is the point.
+// Keying the claim to the directory a derivation happens to write into meant a
+// second attempt with a fresh working directory — exactly what a job rerun is
+// — saw no claim at all and derived the plan again. The guard was local to the
+// very thing it was supposed to be independent of.
+func plannerClaimStores(configured string) (stores []string, durable bool, err error) {
+	machine, err := machineClaimStore()
+	if err != nil {
+		return nil, false, err
+	}
+	stores = []string{machine}
+	external := strings.TrimSpace(configured)
+	if external == "" {
+		external = strings.TrimSpace(os.Getenv(plannerClaimStoreEnv))
+	}
+	if external != "" {
+		durable = true
+		if external != machine {
+			stores = append(stores, external)
+		}
+	}
+	return stores, durable, nil
 }
 
 // claimPlannerExecution takes an exclusive claim on deriving the plan
@@ -1296,52 +1373,69 @@ func (c plannerClaim) release() {
 //
 // The claim is the EXECUTION guard the contract asks for: one planner run, and
 // a replan, retry or second invocation refused. It is keyed by the pair of
-// digests that identify the derivation, so it survives being asked for under a
-// different output path — which is what a rerun with a fresh working directory
-// looks like — and it is taken before any planning happens, so a second
+// digests that identify the derivation, taken in stores that do not move with
+// the output directory, and taken BEFORE any planning happens — so a second
 // invocation is refused instead of doing the work and discovering afterwards
 // that it was not allowed to keep it.
 //
-// With no claim directory there is nothing durable to write to and the guard
-// degrades to the Stage-2 O_EXCL write alone. That is stated rather than
-// silently accepted: the caller is told what it is not getting.
-func claimPlannerExecution(dir string, stage1, bundle walltime.Digest) (plannerClaim, error) {
-	if strings.TrimSpace(dir) == "" {
-		fmt.Fprintf(os.Stderr,
-			"testbucket wall: no --claim-dir, so this derivation is guarded only by the Stage-2 receipt write; a rerun on a fresh runner cannot be detected\n")
-		return plannerClaim{}, nil
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+// The create is O_EXCL, which is the atomic compare-and-set: the winner is
+// decided by the filesystem rather than by a read-then-write this code
+// performs and two concurrent attempts could interleave.
+func claimPlannerExecution(configured string, stage1, bundle walltime.Digest) (plannerClaim, error) {
+	stores, durable, err := plannerClaimStores(configured)
+	if err != nil {
 		return plannerClaim{}, err
 	}
 	// The two digests, in a fixed order, are the derivation's identity.
-	sum := sha256.Sum256([]byte(string(stage1) + "\x00" + string(bundle)))
-	path := filepath.Join(dir, fmt.Sprintf("planner-claim-%x.json", sum))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
-		if os.IsExist(err) {
-			return plannerClaim{}, fmt.Errorf(
-				"this plan has already been derived: Stage-1 %s over bundle %s was claimed at %s. The contract allows one planner execution and refuses a replan, retry or second invocation; independent verifier replay is a different path and does not take this claim",
-				stage1, bundle, path)
+	key := fmt.Sprintf("%x", sha256.Sum256([]byte(string(stage1)+"\x00"+string(bundle))))
+	claim := plannerClaim{receipt: &walltime.PlannerClaimReceipt{
+		Store: stores[len(stores)-1], Durable: durable, Key: key, Stage1: stage1, Bundle: bundle,
+	}}
+	for _, dir := range stores {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			claim.release()
+			return plannerClaim{}, err
 		}
-		return plannerClaim{}, err
+		path := filepath.Join(dir, "planner-claim-"+key+".json")
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			claim.release()
+			if os.IsExist(err) {
+				return plannerClaim{}, fmt.Errorf(
+					"this plan has already been derived: Stage-1 %s over bundle %s was claimed at %s. The contract allows one planner execution and refuses a replan, retry or second invocation; independent verifier replay is a different path and does not take this claim",
+					stage1, bundle, path)
+			}
+			return plannerClaim{}, err
+		}
+		enc := json.NewEncoder(f)
+		enc.SetIndent("", "  ")
+		encErr := enc.Encode(claim.receipt)
+		syncErr := f.Sync()
+		closeErr := f.Close()
+		claim.paths = append(claim.paths, path)
+		for _, e := range []error{encErr, syncErr, closeErr} {
+			if e != nil {
+				claim.release()
+				return plannerClaim{}, e
+			}
+		}
 	}
-	defer f.Close()
-	// What was claimed, so a reader of the claim can tell which derivation it
-	// belongs to rather than only that something happened here.
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(map[string]string{
-		"kind":          "tb.walltime.planner-claim/v1",
-		"stage1_digest": string(stage1),
-		"bundle_digest": string(bundle),
-		"claimed_by":    "wall plan --frozen",
-		"claim_is_for":  "one authorised planner execution; verifier replay does not claim",
-	}); err != nil {
-		return plannerClaim{}, err
+	return claim, nil
+}
+
+// requireDurablePlannerClaim refuses a scored derivation whose claim was taken
+// only somewhere that cannot outlive a runner.
+//
+// A machine-local claim guards a second invocation on one machine and nothing
+// more. A job rerun gets a fresh runner, so for an eligible or scored arm the
+// store has to be one the deployment provides and both attempts resolve.
+// Refusing here — before any planner work and before any derived write — is
+// what makes the one-shot rule mechanical rather than aspirational.
+func requireDurablePlannerClaim(c plannerClaim) error {
+	if c.receipt == nil || c.receipt.Durable {
+		return nil
 	}
-	if err := f.Sync(); err != nil {
-		return plannerClaim{}, err
-	}
-	return plannerClaim{path: path}, nil
+	return fmt.Errorf(
+		"a scored derivation needs a DURABLE one-shot claim and this one was taken only in the machine store %s: a job rerun would get a fresh runner, see no claim and derive the plan a second time. Set %s (or --wall-claim-store) to a store every attempt of the job resolves",
+		c.receipt.Store, plannerClaimStoreEnv)
 }

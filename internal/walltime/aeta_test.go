@@ -9,15 +9,22 @@ func minimalRegistry() AetaRegistry {
 	return AetaRegistry{
 		Kind: RegistryKind, Version: "1",
 		Components: []Component{
+			// EVERY physical component declares its own bound, not only the
+			// residual. A fixture that bounded the residual alone made an
+			// unbounded action-only or Palloc component the shape of a good
+			// one, and the completeness check read the resulting zero as
+			// "nothing to enforce".
 			{ID: "action_containment_bootstrap", Parent: "action", Owner: "testbucket",
 				Class: ClassActionOnly, Included: true, Formula: FormulaConstant,
-				PointNs: 20 * millisecond, IntervalNs: 10 * millisecond},
+				PointNs: 20 * millisecond, IntervalNs: 10 * millisecond,
+				BoundNs: 2 * second},
 			{ID: "bucket_script", Parent: "action", Owner: "testbucket",
 				Class: ClassPalloc, Included: true, Formula: FormulaPallocSum,
-				IntervalFraction: 0.10},
+				IntervalFraction: 0.10, BoundNs: 600 * second},
 			{ID: "invocation_bootstrap", Parent: "invocation", Owner: "testbucket",
 				Class: ClassActionOnly, Included: true, Formula: FormulaPerInvocation,
-				PerUnitNs: 30 * millisecond, IntervalNs: 10 * millisecond},
+				PerUnitNs: 30 * millisecond, IntervalNs: 10 * millisecond,
+				BoundNs: 2 * second},
 			{ID: "unnamed_overhead", Parent: "action", Owner: "testbucket",
 				Class: ClassResidual, Included: true, Formula: FormulaConstant,
 				PointNs: 100 * millisecond, BoundNs: 200 * millisecond},
@@ -226,4 +233,107 @@ func TestCompletenessFindsUnforecastMaterialTime(t *testing.T) {
 	if !bounded {
 		t.Errorf("a residual component past its declared bound was accepted: %+v", overFindings)
 	}
+}
+
+// EVERY PHYSICAL COMPONENT CARRIES ITS OWN BOUND.
+//
+// The contract asks the registry to map every physical phase class to
+// immutable metadata INCLUDING a bound, and makes an exceeded bound or an
+// unbounded material component fail ETA completeness. The registry required a
+// positive bound only for ClassResidual and the completeness check enforced it
+// only when one was declared, so an action-only or Palloc phase could be
+// mapped, admissible and entirely unbounded: the component-local limit simply
+// absent for most of the taxonomy.
+//
+// Aggregate calibration is not a substitute. One component's overrun hides
+// inside another's underrun, which is the whole reason the limit is
+// per-component.
+func TestEveryPhysicalComponentDeclaresItsOwnBound(t *testing.T) {
+	// Registry validation refuses a missing bound in every class.
+	for _, tc := range []struct {
+		name  string
+		index int
+	}{
+		{"an action-only component", 0},
+		{"a Palloc component", 1},
+		{"a per-invocation component", 2},
+		{"a residual component", 3},
+	} {
+		t.Run(tc.name+" with no bound is refused", func(t *testing.T) {
+			reg := minimalRegistry()
+			reg.Components[tc.index].BoundNs = 0
+			err := reg.Validate()
+			if err == nil {
+				t.Fatal("a registry with an unbounded physical component validated")
+			}
+			if !strings.Contains(err.Error(), "declares no bound") &&
+				!strings.Contains(err.Error(), "must declare a bound") {
+				t.Errorf("the refusal does not name the missing bound: %v", err)
+			}
+		})
+	}
+
+	// THE RESIDUAL RULE IS STRICTER, NOT REPLACED.
+	t.Run("a residual bound above the frozen per-component limit is refused", func(t *testing.T) {
+		reg := minimalRegistry()
+		reg.Components[3].BoundNs = ResidualComponentLimit + 1
+		if err := reg.Validate(); err == nil {
+			t.Fatal("a residual above the frozen per-component limit validated")
+		}
+	})
+	t.Run("a non-residual bound above that limit is allowed", func(t *testing.T) {
+		reg := minimalRegistry()
+		reg.Components[0].BoundNs = ResidualComponentLimit * 10
+		if err := reg.Validate(); err != nil {
+			t.Errorf("the residual cap was applied to a non-residual component: %v", err)
+		}
+	})
+
+	// AND COMPLETENESS REFUSES A MISSING BOUND DEFENSIVELY, rather than
+	// reading zero as "nothing to enforce". Validation already refuses it, so
+	// a zero can only arrive through a registry nobody validated — which is
+	// exactly when the check matters.
+	t.Run("completeness does not treat a missing bound as a skipped check", func(t *testing.T) {
+		reg := minimalRegistry()
+		reg.Components[0].BoundNs = 0
+		aeta, err := minimalRegistry().Instantiate(AetaInputs{
+			BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:s2",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		phases := []Phase{{
+			ComponentID: "action_containment_bootstrap", Parent: "action",
+			StartNs: 0, EndNs: Nanos(30 * second),
+		}}
+		findings := reg.CheckCompleteness(phases, aeta)
+		var named bool
+		for _, f := range findings {
+			if strings.Contains(f.Detail, "declares no bound") {
+				named = true
+			}
+		}
+		if !named {
+			t.Errorf("a mapped phase whose component declares no bound passed completeness: %+v", findings)
+		}
+	})
+
+	// A BOUNDED COMPONENT WITHIN ITS BOUND IS STILL FINE: the rule refuses
+	// missing limits, not measurement.
+	t.Run("a component inside its own bound raises nothing", func(t *testing.T) {
+		reg := minimalRegistry()
+		aeta, err := reg.Instantiate(AetaInputs{
+			BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:s2",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		phases := []Phase{{
+			ComponentID: "action_containment_bootstrap", Parent: "action",
+			StartNs: 0, EndNs: Nanos(20 * millisecond),
+		}}
+		if findings := reg.CheckCompleteness(phases, aeta); len(findings) != 0 {
+			t.Errorf("a component inside its bound produced findings: %+v", findings)
+		}
+	})
 }

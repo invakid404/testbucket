@@ -108,7 +108,7 @@ inputs:
       only says this file does not already exist, and it is consulted after the
       planner has run. `claim-dir` is what makes the one-shot rule mechanical.
     default: ""
-  claim-dir:
+  claim-store:
     description: >-
       DURABLE directory holding the one-shot planner claim. The contract allows
       one planner execution and refuses a replan, retry or second invocation;
@@ -117,11 +117,16 @@ inputs:
       and rejected afterwards.
 
       It must outlive one runner. A job rerun gets a fresh runner and a fresh
-      filesystem, so a claim written only to the runner's disk cannot see that
-      an earlier attempt already derived this plan — which is exactly the case
-      the rule exists for. Point this at the shared frozen-documents location
-      the campaign persists, not at the workspace. Left empty, the derivation
-      is guarded only by the Stage-2 write and the command says so on stderr.
+      filesystem, so a store that moves with the workspace cannot see that an
+      earlier attempt already derived this plan — which is exactly the case the
+      rule exists for.
+
+      This is a STORE, not an output directory. The claim is always also taken
+      in a machine-local store, so leaving this empty weakens the cross-runner
+      guarantee without removing the same-machine one — but a SCORED derivation
+      refuses to plan without a durable store configured here or in
+      TB_WALL_PLANNER_CLAIM_STORE, because a guarantee that cannot survive a
+      rerun is not the one the contract asks for.
 
       Independent verifier replay does not take this claim: re-deriving the
       same plan on purpose is not a second authorised execution.
@@ -217,7 +222,7 @@ runs:
         TB_SCORER: ${{ inputs.scorer }}
         TB_REGISTRY: ${{ inputs.registry }}
         TB_DERIVED_OUT: ${{ inputs.derived-out }}
-        TB_CLAIM_DIR: ${{ inputs.claim-dir }}
+        TB_CLAIM_STORE: ${{ inputs.claim-store }}
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
         TB_AUTHORITY: ${{ inputs.authority }}
       run: |
@@ -248,7 +253,7 @@ runs:
           if [ -n "$TB_SCORER" ]; then frozen+=(--palloc-scorer "$TB_SCORER"); fi
           if [ -n "$TB_REGISTRY" ]; then frozen+=(--wall-registry "$TB_REGISTRY"); fi
           if [ -n "$TB_DERIVED_OUT" ]; then frozen+=(--wall-out-dir "$TB_DERIVED_OUT"); fi
-          if [ -n "$TB_CLAIM_DIR" ]; then frozen+=(--wall-claim-dir "$TB_CLAIM_DIR"); fi
+          if [ -n "$TB_CLAIM_STORE" ]; then frozen+=(--wall-claim-store "$TB_CLAIM_STORE"); fi
           matrix=$(testbucket plan "${frozen[@]}" --json)
           printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
           exit 0

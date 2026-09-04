@@ -634,11 +634,28 @@ jobs:
       # campaign's binary is inside an archive that does not contain it.
       - name: Refuse a release with no passing campaign
         env:
-          # Path, inside the tagged tree, to the campaign index naming the
-          # five pairs and their per-bucket verdicts. There is deliberately no
-          # override and no skip: a release that could opt out of this gate
-          # would not be gated.
-          TB_CAMPAIGN_INDEX: campaign/index.json
+          # WHERE THE CAMPAIGN EVIDENCE COMES FROM.
+          #
+          # It cannot come from the tagged tree. An index that binds the release
+          # SHA cannot be part of the bytes that SHA is computed over: inserting
+          # it changes the tree and therefore the commit, and regenerating it
+          # changes it again. Reading a fixed in-tree path was a gate no
+          # compliant campaign could ever satisfy.
+          #
+          # So the evidence is produced outside the commit and fetched here by
+          # IMMUTABLE identity — the workflow run that produced it and the
+          # artifact name within that run, neither of which can be moved the way
+          # a tag can — and pinned by digest, which is what makes the download
+          # evidence rather than a file the publisher happened to find.
+          #
+          # There is still deliberately no skip. All three are required, and the
+          # gate refuses when any is missing, exactly as it refused a missing
+          # in-tree index.
+          TB_CAMPAIGN_RUN: ${{ vars.TB_CAMPAIGN_EVIDENCE_RUN }}
+          TB_CAMPAIGN_ARTIFACT: ${{ vars.TB_CAMPAIGN_EVIDENCE_ARTIFACT }}
+          TB_CAMPAIGN_INDEX_DIGEST: ${{ vars.TB_CAMPAIGN_EVIDENCE_DIGEST }}
+          TB_CAMPAIGN_INDEX: ${{ runner.temp }}/campaign-evidence/index.json
+          GH_TOKEN: ${{ github.token }}
           TB_CAMPAIGN_AUTHORITY: ewj2-campaign
           TB_CAMPAIGN_AUTHORITY_KEY: ${{ vars.TB_CAMPAIGN_AUTHORITY_KEY }}
           # The immutable commit this tag resolves to. github.sha on a tag push
@@ -654,11 +671,26 @@ jobs:
           TB_BUILD: ${{ runner.temp }}/build
         run: |
           set -euo pipefail
-          if [ ! -f "$TB_CAMPAIGN_INDEX" ]; then
-            echo "REFUSED: no campaign index at $TB_CAMPAIGN_INDEX." >&2
+          if [ -z "$TB_CAMPAIGN_RUN" ] || [ -z "$TB_CAMPAIGN_ARTIFACT" ] || [ -z "$TB_CAMPAIGN_INDEX_DIGEST" ]; then
+            echo "REFUSED: no addressed campaign evidence." >&2
+            echo "Set TB_CAMPAIGN_EVIDENCE_RUN, TB_CAMPAIGN_EVIDENCE_ARTIFACT and" >&2
+            echo "TB_CAMPAIGN_EVIDENCE_DIGEST to the workflow run, artifact name and sha256 of" >&2
+            echo "the campaign index produced for this exact commit." >&2
             echo "The frozen acceptance contract prohibits a release until an authenticated" >&2
             echo "five-pair / ten-run / eighty-action-row campaign across at least three UTC" >&2
             echo "dates has passed. Tagging does not satisfy that rule; producing the evidence does." >&2
+            exit 1
+          fi
+          # Fetched by immutable run identity, into the publisher's own
+          # directory. `gh run download` addresses a specific upload of a
+          # specific run; it cannot be pointed at a later one by moving a ref.
+          mkdir -p "$(dirname "$TB_CAMPAIGN_INDEX")"
+          gh run download "$TB_CAMPAIGN_RUN" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$TB_CAMPAIGN_ARTIFACT" \
+            --dir "$(dirname "$TB_CAMPAIGN_INDEX")"
+          if [ ! -f "$TB_CAMPAIGN_INDEX" ]; then
+            echo "REFUSED: artifact $TB_CAMPAIGN_ARTIFACT of run $TB_CAMPAIGN_RUN holds no index.json." >&2
             exit 1
           fi
           if [ -z "$TB_CAMPAIGN_AUTHORITY_KEY" ]; then
@@ -671,6 +703,8 @@ jobs:
           # from, and delivered a binary this release actually publishes.
           "$RUNNER_TEMP/testbucket-gate" wall campaign \
             --index "$TB_CAMPAIGN_INDEX" \
+            --index-digest "$TB_CAMPAIGN_INDEX_DIGEST" \
+            --index-origin "run/$TB_CAMPAIGN_RUN/artifact/$TB_CAMPAIGN_ARTIFACT" \
             --authority "$TB_CAMPAIGN_AUTHORITY" \
             --authority-key "$TB_CAMPAIGN_AUTHORITY_KEY" \
             --release-sha "$TB_RELEASE_SHA" \

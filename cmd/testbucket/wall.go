@@ -829,10 +829,24 @@ func runWallCampaign(args []string) error {
 	releaseSHA := fs.String("release-sha", "", "the full 40-hex commit the release ref resolves to. A campaign is evidence for the delivery it was produced for, so the release-binding gate does not pass without it — and every arm's reviewed tip and release ref must be this commit")
 	releaseManifest := fs.String("release-manifest", "", "the canonical publish set (`wall release-manifest`): every asset this release will upload, with its digest and, for archives, the digest of every file inside. It is RE-VERIFIED against the bytes on disk before it is believed, and the publisher uploads exactly the assets it names — so the set that is gated and the set that is published are the same set by construction")
 	releaseDist := fs.String("release-dist", ".", "directory the release manifest's paths are relative to")
+	indexDigest := fs.String("index-digest", "", "sha256 of the exact campaign-index bytes this gate must evaluate, as `sha256:<64-hex>`. REQUIRED with --release-sha.\n\nCampaign evidence cannot live in the commit being released: inserting a Stage-1 document that names the release SHA changes the tree and therefore the SHA, and regenerating it changes it again. So the evidence is produced outside that commit and carried to the publisher, and a file the publisher merely found is not evidence — this is the publisher stating which exact bytes it downloaded, by digest, so a substituted or stale index is refused rather than evaluated")
+	indexOrigin := fs.String("index-origin", "", "immutable identity the campaign evidence was fetched from, e.g. `run/<workflow-run-id>/artifact/<name>`. Recorded with the result so a reader can go and look, rather than having to trust that the right file was downloaded")
 	var authorityKeys stringList
 	fs.Var(&authorityKeys, "authority-key", "a PREDECLARED authority public key (hex); repeatable and required with --index")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	// THE EVIDENCE IS ADDRESSED, NOT FOUND.
+	//
+	// The publish gate used to read a fixed path inside the tagged tree, which
+	// is a place campaign evidence cannot be: an index that binds the release
+	// SHA cannot be part of the bytes that SHA is computed over. Evidence is
+	// therefore produced outside the commit and handed to the publisher — and
+	// once it travels, "the file at this path" stops being an identity. The
+	// digest is what makes the handoff verifiable, so it is required exactly
+	// where the gate authorises a release.
+	if *releaseSHA != "" && strings.TrimSpace(*indexDigest) == "" {
+		return fmt.Errorf("--release-sha authorises a delivery, so --index-digest is required: the publisher must say which exact campaign-index bytes it is gating on, or a substituted index would be evaluated as though it were the produced evidence")
 	}
 	if (*index == "") == (*in == "") {
 		return fmt.Errorf("pass exactly one of --index (a campaign) or --in (the calculator)")
@@ -856,8 +870,25 @@ func runWallCampaign(args []string) error {
 	calculatorOnly := false
 	if *index != "" {
 		var idx walltime.CampaignIndex
-		if err := walltime.ReadJSONFile(*index, &idx); err != nil {
+		// THE BYTES ARE CHECKED BEFORE THEY ARE PARSED. Reading and then
+		// digesting what was parsed would digest this process's idea of the
+		// document; digesting the file first is what ties the decision to the
+		// evidence the publisher said it fetched.
+		raw, err := os.ReadFile(*index)
+		if err != nil {
 			return err
+		}
+		if want := strings.TrimSpace(*indexDigest); want != "" {
+			if got := walltime.DigestBytes(raw); string(got) != want {
+				return fmt.Errorf("the campaign index at %s digests to %s, but this gate was told to evaluate %s%s; a release is authorised by the evidence that was produced for it and by no other bytes",
+					*index, got, want, originSuffix(*indexOrigin))
+			}
+		}
+		if err := json.Unmarshal(raw, &idx); err != nil {
+			return fmt.Errorf("parse the campaign index at %s: %w", *index, err)
+		}
+		if o := strings.TrimSpace(*indexOrigin); o != "" {
+			fmt.Fprintf(os.Stderr, "testbucket wall: campaign evidence %s fetched from %s\n", walltime.DigestBytes(raw), o)
 		}
 		gates, _ = walltime.EvaluateCampaignIndex(idx, walltime.FileCampaignLoader{}, authorityKeys, *authority, release)
 	} else {
@@ -1144,4 +1175,14 @@ func fullPlanDigest(path string) (walltime.Digest, error) {
 		return "", err
 	}
 	return walltime.DigestJSON(doc)
+}
+
+// originSuffix names where evidence was said to come from, when the caller
+// stated it. A digest mismatch is much easier to act on when the message says
+// which artifact was supposed to have been downloaded.
+func originSuffix(origin string) string {
+	if o := strings.TrimSpace(origin); o != "" {
+		return " (fetched from " + o + ")"
+	}
+	return ""
 }

@@ -1566,6 +1566,16 @@ type Stage2Receipt struct {
 	// puts them inside the one document that is signed and independently
 	// replayed.
 	Sidecars map[string]Digest `json:"derived_document_digests,omitempty"`
+	// PlannerClaim is the ONE-SHOT EXECUTION CLAIM this derivation was
+	// performed under.
+	//
+	// The contract allows one planner execution and refuses a replan, retry or
+	// second invocation. Proving that needs the claim to be part of the signed
+	// derived-plan receipt rather than a file on whichever machine happened to
+	// run: a receipt that carried no claim could not be distinguished from one
+	// produced by a second attempt on a fresh runner, which is exactly the
+	// case a job rerun creates.
+	PlannerClaim *PlannerClaimReceipt `json:"planner_claim,omitempty"`
 
 	Algorithms struct {
 		FullPlan     AlgorithmIdentity `json:"full_plan"`
@@ -2074,4 +2084,25 @@ func checkRunnableNames(s RunnableSnapshot) error {
 		}
 	}
 	return nil
+}
+
+// PlannerClaimReceipt records the one-shot claim a derivation was performed
+// under, so the claim travels inside the Stage-2 receipt instead of living
+// only on the machine that took it.
+type PlannerClaimReceipt struct {
+	// Store is the claim store's identity: WHERE the claim was taken, so a
+	// reader can tell a durable shared store from a local one rather than
+	// having to assume.
+	Store string `json:"store"`
+	// Durable says whether that store was declared to outlive one runner. A
+	// scored arm requires it; recording it means a receipt cannot imply a
+	// guarantee it was not given.
+	Durable bool `json:"durable"`
+	// Key is the derivation's identity — the Stage-1 and bundle digests — so
+	// the claim names what it claimed rather than only that something was
+	// claimed.
+	Key       string `json:"key"`
+	Stage1    Digest `json:"stage1_digest"`
+	Bundle    Digest `json:"bundle_digest"`
+	ClaimedAt string `json:"claimed_at,omitempty"`
 }

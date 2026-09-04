@@ -674,10 +674,21 @@ func testReceipt(stage1, bundle Digest) Stage2Receipt {
 // invocation-level ones are present but not summed, because their time is
 // already inside bucket_script.
 func testRegistry() AetaRegistry {
+	// Every physical component carries its OWN bound. This fixture used to
+	// omit them on the action-only and Palloc components and was then asserted
+	// to be the registry a scored row is measured against — which made an
+	// unbounded component the shape of a good one and left the contract's
+	// component-local limit unenforced for most of the taxonomy.
+	//
+	// The bound is derived from the component's own forecast rather than a
+	// blanket constant, so it is a limit about THIS component: generous enough
+	// not to fire on the fixture's own numbers, specific enough to mean
+	// something.
+	bound := func(point int64) int64 { return point + 2*second }
 	c := func(id, parent string, class ComponentClass, included bool, point int64) Component {
 		return Component{ID: id, Parent: parent, Owner: "testbucket", Class: class, Included: included,
 			Formula: FormulaConstant, Inputs: []string{"stage1"}, PointNs: point,
-			IntervalNs: 100 * millisecond}
+			IntervalNs: 100 * millisecond, BoundNs: bound(point)}
 	}
 	return AetaRegistry{
 		Kind: RegistryKind, Version: "1",
@@ -685,18 +696,19 @@ func testRegistry() AetaRegistry {
 			c("action_containment_bootstrap", "action", ClassActionOnly, true, 20*millisecond),
 			c("action_prologue", "action", ClassActionOnly, true, 480*millisecond),
 			{ID: "bucket_script", Parent: "action", Owner: "testbucket", Class: ClassPalloc, Included: true,
-				Formula: FormulaPallocSum, Inputs: []string{"palloc"}, IntervalNs: 2 * second},
+				Formula: FormulaPallocSum, Inputs: []string{"palloc"}, IntervalNs: 2 * second,
+				BoundNs: 600 * second},
 			c("action_epilogue_flush", "action", ClassActionOnly, true, 285*millisecond),
 			c("action_suffix", "action", ClassActionOnly, true, 15*millisecond),
 			c("script_containment_bootstrap", "script", ClassActionOnly, false, 20*millisecond),
 			c("between_invocation_gap", "script", ClassActionOnly, false, 80*millisecond),
 			{ID: "invocation", Parent: "script", Owner: "testbucket", Class: ClassPalloc, Included: false,
-				Formula: FormulaPallocSum, Inputs: []string{"palloc"}},
+				Formula: FormulaPallocSum, Inputs: []string{"palloc"}, BoundNs: 600 * second},
 			c("script_epilogue", "script", ClassActionOnly, false, 65*millisecond),
 			c("script_suffix", "script", ClassActionOnly, false, 15*millisecond),
 			c("invocation_bootstrap", "invocation", ClassActionOnly, false, 20*millisecond),
 			{ID: "invocation_containment", Parent: "invocation", Owner: "testbucket", Class: ClassPalloc, Included: false,
-				Formula: FormulaPallocSum, Inputs: []string{"palloc"}},
+				Formula: FormulaPallocSum, Inputs: []string{"palloc"}, BoundNs: 600 * second},
 			c("invocation_suffix", "invocation", ClassActionOnly, false, 15*millisecond),
 		},
 	}

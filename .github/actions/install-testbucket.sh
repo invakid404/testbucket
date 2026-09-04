@@ -56,6 +56,77 @@ if [ "$TB_VERSION" = "local" ] || [ "$TB_VERSION" = "source" ]; then
   exit 0
 fi
 
+# --- candidate: an immutable PRE-PUBLICATION artifact ---------------------------
+#
+# This is what breaks the release cycle. A scored candidate arm has to run the
+# exact binary being proposed, but that binary cannot be installed from a
+# published release: publication is itself gated on the campaign the scored arm
+# is part of. Building from source instead would deliver bytes nobody attested,
+# and there is no release asset at an arbitrary commit to checksum-verify.
+#
+# So a candidate is delivered as an artifact of the build workflow run that
+# produced it, addressed by IMMUTABLE run identity and pinned by digest:
+#
+#   --version candidate:<workflow-run-id>/<artifact-name>@sha256:<64-hex>
+#
+# The run id and artifact name say exactly which upload this is — they cannot be
+# moved the way a tag can — and the digest is what makes the download evidence
+# rather than a fetch. Both are required, and the archive is refused unless its
+# bytes hash to the digest that was demanded. This is deliberately NOT a
+# published release and never claims to be one.
+if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
+  spec="${TB_VERSION#candidate:}"
+  cand_digest="${spec##*@}"
+  cand_path="${spec%@*}"
+  cand_run="${cand_path%%/*}"
+  cand_artifact="${cand_path#*/}"
+  if [ "$cand_digest" = "$spec" ] || [ "$cand_path" = "$cand_run" ] ||
+     [ -z "$cand_run" ] || [ -z "$cand_artifact" ] || [ -z "$cand_digest" ]; then
+    echo "install-testbucket: a candidate needs candidate:<run-id>/<artifact>@sha256:<64-hex>; got '$TB_VERSION'" >&2
+    echo "An unpinned pre-publication binary is a download, not a delivery identity." >&2
+    exit 1
+  fi
+  if ! printf '%s' "$cand_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+    echo "install-testbucket: candidate digest '$cand_digest' is not sha256:<64-hex>" >&2
+    exit 1
+  fi
+  if ! printf '%s' "$cand_run" | grep -Eq '^[0-9]+$'; then
+    echo "install-testbucket: candidate run id '$cand_run' is not a workflow run id" >&2
+    exit 1
+  fi
+  : "${TB_REPO:?TB_REPO is required to download a candidate artifact}"
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "install-testbucket: downloading a candidate artifact needs the gh CLI" >&2
+    exit 1
+  fi
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  echo "downloading candidate artifact $cand_artifact from run $cand_run"
+  gh run download "$cand_run" --repo "$TB_REPO" --name "$cand_artifact" --dir "$work"
+  archive=$(find "$work" -type f -name '*.tar.gz' | head -n1)
+  if [ -z "$archive" ]; then
+    echo "install-testbucket: candidate artifact $cand_artifact holds no .tar.gz" >&2
+    exit 1
+  fi
+  got="sha256:$(sha256sum "$archive" | cut -d' ' -f1)"
+  if [ "$got" != "$cand_digest" ]; then
+    echo "install-testbucket: candidate archive digests to $got, not the demanded $cand_digest" >&2
+    echo "A pre-publication artifact is trusted only because its bytes were named in advance." >&2
+    exit 1
+  fi
+  tar -xzf "$archive" -C "$work"
+  cand_bin=$(find "$work" -type f -name testbucket -perm -u+x | head -n1)
+  if [ -z "$cand_bin" ]; then
+    echo "install-testbucket: candidate archive holds no testbucket binary" >&2
+    exit 1
+  fi
+  mv "$cand_bin" "$bin"
+  chmod +x "$bin"
+  printf '%s\n' "$TB_BINDIR" >>"${GITHUB_PATH:-/dev/null}"
+  "$bin" version || true
+  exit 0
+fi
+
 # --- released: download + checksum-verify --------------------------------------
 : "${TB_REPO:?TB_REPO is required to download a released binary}"
 

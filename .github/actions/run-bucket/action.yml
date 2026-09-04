@@ -512,9 +512,29 @@ runs:
             # applies a strict expression later, which only turned a falsely
             # accepted scored request into a failure further downstream.
             if [ "$TB_SCORED" = "true" ]; then
-              if ! printf "%s" "$TB_VERSION" | grep -Eq "^v[0-9]+\.[0-9]+\.[0-9]+$"; then
-                echo "scored=true needs an exact published stable release tag (vMAJOR.MINOR.PATCH), got '"'"'$TB_VERSION'"'"'." >&2
-                echo "A moving alias is descriptive metadata rather than a delivery identity; a prerelease is a build the project has not stood behind; a commit SHA has no release asset to download and checksum-verify." >&2
+              # TWO delivery identities are admissible, and both are immutable.
+              #
+              # An exact published stable tag is one. The other is a
+              # PRE-PUBLICATION candidate artifact, addressed by workflow run
+              # id and artifact name and pinned by digest. That second form is
+              # what makes a scored candidate arm possible at all: the binary
+              # being proposed cannot come from a published release, because
+              # publication is gated on the very campaign this arm belongs to.
+              # It is not a released build and does not claim to be — it is an
+              # immutable upload whose bytes were named in advance.
+              #
+              # What stays refused is anything that is not an identity: a
+              # moving alias is descriptive metadata, a prerelease is a build
+              # the project has not stood behind, a bare commit SHA has no
+              # artifact to fetch and no digest to check, and `local` is bytes
+              # nobody attested.
+              if printf "%s" "$TB_VERSION" | grep -Eq "^v[0-9]+\.[0-9]+\.[0-9]+$"; then
+                :
+              elif printf "%s" "$TB_VERSION" | grep -Eq "^candidate:[0-9]+/[^@/]+@sha256:[0-9a-f]{64}$"; then
+                :
+              else
+                echo "scored=true needs an exact published stable release tag (vMAJOR.MINOR.PATCH) or a digest-pinned pre-publication candidate (candidate:<run-id>/<artifact>@sha256:<64-hex>), got '"'"'$TB_VERSION'"'"'." >&2
+                echo "A moving alias is descriptive metadata rather than a delivery identity; a prerelease is a build the project has not stood behind; a bare commit SHA has no artifact to fetch and no digest to verify; local is bytes nobody attested." >&2
                 exit 1
               fi
             fi

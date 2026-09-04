@@ -62,8 +62,22 @@ type Component struct {
 	// and a large one scales.
 	IntervalNs       int64   `json:"interval_ns,omitempty"`
 	IntervalFraction float64 `json:"interval_fraction,omitempty"`
-	// BoundNs caps a residual component.
-	BoundNs int64 `json:"bound_ns,omitempty"`
+	// BoundNs is the component's OWN upper limit, and every physical
+	// component declares one.
+	//
+	// It used to be described and enforced as a residual-only cap: the
+	// registry required it for ClassResidual and accepted zero everywhere
+	// else, and the completeness check read a zero as "no limit to enforce".
+	// So an action-only or Palloc phase could be mapped, admissible and
+	// entirely unbounded — the contract's component-local limit simply absent
+	// for most of the taxonomy.
+	//
+	// Aggregate calibration cannot stand in for it. One component's overrun
+	// hides inside another's underrun, which is exactly what a per-component
+	// bound exists to catch. A residual component is bounded MORE tightly
+	// still (see ResidualComponentLimit); this is the floor everything else
+	// shares.
+	BoundNs int64 `json:"bound_ns"`
 }
 
 // AetaRegistry is the Stage-1 frozen template.
@@ -116,10 +130,16 @@ func (r AetaRegistry) Validate() error {
 		default:
 			return fmt.Errorf("component %q has unknown formula %q", c.ID, c.Formula)
 		}
-		if c.Class == ClassResidual {
-			if c.BoundNs <= 0 || c.BoundNs > ResidualComponentLimit {
-				return fmt.Errorf("residual component %q must declare a bound in (0, %s]", c.ID, dur(ResidualComponentLimit))
-			}
+		// EVERY PHYSICAL COMPONENT DECLARES A BOUND. Zero is not "unlimited";
+		// it is a component the registry cannot enforce anything about, and
+		// the contract asks the registry to map every physical phase class to
+		// a bound.
+		if c.BoundNs <= 0 {
+			return fmt.Errorf("component %q declares no bound; every physical component carries its own limit, and a missing one is not an unlimited one", c.ID)
+		}
+		// A residual is bounded more tightly than the rest.
+		if c.Class == ClassResidual && c.BoundNs > ResidualComponentLimit {
+			return fmt.Errorf("residual component %q must declare a bound in (0, %s]", c.ID, dur(ResidualComponentLimit))
 		}
 		if c.Class == ClassPalloc && c.Formula != FormulaPallocSum {
 			return fmt.Errorf("component %q is test-dependent but does not aggregate Palloc", c.ID)
@@ -328,11 +348,23 @@ func (r AetaRegistry) CheckCompleteness(phases []Phase, aeta *AetaInstance) []Fi
 		if c.Class == ClassResidual {
 			residual += p.Duration()
 		}
-		// EVERY COMPONENT'S OWN BOUND, not only a residual one. The registry
-		// declares a bound per component and the contract makes an exceeded
-		// bound ineligible; checking it for one class left the others declared
-		// and unenforced.
-		if c.BoundNs > 0 && p.Duration() > c.BoundNs {
+		// EVERY COMPONENT'S OWN BOUND, not only a residual one — and a missing
+		// bound is a refusal here too, not a skipped check.
+		//
+		// Registry validation now requires a positive bound, so a zero can
+		// only arrive through a registry that was never validated. Reading it
+		// as "nothing to enforce" is how the check was bypassed in the first
+		// place, so completeness refuses it defensively rather than trusting
+		// that someone upstream looked.
+		if c.BoundNs <= 0 {
+			out = append(out, Finding{
+				Code: "WT-017", Severity: SeverityIneligible,
+				Detail: fmt.Sprintf("phase %s is mapped to component %q, which declares no bound; an unbounded component cannot be checked against anything",
+					p.Name(), c.ID),
+			})
+			continue
+		}
+		if p.Duration() > c.BoundNs {
 			out = append(out, Finding{
 				Code: "WT-017", Severity: SeverityIneligible,
 				Detail: fmt.Sprintf("phase %s observed at %s, above its %s bound", p.Name(), dur(p.Duration()), dur(c.BoundNs)),

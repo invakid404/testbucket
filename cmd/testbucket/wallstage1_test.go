@@ -164,6 +164,10 @@ func stage1Inputs(t *testing.T, extra ...string) []string {
 				ID: "action_containment_bootstrap", Parent: "action", Owner: "testbucket",
 				Class: walltime.ClassActionOnly, Included: true, Formula: walltime.FormulaConstant,
 				PointNs: 20_000_000, IntervalNs: 10_000_000,
+				// Every physical component carries its own limit. A fixture
+				// that omitted it made an unbounded component the shape of a
+				// good one.
+				BoundNs: 500_000_000,
 			}},
 		}),
 		"--runner-image", "ubuntu-24.04@sha256:" + strings.Repeat("a", 64),
@@ -495,6 +499,10 @@ func bundleFor(storeBytes []byte) walltime.PlanningInputBundle {
 // is an output-collision check; the contract asks for the second invocation to
 // be rejected.
 func TestThePlannerClaimRefusesASecondInvocationBeforeItRuns(t *testing.T) {
+	// The machine store is redirected, so the suite never writes into the
+	// developer's real state directory and one test cannot claim a derivation
+	// out from under another.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	dir := t.TempDir()
 	const stage1, bundle = walltime.Digest("sha256:stage1"), walltime.Digest("sha256:bundle")
 
@@ -528,9 +536,65 @@ func TestThePlannerClaimRefusesASecondInvocationBeforeItRuns(t *testing.T) {
 		t.Errorf("a released claim still blocked its own derivation: %v", err)
 	}
 
-	// AND WITH NO DURABLE LOCATION THE GUARD DEGRADES RATHER THAN PRETENDING.
-	if _, err := claimPlannerExecution("", stage1, bundle); err != nil {
-		t.Errorf("an unconfigured claim directory refused the derivation: %v", err)
+	// AND WITH NO CONFIGURED STORE THE MACHINE STORE STILL HOLDS THE CLAIM.
+	//
+	// This used to assert the opposite — that an unconfigured store simply let
+	// the derivation through — because the claim lived in the caller's output
+	// directory and an unset one meant no guard at all. The claim is now taken
+	// in a store that does not move with the working directory, so a repeat on
+	// the same machine is refused whether or not a durable store was
+	// configured. Failing to configure one weakens the CROSS-RUNNER guarantee;
+	// it no longer removes the local one.
+	other := walltime.Digest("sha256:unconfigured-store")
+	if _, err := claimPlannerExecution("", stage1, other); err != nil {
+		t.Fatalf("the first derivation could not claim in the machine store: %v", err)
+	}
+	if _, err := claimPlannerExecution("", stage1, other); err == nil {
+		t.Error("an unconfigured store let the same derivation run twice on one machine")
+	}
+}
+
+// A SCORED DERIVATION REFUSES TO PLAN WITHOUT A DURABLE CLAIM.
+//
+// The machine store guards a second invocation on one machine and nothing
+// more. A job rerun gets a fresh runner, so for an eligible or scored arm the
+// store has to be one the deployment provides and every attempt resolves —
+// and the refusal has to come before any planner work.
+func TestAScoredDerivationRequiresADurableClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv(plannerClaimStoreEnv, "")
+
+	local, err := claimPlannerExecution("", walltime.Digest("sha256:s"), walltime.Digest("sha256:b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.receipt.Durable {
+		t.Error("a claim taken only in the machine store reported itself durable")
+	}
+	err = requireDurablePlannerClaim(local)
+	if err == nil {
+		t.Fatal("a scored derivation was allowed to plan on a machine-local claim")
+	}
+	if !strings.Contains(err.Error(), "DURABLE") {
+		t.Errorf("the refusal does not say a durable claim is required: %v", err)
+	}
+
+	// WITH ONE CONFIGURED, the scored path proceeds and the receipt says so —
+	// so a reader of the Stage-2 receipt can tell which guarantee was given.
+	durable, err := claimPlannerExecution(t.TempDir(), walltime.Digest("sha256:s2"), walltime.Digest("sha256:b2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !durable.receipt.Durable {
+		t.Error("a claim taken in a configured store did not report itself durable")
+	}
+	if err := requireDurablePlannerClaim(durable); err != nil {
+		t.Errorf("a durable claim was refused: %v", err)
+	}
+	// It is held in BOTH stores, so the machine-local guard is not lost by
+	// configuring an external one.
+	if len(durable.paths) != 2 {
+		t.Errorf("the claim was taken in %d store(s), want the machine store and the configured one", len(durable.paths))
 	}
 }
 
@@ -559,4 +623,74 @@ func TestADerivedArtifactIsNotOverwritten(t *testing.T) {
 	if !strings.Contains(string(b), "first") {
 		t.Errorf("the first derivation's output was replaced: %s", b)
 	}
+}
+
+// THE PUBLISHER STATES WHICH EVIDENCE IT IS GATING ON.
+//
+// Campaign evidence cannot live in the commit being released — an index that
+// binds the release SHA cannot be part of the bytes that SHA is computed over —
+// so it is produced outside that commit and carried to the publisher. Once it
+// travels, "the file at this path" stops being an identity: a stale or
+// substituted index at the same path is indistinguishable from the produced
+// evidence. The digest is what makes the handoff verifiable, and it is required
+// exactly where the gate authorises a delivery.
+func TestThePublishGateRequiresAddressedCampaignEvidence(t *testing.T) {
+	dir := t.TempDir()
+	index := filepath.Join(dir, "index.json")
+	raw := []byte(`{"kind":"tb.walltime.campaign-index/v1","campaign_id":"ewj2"}`)
+	if err := os.WriteFile(index, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const sha = "0000000000000000000000000000000000000000"
+
+	// A DELIVERY-AUTHORISING RUN WITHOUT A STATED DIGEST IS REFUSED, before any
+	// evidence is read.
+	t.Run("no digest with a release sha", func(t *testing.T) {
+		err := runWallCampaign([]string{
+			"--index", index, "--authority", "ewj2-campaign",
+			"--authority-key", "aa", "--release-sha", sha,
+		})
+		if err == nil {
+			t.Fatal("the gate authorised a delivery without saying which evidence it read")
+		}
+		if !strings.Contains(err.Error(), "--index-digest is required") {
+			t.Errorf("the refusal does not require the digest: %v", err)
+		}
+	})
+
+	// EVIDENCE THAT IS NOT THE ADDRESSED BYTES IS REFUSED, and the refusal
+	// names where it was supposed to have come from.
+	t.Run("evidence that does not match the stated digest", func(t *testing.T) {
+		err := runWallCampaign([]string{
+			"--index", index, "--authority", "ewj2-campaign",
+			"--authority-key", "aa", "--release-sha", sha,
+			"--index-digest", "sha256:" + strings.Repeat("b", 64),
+			"--index-origin", "run/12345/artifact/campaign-evidence",
+		})
+		if err == nil {
+			t.Fatal("a substituted campaign index was evaluated as the produced evidence")
+		}
+		for _, want := range []string{"digests to", "run/12345/artifact/campaign-evidence"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not mention %q: %v", want, err)
+			}
+		}
+	})
+
+	// AND THE ADDRESSED BYTES ARE ACCEPTED FOR EVALUATION. It still fails the
+	// campaign itself — the fixture is an empty index — but it gets past the
+	// handoff, which is the thing that used to be impossible.
+	t.Run("the addressed bytes reach the gate", func(t *testing.T) {
+		err := runWallCampaign([]string{
+			"--index", index, "--authority", "ewj2-campaign",
+			"--authority-key", "aa", "--release-sha", sha,
+			"--index-digest", string(walltime.DigestBytes(raw)),
+		})
+		if err != nil && strings.Contains(err.Error(), "digests to") {
+			t.Errorf("the addressed evidence was refused as a mismatch: %v", err)
+		}
+		if err != nil && strings.Contains(err.Error(), "--index-digest is required") {
+			t.Errorf("the addressed evidence was refused for a missing digest: %v", err)
+		}
+	})
 }

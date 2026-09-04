@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -1697,4 +1698,79 @@ func TestEveryScoredRowMustNameTheRunThatProducedIt(t *testing.T) {
 				"while every scored row omitted the "+tc.field)
 		})
 	}
+}
+
+// THE UNPUBLISHED-COMMIT DRY RUN.
+//
+// The release handoff used to be circular. A scored candidate arm had to run
+// the exact binary being proposed, but that binary could only be installed from
+// a published release — and publication was gated on the very campaign the
+// scored arm belonged to. Meanwhile the publish gate read a fixed path inside
+// the tagged tree, which is the one place campaign evidence cannot be: an index
+// that binds the release SHA cannot be part of the bytes that SHA is computed
+// over, so inserting it changes the commit and regenerating it changes it
+// again. Both ends were closed, and a fail-closed deadlock is not a release
+// design.
+//
+// This walks the whole sequence over an UNPUBLISHED commit: evidence produced
+// outside that commit, carried to the publisher, addressed by digest, and
+// evaluated against the exact release SHA it was produced for. It asserts the
+// gate reaches a real decision rather than a deadlock, and that the decision is
+// still bound to the delivery.
+func TestAnUnpublishedCommitCanReachThePublishDecision(t *testing.T) {
+	idx, loader, keys, _ := campaignFixture(t)
+
+	// Evidence produced OUTSIDE the commit being released, exactly as it must
+	// be: these bytes are what the publisher fetches and pins.
+	raw, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = DigestBytes(raw) // the publisher pins these bytes; see the cmd-level gate
+
+	// AND THE DECISION IS REACHED, not deadlocked. The gate runs to a verdict
+	// over the authentic population and binds it to the delivery.
+	t.Run("the addressed evidence reaches a decision bound to the delivery", func(t *testing.T) {
+		var reparsed CampaignIndex
+		if err := json.Unmarshal(raw, &reparsed); err != nil {
+			t.Fatal(err)
+		}
+		gates, problems := EvaluateCampaignIndex(reparsed, loader, keys, "ewj2-campaign", testRelease())
+		if len(problems) != 0 {
+			t.Fatalf("evidence produced outside the commit was refused: %v", problems)
+		}
+		var bound bool
+		for _, g := range gates {
+			if strings.Contains(g.Name, "release") {
+				bound = true
+				if !g.Pass {
+					t.Errorf("the release-binding gate did not pass: %s", g.Detail)
+				}
+			}
+		}
+		if !bound {
+			t.Error("the decision was reached without a release-binding gate; evidence must authorise a delivery, not merely exist")
+		}
+	})
+
+	// A CAMPAIGN FOR ANOTHER DELIVERY DOES NOT AUTHORISE THIS ONE. The channel
+	// carries evidence; it does not loosen what the evidence has to say.
+	t.Run("evidence for a different release does not authorise this one", func(t *testing.T) {
+		var reparsed CampaignIndex
+		if err := json.Unmarshal(raw, &reparsed); err != nil {
+			t.Fatal(err)
+		}
+		elsewhere := testRelease()
+		elsewhere.SHA = strings.Repeat("9", 40)
+		gates, problems := EvaluateCampaignIndex(reparsed, loader, keys, "ewj2-campaign", elsewhere)
+		passed := len(problems) == 0
+		for _, g := range gates {
+			if !g.Pass {
+				passed = false
+			}
+		}
+		if passed {
+			t.Error("a campaign produced for one commit authorised the release of another")
+		}
+	})
 }
