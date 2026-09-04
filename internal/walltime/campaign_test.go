@@ -188,8 +188,36 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 					// resting on a plain file.
 					StartedAt: scheduledInstant(pair),
 					Terminal:  TerminalPassed,
+					// THE COMPLETE DELIVERY IDENTITY.
+					//
+					// This fixture used to name only the campaign, run,
+					// bucket, Stage-1 and verifier, leaving the workflow
+					// attempt, repository, workflow run, job, step, step
+					// attempt, Stage-2 and component registry blank — and
+					// then asserted that the result was an authentic
+					// population every gate should accept. That made an
+					// underbound row the definition of a good one: a
+					// presence rule could not be added without this
+					// "authentic" fixture failing, so the fixture was
+					// silently holding the trust boundary open. A positive
+					// control has to be at least as complete as the evidence
+					// the contract requires, or it certifies the gap.
 					Run: RunIdentity{
-						CampaignID: "ewj2", RunID: runID, BucketID: fmt.Sprint(b), Stage1: stage1,
+						CampaignID:  "ewj2",
+						RunID:       runID,
+						AttemptID:   "1",
+						BucketID:    fmt.Sprint(b),
+						Repository:  "invakid404/testbucket",
+						WorkflowRun: runID,
+						Job:         role + "-bucket",
+						Step:        "run-bucket",
+						StepAttempt: "1",
+						Stage1:      stage1,
+						// The single derived plan this arm realized. Every row
+						// of one arm names the same one, which is what binds
+						// the arm to one plan rather than to eight.
+						Stage2:            Digest("sha256:stage2-" + runID),
+						ComponentRegistry: regDigest,
 						// The delivery-bound verifier that judged this row.
 						// It must be the identity the verdict is signed
 						// under, or the string is signed but attributable to
@@ -1592,4 +1620,81 @@ func TestAnArmMustBeOneRunOfTheWorkflow(t *testing.T) {
 			t.Fatal("an arm whose rows differ only in their bucket was refused; the bucket is the one field that must vary")
 		}
 	})
+}
+
+// AN IDENTITY MUST EXIST, not merely be agreed upon.
+//
+// The arm-coherence rule compares every row to the first admissible one, and
+// blanks agree with blanks. So a population in which EVERY scored row omits
+// the same field is perfectly coherent and entirely unattributable: ten runs
+// that cannot be shown to be ten runs, eighty rows that cannot be linked to
+// the step attempts that produced them. The contract requires the action
+// wrapper to link one-to-one to an external run-bucket step attempt and the
+// population to carry no retry or replacement; neither claim can be checked
+// against a row that does not say which attempt it came from.
+//
+// Presence and equality are complementary and this suite asserts both: this
+// test blanks a field UNIFORMLY, so equality is satisfied and only presence
+// can refuse it, while TestAnArmMustBeOneRunOfTheWorkflow varies one row, so
+// presence is satisfied and only equality can refuse it.
+//
+// Every case re-signs with the approved verdict key, so a signature failure
+// cannot stand in for the rule and make an absent check look present.
+func TestEveryScoredRowMustNameTheRunThatProducedIt(t *testing.T) {
+	// The positive control comes first and is COMPLETE. An underbound
+	// "authentic" fixture would make a blank row the definition of a good one
+	// and quietly hold this boundary open, which is exactly what the previous
+	// fixture did.
+	t.Run("the complete authentic population passes", func(t *testing.T) {
+		idx, loader, keys, _ := campaignFixture(t)
+		for _, p := range idx.Pairs {
+			for _, arm := range []CampaignArm{p.Baseline, p.Candidate} {
+				for _, path := range arm.VerdictPaths {
+					for _, f := range requiredIdentityFields(loader.verdicts[path].Run) {
+						if strings.TrimSpace(f.value) == "" {
+							t.Fatalf("the positive fixture omits the %s, so it cannot certify a presence rule", f.name)
+						}
+					}
+				}
+			}
+		}
+		if !campaignPasses(t, idx, loader, keys) {
+			t.Fatal("the complete authentic population was refused")
+		}
+	})
+
+	for _, tc := range []struct {
+		field string
+		blank func(*RunIdentity)
+	}{
+		{"workflow attempt", func(r *RunIdentity) { r.AttemptID = "" }},
+		{"repository", func(r *RunIdentity) { r.Repository = "" }},
+		{"workflow run", func(r *RunIdentity) { r.WorkflowRun = "" }},
+		{"job", func(r *RunIdentity) { r.Job = "" }},
+		{"step", func(r *RunIdentity) { r.Step = "" }},
+		{"step attempt", func(r *RunIdentity) { r.StepAttempt = "" }},
+		{"Stage-2 digest", func(r *RunIdentity) { r.Stage2 = "" }},
+		{"component registry digest", func(r *RunIdentity) { r.ComponentRegistry = "" }},
+	} {
+		t.Run("a population whose every row omits the "+tc.field+" is refused", func(t *testing.T) {
+			idx, loader, keys, _ := campaignFixture(t)
+			// UNIFORMLY blank, across every scored row of every arm, so the
+			// arm-coherence rule is satisfied and cannot be what refuses it.
+			for _, p := range idx.Pairs {
+				for _, arm := range []CampaignArm{p.Baseline, p.Candidate} {
+					for _, path := range arm.VerdictPaths {
+						blanked := *loader.verdicts[path]
+						tc.blank(&blanked.Run)
+						blanked.Signature = nil
+						if err := blanked.Sign(testVerdictIdentity, testVerdictAuthority); err != nil {
+							t.Fatal(err)
+						}
+						loader.verdicts[path] = &blanked
+					}
+				}
+			}
+			refusedBecause(t, idx, loader, keys, "names no "+tc.field,
+				"while every scored row omitted the "+tc.field)
+		})
+	}
 }

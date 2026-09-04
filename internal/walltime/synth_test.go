@@ -140,6 +140,14 @@ func mustSigningKey() ed25519.PrivateKey {
 // run is the identity every record, the roster and the seal share. One source
 // so the fixture cannot drift the way production must not.
 func (s *synthRun) run() RunIdentity {
+	// The registry actually in force, not a blank placeholder. A fixture that
+	// left it empty made "no component registry" the shape of a good row, so
+	// the presence rule could not be added without this fixture failing —
+	// which is how an underbound positive control holds a trust boundary open.
+	registry, err := testRegistry().DigestOf()
+	if err != nil {
+		panic(err)
+	}
 	return RunIdentity{
 		// bucket-1 rather than a fixture-only label: production passes the
 		// plan's own bucket NAME as the run's bucket id, and every per-bucket
@@ -147,6 +155,11 @@ func (s *synthRun) run() RunIdentity {
 		// different spelling would exercise the check against a shape no run
 		// produces.
 		CampaignID: "ewj2", BucketID: "bucket-1", RunID: "r1",
+		// The workflow ATTEMPT, which the contract requires a scored row to
+		// name: GITHUB_RUN_ID survives a rerun and GITHUB_RUN_ATTEMPT does
+		// not, so without it a row cannot be placed in the no-retry
+		// population at all.
+		AttemptID:  "1",
 		Repository: "example/mandel", WorkflowRun: "run-1", Job: "test",
 		Step: "run-bucket", StepAttempt: "1",
 		// The delivery-bound verifier the row is measured against. The replay
@@ -154,6 +167,7 @@ func (s *synthRun) run() RunIdentity {
 		// re-derivation of the right plan by somebody nobody bound to this row.
 		VerifierID: "synthetic-verifier",
 		Stage2:     s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+		ComponentRegistry: registry,
 	}
 }
 

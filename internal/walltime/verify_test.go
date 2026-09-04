@@ -3074,3 +3074,131 @@ func TestRequireApprovalIsSeparateFromValidate(t *testing.T) {
 		t.Errorf("a properly approved manifest was refused: %v", err)
 	}
 }
+
+// A SCORED ROW MUST NAME THE RUN THAT PRODUCED IT.
+//
+// verifyRunIdentity asks whether every record AGREES about the identity, and
+// blanks agree with blanks perfectly. A row whose every record, roster entry
+// and seal repeats an empty workflow attempt was therefore scorable: nothing
+// said which attempt, repository, job, step, derived plan or component
+// registry produced it, and nothing asked.
+//
+// That is not a cosmetic gap. The contract requires the action wrapper to link
+// one-to-one to an external run-bucket step attempt, and the retained
+// population to be ten runs and eighty rows with no retry or replacement.
+// Neither can be checked against evidence that does not say which attempt it
+// came from, so an underbound row makes the no-retry population unverifiable
+// rather than merely under-described.
+//
+// The producer cannot self-certify this by usually setting its flags: the
+// verifier is the trust boundary, so the verifier establishes it.
+func TestAScoredRowMustNameTheRunThatProducedIt(t *testing.T) {
+	for _, tc := range []struct {
+		field string
+		blank func(*RunIdentity)
+	}{
+		{"workflow attempt", func(r *RunIdentity) { r.AttemptID = "" }},
+		{"repository", func(r *RunIdentity) { r.Repository = "" }},
+		{"workflow run", func(r *RunIdentity) { r.WorkflowRun = "" }},
+		{"job", func(r *RunIdentity) { r.Job = "" }},
+		{"step", func(r *RunIdentity) { r.Step = "" }},
+		{"step attempt", func(r *RunIdentity) { r.StepAttempt = "" }},
+		{"Stage-2 digest", func(r *RunIdentity) { r.Stage2 = "" }},
+		{"component registry digest", func(r *RunIdentity) { r.ComponentRegistry = "" }},
+		{"campaign identity", func(r *RunIdentity) { r.CampaignID = "" }},
+		{"run identity", func(r *RunIdentity) { r.RunID = "" }},
+		{"verifier identity", func(r *RunIdentity) { r.VerifierID = "" }},
+	} {
+		t.Run("a row naming no "+tc.field+" is not scorable", func(t *testing.T) {
+			dir := t.TempDir()
+			s := newSynthRun(filepath.Join(dir, "records"))
+			docs := writeFrozenDocs(t, dir, s)
+			s.stage2 = docs.digest
+			// UNIFORMLY blank, in every record, so the records agree with one
+			// another and only the presence rule can refuse the row.
+			s.write(t, func(_ Level, _ int, _ Producer, _ string, r *Record) {
+				tc.blank(&r.Run)
+			})
+
+			v, err := VerifyDir(VerifyOptions{
+				Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
+				RegistryPath: docs.registry, AetaPath: docs.aeta, PcheckPath: docs.pcheck, ScorerPath: docs.scorer,
+				TrainingSetPath: docs.trainingSet, Audit: docs.audit,
+				ReplayPath: docs.replay, InvocationsPath: docs.invocations,
+				AuthorityKeys: []string{docs.authority}, Authority: "ewj2-campaign",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Eligible {
+				t.Fatalf("a row whose every record agrees about having no %s was scored", tc.field)
+			}
+			var named bool
+			for _, f := range v.Findings {
+				if strings.Contains(f.Detail, "names no "+tc.field) {
+					named = true
+				}
+			}
+			if !named {
+				t.Errorf("the row was refused, but no finding says it names no %s: %+v", tc.field, v.Findings)
+			}
+		})
+	}
+}
+
+// AND THE STEP-ATTEMPT CROSS-CHECK CANNOT BE BYPASSED BY OMISSION.
+//
+// The comparison used to require BOTH sides to be present, so a recorded
+// identity that named nothing skipped it: the GitHub document could state the
+// repository, workflow run, job, step and attempt, the records could state
+// none of them, and the check reported no problem. That is precisely the case
+// the cross-check exists for — a ledger that cannot be linked to the step it
+// claims to come from — and it was the case that passed.
+func TestTheStepAttemptCrossCheckRefusesAnAbsentRecordedIdentity(t *testing.T) {
+	api := StepAttempt{
+		Repository: "example/mandel", WorkflowRun: "run-1",
+		Job: "test", Step: "run-bucket", Attempt: "1",
+	}
+	for _, tc := range []struct {
+		field string
+		blank func(*RunIdentity)
+	}{
+		{"repository", func(r *RunIdentity) { r.Repository = "" }},
+		{"workflow run", func(r *RunIdentity) { r.WorkflowRun = "" }},
+		{"job", func(r *RunIdentity) { r.Job = "" }},
+		{"step", func(r *RunIdentity) { r.Step = "" }},
+		{"step attempt", func(r *RunIdentity) { r.StepAttempt = "" }},
+	} {
+		t.Run("records omitting the "+tc.field+" the step attempt supplies are refused", func(t *testing.T) {
+			run := RunIdentity{
+				Repository: "example/mandel", WorkflowRun: "run-1",
+				Job: "test", Step: "run-bucket", StepAttempt: "1",
+			}
+			tc.blank(&run)
+			problems := api.CheckIdentity(run, Record{}, Record{})
+			var named bool
+			for _, p := range problems {
+				if strings.Contains(p, "the records name none") {
+					named = true
+				}
+			}
+			if !named {
+				t.Errorf("a recorded identity omitting the %s was accepted against a step attempt that supplies it: %v", tc.field, problems)
+			}
+		})
+	}
+
+	// AND A MATCHING PAIR IS STILL ACCEPTED, so the rule has not become "any
+	// cross-check fails".
+	t.Run("a complete matching identity raises nothing", func(t *testing.T) {
+		run := RunIdentity{
+			Repository: "example/mandel", WorkflowRun: "run-1",
+			Job: "test", Step: "run-bucket", StepAttempt: "1",
+		}
+		for _, p := range api.CheckIdentity(run, Record{}, Record{}) {
+			if strings.Contains(p, "the records name") {
+				t.Errorf("a complete matching identity was faulted: %s", p)
+			}
+		}
+	})
+}

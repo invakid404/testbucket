@@ -77,16 +77,36 @@ func (s StepAttempt) Window() (time.Time, time.Time, error) {
 // missing link, or an envelope that lies outside the step it claims to be.
 func (s StepAttempt) CheckIdentity(run RunIdentity, start, end Record) []string {
 	var problems []string
-	if s.Repository != "" && run.Repository != "" && s.Repository != run.Repository {
-		problems = append(problems, fmt.Sprintf("the records name repository %q, the step attempt %q", run.Repository, s.Repository))
-	}
+	// ABSENCE IS NOT AGREEMENT.
+	//
+	// Both sides used to have to be present before they were compared, so a
+	// recorded identity that named nothing skipped the comparison entirely:
+	// the API document could state the repository, workflow run, job, step and
+	// attempt, the records could state none of them, and this returned no
+	// problem at all. That is the one case the cross-check exists for — a
+	// ledger that cannot be linked to the step it claims to come from — and it
+	// was the case that passed.
+	//
+	// When the API supplies a value, the records must supply it too, and it
+	// must match. When the API itself is silent there is nothing to compare
+	// against and the row's own presence rule (see requiredIdentityFields)
+	// still requires the value to exist.
 	for _, f := range []struct{ name, recorded, api string }{
+		{"repository", run.Repository, s.Repository},
 		{"workflow run", run.WorkflowRun, s.WorkflowRun},
 		{"job", run.Job, s.Job},
 		{"step", run.Step, s.Step},
 		{"step attempt", run.StepAttempt, s.Attempt},
 	} {
-		if f.api != "" && f.recorded != "" && f.api != f.recorded {
+		if f.api == "" {
+			continue
+		}
+		if f.recorded == "" {
+			problems = append(problems, fmt.Sprintf(
+				"the step attempt names %s %q and the records name none; a row that omits the identity the step attempt supplies cannot be linked to it", f.name, f.api))
+			continue
+		}
+		if f.api != f.recorded {
 			problems = append(problems, fmt.Sprintf("the records name %s %q, the step attempt %q", f.name, f.recorded, f.api))
 		}
 	}

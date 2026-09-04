@@ -351,6 +351,28 @@ func loadArm(index CampaignIndex, arm CampaignArm, role string, pair int, loader
 				row, v.Signature.Authority, v.Run.VerifierID))
 			continue
 		}
+		// PRESENCE BEFORE COHERENCE, and before this row is allowed to become
+		// the identity every later row is measured against.
+		//
+		// The arm-coherence rule compares rows to the first admissible one. If
+		// that first row names no attempt, no repository, no job or no derived
+		// plan, then a population in which EVERY row omits the same field is
+		// perfectly coherent and entirely unattributable — ten runs that
+		// cannot be shown to be ten runs. Equality and existence are
+		// complementary: the verifier establishes this for a scored row, and
+		// the loader establishes it again here rather than trusting that it
+		// was established upstream.
+		var absent []string
+		for _, f := range requiredIdentityFields(v.Run) {
+			if strings.TrimSpace(f.value) == "" {
+				absent = append(absent, f.name)
+			}
+		}
+		if len(absent) > 0 {
+			problems = append(problems, fmt.Sprintf(
+				"%s names no %s, so it cannot be attributed to the run that produced it", row, strings.Join(absent, ", no ")))
+			continue
+		}
 		if v.RecordsDigest == "" {
 			problems = append(problems, row+" names no records digest, so it cannot be tied to the evidence it was derived from")
 			continue

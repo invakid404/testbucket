@@ -339,16 +339,28 @@ func verifyRunIdentity(v *Verdict, recs []Record) {
 	if where == "" {
 		established, where = recs[0].Run, fmt.Sprintf("the first %s/%s record", recs[0].Producer, recs[0].Level)
 	}
-	// The verifier identity must EXIST, not merely be repeated consistently.
+	// THE IDENTITY MUST EXIST, not merely be repeated consistently.
 	//
 	// runIdentityDiff answers "do these records agree", and a row whose every
-	// record, roster and seal repeats a blank verifier agrees with itself
-	// perfectly. It was then scorable: no record named who verified it, and
-	// nothing asked. Attribution is a property of the value, not of the
-	// agreement.
-	if strings.TrimSpace(established.VerifierID) == "" {
-		v.add("WT-026", SeverityIneligible, fmt.Sprintf(
-			"%s names no verifier identity; a row every record of which agrees about having no verifier is a row attributable to nobody", where))
+	// record, roster and seal repeats a BLANK agrees with itself perfectly. It
+	// was then scorable: nothing named which workflow attempt produced it,
+	// which repository, job or step ran it, or which derived plan and
+	// component registry were in force — and nothing asked, because agreement
+	// about nothing is still agreement.
+	//
+	// This mattered beyond tidiness. The contract requires the action wrapper
+	// to link one-to-one to an external run-bucket step attempt and the
+	// population to be ten runs with no retry or replacement. Neither claim
+	// can be checked against a row that does not say which attempt it came
+	// from, so a signed row missing these values makes the no-retry population
+	// unverifiable rather than merely under-described. Existence is a property
+	// of the value; consistency is a property of the collection, and only the
+	// first can be established here.
+	for _, f := range requiredIdentityFields(established) {
+		if strings.TrimSpace(f.value) == "" {
+			v.add("WT-026", SeverityIneligible, fmt.Sprintf(
+				"%s names no %s; a row every record of which agrees about having no %s is a row that cannot be attributed to the run that produced it", where, f.name, f.name))
+		}
 	}
 	for _, r := range recs {
 		if diff := runIdentityDiff(established, r.Run); diff != "" {
@@ -357,6 +369,34 @@ func verifyRunIdentity(v *Verdict, recs []Record) {
 				r.Producer, r.Level, r.Seq, where, diff))
 			return
 		}
+	}
+}
+
+// requiredIdentityFields is the delivery identity a SCORED row must carry.
+//
+// Every one of these is named by the frozen contract as something an action,
+// peer or trace record binds: which campaign, run and attempt of the workflow
+// produced it, which bucket of that run, which repository, workflow run, job
+// and step executed it, which frozen planning inputs and derived plan it
+// realized, which component registry was in force, and which delivery
+// verifier judged it. A row missing any of them is not a weaker measurement;
+// it is a measurement that cannot be placed in the population the release
+// gate counts.
+func requiredIdentityFields(r RunIdentity) []identityField {
+	return []identityField{
+		{"campaign identity", r.CampaignID},
+		{"run identity", r.RunID},
+		{"workflow attempt", r.AttemptID},
+		{"bucket identity", r.BucketID},
+		{"repository", r.Repository},
+		{"workflow run", r.WorkflowRun},
+		{"job", r.Job},
+		{"step", r.Step},
+		{"step attempt", r.StepAttempt},
+		{"Stage-1 digest", string(r.Stage1)},
+		{"Stage-2 digest", string(r.Stage2)},
+		{"component registry digest", string(r.ComponentRegistry)},
+		{"verifier identity", r.VerifierID},
 	}
 }
 
