@@ -233,8 +233,12 @@ func TestAnAblationIsBoundToItsOwnDelivery(t *testing.T) {
 		edit func(*Verdict)
 		want string
 	}{
-		{"another Stage-1", func(v *Verdict) { v.Run.Stage1 = "sha256:elsewhere" }, "not the"},
-		{"another verifier build", func(v *Verdict) { v.VerifierBinary = "sha256:other-build" }, "not the"},
+		{"another Stage-1", func(v *Verdict) {
+			v.Run.Stage1 = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
+		}, "not the"},
+		{"another verifier build", func(v *Verdict) {
+			v.VerifierBinary = "sha256:fe86119ef9718c62fe2c643373e54f8e7f1047b1e6da468befa19fb95156f390"
+		}, "not the"},
 		{"another run", func(v *Verdict) { v.Run.RunID = "some-other-run" }, "but its verdict was recorded under"},
 		{"no records digest", func(v *Verdict) { v.RecordsDigest = "" }, "names no records digest"},
 		{"an incomplete measurement", func(v *Verdict) { v.Complete = false }, "not a complete measurement"},
@@ -359,13 +363,13 @@ func TestAnAblationMustProveItsRealizedTopology(t *testing.T) {
 
 		{"a plan the row did not measure", func(idx *CampaignIndex, l memoryLoader) {
 			resign(l.verdicts[idx.Ablations[0].VerdictPath], testVerdictAuthority, func(v *Verdict) {
-				v.Run.Stage2 = "sha256:some-other-plan"
+				v.Run.Stage2 = "sha256:43cba9100261b85ebbfb321f769cb66f73c717e41518a1a1bedce4eadb4a0737"
 			})
 		}, "but the receipt it names digests to"},
 
 		{"a plan derived from another Stage-1", func(idx *CampaignIndex, l memoryLoader) {
 			r := *l.stage2[idx.Ablations[0].Stage2Path]
-			r.Stage1Digest = "sha256:elsewhere"
+			r.Stage1Digest = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
 			// The receipt's own claim follows its parents, so that this case
 			// exercises the ablation's Stage-1 binding rather than tripping
 			// the schema's separate claim-parent rule first. Two defects in

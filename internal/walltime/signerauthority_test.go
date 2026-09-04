@@ -45,7 +45,7 @@ func TestAnAuthorizedKeyLogEntryIsBoundToItsWholeClaim(t *testing.T) {
 	keys := []string{PublicKeyOf(key)}
 	base := KeyLogEntry{
 		Producer: ProducerPeer, Level: LevelInvocation, Seq: 3,
-		PublicKey: "abc", Binary: "sha256:binary",
+		PublicKey: "abc", Binary: "sha256:9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd",
 	}
 	authorized := base
 	if err := authorized.Authorize(keyLogAuthority(base), key); err != nil {
@@ -68,7 +68,9 @@ func TestAnAuthorizedKeyLogEntryIsBoundToItsWholeClaim(t *testing.T) {
 		{"a different level", func(e *KeyLogEntry) { e.Level = LevelScript }, "not the"},
 		{"a different sequence", func(e *KeyLogEntry) { e.Seq = 4 }, "not the"},
 		{"a different public key", func(e *KeyLogEntry) { e.PublicKey = "def" }, "does not verify"},
-		{"a different binary", func(e *KeyLogEntry) { e.Binary = "sha256:other" }, "does not verify"},
+		{"a different binary", func(e *KeyLogEntry) {
+			e.Binary = "sha256:d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+		}, "does not verify"},
 		{"an authorization made for another role", func(e *KeyLogEntry) {
 			other := *e
 			other.Producer = ProducerTrace
@@ -102,7 +104,7 @@ func TestAnAuthorizedKeyLogEntryIsBoundToItsWholeClaim(t *testing.T) {
 // makes the check say whether a privileged producer path existed.
 func TestRegisterKeyAuthorizesWhenItHoldsTheCapability(t *testing.T) {
 	key := mustSigningKey()
-	entry := KeyLogEntry{Producer: ProducerPeer, Level: LevelScript, Seq: 0, PublicKey: "abc", Binary: "sha256:b"}
+	entry := KeyLogEntry{Producer: ProducerPeer, Level: LevelScript, Seq: 0, PublicKey: "abc", Binary: "sha256:3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"}
 
 	withKey := t.TempDir()
 	t.Setenv(RunKeyEnv, EncodeKey(key))

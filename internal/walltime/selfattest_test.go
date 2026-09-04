@@ -22,13 +22,13 @@ func TestASelfAttestedBuildIsRefused(t *testing.T) {
 	build := func(verifier string) BuildAttestation {
 		a := BuildAttestation{
 			Kind: BuildAttestationKind, SubjectName: "testbucket-linux-amd64",
-			SubjectDigest:    "sha256:aaaa",
+			SubjectDigest:    "sha256:61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4",
 			SourceRepository: "invakid404/testbucket",
 			SourceCommit:     "295c48aa98120245334e9cc0928b3c6c313c750d",
 			BuilderID:        builder,
 			Issuer:           "https://token.actions.githubusercontent.com",
 			BuildRun:         "1", BuildAttempt: "1",
-			VerifierID: verifier, VerifierBinary: "sha256:bbbb", VerifierVersion: "v0.3.0",
+			VerifierID: verifier, VerifierBinary: "sha256:81cc5b17018674b401b42f35ba07bb79e211239c23bffe658da1577e3e646877", VerifierVersion: "v0.3.0",
 			VerifiedAt: "2026-09-02T00:00:00Z", Result: AttestationVerified,
 		}
 		if err := a.Sign(builder, key); err != nil {
@@ -45,7 +45,7 @@ func TestASelfAttestedBuildIsRefused(t *testing.T) {
 
 	keys := []string{PublicKeyOf(key), PublicKeyOf(verifierKey)}
 	self := build(builder)
-	problems := self.Verify("sha256:aaaa", "295c48aa98120245334e9cc0928b3c6c313c750d", keys)
+	problems := self.Verify("sha256:61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4", "295c48aa98120245334e9cc0928b3c6c313c750d", keys)
 	joined := strings.Join(problems, "\n")
 	if !strings.Contains(joined, "both the builder and the verifier") {
 		t.Errorf("a self-attested build was accepted: %v", problems)
@@ -54,7 +54,7 @@ func TestASelfAttestedBuildIsRefused(t *testing.T) {
 	// And an independently verified one still passes, so the rule was added
 	// rather than the path broken.
 	independent := build("release-verification@example.org")
-	if problems := independent.Verify("sha256:aaaa", "295c48aa98120245334e9cc0928b3c6c313c750d", keys); len(problems) != 0 {
+	if problems := independent.Verify("sha256:61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4", "295c48aa98120245334e9cc0928b3c6c313c750d", keys); len(problems) != 0 {
 		t.Errorf("an independently verified build was refused: %v", problems)
 	}
 
@@ -65,7 +65,7 @@ func TestASelfAttestedBuildIsRefused(t *testing.T) {
 	if err := oneKey.Countersign(oneKey.VerifierID, key); err != nil {
 		t.Fatal(err)
 	}
-	if problems := oneKey.Verify("sha256:aaaa", "295c48aa98120245334e9cc0928b3c6c313c750d", keys); len(problems) == 0 {
+	if problems := oneKey.Verify("sha256:61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4", "295c48aa98120245334e9cc0928b3c6c313c750d", keys); len(problems) == 0 {
 		t.Error("a builder that signed both halves under one key passed as independent verification")
 	}
 
@@ -75,7 +75,7 @@ func TestASelfAttestedBuildIsRefused(t *testing.T) {
 	if err := misattributed.Countersign("somebody-else@example.org", verifierKey); err != nil {
 		t.Fatal(err)
 	}
-	if problems := misattributed.Verify("sha256:aaaa", "295c48aa98120245334e9cc0928b3c6c313c750d", keys); len(problems) == 0 {
+	if problems := misattributed.Verify("sha256:61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4", "295c48aa98120245334e9cc0928b3c6c313c750d", keys); len(problems) == 0 {
 		t.Error("a countersignature by a party the document does not name passed")
 	}
 
@@ -83,7 +83,7 @@ func TestASelfAttestedBuildIsRefused(t *testing.T) {
 	// produced: every verifier field written and signed by the builder.
 	builderOnly := independent
 	builderOnly.VerifierSignature = nil
-	if problems := builderOnly.Verify("sha256:aaaa", "295c48aa98120245334e9cc0928b3c6c313c750d", keys); len(problems) == 0 {
+	if problems := builderOnly.Verify("sha256:61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4", "295c48aa98120245334e9cc0928b3c6c313c750d", keys); len(problems) == 0 {
 		t.Error("an attestation with no verifier signature passed as verified")
 	}
 }

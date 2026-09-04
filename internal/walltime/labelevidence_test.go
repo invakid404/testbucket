@@ -19,9 +19,9 @@ import (
 func TestFabricatedTrainingReferencesAreRefused(t *testing.T) {
 	set := admissibleSet()
 	for i := range set.Labels {
-		set.Labels[i].ReceiptHash = Digest("sha256:" + strings.Repeat("1", 64))
-		set.Labels[i].SelectedWorkDigest = Digest("sha256:" + strings.Repeat("2", 64))
-		set.Labels[i].TopologyReceipt = Digest("sha256:" + strings.Repeat("3", 64))
+		set.Labels[i].ReceiptHash = DigestBytes([]byte("other-1"))
+		set.Labels[i].SelectedWorkDigest = DigestBytes([]byte("other-2"))
+		set.Labels[i].TopologyReceipt = DigestBytes([]byte("other-3"))
 		set.Labels[i].Evidence = nil
 	}
 	if err := set.Seal("ewj2-training", trainingSealKey); err != nil {
@@ -103,7 +103,7 @@ func TestEveryClauseOfTheLabelEvidenceChain(t *testing.T) {
 		{"no evidence at all", func(l *TrainingLabel) { l.Evidence = nil }, "carries no evidence"},
 		{"an absent receipt", func(l *TrainingLabel) { l.Evidence.ReceiptBytes = nil }, "is absent"},
 		{"a receipt hash that addresses other bytes", func(l *TrainingLabel) {
-			l.ReceiptHash = Digest("sha256:" + strings.Repeat("4", 64))
+			l.ReceiptHash = DigestBytes([]byte("other-4"))
 		}, "digests to"},
 		{"an unsigned receipt", func(l *TrainingLabel) {
 			var r PhysicalVReceipt
@@ -161,7 +161,7 @@ func TestEveryClauseOfTheLabelEvidenceChain(t *testing.T) {
 		}, "but its receipt observed"},
 		{"an attribution the receipt does not make", func(l *TrainingLabel) {
 			resealReceipt(l, func(r *PhysicalVReceipt) {
-				r.SelectedWorkDigest = Digest("sha256:" + strings.Repeat("5", 64))
+				r.SelectedWorkDigest = DigestBytes([]byte("other-5"))
 			})
 		}, "its own receipt attributes it to"},
 		{"selected work for another unit", func(l *TrainingLabel) {
@@ -182,7 +182,7 @@ func TestEveryClauseOfTheLabelEvidenceChain(t *testing.T) {
 		}, "names no validator"},
 		{"a topology receipt for other selected work", func(l *TrainingLabel) {
 			resealTopology(l, func(tp *TopologyValidationReceipt) {
-				tp.SelectedWorkDigest = Digest("sha256:" + strings.Repeat("6", 64))
+				tp.SelectedWorkDigest = DigestBytes([]byte("other-6"))
 			})
 			resealReceipt(l, func(r *PhysicalVReceipt) { r.TopologyReceipt = l.TopologyReceipt })
 		}, "validates selected work"},

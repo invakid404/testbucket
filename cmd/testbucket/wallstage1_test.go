@@ -451,8 +451,8 @@ func bundleFor(storeBytes []byte) walltime.PlanningInputBundle {
 	// closure is not bound is a frozen input whose provenance is invented.
 	tools := func(head, path string) map[string]walltime.ToolIdentity {
 		return map[string]walltime.ToolIdentity{
-			head:   {Version: "4.1.10", Path: path, Integrity: "sha256:head"},
-			"node": {Version: "24.19.0", Path: "/usr/bin/node", Integrity: "sha256:node"},
+			head:   {Version: "4.1.10", Path: path, Integrity: "sha256:9f2e6d33a3717ee826353a404ba4618d1aeeb6879ad7936bce8ed5f46814924d"},
+			"node": {Version: "24.19.0", Path: "/usr/bin/node", Integrity: "sha256:545ea538461003efdc8c81c244531b003f6f26cfccf6c0073b3239fdedf49446"},
 		}
 	}
 	disc := walltime.NewRawSnapshot("vitest-list",
@@ -467,7 +467,7 @@ func bundleFor(storeBytes []byte) walltime.PlanningInputBundle {
 	// The frozen acceptance contract profiles exactly one workload.
 	b.Source.Repository = walltime.FrozenProfileRepository
 	b.Source.Commit = walltime.FrozenProfileCommit
-	b.Source.Tree = "sha256:tree"
+	b.Source.Tree = "sha256:dc9c5edb8b2d479e697b4b0b8ab874f32b325138598ce9e7b759eb8292110622"
 	b.Acquisition.Argv = []string{"testbucket", "wall", "bundle"}
 	b.Acquisition.Cwd = "/repo"
 	b.Acquisition.Env = map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": "shared/f/lib/cases/"}
@@ -504,7 +504,7 @@ func TestThePlannerClaimRefusesASecondInvocationBeforeItRuns(t *testing.T) {
 	// out from under another.
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	dir := t.TempDir()
-	const stage1, bundle = walltime.Digest("sha256:stage1"), walltime.Digest("sha256:bundle")
+	const stage1, bundle = walltime.Digest("sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"), walltime.Digest("sha256:1e6ed65d77d6364eeaed5a745ba5c4985ae2b700dd85d7cf7f027bdf294a33fc")
 
 	first, err := claimPlannerExecution(dir, stage1, bundle)
 	if err != nil {
@@ -522,10 +522,10 @@ func TestThePlannerClaimRefusesASecondInvocationBeforeItRuns(t *testing.T) {
 
 	// A DIFFERENT DERIVATION IS NOT BLOCKED: the claim is keyed by identity,
 	// not by an output path, so another Stage-1 or another bundle proceeds.
-	if _, err := claimPlannerExecution(dir, stage1, walltime.Digest("sha256:other-bundle")); err != nil {
+	if _, err := claimPlannerExecution(dir, stage1, walltime.Digest("sha256:72cb9f157914e773011a1c32d55763ef237b88888dcaf36b3bb21ceec2eecc6a")); err != nil {
 		t.Errorf("a different derivation was blocked by another's claim: %v", err)
 	}
-	if _, err := claimPlannerExecution(dir, walltime.Digest("sha256:other-stage1"), bundle); err != nil {
+	if _, err := claimPlannerExecution(dir, walltime.Digest("sha256:ec3813d11a45b190e8e5501f714b71d3accfc991d91cce8d218a2c2bcb25f0a8"), bundle); err != nil {
 		t.Errorf("a different derivation was blocked by another's claim: %v", err)
 	}
 
@@ -545,7 +545,7 @@ func TestThePlannerClaimRefusesASecondInvocationBeforeItRuns(t *testing.T) {
 	// the same machine is refused whether or not a durable store was
 	// configured. Failing to configure one weakens the CROSS-RUNNER guarantee;
 	// it no longer removes the local one.
-	other := walltime.Digest("sha256:unconfigured-store")
+	other := walltime.Digest("sha256:08c4f47566e38c4e5bd906fb164ec38525724222bcedae2bbab892f2ad584210")
 	if _, err := claimPlannerExecution("", stage1, other); err != nil {
 		t.Fatalf("the first derivation could not claim in the machine store: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestAScoredDerivationRequiresADurableClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv(plannerClaimStoreEnv, "")
 
-	local, err := claimPlannerExecution("", walltime.Digest("sha256:s"), walltime.Digest("sha256:b"))
+	local, err := claimPlannerExecution("", walltime.Digest("sha256:043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89"), walltime.Digest("sha256:3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +589,7 @@ func TestAScoredDerivationRequiresADurableClaim(t *testing.T) {
 
 	// A PATHNAME ALONE DOES NOT CERTIFY DURABILITY. An arbitrary directory is
 	// exactly what a fresh hosted runner also has.
-	unattested, uerr := claimPlannerExecution(t.TempDir(), walltime.Digest("sha256:s3"), walltime.Digest("sha256:b3"))
+	unattested, uerr := claimPlannerExecution(t.TempDir(), walltime.Digest("sha256:41242b9fae56fad4e6e77dfe33cb18d1c3fc583f988cf25ef9f2d9be0d440bbb"), walltime.Digest("sha256:76a8277347f52530e1cf979175a178980b3a180d176165c985d85f7e142f1eed"))
 	if uerr != nil {
 		t.Fatal(uerr)
 	}
@@ -610,11 +610,11 @@ func TestAScoredDerivationRequiresADurableClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	subject := walltime.DigestBytes([]byte(plannerStoreSubject + store))
+	subject := walltime.PlannerClaimStoreSubject(store)
 	t.Setenv(plannerClaimAttestationEnv, walltime.SignApproval(walltime.CampaignAuthority, key, subject))
 	t.Setenv(plannerClaimAuthorityKeysEnv, walltime.PublicKeyOf(key))
 
-	durable, err := claimPlannerExecution(store, walltime.Digest("sha256:s2"), walltime.Digest("sha256:b2"))
+	durable, err := claimPlannerExecution(store, walltime.Digest("sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4"), walltime.Digest("sha256:4814d92093ac8a0f4a2163ab87dee509ba306a58f5888be0edcb2fcd0712028b"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,7 +697,7 @@ func TestThePublishGateRequiresAddressedCampaignEvidence(t *testing.T) {
 		err := runWallCampaign([]string{
 			"--index", index, "--authority", "ewj2-campaign",
 			"--authority-key", "aa", "--release-sha", sha,
-			"--index-digest", "sha256:" + strings.Repeat("b", 64),
+			"--index-digest", string(walltime.DigestBytes([]byte("a different index"))),
 			"--index-origin", "run/12345/artifact/campaign-evidence",
 		})
 		if err == nil {

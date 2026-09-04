@@ -2,6 +2,7 @@ package planbind
 
 import (
 	"context"
+	"crypto/ed25519"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,7 +75,7 @@ func baseAcquire(t *testing.T, root string, mutate func(*AcquireOptions)) Acquir
 		},
 		Env:        map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": ""},
 		Resolve:    testResolver,
-		Repository: "example/mandel", Commit: testCommit, Tree: "sha256:tree",
+		Repository: "example/mandel", Commit: testCommit, Tree: "sha256:dc9c5edb8b2d479e697b4b0b8ab874f32b325138598ce9e7b759eb8292110622",
 	}
 	if mutate != nil {
 		mutate(&opt)
@@ -89,14 +90,14 @@ func testResolver(argv []string) (map[string]string, map[string]walltime.ToolIde
 	head := argv[0]
 	return map[string]string{head: "/usr/local/bin/" + filepath.Base(head)},
 		map[string]walltime.ToolIdentity{
-			head:   {Version: "1.0.0", Path: "/usr/local/bin/" + filepath.Base(head), Integrity: "sha256:head"},
-			"node": {Version: "24.19.0", Path: "/usr/local/bin/node", Integrity: "sha256:node"},
+			head:   {Version: "1.0.0", Path: "/usr/local/bin/" + filepath.Base(head), Integrity: "sha256:9f2e6d33a3717ee826353a404ba4618d1aeeb6879ad7936bce8ed5f46814924d"},
+			"node": {Version: "24.19.0", Path: "/usr/local/bin/node", Integrity: "sha256:545ea538461003efdc8c81c244531b003f6f26cfccf6c0073b3239fdedf49446"},
 		}, nil
 }
 
 func plan(t *testing.T, b *walltime.PlanningInputBundle) *Result {
 	t.Helper()
-	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
+	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"}))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -176,7 +177,7 @@ func TestTheTwoDigestsAnswerDifferentQuestions(t *testing.T) {
 func TestAmbientInputsAreRefused(t *testing.T) {
 	root := t.TempDir()
 	b := acquire(t, root, func(o *AcquireOptions) { o.Runnables = nil })
-	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
+	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"}))
 	if err == nil {
 		t.Fatalf("planning succeeded with no frozen listing for a name-sliced target")
 	}
@@ -200,7 +201,7 @@ func TestBundleTamperingIsCaught(t *testing.T) {
 	if err := b.Validate(); err == nil {
 		t.Fatalf("a rewritten discovery snapshot validated")
 	}
-	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"})); err == nil {
+	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"})); err == nil {
 		t.Fatalf("a rewritten discovery snapshot was planned from")
 	}
 }
@@ -218,7 +219,7 @@ func TestColdStartIsBoundAsAColdStart(t *testing.T) {
 		BundleArgv:    []string{"testbucket", "wall", "bundle", "--root", root, "--store-absent"},
 		Resolve:       testResolver,
 		Env:           map[string]string{},
-		Repository:    "example/mandel", Commit: testCommit, Tree: "sha256:tree",
+		Repository:    "example/mandel", Commit: testCommit, Tree: "sha256:dc9c5edb8b2d479e697b4b0b8ab874f32b325138598ce9e7b759eb8292110622",
 	})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
@@ -244,7 +245,7 @@ func TestColdStartIsBoundAsAColdStart(t *testing.T) {
 func TestWallRenderedScriptCarriesItsSpecs(t *testing.T) {
 	root := t.TempDir()
 	b := acquire(t, root, func(o *AcquireOptions) { o.WallDir = "/tmp/wall" })
-	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
+	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"}))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -281,7 +282,7 @@ func TestFrozenPlanRefusesAStaleStore(t *testing.T) {
 		// instant well past the frozen 14-day policy.
 		o.Instant = time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	})
-	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
+	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"}))
 	if err == nil {
 		t.Fatalf("the frozen path planned from a stale store")
 	}
@@ -294,7 +295,7 @@ func TestFrozenPlanRefusesAStaleStore(t *testing.T) {
 	fresh := acquire(t, root, func(o *AcquireOptions) {
 		o.Instant = time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 	})
-	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: fresh, Stage1: "sha256:stage1"})); err != nil {
+	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: fresh, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"})); err != nil {
 		t.Errorf("a store inside the stale policy was refused: %v", err)
 	}
 }
@@ -372,7 +373,7 @@ func TestAColdStartCannotCarryAWarmStore(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "is not a cold start") {
 		t.Errorf("error %q does not name the contradiction", err)
 	}
-	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: &forged, Stage1: "sha256:stage1"})); err == nil {
+	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: &forged, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"})); err == nil {
 		t.Errorf("a bundle declaring a cold start over warm bytes was planned")
 	}
 
@@ -487,9 +488,27 @@ func withClaim(t *testing.T, opt PlanOptions) PlanOptions {
 	if err != nil {
 		t.Fatal(err)
 	}
+	const store = "authority/durable-claims"
+	subject := walltime.PlannerClaimStoreSubject(store)
 	opt.PlannerClaim = &walltime.PlannerClaimReceipt{
-		Store: "authority/durable-claims", Durable: true,
-		Key: "fixture", Stage1: opt.Stage1, Bundle: d,
+		Store: store, Durable: true,
+		// The CANONICAL key, which any checker recomputes from the two
+		// parents, and the authority's real signature over the store. A
+		// hand-authored `Durable: true` beside `Key: "fixture"` used to pass,
+		// so Stage 2 could not tell an earned claim from a declared one.
+		Key: walltime.PlannerClaimKey(opt.Stage1, d), Stage1: opt.Stage1, Bundle: d,
+		Attestation:   walltime.SignApproval(walltime.CampaignAuthority, fixtureAuthorityKey, subject),
+		AuthorityKeys: []string{walltime.PublicKeyOf(fixtureAuthorityKey)},
 	}
 	return opt
 }
+
+// fixtureAuthorityKey stands in for the protected campaign authority, minted
+// once so every fixture claim verifies against the same predeclared key.
+var fixtureAuthorityKey = func() ed25519.PrivateKey {
+	k, err := walltime.NewSigningKey()
+	if err != nil {
+		panic(err)
+	}
+	return k
+}()

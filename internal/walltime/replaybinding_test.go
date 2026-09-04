@@ -22,7 +22,7 @@ func TestEverySignedReplayClaimIsChecked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	instr := InstrumentationIdentity{VerifierBinary: "sha256:verifier"}
+	instr := InstrumentationIdentity{VerifierBinary: "sha256:88c9eae68eb300b2971a2bec9e5a26ff4179fd661d6b7d861e4c6557b9aaee14"}
 
 	good := func() ReplayAttestation {
 		return ReplayAttestation{
@@ -32,7 +32,7 @@ func TestEverySignedReplayClaimIsChecked(t *testing.T) {
 			BundleDigest:   issued.BundleDigest,
 			Recomputed:     claimed(matchableReceipt()),
 			VerifierID:     verifierID,
-			VerifierBinary: "sha256:verifier",
+			VerifierBinary: "sha256:88c9eae68eb300b2971a2bec9e5a26ff4179fd661d6b7d861e4c6557b9aaee14",
 			Signature:      &Signature{Authority: verifierID},
 		}
 	}
@@ -48,11 +48,11 @@ func TestEverySignedReplayClaimIsChecked(t *testing.T) {
 		want             string
 	}{
 		{"a top-level bundle claim its own receipt contradicts", func(a *ReplayAttestation) {
-			a.BundleDigest = "sha256:some-other-bundle"
+			a.BundleDigest = "sha256:18d9a6c2e32e9c88dd6e3eac86f55326aef52245b016ab455ca9d7e006940366"
 		}, verifierID, "while the receipt it recomputed names"},
 		{"a top-level bundle claim the issued receipt contradicts", func(a *ReplayAttestation) {
-			a.BundleDigest = "sha256:some-other-bundle"
-			a.Recomputed.BundleDigest = "sha256:some-other-bundle"
+			a.BundleDigest = "sha256:18d9a6c2e32e9c88dd6e3eac86f55326aef52245b016ab455ca9d7e006940366"
+			a.Recomputed.BundleDigest = "sha256:18d9a6c2e32e9c88dd6e3eac86f55326aef52245b016ab455ca9d7e006940366"
 		}, verifierID, "but the issued receipt was derived from"},
 		{"no verifier identity", func(a *ReplayAttestation) {
 			a.VerifierID = ""
@@ -93,7 +93,7 @@ func TestAValidlySignedContradictionIsStillRefused(t *testing.T) {
 	}
 	a := ReplayAttestation{
 		Kind: ReplayKind, Stage1Digest: issued.Stage1Digest, Stage2Digest: issuedDigest,
-		BundleDigest: "sha256:a-bundle-this-replay-never-read",
+		BundleDigest: "sha256:32c40e72d203947a6c3104b9868180caee9c2353a587c83af822887d59511ec6",
 		Recomputed:   claimed(matchableReceipt()), VerifierID: verifierID,
 	}
 	d, err := a.DigestOf()

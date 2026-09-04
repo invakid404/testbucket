@@ -215,7 +215,12 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     permissions:
+      # actions: read is what lets this job DOWNLOAD the build artifacts it
+      # verifies. Declaring any permission makes every undeclared one `none`,
+      # so the download was relying on this repository being public — which is
+      # not a declaration and fails on a private or protected installation.
       contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -79,7 +79,7 @@ func TestExecProducesThreeIndependentLedgers(t *testing.T) {
 	dir := t.TempDir()
 	code, err := Exec(ExecOptions{
 		Level: LevelInvocation, Seq: 0, Dir: dir,
-		Run:  RunIdentity{BucketID: "b1", Stage2: "sha256:test"},
+		Run:  RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
 		Argv: []string{"sh", "-c", "sleep 0.05"}, Cwd: dir,
 		Selector: []string{"tests/fast.spec.ts"}, Desc: "tests/fast.spec.ts",
 		Timeout: 30 * time.Second,
@@ -215,7 +215,7 @@ func TestPeerAndTraceAreIndependent(t *testing.T) {
 // nesting the verifier derives from it.
 func TestActionEnvelopeSpansSteps(t *testing.T) {
 	dir := t.TempDir()
-	run := RunIdentity{BucketID: "b1", Stage2: "sha256:test"}
+	run := RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
 		t.Fatalf("BeginAction: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestEnvelopeCoversEveryWrapperOwnedOperation(t *testing.T) {
 	}
 	t.Cleanup(func() { atStartReading, atEndReading = nil, nil })
 
-	run := RunIdentity{BucketID: "b1", Stage2: "sha256:test"}
+	run := RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
 		t.Fatalf("BeginAction: %v", err)
 	}
@@ -522,7 +522,7 @@ func TestEnvelopeBracketsTheWholeCall(t *testing.T) {
 // the peer and the trace would never see that work.
 func TestRunInActionJoinsBeforeItSpawns(t *testing.T) {
 	dir := t.TempDir()
-	run := RunIdentity{BucketID: "b1", Stage2: "sha256:test"}
+	run := RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
 		t.Fatalf("BeginAction: %v", err)
 	}
@@ -578,7 +578,7 @@ func TestRunInActionJoinsBeforeItSpawns(t *testing.T) {
 // failed setup stays in the ledger with its reason, so it does.
 func TestBootstrapFailureIsRetained(t *testing.T) {
 	dir := t.TempDir()
-	run := RunIdentity{BucketID: "b1", Stage2: "sha256:test"}
+	run := RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 
 	// Make observer startup fail: the launcher is the seam production uses to
 	// spawn them, so this is the real failure path, not a simulated one.
@@ -648,7 +648,7 @@ func TestAPreWriterBootstrapFailureIsRetained(t *testing.T) {
 	atRecordsDir = func(string) error { return injected }
 	t.Cleanup(func() { atRecordsDir = original })
 
-	run := RunIdentity{CampaignID: "ewj2", RunID: "r1", BucketID: "bucket-1", Stage2: "sha256:test"}
+	run := RunIdentity{CampaignID: "ewj2", RunID: "r1", BucketID: "bucket-1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	if _, err := BeginAction(dir, run, time.Minute); err == nil {
 		t.Fatalf("an injected bootstrap failure was not reported")
 	} else if !strings.Contains(err.Error(), injected.Error()) {
@@ -737,7 +737,7 @@ func TestObserversNeverInheritAWallTimeSecret(t *testing.T) {
 	// than that on this platform, which would fail the envelope for a reason
 	// this test is not about.
 	dir := shortTempDir(t)
-	run := RunIdentity{CampaignID: "ewj2", RunID: "r1", BucketID: "bucket-1", Stage2: "sha256:test"}
+	run := RunIdentity{CampaignID: "ewj2", RunID: "r1", BucketID: "bucket-1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	// Both levels: the action level detaches, the script level does not, and
 	// neither may carry a secret.
 	if _, err := Exec(ExecOptions{
@@ -800,7 +800,7 @@ func TestDetachedActionObserversAreScrubbed(t *testing.T) {
 	t.Cleanup(func() { ObserverLauncher = original })
 
 	dir := t.TempDir()
-	run := RunIdentity{CampaignID: "ewj2", RunID: "detached", BucketID: "bucket-0", Stage2: "sha256:stage2"}
+	run := RunIdentity{CampaignID: "ewj2", RunID: "detached", BucketID: "bucket-0", Stage2: "sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5"}
 	if _, err := BeginAction(dir, run, 20*time.Second); err != nil {
 		t.Fatalf("BeginAction: %v", err)
 	}

@@ -28,8 +28,8 @@ func TestTheActionLifecycleProducesCompleteRecords(t *testing.T) {
 		CampaignID: "ewj2", RunID: "e2e-1", AttemptID: "1", BucketID: "bucket-0",
 		Repository: "invakid404/testbucket", WorkflowRun: "100", Job: "test",
 		Step: "run-bucket", StepAttempt: "1",
-		Stage1: "sha256:stage1", Stage2: "sha256:stage2",
-		ComponentRegistry: "sha256:registry", VerifierID: "ewj2-verifier",
+		Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f", Stage2: "sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5",
+		ComponentRegistry: "sha256:872491a30d60d598962de6e7b834ab76b2aa65fbab102c6ebaaae6acdc238822", VerifierID: "ewj2-verifier",
 	}
 	runKey := mustSigningKey()
 	t.Setenv(RunKeyEnv, EncodeKey(runKey))

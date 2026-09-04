@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -691,7 +690,22 @@ func runWallReplay(args []string) error {
 		return fmt.Errorf("Stage 1 binds scorer %s but none was supplied; pass --scorer so the replay allocates the way the plan did", lineage.ScorerDigest)
 	}
 
-	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{Bundle: &bundle, Stage1: stage1, Scorer: scorer})
+	// REPLAY CARRIES THE ISSUED CLAIM; IT DOES NOT TAKE ONE.
+	//
+	// The claim is a field of the receipt being re-derived, so a replay that
+	// omitted it produced a receipt the schema refuses and failed inside
+	// derivation before it could compare anything — every otherwise-valid
+	// preflight unusable. Minting a fresh claim here would be worse: replay is
+	// deliberately not a second authorised execution, and a claim it invented
+	// would compare equal to nothing.
+	//
+	// So the issued claim is passed through and then CHECKED like every other
+	// field, by Matches below. Replay's job is to show the same derivation
+	// produces the same document, and the claim is part of that document.
+	res, err := planbind.Plan(context.Background(), planbind.PlanOptions{
+		Bundle: &bundle, Stage1: stage1, Scorer: scorer,
+		PlannerClaim: issued.PlannerClaim,
+	})
 	if err != nil {
 		return err
 	}
@@ -1320,10 +1334,6 @@ const plannerClaimStoreEnv = "TB_WALL_PLANNER_CLAIM_STORE"
 // pathname suggests.
 const plannerClaimAttestationEnv = "TB_WALL_PLANNER_CLAIM_STORE_ATTESTATION"
 
-// plannerStoreSubject namespaces what that signature is over, so a signature
-// taken for some other purpose cannot be replayed as a durability attestation.
-const plannerStoreSubject = "tb.walltime.planner-claim-store/v1\x00"
-
 // plannerClaimAuthorityKeysEnv carries the predeclared campaign-authority
 // public keys the store attestation is verified against. A signature checked
 // against whatever signed it is one anybody can mint.
@@ -1415,12 +1425,11 @@ func plannerStoreAttested(store string) bool {
 	if sig == "" || len(keys) == 0 {
 		return false
 	}
+	subject := walltime.PlannerClaimStoreSubject(store)
 	return walltime.VerifySigned(&walltime.Signature{
-		Authority: walltime.CampaignAuthority,
-		KeyID:     keys[0],
-		Digest:    walltime.DigestBytes([]byte(plannerStoreSubject + store)),
-		Value:     sig,
-	}, walltime.DigestBytes([]byte(plannerStoreSubject+store)), keys) == nil
+		Authority: walltime.CampaignAuthority, KeyID: keys[0],
+		Digest: subject, Value: sig,
+	}, subject, keys) == nil
 }
 
 // claimPlannerExecution takes an exclusive claim on deriving the plan
@@ -1442,9 +1451,16 @@ func claimPlannerExecution(configured string, stage1, bundle walltime.Digest) (p
 		return plannerClaim{}, err
 	}
 	// The two digests, in a fixed order, are the derivation's identity.
-	key := fmt.Sprintf("%x", sha256.Sum256([]byte(string(stage1)+"\x00"+string(bundle))))
+	// The canonical key both parties compute: whoever checks the receipt
+	// re-derives it rather than trusting the spelling.
+	key := walltime.PlannerClaimKey(stage1, bundle)
 	claim := plannerClaim{receipt: &walltime.PlannerClaimReceipt{
 		Store: stores[len(stores)-1], Durable: durable, Key: key, Stage1: stage1, Bundle: bundle,
+		// The authority's signed statement about the store travels WITH the
+		// claim, so a reader of the Stage-2 receipt can reach the durability
+		// conclusion themselves instead of believing the flag beside it.
+		Attestation:   strings.TrimSpace(os.Getenv(plannerClaimAttestationEnv)),
+		AuthorityKeys: splitList(os.Getenv(plannerClaimAuthorityKeysEnv)),
 	}}
 	for _, dir := range stores {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -1467,6 +1483,15 @@ func claimPlannerExecution(configured string, stage1, bundle walltime.Digest) (p
 		encErr := enc.Encode(claim.receipt)
 		syncErr := f.Sync()
 		closeErr := f.Close()
+		// THE DIRECTORY ENTRY IS COMMITTED TOO. Syncing the file makes its
+		// CONTENTS durable; the entry that makes it findable lives in the
+		// directory, and a crash between the two leaves a claim nobody can
+		// see — which is exactly the state a second attempt would read as
+		// "not yet claimed".
+		if dh, derr := os.Open(dir); derr == nil {
+			_ = dh.Sync()
+			_ = dh.Close()
+		}
 		claim.paths = append(claim.paths, path)
 		for _, e := range []error{encErr, syncErr, closeErr} {
 			if e != nil {

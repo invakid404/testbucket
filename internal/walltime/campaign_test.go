@@ -217,7 +217,7 @@ func campaignFixture(t *testing.T) (CampaignIndex, memoryLoader, []string, ed255
 						// The single derived plan this arm realized. Every row
 						// of one arm names the same one, which is what binds
 						// the arm to one plan rather than to eight.
-						Stage2:            Digest("sha256:stage2-" + runID),
+						Stage2:            DigestBytes([]byte("stage2-" + runID)),
 						ComponentRegistry: regDigest,
 						// The delivery-bound verifier that judged this row.
 						// It must be the identity the verdict is signed
@@ -368,14 +368,14 @@ func addFixtureAblations(t *testing.T, idx *CampaignIndex, loader memoryLoader, 
 		// manifest that authorised it. A stratum label with no plan behind it
 		// is an intent; this is what the run realized.
 		receiptPath := fmt.Sprintf("ablation-stage2-%s.json", stratum)
-		receipt := testReceipt(stage1, Digest("sha256:ablation-bundle-"+stratum))
+		receipt := testReceipt(stage1, DigestBytes([]byte("ablation-bundle-"+stratum)))
 		// Four DIFFERENT experiments derive four different plans. Whole-file
 		// multi-file, collision-atom, legal-non-atom-slice and sequential
 		// runs produce materially different atom and membership documents, and
 		// the fixture says so rather than handing them one generic shape.
-		receipt.PlanDigest = Digest("sha256:plan-" + stratum)
-		receipt.TopologyDigest = Digest("sha256:topology-" + stratum)
-		receipt.InvocationDigest = Digest("sha256:invocations-" + stratum)
+		receipt.PlanDigest = DigestBytes([]byte("plan-" + stratum))
+		receipt.TopologyDigest = DigestBytes([]byte("topology-" + stratum))
+		receipt.InvocationDigest = DigestBytes([]byte("stratum-fixture"))
 		// THE PLAN THIS STRATUM ACTUALLY DERIVED. Four different experiments
 		// produce four materially different documents, and the receipt binds
 		// the digests OF THOSE DOCUMENTS rather than four arbitrary strings.
@@ -490,7 +490,9 @@ func TestCampaignIndexRefusals(t *testing.T) {
 		{
 			name: "a row bound to another Stage-1 manifest",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
-				resign(l.verdicts["baseline-0-3.json"], testVerdictAuthority, func(v *Verdict) { v.Run.Stage1 = "sha256:elsewhere" })
+				resign(l.verdicts["baseline-0-3.json"], testVerdictAuthority, func(v *Verdict) {
+					v.Run.Stage1 = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
+				})
 			},
 			want: "names Stage-1",
 		},
@@ -578,7 +580,7 @@ func TestCampaignIndexRefusals(t *testing.T) {
 			name: "a verdict produced by an unapproved verifier",
 			edit: func(i *CampaignIndex, l memoryLoader, key ed25519.PrivateKey) {
 				resign(l.verdicts["baseline-3-0.json"], testVerdictAuthority, func(v *Verdict) {
-					v.VerifierBinary = Digest("sha256:" + strings.Repeat("cc", 32))
+					v.VerifierBinary = DigestBytes([]byte("other-cc"))
 				})
 			},
 			want: "not the",
@@ -1098,7 +1100,7 @@ func TestCampaignMustExecuteTheFrozenPairOrder(t *testing.T) {
 		{
 			name: "the index claims an order the authority did not freeze",
 			edit: func(t *testing.T, idx *CampaignIndex, _ map[string]*Stage1Manifest, _ ed25519.PrivateKey) {
-				idx.OrderDigest = "sha256:some-other-order"
+				idx.OrderDigest = "sha256:4aebe01dbb7d7e463f9e04505ca37c838fa4dacf035ed0e8b64a1d4dd85f7119"
 			},
 			want: "but the authority froze",
 		},
@@ -1563,11 +1565,17 @@ func TestAnArmMustBeOneRunOfTheWorkflow(t *testing.T) {
 		{"step", func(r *RunIdentity) { r.Step = "another-step" }, "not the same run of the workflow"},
 		// Stage-2 is in the set, so an arm is also bound to ONE derived plan
 		// rather than to eight.
-		{"Stage-2", func(r *RunIdentity) { r.Stage2 = Digest("sha256:" + strings.Repeat("b", 64)) }, "not the same run of the workflow"},
-		{"component registry", func(r *RunIdentity) { r.ComponentRegistry = Digest("sha256:" + strings.Repeat("c", 64)) }, "not the same run of the workflow"},
+		{"Stage-2", func(r *RunIdentity) {
+			r.Stage2 = DigestBytes([]byte("other-b"))
+		}, "not the same run of the workflow"},
+		{"component registry", func(r *RunIdentity) {
+			r.ComponentRegistry = DigestBytes([]byte("other-c"))
+		}, "not the same run of the workflow"},
 		{"campaign", func(r *RunIdentity) { r.CampaignID = "another-campaign" }, "not the same run of the workflow"},
 		{"run", func(r *RunIdentity) { r.RunID = "another-run" }, "not the same run of the workflow"},
-		{"Stage-1", func(r *RunIdentity) { r.Stage1 = Digest("sha256:" + strings.Repeat("d", 64)) }, "not the same run of the workflow"},
+		{"Stage-1", func(r *RunIdentity) {
+			r.Stage1 = DigestBytes([]byte("other-d"))
+		}, "not the same run of the workflow"},
 		// The verifier identity is refused one check earlier, by the rule that
 		// the identity which judged a row must be the identity that signed the
 		// verdict. Asserted here for completeness of the field set, with the

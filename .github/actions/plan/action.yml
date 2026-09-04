@@ -108,6 +108,27 @@ inputs:
       only says this file does not already exist, and it is consulted after the
       planner has run. `claim-dir` is what makes the one-shot rule mechanical.
     default: ""
+  claim-store-attestation:
+    description: >-
+      The campaign authority's SIGNATURE over the claim store's identity, which
+      is what makes the store durable rather than merely configured.
+
+      Durability used to be inferred from "a path was configured", which an
+      arbitrary directory on a fresh runner satisfies exactly as well as a
+      shared store — the planner certifying the constraint the planner is
+      subject to. The signature is produced by the party that provisioned the
+      store, travels into the Stage-2 receipt with the claim, and is re-verified
+      wherever the receipt is read.
+
+      A SCORED derivation refuses to plan without it. Left empty the claim is
+      taken in the machine store and reported non-durable.
+    default: ""
+  campaign-authority-keys:
+    description: >-
+      Comma-separated PREDECLARED campaign-authority public keys the store
+      attestation is verified against. A signature checked against whatever
+      signed it is one anybody can mint.
+    default: ""
   claim-store:
     description: >-
       DURABLE directory holding the one-shot planner claim. The contract allows
@@ -223,6 +244,8 @@ runs:
         TB_REGISTRY: ${{ inputs.registry }}
         TB_DERIVED_OUT: ${{ inputs.derived-out }}
         TB_CLAIM_STORE: ${{ inputs.claim-store }}
+        TB_WALL_PLANNER_CLAIM_STORE_ATTESTATION: ${{ inputs.claim-store-attestation }}
+        TB_WALL_CAMPAIGN_AUTHORITY_KEYS: ${{ inputs.campaign-authority-keys }}
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
         TB_AUTHORITY: ${{ inputs.authority }}
       run: |

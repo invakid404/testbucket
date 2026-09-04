@@ -21,7 +21,7 @@ func frozenScorer() *walltime.Scorer {
 		Coefficients:  map[string]float64{"atom_size": 1, "runnable_count": 2},
 		Intercept:     5, Floor: 0.1,
 		Lineage: walltime.TrainingLineageID{
-			ReceiptSetDigest: "sha256:sealed", Cutoff: "2026-08-30T00:00:00Z",
+			ReceiptSetDigest: "sha256:c9d0036bed6744bcdf692fc980d8717d7e5f5a4f4e8266b4a84982602fb1cd09", Cutoff: "2026-08-30T00:00:00Z",
 			Epoch: "vitest-4.1.10", ScorerID: "test-scorer",
 			Algorithm: "ridge-least-squares", TieBreak: "unit_id_ascending",
 		},
@@ -36,7 +36,7 @@ func TestPallocAllocatesWithoutTouchingTheMatrix(t *testing.T) {
 	b := acquire(t, root, nil)
 
 	plain := plan(t, b)
-	scored, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: frozenScorer()}))
+	scored, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f", Scorer: frozenScorer()}))
 	if err != nil {
 		t.Fatalf("Plan with a frozen scorer: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestAllocationFailsClosed(t *testing.T) {
 	b := acquire(t, root, nil)
 	sc := frozenScorer()
 	sc.FeatureSchema = append(sc.FeatureSchema, "previous_run_seconds")
-	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: sc}))
+	_, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f", Scorer: sc}))
 	if err == nil {
 		t.Fatalf("a plan succeeded with a scorer whose schema the builder cannot satisfy")
 	}
@@ -112,11 +112,11 @@ func TestAllocationFailsClosed(t *testing.T) {
 func TestFeatureVectorsCarryOnlyPreplanProvenance(t *testing.T) {
 	root := t.TempDir()
 	b := acquire(t, root, nil)
-	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1", Scorer: frozenScorer()}))
+	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f", Scorer: frozenScorer()}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	fb := NewFeatureBuilder(b, nil, "sha256:stage1")
+	fb := NewFeatureBuilder(b, nil, "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f")
 	allowed := map[string]bool{
 		walltime.ProvUnitIdentity: true, walltime.ProvDiscoverySnapshot: true,
 		walltime.ProvRunnableSnapshot: true, walltime.ProvPreplanAtom: true,
@@ -175,7 +175,7 @@ func TestRunnableCountComesFromTheFrozenListing(t *testing.T) {
 		t.Errorf("the frozen names are not in the parser's order: %v", snap.Names)
 	}
 
-	fb := NewFeatureBuilder(b, nil, "sha256:stage1")
+	fb := NewFeatureBuilder(b, nil, "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f")
 	v := fb.Vector(runner.Unit{
 		ID: "tests/alpha.spec.ts", Kind: runner.KindPackage, Count: 1,
 		Packages: []runner.LivePackage{{ID: "tests/alpha.spec.ts", HasTests: true}},

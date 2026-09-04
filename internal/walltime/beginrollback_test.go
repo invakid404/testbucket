@@ -48,7 +48,7 @@ func TestBeginActionCleansUpEverythingItStarted(t *testing.T) {
 		}
 	})
 
-	run := RunIdentity{CampaignID: "ewj2", RunID: "post-admit-failure", BucketID: "bucket-0", Stage2: "sha256:stage2"}
+	run := RunIdentity{CampaignID: "ewj2", RunID: "post-admit-failure", BucketID: "bucket-0", Stage2: "sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5"}
 	if _, err := BeginAction(dir, run, 30*time.Second); err == nil {
 		t.Fatal("BeginAction succeeded despite a roster path it could not write")
 	}

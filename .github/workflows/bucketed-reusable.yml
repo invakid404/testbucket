@@ -33,8 +33,32 @@ name: testbucket bucketed (reusable)
 # this file in .github/actionlint.yaml, with the same reasoning written there.
 
 on:
+  # CALLER PERMISSIONS.
+  #
+  # This workflow's jobs download artifacts and, for a scored arm, read this
+  # job's own step timestamps back, both of which need `actions: read` on the
+  # CALLER's token. A reusable workflow cannot request more than its caller
+  # granted — it can only narrow — so the requirement is stated here rather
+  # than declared in the jobs, where declaring it would break every caller that
+  # grants only `contents: read` and does not use wall time at all.
+  #
+  # A caller that wants a scored row grants:
+  #
+  #     permissions:
+  #       contents: read
+  #       actions: read
+  #
+  # A caller that grants less is not silently downgraded: the A_GH collector
+  # says it could not read the step attempt and exits 0, and the verifier
+  # reports the row INELIGIBLE. That is the fail-closed path.
   workflow_call:
     secrets:
+      planner-claim-store-attestation:
+        description: >-
+          The campaign authority's signature over the planner claim store's
+          identity. It is what makes the store DURABLE rather than merely
+          configured, and a scored derivation refuses to plan without it.
+        required: false
       # Declared by NAME so an external caller can pass them. Without a
       # `secrets:` block a called workflow receives none, and `secrets: inherit`
       # only works when the caller is in the same organisation or repository —
@@ -184,6 +208,13 @@ on:
           containment is done by the script-level wrapper on request rather
           than by the measured script, whose containment is never delegated
           to it.
+        type: string
+        default: ""
+      campaign-authority-keys:
+        description: >-
+          Comma-separated PREDECLARED campaign-authority public keys. The claim
+          store's durability attestation is verified against these; a signature
+          checked against whatever signed it is one anybody can mint.
         type: string
         default: ""
       planner-claim-store:
@@ -493,6 +524,13 @@ jobs:
           # claim needs the same durable external channel the campaign
           # evidence handoff needs.
           claim-store: ${{ inputs.frozen-inputs-artifact != '' && inputs.planner-claim-store || '' }}
+          # The authority's signed statement that the store outlives a runner,
+          # and the predeclared keys it verifies against. Without both, a
+          # SCORED derivation refuses to plan: a configured pathname is
+          # something the planner can choose for itself, and the planner is the
+          # party whose one-shot behaviour is being constrained.
+          claim-store-attestation: ${{ secrets.planner-claim-store-attestation }}
+          campaign-authority-keys: ${{ inputs.campaign-authority-keys }}
           authority-key: ${{ inputs.authority-key }}
           authority: ${{ inputs.authority }}
 
@@ -522,11 +560,15 @@ jobs:
   test:
     needs: plan
     runs-on: ${{ inputs.runs-on }}
-    # No `permissions:` block here on purpose. A called reusable workflow can
-    # only NARROW what its caller granted, never request more, so declaring
-    # `actions: read` would make every existing caller that grants only
-    # `contents: read` fail at startup — a break for consumers who do not use
-    # wall-time at all.
+    # No `permissions:` block here on purpose, and the requirement is stated
+    # in the workflow_call contract instead — see CALLER PERMISSIONS above.
+    #
+    # A called reusable workflow can only NARROW what its caller granted, never
+    # request more, so declaring `actions: read` here would make every existing
+    # caller that grants only `contents: read` fail at startup — a break for
+    # consumers who do not use wall-time at all. Declaring it would therefore
+    # not make the permission explicit; it would make the workflow unusable for
+    # callers that legitimately do not need it.
     #
     # The A_GH collector needs `actions: read` to read this job's own step
     # timestamps back. A caller that wants a scored row grants it; a caller

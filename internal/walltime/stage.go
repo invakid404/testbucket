@@ -3,6 +3,7 @@ package walltime
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -1720,6 +1721,26 @@ func (r Stage2Receipt) Validate() error {
 	if r.Stage1Digest == "" || r.BundleDigest == "" {
 		return fmt.Errorf("stage-2 receipt does not name its parent Stage-1 manifest and input bundle")
 	}
+	// AND THEY ARE DIGESTS, not merely non-empty.
+	//
+	// These fields are documented and signed as SHA-256 identities while
+	// validation asked only that they were set, so "sha256:stage1" passed. A
+	// signature over a malformed identity is a signature over a label: it
+	// binds the spelling and proves nothing about what was hashed.
+	if err := requireDigests(map[string]Digest{
+		"the parent Stage-1 manifest":  r.Stage1Digest,
+		"the parent input bundle":      r.BundleDigest,
+		"the full plan document":       r.PlanDigest,
+		"the semantic plan projection": r.SemanticDigest,
+		"the atoms":                    r.AtomDigest,
+		"the topology":                 r.TopologyDigest,
+		"the rendered membership":      r.MembershipDigest,
+		"the invocations":              r.InvocationDigest,
+		"the generated script":         r.ScriptDigest,
+		"the matrix":                   r.MatrixDigest,
+	}); err != nil {
+		return fmt.Errorf("stage-2 receipt %w", err)
+	}
 	// THE ONE-SHOT CLAIM IS PART OF THE RECEIPT, and it is checked here.
 	//
 	// Carrying the claim inside the Stage-2 digest protects the SPELLING of an
@@ -2124,6 +2145,28 @@ type PlannerClaimReceipt struct {
 	Stage1    Digest `json:"stage1_digest"`
 	Bundle    Digest `json:"bundle_digest"`
 	ClaimedAt string `json:"claimed_at,omitempty"`
+	// Attestation is the campaign authority's SIGNATURE over the store
+	// identity, and AuthorityKeys are the predeclared keys it verifies
+	// against. They travel with the claim so that durability is something a
+	// reader of the receipt can check, rather than a Boolean the producer
+	// wrote about itself.
+	Attestation   string   `json:"store_attestation,omitempty"`
+	AuthorityKeys []string `json:"authority_keys,omitempty"`
+}
+
+// PlannerClaimKey is the canonical identity of one derivation: the hash of its
+// Stage-1 manifest and its planning-input bundle, in that order. Both the party
+// taking the claim and the party checking the receipt compute it the same way,
+// so neither has to trust the other's spelling.
+func PlannerClaimKey(stage1, bundle Digest) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(string(stage1)+"\x00"+string(bundle))))
+}
+
+// PlannerClaimStoreSubject namespaces what the authority signs when it attests
+// that a claim store outlives a runner, so a signature taken for some other
+// purpose cannot be replayed as a durability statement.
+func PlannerClaimStoreSubject(store string) Digest {
+	return DigestBytes([]byte("tb.walltime.planner-claim-store/v1\x00" + store))
 }
 
 // validateFor requires a claim that exists, is durable, and belongs to this
@@ -2140,8 +2183,36 @@ func (c *PlannerClaimReceipt) validateFor(stage1, bundle Digest) error {
 	if strings.TrimSpace(c.Store) == "" || strings.TrimSpace(c.Key) == "" {
 		return fmt.Errorf("carries a planner claim that names no store or no derivation key, so it identifies no one-shot event")
 	}
+	// THE KEY IS RECOMPUTED, not read.
+	//
+	// An arbitrary non-empty string satisfied "has a key", so a hand-authored
+	// claim could name its own derivation anything. The key is the canonical
+	// hash of the two parents, which means anyone checking the receipt can
+	// derive it rather than take it on trust — and a claim whose key is not
+	// that hash is a claim about some other derivation, or about nothing.
+	if want := PlannerClaimKey(stage1, bundle); c.Key != want {
+		return fmt.Errorf("carries a planner claim keyed %q, but the canonical key for Stage-1 %s over bundle %s is %q; a key that is not the hash of its own parents cannot be recomputed by anyone checking it",
+			c.Key, stage1, bundle, want)
+	}
 	if !c.Durable {
 		return fmt.Errorf("carries a planner claim taken in %q, which is not durable across workflow attempts; a claim a rerun cannot see does not establish that the planner ran once", c.Store)
+	}
+	// AND DURABILITY IS EVIDENCE, not a Boolean the producer set.
+	//
+	// Durable was a field the planner wrote about itself, so a hand-authored
+	// receipt asserting it was indistinguishable from one that earned it. The
+	// authority's signed statement about the store travels with the claim and
+	// is re-verified here, which is what lets a reader of the receipt reach the
+	// same conclusion instead of believing the flag.
+	if strings.TrimSpace(c.Attestation) == "" || len(c.AuthorityKeys) == 0 {
+		return fmt.Errorf("carries a planner claim asserting durability with no authority attestation for store %q; a durability flag the producer set is not evidence that the store outlives a runner", c.Store)
+	}
+	subject := PlannerClaimStoreSubject(c.Store)
+	if err := VerifySigned(&Signature{
+		Authority: CampaignAuthority, KeyID: c.AuthorityKeys[0],
+		Digest: subject, Value: c.Attestation,
+	}, subject, c.AuthorityKeys); err != nil {
+		return fmt.Errorf("carries a planner claim whose durability attestation for store %q does not verify: %w", c.Store, err)
 	}
 	if c.Stage1 != stage1 || c.Bundle != bundle {
 		return fmt.Errorf("carries a planner claim for Stage-1 %s over bundle %s, but the receipt derives Stage-1 %s over bundle %s; a claim on another derivation is not a claim on this one",

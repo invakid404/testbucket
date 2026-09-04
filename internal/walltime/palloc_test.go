@@ -254,7 +254,7 @@ func TestPcheckProjectsFrozenValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	palloc, features := scoredPalloc(*scorer, map[string]float64{"u1": 3, "u2": 4.5})
-	doc, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer, palloc, features, []PcheckInvocation{
+	doc, err := BuildPcheck("sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5", "sha256:bf5cf59e356652253268c604cbf8df8cfdb03a4a0d32b27ad158e581709c80e4", *scorer, palloc, features, []PcheckInvocation{
 		{Seq: 0, BucketIndex: 1, Units: []string{"u1", "u2"}},
 	}, 1, "bucket-1")
 	if err != nil {
@@ -263,7 +263,7 @@ func TestPcheckProjectsFrozenValues(t *testing.T) {
 	if got := doc.Invocations[0].PredictedNs; got != int64(7.5*float64(second)) {
 		t.Errorf("Pcheck = %d ns, want 7.5 s", got)
 	}
-	if _, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer, palloc, features, []PcheckInvocation{
+	if _, err := BuildPcheck("sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5", "sha256:bf5cf59e356652253268c604cbf8df8cfdb03a4a0d32b27ad158e581709c80e4", *scorer, palloc, features, []PcheckInvocation{
 		{Seq: 0, Units: []string{"u1", "unknown"}},
 	}, 1, "bucket-1"); err == nil {
 		t.Errorf("a unit with no frozen Palloc value was projected as zero")
@@ -280,7 +280,7 @@ func TestPcheckRecomputes(t *testing.T) {
 		t.Fatal(err)
 	}
 	palloc, features := scoredPalloc(*scorer, map[string]float64{"u1": 3, "u2": 4.5})
-	doc, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer, palloc, features, []PcheckInvocation{
+	doc, err := BuildPcheck("sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5", "sha256:bf5cf59e356652253268c604cbf8df8cfdb03a4a0d32b27ad158e581709c80e4", *scorer, palloc, features, []PcheckInvocation{
 		{Seq: 0, BucketIndex: 1, Units: []string{"u1", "u2"}},
 		{Seq: 1, BucketIndex: 1, Units: []string{"u1"}},
 	}, 1, "bucket-1")
@@ -310,7 +310,7 @@ func TestPcheckRecomputes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base, baseFeatures := scoredPalloc(*scorer, map[string]float64{"u1": 3, "u2": 4.5})
-			edited, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer,
+			edited, err := BuildPcheck("sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5", "sha256:bf5cf59e356652253268c604cbf8df8cfdb03a4a0d32b27ad158e581709c80e4", *scorer,
 				base, baseFeatures, []PcheckInvocation{
 					{Seq: 0, BucketIndex: 1, Units: []string{"u1", "u2"}},
 					{Seq: 1, BucketIndex: 1, Units: []string{"u1"}},
@@ -417,7 +417,7 @@ func TestPcheckIsReDerivedFromTheFrozenScorer(t *testing.T) {
 			c.Features = append([]Feature(nil), fv.Features...)
 			fs = append(fs, c)
 		}
-		doc, err := BuildPcheck("sha256:stage2", "sha256:membership", *scorer, p, fs,
+		doc, err := BuildPcheck("sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5", "sha256:bf5cf59e356652253268c604cbf8df8cfdb03a4a0d32b27ad158e581709c80e4", *scorer, p, fs,
 			[]PcheckInvocation{{Seq: 0, BucketIndex: 1, Units: []string{"u1", "u2"}}}, 1, "bucket-1")
 		if err != nil {
 			t.Fatal(err)

@@ -66,7 +66,7 @@ func TestTheDelegateTheActionExportsIsExactlyOneDecodableValue(t *testing.T) {
 		return runWallBegin([]string{
 			"--dir", wall, "--timeout", "8s",
 			"--campaign-id", "ewj2", "--run-id", "export-1", "--bucket-id", "bucket-0",
-			"--stage1", "sha256:s1", "--stage2", "sha256:s2",
+			"--stage1", "sha256:e8bc163c82eee18733288c7d4ac636db3a6deb013ef2d37b68322be20edc45cc", "--stage2", "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4",
 		})
 	})
 	if err != nil {

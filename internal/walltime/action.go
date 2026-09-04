@@ -539,6 +539,12 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 		return 1, fmt.Errorf("walltime: retain the identity of an action-owned child: %w", err)
 	}
 	if err := child.close(); err != nil {
+		// THE CHILD IS ALREADY RUNNING. Returning here left a started process
+		// unreaped whenever the ledger close reported a real error — the one
+		// post-Start path that did not terminate and wait. A lifecycle that
+		// cannot be recorded still has to end.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return 1, fmt.Errorf("walltime: close the action-child ledger: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {

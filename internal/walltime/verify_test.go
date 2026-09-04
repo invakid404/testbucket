@@ -272,8 +272,8 @@ func writeFrozenDocs(t *testing.T, dir string, s *synthRun) frozenDocs {
 // integrity of the bytes that reported it.
 func testTools(head string) map[string]ToolIdentity {
 	return map[string]ToolIdentity{
-		head:   {Version: "4.1.10", Path: "/repo/node_modules/.bin/" + head, Integrity: "sha256:head"},
-		"node": {Version: "24.19.0", Path: "/usr/bin/node", Integrity: "sha256:node"},
+		head:   {Version: "4.1.10", Path: "/repo/node_modules/.bin/" + head, Integrity: "sha256:9f2e6d33a3717ee826353a404ba4618d1aeeb6879ad7936bce8ed5f46814924d"},
+		"node": {Version: "24.19.0", Path: "/usr/bin/node", Integrity: "sha256:545ea538461003efdc8c81c244531b003f6f26cfccf6c0073b3239fdedf49446"},
 	}
 }
 
@@ -300,7 +300,7 @@ func testBundle() PlanningInputBundle {
 	b.Store = NewRawSnapshot("test-timings.json", nil, "/repo", testStoreBytes())
 	b.Source.Repository = FrozenProfileRepository
 	b.Source.Commit = testConsumerCommit
-	b.Source.Tree = "sha256:tree"
+	b.Source.Tree = "sha256:dc9c5edb8b2d479e697b4b0b8ab874f32b325138598ce9e7b759eb8292110622"
 	b.Acquisition.Argv = []string{"testbucket", "wall", "bundle"}
 	b.Acquisition.Cwd = "/repo"
 	b.Acquisition.Env = map[string]string{"TB_DISCOVERY_EXCLUDE_PREFIXES": "shared/f/lib/cases/"}
@@ -599,9 +599,9 @@ const (
 func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	m := Stage1Manifest{Kind: Stage1Kind, Role: "candidate", Bundle: b}
 	m.Actions = map[string]ActionIdentity{
-		"plan":       {Commit: testTip, ContentDigest: "sha256:plan"},
-		"run-bucket": {Commit: testTip, ContentDigest: "sha256:run"},
-		"record":     {Commit: testTip, ContentDigest: "sha256:record"},
+		"plan":       {Commit: testTip, ContentDigest: "sha256:64879f7d6b960a01909762d911a32d4582c20010c5641ee90278b644a9e3b525"},
+		"run-bucket": {Commit: testTip, ContentDigest: "sha256:acba25512100f80b56fc3ccd14c65be55d94800cda77585c5f41a887e398f9be"},
+		"record":     {Commit: testTip, ContentDigest: "sha256:70ce871f8a3d3fb449bc3c3ace6547cef02dfc74ffe48d912532a724bfdbe5b9"},
 	}
 	m.Source.ReviewTip = testTip
 	m.Source.ReleaseRefSHA = testTip
@@ -656,15 +656,15 @@ func testReceipt(stage1, bundle Digest) Stage2Receipt {
 		// Every real derivation is performed under a one-shot claim, so the
 		// fixture that stands in for one carries it too.
 		PlannerClaim:     fixtureClaim(stage1, bundle),
-		InputAccess:      []InputAccess{{Field: "discovery[0]", Digest: "sha256:disc"}},
-		PlanDigest:       "sha256:plan-full",
-		SemanticDigest:   "sha256:plan-semantic",
-		AtomDigest:       "sha256:atoms",
-		TopologyDigest:   "sha256:topology",
-		MembershipDigest: "sha256:membership",
-		InvocationDigest: "sha256:invocations",
-		ScriptDigest:     "sha256:script",
-		MatrixDigest:     "sha256:matrix",
+		InputAccess:      []InputAccess{{Field: "discovery[0]", Digest: "sha256:6bf99799d0ef91be6c25a22943f74caaf655814b216ee8cb52ef61223d4f2d06"}},
+		PlanDigest:       "sha256:29130eaddf40512cc8c42f7de5e0fab6ccbb458632b0520c13cbbdb9942ffa35",
+		SemanticDigest:   "sha256:99d4a41b72705f3119da7c3aabd5b4bc37b9b0ed2d0fa7a884d424858dfe2b8e",
+		AtomDigest:       "sha256:bb112e00adab41da3eb94bae7e85c88c6eb4a71738ca9d3b432fabe1e91d5813",
+		TopologyDigest:   "sha256:e6e2b826e31fca5c36125c48f130dcb6f961e698ff8a8776a1f290cf0892e8e6",
+		MembershipDigest: "sha256:bf5cf59e356652253268c604cbf8df8cfdb03a4a0d32b27ad158e581709c80e4",
+		InvocationDigest: "sha256:60bbdfe432754c3b18c1f8fe5707acf7a6829bea0e58ccf7f36e26581c166a70",
+		ScriptDigest:     "sha256:21a0270b7f66a1e4c25933f13a1e5a1bbb4757578072930c8189131f9c6aaae1",
+		MatrixDigest:     "sha256:6e00cd562cc2d88e238dfb81d9439de7ec843ee9d0c9879d549cb1436786f975",
 		PlannerResult:    "ok", RendererResult: "ok",
 	}
 	r.Algorithms.FullPlan = AlgorithmIdentity{Name: FullPlanDigestAlgorithm, Canonicalizer: CanonAlgorithm, Implementation: "testbucket"}
@@ -861,7 +861,7 @@ func TestVerifierRefusals(t *testing.T) {
 		{
 			name: "records name a plan nobody authorised", code: "WT-018",
 			mutate: func(l Level, seq int, p Producer, b string, r *Record) {
-				r.Run.Stage2 = "sha256:some-other-plan"
+				r.Run.Stage2 = "sha256:43cba9100261b85ebbfb321f769cb66f73c717e41518a1a1bedce4eadb4a0737"
 			},
 		},
 	}
@@ -979,7 +979,7 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			name: "a projection of some other plan's membership",
 			edit: func(t *testing.T, docs frozenDocs) {
 				editJSON(t, docs.pcheck, func(m map[string]any) {
-					m["rendered_membership_digest"] = "sha256:elsewhere"
+					m["rendered_membership_digest"] = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
 				})
 			},
 			want: "covers membership",
@@ -1002,7 +1002,7 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			name: "a replay that derived a different plan",
 			edit: func(t *testing.T, docs frozenDocs) {
 				editJSON(t, docs.replay, func(m map[string]any) {
-					m["recomputed"].(map[string]any)["atom_digest"] = "sha256:different-atoms"
+					m["recomputed"].(map[string]any)["atom_digest"] = "sha256:4b0d66adcaa2f52b74292aaaa14203f9f28770b51f88647d625e0ad3895aee66"
 				})
 			},
 			want: "derived a different plan",
@@ -1010,7 +1010,9 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 		{
 			name: "a replay attesting to another receipt",
 			edit: func(t *testing.T, docs frozenDocs) {
-				editJSON(t, docs.replay, func(m map[string]any) { m["stage2_digest"] = "sha256:elsewhere" })
+				editJSON(t, docs.replay, func(m map[string]any) {
+					m["stage2_digest"] = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
+				})
 			},
 			want: "attests to Stage-2 receipt",
 		},
@@ -1018,7 +1020,7 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			name: "a replay run by an unapproved verifier binary",
 			edit: func(t *testing.T, docs frozenDocs) {
 				editJSON(t, docs.replay, func(m map[string]any) {
-					m["verifier_binary"] = "sha256:" + strings.Repeat("ab", 32)
+					m["verifier_binary"] = DigestBytes([]byte("other-ab"))
 				})
 			},
 			want: "not the",
@@ -1040,7 +1042,7 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			edit: func(t *testing.T, docs frozenDocs) {
 				editJSON(t, docs.invocations, func(m map[string]any) {
 					invs := m["invocations"].([]any)
-					invs[0].(map[string]any)["selector_digest"] = "sha256:another-selection"
+					invs[0].(map[string]any)["selector_digest"] = "sha256:68df8eca59d955300aa9b2917246ed70bc4378c8def3668362debe79bec80f8e"
 				})
 			},
 			want: "selector digest",
@@ -1050,7 +1052,7 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 			edit: func(t *testing.T, docs frozenDocs) {
 				editJSON(t, docs.invocations, func(m map[string]any) {
 					invs := m["invocations"].([]any)
-					invs[1].(map[string]any)["unit_digest"] = "sha256:different-membership"
+					invs[1].(map[string]any)["unit_digest"] = "sha256:5ac3c8804f65ddc376113654eaf96a19681d5035ba181d7a87380fd26565c748"
 				})
 			},
 			want: "unit membership digest",
@@ -1068,14 +1070,18 @@ func TestVerifierRefusesUnboundDerivedDocuments(t *testing.T) {
 		{
 			name: "an invocation manifest for another plan",
 			edit: func(t *testing.T, docs frozenDocs) {
-				editJSON(t, docs.invocations, func(m map[string]any) { m["stage2_digest"] = "sha256:elsewhere" })
+				editJSON(t, docs.invocations, func(m map[string]any) {
+					m["stage2_digest"] = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
+				})
 			},
 			want: "invocation manifest names Stage-2",
 		},
 		{
 			name: "a forecast for another plan",
 			edit: func(t *testing.T, docs frozenDocs) {
-				editJSON(t, docs.aeta, func(m map[string]any) { m["stage2_digest"] = "sha256:elsewhere" })
+				editJSON(t, docs.aeta, func(m map[string]any) {
+					m["stage2_digest"] = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
+				})
 			},
 			want: "names Stage-2",
 		},
@@ -1129,7 +1135,7 @@ func TestVerifierRefusesAnUnapprovedProducerBinary(t *testing.T) {
 	s.stage2 = docs.digest
 	s.write(t, nil)
 	editJSON(t, docs.stage1, func(m map[string]any) {
-		m["instrumentation"].(map[string]any)["trace_binary"] = "sha256:" + strings.Repeat("ab", 32)
+		m["instrumentation"].(map[string]any)["trace_binary"] = DigestBytes([]byte("other-ab"))
 	})
 	v, err := VerifyDir(VerifyOptions{
 		Dir: s.dir, Stage1Path: docs.stage1, Stage2Path: docs.stage2,
@@ -1205,7 +1211,7 @@ func TestStage1BindsEveryRequiredIdentity(t *testing.T) {
 		want string
 	}{
 		{"an abbreviated action commit", func(m *Stage1Manifest) {
-			m.Actions["plan"] = ActionIdentity{Commit: "693a1998", ContentDigest: "sha256:plan"}
+			m.Actions["plan"] = ActionIdentity{Commit: "693a1998", ContentDigest: "sha256:64879f7d6b960a01909762d911a32d4582c20010c5641ee90278b644a9e3b525"}
 		}, "full 40-character commit SHA"},
 		{"no release ref to prove the delivery", func(m *Stage1Manifest) { m.Source.ReleaseRefSHA = "" }, "release ref SHA"},
 		{"a release ref that is not the reviewed tip", func(m *Stage1Manifest) {
@@ -1281,9 +1287,9 @@ func TestStage1BindsEveryRequiredIdentity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := base()
 			m.Actions = map[string]ActionIdentity{
-				"plan":       {Commit: testTip, ContentDigest: "sha256:plan"},
-				"run-bucket": {Commit: testTip, ContentDigest: "sha256:run"},
-				"record":     {Commit: testTip, ContentDigest: "sha256:record"},
+				"plan":       {Commit: testTip, ContentDigest: "sha256:64879f7d6b960a01909762d911a32d4582c20010c5641ee90278b644a9e3b525"},
+				"run-bucket": {Commit: testTip, ContentDigest: "sha256:acba25512100f80b56fc3ccd14c65be55d94800cda77585c5f41a887e398f9be"},
+				"record":     {Commit: testTip, ContentDigest: "sha256:70ce871f8a3d3fb449bc3c3ace6547cef02dfc74ffe48d912532a724bfdbe5b9"},
 			}
 			tc.edit(&m)
 			err := m.Validate()
@@ -1471,7 +1477,9 @@ func TestMixedRepeatedRunIdentityIsRefused(t *testing.T) {
 		{"a different job", func(r *RunIdentity) { r.Job = "other-job" }},
 		{"a different step attempt", func(r *RunIdentity) { r.StepAttempt = "7" }},
 		{"a different workflow run", func(r *RunIdentity) { r.WorkflowRun = "run-2" }},
-		{"a different Stage-1 manifest", func(r *RunIdentity) { r.Stage1 = Digest("sha256:" + strings.Repeat("9", 64)) }},
+		{"a different Stage-1 manifest", func(r *RunIdentity) {
+			r.Stage1 = DigestBytes([]byte("other-9"))
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := verifySynth(t, func(level Level, seq int, producer Producer, boundary string, r *Record) {
@@ -1621,10 +1629,10 @@ func TestEverySnapshotBindsTheClosureOfItsOwnArgv(t *testing.T) {
 			b.Discovery[0].Tools = map[string]ToolIdentity{"node": {Version: "24.19.0"}}
 		}, "no version or integrity"},
 		{"a discovery tool with no version", func(b *PlanningInputBundle) {
-			b.Discovery[0].Tools = map[string]ToolIdentity{"node": {Integrity: "sha256:node"}}
+			b.Discovery[0].Tools = map[string]ToolIdentity{"node": {Integrity: "sha256:545ea538461003efdc8c81c244531b003f6f26cfccf6c0073b3239fdedf49446"}}
 		}, "no version or integrity"},
 		{"a discovery tool recorded as unresolved", func(b *PlanningInputBundle) {
-			b.Discovery[0].Tools = map[string]ToolIdentity{"node": {Version: Unresolved, Integrity: "sha256:node"}}
+			b.Discovery[0].Tools = map[string]ToolIdentity{"node": {Version: Unresolved, Integrity: "sha256:545ea538461003efdc8c81c244531b003f6f26cfccf6c0073b3239fdedf49446"}}
 		}, "could not resolve tool"},
 		{"a runnable listing with no environment", func(b *PlanningInputBundle) {
 			withRunnable(b, func(r *RunnableSnapshot) { r.Env = nil })
@@ -1687,7 +1695,7 @@ func TestCompareArmsFindsEveryUnequalInvariant(t *testing.T) {
 	candidate.Instrumentation.PeerBinary = candidateBinary
 	candidate.Instrumentation.TraceBinary = candidateBinary
 	candidate.Instrumentation.VerifierBinary = candidateBinary
-	candidate.Actions["run-bucket"] = ActionIdentity{Commit: testTip, ContentDigest: "sha256:candidate-run"}
+	candidate.Actions["run-bucket"] = ActionIdentity{Commit: testTip, ContentDigest: "sha256:2c2d31e985358ad00ff919d5199dd35917b68f7b2b9053a1303a7875f1ac39ea"}
 	if diffs := CompareArms(baseline, candidate); len(diffs) != 0 {
 		t.Errorf("the permitted candidate tuple was reported as a difference: %v", diffs)
 	}
@@ -1701,9 +1709,15 @@ func TestCompareArmsFindsEveryUnequalInvariant(t *testing.T) {
 		{"a different K", func(m *Stage1Manifest) { m.Bundle.Selection.K = 4 }, "selection.k"},
 		{"a different sweep count", func(m *Stage1Manifest) { m.Bundle.Selection.Count = 2 }, "selection.count"},
 		{"a different store", func(m *Stage1Manifest) { m.Bundle.Store = NewRawSnapshot("s", nil, "/repo", []byte("other")) }, "store"},
-		{"a different lockfile", func(m *Stage1Manifest) { m.Consumer.Lockfile = "sha256:other" }, "consumer.lockfile"},
-		{"a different training lineage", func(m *Stage1Manifest) { m.TrainingLineage.ScorerDigest = "sha256:other" }, "training_lineage"},
-		{"a different component registry", func(m *Stage1Manifest) { m.Registry = "sha256:other" }, "component_registry"},
+		{"a different lockfile", func(m *Stage1Manifest) {
+			m.Consumer.Lockfile = "sha256:d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+		}, "consumer.lockfile"},
+		{"a different training lineage", func(m *Stage1Manifest) {
+			m.TrainingLineage.ScorerDigest = "sha256:d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+		}, "training_lineage"},
+		{"a different component registry", func(m *Stage1Manifest) {
+			m.Registry = "sha256:d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+		}, "component_registry"},
 		{"a different consumer commit", func(m *Stage1Manifest) { m.Consumer.Commit = strings.Repeat("b", 40) }, "consumer.commit"},
 		{"a different source profile", func(m *Stage1Manifest) { m.SourceProfile.Integrities["vitest"] = "sha512-different" }, "source_profile"},
 	} {
@@ -1905,7 +1919,9 @@ func TestStoreReceiptDistinguishesEveryRowState(t *testing.T) {
 		{"a measured zero relabelled as a gap",
 			func(r *StoreReceipt) { r.Classifications[RowObservedZero] = 0; r.Classifications[RowMissing] = 2 },
 			instant, "carry no sample"},
-		{"a digest for some other store", func(r *StoreReceipt) { r.Digest = "sha256:elsewhere" }, instant, "the bundle froze"},
+		{"a digest for some other store", func(r *StoreReceipt) {
+			r.Digest = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
+		}, instant, "the bundle froze"},
 		{"the wrong schema", func(r *StoreReceipt) { r.Schema = 99 }, instant, "frozen bytes are schema"},
 		{"the wrong comparability token", func(r *StoreReceipt) { r.Token = "-race -count=100" }, instant, "measured under"},
 	} {
@@ -2208,7 +2224,7 @@ func TestVerdictSignsWithEpochScaleInstants(t *testing.T) {
 	const epoch = Nanos(1788243122402847000)
 	v := Verdict{
 		Schema:        SchemaVersion,
-		RecordsDigest: "sha256:abc",
+		RecordsDigest: "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
 		Envelopes: []Envelope{{
 			Level:    LevelAction,
 			Physical: Interval{StartNs: epoch, EndNs: epoch + Nanos(90*second), OK: true},
@@ -2777,7 +2793,9 @@ func TestDerivedDocumentsMustBeBoundToStageTwo(t *testing.T) {
 		{
 			name: "a substituted forecast",
 			doc:  func(d frozenDocs) string { return d.aeta },
-			edit: func(m map[string]any) { m["registry_digest"] = "sha256:elsewhere" },
+			edit: func(m map[string]any) {
+				m["registry_digest"] = "sha256:7b1b763ee8f62eb88e4742a760f912d0b19bcd58b2b948999784bacc15a7f4d7"
+			},
 			want: "the Stage-2 receipt binds aeta",
 		},
 	} {
@@ -2872,7 +2890,7 @@ func TestTheAuditPlanMustBeTheOneStageTwoFroze(t *testing.T) {
 					// A clean audit, with no problems at all — which is
 					// exactly what the substitution buys.
 					return &AuditEvidence{
-						Bucket: bucket, PlanDigest: "sha256:the-plan-that-describes-only-what-ran",
+						Bucket: bucket, PlanDigest: "sha256:a07aad1a320cdd25d5ed99e5afd5e48267960039b068177f4fd236e42d606eb0",
 						Report: "PASS — every planned package reported exactly the invocations the plan scheduled",
 					}, nil
 				}
@@ -2894,7 +2912,7 @@ func TestTheAuditPlanMustBeTheOneStageTwoFroze(t *testing.T) {
 			name: "an audit with no Stage-2 receipt to bind against",
 			audit: func(docs frozenDocs) AuditFunc {
 				return func(bucket string) (*AuditEvidence, error) {
-					return &AuditEvidence{Bucket: bucket, PlanDigest: "sha256:anything"}, nil
+					return &AuditEvidence{Bucket: bucket, PlanDigest: "sha256:ee0874170b7f6f32b8c2ac9573c428d35b575270a66b757c2c0185d2bd09718d"}, nil
 				}
 			},
 			want: "no Stage-2 receipt to bind its plan to",
@@ -2972,7 +2990,7 @@ func TestAPlanMustHaveBeenAuthorisedBeforeItExisted(t *testing.T) {
 			edit: func(t *testing.T, docs frozenDocs) {
 				editJSON(t, docs.stage2, func(m map[string]any) {
 					m["stage1_approval"] = map[string]any{
-						"authority": "ewj2-campaign", "key_id": "beef", "signature_digest": "sha256:invented",
+						"authority": "ewj2-campaign", "key_id": "beef", "signature_digest": "sha256:80914f0274ced542b3c64fd18666296efc1be86f90fc57f02ac5b46ed46d4489",
 					}
 				})
 			},
@@ -3033,7 +3051,7 @@ func TestRequireApprovalIsSeparateFromValidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := func() Stage1Manifest {
-		m := testManifest(testBundle(), "sha256:registry")
+		m := testManifest(testBundle(), "sha256:872491a30d60d598962de6e7b834ab76b2aa65fbab102c6ebaaae6acdc238822")
 		m.Schedule = CampaignSchedule{}
 		return m
 	}

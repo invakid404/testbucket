@@ -34,7 +34,7 @@ func minimalRegistry() AetaRegistry {
 
 func TestRegistryInstantiation(t *testing.T) {
 	reg := minimalRegistry()
-	got, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:s2"})
+	got, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4"})
 	if err != nil {
 		t.Fatalf("Instantiate: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestRegistryInstantiation(t *testing.T) {
 	if got.UpperNs <= got.LowerNs {
 		t.Errorf("the composed interval is degenerate: [%d,%d]", got.LowerNs, got.UpperNs)
 	}
-	if got.Stage2 != "sha256:s2" {
+	if got.Stage2 != "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4" {
 		t.Errorf("the instance does not carry its Stage-2 parent")
 	}
 	// Instantiation without a verified Stage-2 receipt is refused: a forecast
@@ -99,7 +99,7 @@ func TestRegistryRefusesUnboundedResidual(t *testing.T) {
 // gate.
 func TestAetaRecomputes(t *testing.T) {
 	reg := minimalRegistry()
-	in := AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:s2"}
+	in := AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4"}
 	got, err := reg.Instantiate(in)
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +119,9 @@ func TestAetaRecomputes(t *testing.T) {
 			a.PointNs += second
 		}, "component"},
 		{"the inputs were restated", func(a *AetaInstance) { a.Inputs.Invocations = 99 }, "the frozen template gives"},
-		{"it names another plan", func(a *AetaInstance) { a.Stage2 = "sha256:other" }, "Stage-2"},
+		{"it names another plan", func(a *AetaInstance) {
+			a.Stage2 = "sha256:d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+		}, "Stage-2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			edited, err := reg.Instantiate(in)
@@ -152,7 +154,7 @@ func TestResidualAllowanceIsCapped(t *testing.T) {
 	// A residual that instantiates above its own bound is refused outright.
 	reg.Components[3].PointNs = 300 * millisecond
 	reg.Components[3].BoundNs = 200 * millisecond
-	if _, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 1, Stage2: "sha256:s2"}); err == nil {
+	if _, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 1, Stage2: "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4"}); err == nil {
 		t.Errorf("a residual above its bound was instantiated")
 	}
 	// And the aggregate is capped at 0.5% of the forecast, so a small action
@@ -160,7 +162,7 @@ func TestResidualAllowanceIsCapped(t *testing.T) {
 	reg = minimalRegistry()
 	reg.Components[3].PointNs = 400 * millisecond
 	reg.Components[3].BoundNs = 500 * millisecond
-	if _, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 1, Invocations: 1, Stage2: "sha256:s2"}); err == nil {
+	if _, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 1, Invocations: 1, Stage2: "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4"}); err == nil {
 		t.Errorf("a 400 ms allowance on a ~1.5 s forecast was accepted")
 	}
 }
@@ -170,7 +172,7 @@ func TestResidualAllowanceIsCapped(t *testing.T) {
 // phase nobody understood.
 func TestCompletenessFindsUnforecastMaterialTime(t *testing.T) {
 	reg := minimalRegistry()
-	aeta, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 1, Stage2: "sha256:s2"})
+	aeta, err := reg.Instantiate(AetaInputs{BucketID: "b1", PallocSeconds: 60, Invocations: 1, Stage2: "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +299,7 @@ func TestEveryPhysicalComponentDeclaresItsOwnBound(t *testing.T) {
 		reg := minimalRegistry()
 		reg.Components[0].BoundNs = 0
 		aeta, err := minimalRegistry().Instantiate(AetaInputs{
-			BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:s2",
+			BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4",
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -323,7 +325,7 @@ func TestEveryPhysicalComponentDeclaresItsOwnBound(t *testing.T) {
 	t.Run("a component inside its own bound raises nothing", func(t *testing.T) {
 		reg := minimalRegistry()
 		aeta, err := reg.Instantiate(AetaInputs{
-			BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:s2",
+			BucketID: "b1", PallocSeconds: 60, Invocations: 3, Stage2: "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4",
 		})
 		if err != nil {
 			t.Fatal(err)

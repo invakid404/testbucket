@@ -260,3 +260,48 @@ func lessUTF16(a, b string) bool {
 	}
 	return len(ua) < len(ub)
 }
+
+// Valid reports whether this digest has the one shape the schema means by a
+// digest: "sha256:" followed by exactly 64 lowercase hex characters.
+//
+// Digest is a string alias, and validation generally asked only that a field
+// was non-empty — so fields documented and SIGNED as SHA-256 identities
+// accepted "sha256:stage1", "sha256:tree" or "fixture". A signature over a
+// malformed identity is a signature over a label, and a claim key that is not
+// the canonical hash of its parents cannot be recomputed by anyone checking it.
+func (d Digest) Valid() bool {
+	const prefix = "sha256:"
+	s := string(d)
+	if len(s) != len(prefix)+64 || !strings.HasPrefix(s, prefix) {
+		return false
+	}
+	for _, c := range s[len(prefix):] {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// requireDigests refuses any field that is not a well-formed digest, naming
+// every offender rather than the first, so a caller fixes one document instead
+// of discovering its problems one at a time.
+func requireDigests(fields map[string]Digest) error {
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var bad []string
+	for _, name := range names {
+		if !fields[name].Valid() {
+			bad = append(bad, fmt.Sprintf("%s (%q)", name, fields[name]))
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("does not carry a sha256:<64 lowercase hex> identity for %s", strings.Join(bad, ", "))
+	}
+	return nil
+}

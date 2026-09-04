@@ -366,6 +366,19 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	// pointer, so `cmd.Stdout == nil` would be false and the child's output
 	// would go nowhere. The tests measured this the hard way — a wrapper that
 	// swallows the test log is worse than no wrapper.
+	// THE MEASURED CHILD GETS A SCRUBBED ENVIRONMENT, BEFORE IT STARTS.
+	//
+	// cmd.Env was left nil, which hands the child the complete parent
+	// environment — every run key, authority key, verifier, replay, builder,
+	// workload-user, script-user and signer-delegate capability this wrapper
+	// holds. The observers and the action-owned children were filtered; the
+	// process actually being measured, which runs the consumer's test code,
+	// was not.
+	//
+	// A later credential drop is not a substitute: it is not a filter applied
+	// before the child is created, and it does not run at all when no account
+	// is configured. The boundary the contract asks for is the launch itself.
+	cmd.Env = scrubSecrets(nil)
 	stdout, stderr := opt.Stdout, opt.Stderr
 	if stdout == nil {
 		stdout = os.Stdout
@@ -1366,14 +1379,17 @@ func (o *observerProc) ownsPID() bool {
 		return true
 	}
 	if o.proc != nil {
-		// The OS handle for a child we have not reaped. The kernel cannot
-		// recycle this pid while it is held, so the number is still ours —
-		// but ONLY while the registry still holds it. Every path that
-		// completes a wait calls release, so a handle whose entry is gone has
-		// been reaped and is no longer authority over anything; treating a
-		// stale struct field as ownership is the bare-pid authority this whole
-		// rule removes, one indirection further along.
-		return recallObserver(o.pid) != nil
+		// The OS handle for a child we have not reaped, and it must be THE
+		// handle the registry still holds for this pid — not merely some
+		// handle registered at that number.
+		//
+		// Comparing by key presence let a stale object be authorised by a NEW
+		// entry: once the old process was reaped and the pid recycled and
+		// registered for a different one, `recallObserver(pid) != nil` was
+		// true again and the stale object could signal through its own
+		// pid-based handle. Identity, not occupancy, is what ownership means
+		// here.
+		return recallObserver(o.pid) == o.proc
 	}
 	if o.start == "" {
 		// DETACHED, WITH NOTHING TO AUTHENTICATE IT — on any platform.
@@ -1465,16 +1481,26 @@ func (o *observerProc) stillRunning() bool {
 // process is established to be gone, so the registry's answer and the kernel's
 // are never allowed to drift apart.
 func (o *observerProc) release() {
-	// IDEMPOTENT, AND NOT CONDITIONAL ON THIS HANDLE HOLDING THE PROCESS.
+	// IDEMPOTENT, AND IT ONLY DROPS THIS HANDLE'S OWN ENTRY.
 	//
 	// An attached observer reaps through its cmd and never populates proc, so
-	// gating on proc left exactly the paths that DO reap unable to release.
-	// Forgetting a pid the registry does not hold costs nothing, and being
-	// safe to call twice is what lets every cleanup branch call it without
-	// anyone having to reason about which one got there first.
-	if o.pid > 0 {
-		forgetObserver(o.pid)
+	// gating on proc left exactly the paths that DO reap unable to release —
+	// hence the unconditional form. But deleting by pid alone let a stale
+	// object evict the entry belonging to a DIFFERENT process that had since
+	// been registered at the recycled number, which is the same confusion in
+	// the other direction.
+	//
+	// So: forget the pid when the registry still holds this handle, or when
+	// this handle never held one (the attached case, where cmd did the
+	// reaping and there is nothing of anyone else's to delete).
+	if o.pid <= 0 {
+		return
 	}
+	if o.proc != nil {
+		forgetObserverHandle(o.pid, o.proc)
+		return
+	}
+	forgetObserver(o.pid)
 }
 
 // reapExitedChild collects an exited child without blocking, and reports
@@ -1816,4 +1842,11 @@ func recallObserver(pid int) *os.Process {
 // registry cannot hand out ownership of a pid the kernel is free to reuse.
 func forgetObserver(pid int) {
 	observerHandles.Delete(pid)
+}
+
+// forgetObserverHandle drops a pid's entry only when the registry still holds
+// THIS handle for it, so a stale object cannot evict the entry belonging to a
+// different process that was registered at a recycled number.
+func forgetObserverHandle(pid int, p *os.Process) {
+	observerHandles.CompareAndDelete(pid, p)
 }

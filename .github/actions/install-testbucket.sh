@@ -74,6 +74,21 @@ fi
 # rather than a fetch. Both are required, and the archive is refused unless its
 # bytes hash to the digest that was demanded. This is deliberately NOT a
 # published release and never claims to be one.
+# Map the runner's OS/arch onto goreleaser's naming. Fall back to uname so the
+# script is exercisable outside Actions.
+os_raw="${RUNNER_OS:-$(uname -s)}"
+arch_raw="${RUNNER_ARCH:-$(uname -m)}"
+case "$os_raw" in
+  Linux|linux)   os=linux ;;
+  macOS|Darwin|darwin) os=darwin ;;
+  *) echo "install-testbucket: unsupported OS '$os_raw' (linux/darwin are released)" >&2; exit 1 ;;
+esac
+case "$arch_raw" in
+  X64|x86_64|amd64) arch=amd64 ;;
+  ARM64|arm64|aarch64) arch=arm64 ;;
+  *) echo "install-testbucket: unsupported arch '$arch_raw' (amd64/arm64 are released)" >&2; exit 1 ;;
+esac
+
 if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
   spec="${TB_VERSION#candidate:}"
   cand_digest="${spec##*@}"
@@ -92,6 +107,18 @@ if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
   fi
   if ! printf '%s' "$cand_run" | grep -Eq '^[0-9]+$'; then
     echo "install-testbucket: candidate run id '$cand_run' is not a workflow run id" >&2
+    exit 1
+  fi
+  # THE ARTIFACT NAMES THE PLATFORM IT IS FOR.
+  #
+  # "Exactly one archive" is not "the one archive for this runner": a candidate
+  # artifact that happened to hold a single foreign-platform build would have
+  # been accepted and installed. The artifact name must end in the runner's own
+  # os_arch, so the delivery is uniquely addressed per platform and a candidate
+  # built for another one cannot be fetched by accident.
+  if ! printf '%s' "$cand_artifact" | grep -q -- "-${os}_${arch}\$"; then
+    echo "install-testbucket: candidate artifact '$cand_artifact' does not name this runner's platform (expected a name ending -${os}_${arch})" >&2
+    echo "A candidate is published per platform so the delivery is uniquely addressed; one archive is not the same as the right archive." >&2
     exit 1
   fi
   : "${TB_REPO:?TB_REPO is required to download a candidate artifact}"
@@ -126,6 +153,24 @@ if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
     echo "A pre-publication artifact is trusted only because its bytes were named in advance." >&2
     exit 1
   fi
+  # WHAT IS INSIDE IS CONSTRAINED BEFORE IT IS UNPACKED.
+  #
+  # A tar can carry symlinks, hardlinks, devices and paths that climb out of
+  # the extraction directory. The fixed-member check below uses `[ -f ]`, which
+  # FOLLOWS a symlink, while the ambiguity check used `find -type f`, which does
+  # not — so a member named `testbucket` that was a symlink to something
+  # outside the verified tree was installed and executed. Listing the archive
+  # first and refusing anything that is not a regular file, and any path that
+  # is absolute or contains "..", closes that before a single byte is written.
+  if tar -tzvf "$archive" | grep -qvE '^-'; then
+    echo "install-testbucket: the pinned candidate archive holds a member that is not a regular file (symlink, hardlink, device or directory entry)" >&2
+    echo "Only regular files are installable; a link is a name for bytes the digest did not cover." >&2
+    exit 1
+  fi
+  if tar -tzf "$archive" | grep -qE '^/|(^|/)\.\.(/|$)'; then
+    echo "install-testbucket: the pinned candidate archive holds an absolute or traversing path" >&2
+    exit 1
+  fi
   # A FRESH directory, so nothing that arrived beside the archive can be
   # mistaken for something the archive contained.
   pinned="$work/pinned"
@@ -135,13 +180,21 @@ if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
   # member the release archives carry, and asking for it by name means an
   # archive that does not contain it is refused rather than fallen back from.
   cand_bin="$pinned/testbucket"
+  # -h first: `[ -f ]` follows symlinks, so the link check has to come before
+  # the regular-file check rather than after it.
+  if [ -h "$cand_bin" ]; then
+    echo "install-testbucket: the pinned candidate archive's testbucket member is a symlink" >&2
+    exit 1
+  fi
   if [ ! -f "$cand_bin" ]; then
     echo "install-testbucket: the pinned candidate archive holds no testbucket member at its root" >&2
     exit 1
   fi
   # And nothing else executable travelled inside it either: a second binary in
   # the archive is the same ambiguity one level in.
-  extra=$(find "$pinned" -type f -perm -u+x ! -path "$cand_bin" | head -n1)
+  # ANY execute bit, not just the owner's: a member executable by group or
+  # other is executable, and the stated rule is one binary.
+  extra=$(find "$pinned" \( -perm -u+x -o -perm -g+x -o -perm -o+x \) ! -type d ! -path "$cand_bin" | head -n1)
   if [ -n "$extra" ]; then
     echo "install-testbucket: the pinned candidate archive also holds executable $extra; a candidate archive carries one binary" >&2
     exit 1
@@ -149,15 +202,26 @@ if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
   # THE INSTALLED BYTES ARE RE-DIGESTED when the caller states what the
   # builder and verifier attested. The archive digest says which archive; this
   # says which binary, and Stage 1 binds the second.
-  if [ -n "${TB_CANDIDATE_BINARY_DIGEST:-}" ]; then
-    bin_got="sha256:$(sha256sum "$cand_bin" | cut -d' ' -f1)"
-    if [ "$bin_got" != "$TB_CANDIDATE_BINARY_DIGEST" ]; then
-      echo "install-testbucket: the installed candidate binary digests to $bin_got, not the attested $TB_CANDIDATE_BINARY_DIGEST" >&2
-      echo "The archive digest names which archive; this names which binary, and Stage 1 binds the second." >&2
-      exit 1
-    fi
-    echo "candidate binary digest matches the attested $bin_got"
+  # MANDATORY, not optional. An optional check that nothing supplies is not a
+  # check: the archive digest says which archive was downloaded, and this says
+  # which binary is about to run — which is the value Stage 1 binds and the
+  # builder and verifier attested. Without it the delivery is verified up to
+  # the archive and unverified at the thing that executes.
+  if [ -z "${TB_CANDIDATE_BINARY_DIGEST:-}" ]; then
+    echo "install-testbucket: a candidate needs TB_CANDIDATE_BINARY_DIGEST, the attested sha256 of the binary itself" >&2
+    echo "The archive digest names which archive; this names which binary, and Stage 1 binds the second." >&2
+    exit 1
   fi
+  if ! printf '%s' "$TB_CANDIDATE_BINARY_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+    echo "install-testbucket: TB_CANDIDATE_BINARY_DIGEST '$TB_CANDIDATE_BINARY_DIGEST' is not sha256:<64-hex>" >&2
+    exit 1
+  fi
+  bin_got="sha256:$(sha256sum "$cand_bin" | cut -d' ' -f1)"
+  if [ "$bin_got" != "$TB_CANDIDATE_BINARY_DIGEST" ]; then
+    echo "install-testbucket: the installed candidate binary digests to $bin_got, not the attested $TB_CANDIDATE_BINARY_DIGEST" >&2
+    exit 1
+  fi
+  echo "candidate binary digest matches the attested $bin_got"
   mv "$cand_bin" "$bin"
   chmod +x "$bin"
   printf '%s\n' "$TB_BINDIR" >>"${GITHUB_PATH:-/dev/null}"
@@ -167,21 +231,6 @@ fi
 
 # --- released: download + checksum-verify --------------------------------------
 : "${TB_REPO:?TB_REPO is required to download a released binary}"
-
-# Map the runner's OS/arch onto goreleaser's naming. Fall back to uname so the
-# script is exercisable outside Actions.
-os_raw="${RUNNER_OS:-$(uname -s)}"
-arch_raw="${RUNNER_ARCH:-$(uname -m)}"
-case "$os_raw" in
-  Linux|linux)   os=linux ;;
-  macOS|Darwin|darwin) os=darwin ;;
-  *) echo "install-testbucket: unsupported OS '$os_raw' (linux/darwin are released)" >&2; exit 1 ;;
-esac
-case "$arch_raw" in
-  X64|x86_64|amd64) arch=amd64 ;;
-  ARM64|arm64|aarch64) arch=arm64 ;;
-  *) echo "install-testbucket: unsupported arch '$arch_raw' (amd64/arm64 are released)" >&2; exit 1 ;;
-esac
 
 # Resolve TB_VERSION to a concrete release tag.
 tag=""

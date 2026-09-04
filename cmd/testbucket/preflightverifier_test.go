@@ -26,12 +26,14 @@ func currentPlan(t *testing.T) (walltime.PlanningInputBundle, walltime.Stage2Rec
 	bundle.Kind = walltime.BundleKind
 	bundle.Source.Repository = "mandel-ai/mandel"
 	bundle.Source.Commit = frozenProfileCommit
-	bundle.Source.Tree = "sha256:tree"
+	bundle.Source.Tree = "sha256:dc9c5edb8b2d479e697b4b0b8ab874f32b325138598ce9e7b759eb8292110622"
 	bundleDigest, err := bundle.DigestOf()
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := func(c byte) walltime.Digest { return walltime.Digest("sha256:" + strings.Repeat(string(c), 64)) }
+	d := func(c byte) walltime.Digest {
+		return walltime.DigestBytes([]byte{c})
+	}
 	issued := walltime.Stage2Receipt{
 		Kind: walltime.Stage2Kind, Stage1Digest: d('1'), BundleDigest: bundleDigest,
 		InputAccess: []walltime.InputAccess{{Field: "bundle", Digest: bundleDigest}},
@@ -41,15 +43,12 @@ func currentPlan(t *testing.T) (walltime.PlanningInputBundle, walltime.Stage2Rec
 		PlannerResult: "pass", RendererResult: "pass",
 		// Every real derivation is performed under a one-shot claim naming its
 		// own parents, so the fixture that stands in for one carries it.
-		PlannerClaim: &walltime.PlannerClaimReceipt{
-			Store: "authority/durable-claims", Durable: true,
-			Key: "fixture", Stage1: d('1'), Bundle: bundleDigest,
-		},
+		PlannerClaim: fixtureClaim(d('1'), bundleDigest),
 	}
 	issued.Algorithms.FullPlan = walltime.AlgorithmIdentity{
-		Name: walltime.FullPlanDigestAlgorithm, Canonicalizer: "rfc8785/v1", Implementation: "sha256:test"}
+		Name: walltime.FullPlanDigestAlgorithm, Canonicalizer: "rfc8785/v1", Implementation: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	issued.Algorithms.SemanticPlan = walltime.AlgorithmIdentity{
-		Name: walltime.SemanticPlanDigestAlgorithm, Canonicalizer: "rfc8785/v1", Implementation: "sha256:test"}
+		Name: walltime.SemanticPlanDigestAlgorithm, Canonicalizer: "rfc8785/v1", Implementation: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	if err := issued.Validate(); err != nil {
 		t.Fatalf("the fixture plan is not a valid issued receipt: %v", err)
 	}

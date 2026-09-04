@@ -19,7 +19,7 @@ import (
 // limited to the levels the wrapper chain actually produces.
 func TestLowerProducerKeysHaveAPrivilegedAuthorizer(t *testing.T) {
 	runKey := mustSigningKey()
-	run := RunIdentity{CampaignID: "ewj2", RunID: "run-1", BucketID: "bucket-0", Stage2: "sha256:test"}
+	run := RunIdentity{CampaignID: "ewj2", RunID: "run-1", BucketID: "bucket-0", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	keys := []string{PublicKeyOf(runKey)}
 
 	dir := t.TempDir()
@@ -206,7 +206,7 @@ func TestTheDelegationIsOpenedWhereTheRunKeyIs(t *testing.T) {
 // the roster the run key seals; the action-owned children start at 1.
 func TestTheActionChildSignerIsAdmissible(t *testing.T) {
 	runKey := mustSigningKey()
-	run := RunIdentity{CampaignID: "ewj2", RunID: "action-child", BucketID: "bucket-0", Stage2: "sha256:test"}
+	run := RunIdentity{CampaignID: "ewj2", RunID: "action-child", BucketID: "bucket-0", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
 	dir := t.TempDir()
 	encoded, err := OpenSignerDelegation(dir, run, runKey)
 	if err != nil {
@@ -287,8 +287,8 @@ func TestADelegationIsBoundToTheWholeRunIdentity(t *testing.T) {
 		CampaignID: "ewj2", RunID: "shared-run", AttemptID: "1", BucketID: "bucket-0",
 		Repository: "invakid404/testbucket", WorkflowRun: "100", Job: "test",
 		Step: "run-bucket", StepAttempt: "1",
-		Stage1: "sha256:s1", Stage2: "sha256:s2",
-		ComponentRegistry: "sha256:registry", VerifierID: "ewj2-verifier",
+		Stage1: "sha256:e8bc163c82eee18733288c7d4ac636db3a6deb013ef2d37b68322be20edc45cc", Stage2: "sha256:ad328846aa18b32a335816374511cac1063c704b8c57999e51da9f908290a7a4",
+		ComponentRegistry: "sha256:872491a30d60d598962de6e7b834ab76b2aa65fbab102c6ebaaae6acdc238822", VerifierID: "ewj2-verifier",
 	}
 	d := SignerDelegation{
 		Kind: SignerDelegationKind, Run: want, PublicKey: PublicKeyOf(mustSigningKey()),
@@ -313,9 +313,15 @@ func TestADelegationIsBoundToTheWholeRunIdentity(t *testing.T) {
 		{"another repository", func(r *RunIdentity) { r.Repository = "someone/else" }},
 		{"another job", func(r *RunIdentity) { r.Job = "other-job" }},
 		{"another step attempt", func(r *RunIdentity) { r.StepAttempt = "3" }},
-		{"another Stage-1 manifest", func(r *RunIdentity) { r.Stage1 = "sha256:other" }},
-		{"another Stage-2 receipt", func(r *RunIdentity) { r.Stage2 = "sha256:other" }},
-		{"another component registry", func(r *RunIdentity) { r.ComponentRegistry = "sha256:other" }},
+		{"another Stage-1 manifest", func(r *RunIdentity) {
+			r.Stage1 = "sha256:d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+		}},
+		{"another Stage-2 receipt", func(r *RunIdentity) {
+			r.Stage2 = "sha256:d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+		}},
+		{"another component registry", func(r *RunIdentity) {
+			r.ComponentRegistry = "sha256:d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+		}},
 		{"another verifier", func(r *RunIdentity) { r.VerifierID = "other-verifier" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

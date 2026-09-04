@@ -24,7 +24,7 @@ func TestThePlannerRefusesInventedImplementationIdentities(t *testing.T) {
 		t.Fatalf("Acquire: %v", err)
 	}
 	// The genuine bundle plans.
-	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: good, Stage1: "sha256:stage1"})); err != nil {
+	if _, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: good, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"})); err != nil {
 		t.Fatalf("the genuine bundle does not plan: %v", err)
 	}
 
@@ -78,7 +78,7 @@ func TestThePlannerRefusesInventedImplementationIdentities(t *testing.T) {
 				t.Fatal(err)
 			}
 			tc.edit(b)
-			_, err = Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
+			_, err = Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"}))
 			if err == nil {
 				t.Fatalf("the production planner executed under %s", tc.name)
 			}
@@ -136,7 +136,7 @@ func TestARealReceiptIsComparedByEveryClaimItCarries(t *testing.T) {
 	}
 	plan := func(t *testing.T) walltime.Stage2Receipt {
 		t.Helper()
-		res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: bundle, Stage1: "sha256:stage1"}))
+		res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: bundle, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"}))
 		if err != nil {
 			t.Fatalf("Plan: %v", err)
 		}
@@ -157,14 +157,14 @@ func TestARealReceiptIsComparedByEveryClaimItCarries(t *testing.T) {
 		want string
 	}{
 		{"a claimed full-plan implementation nobody ran", func(r *walltime.Stage2Receipt) {
-			r.Algorithms.FullPlan.Implementation = "sha256:never-executed"
+			r.Algorithms.FullPlan.Implementation = "sha256:3e5bfc834bb08eb81022641fe1f0e4e79649af49645e5a08c48632ccb1ad1423"
 		}, "full-plan digest algorithm mismatch"},
 		{"a claimed semantic-plan canonicaliser nobody ran", func(r *walltime.Stage2Receipt) {
 			r.Algorithms.SemanticPlan.Canonicalizer = "some-other-canonicaliser"
 		}, "semantic-plan digest algorithm mismatch"},
 		{"an input access that did not happen", func(r *walltime.Stage2Receipt) {
 			r.InputAccess = append(append([]walltime.InputAccess(nil), r.InputAccess...),
-				walltime.InputAccess{Field: "an-input-nobody-read", Digest: "sha256:invented"})
+				walltime.InputAccess{Field: "an-input-nobody-read", Digest: "sha256:80914f0274ced542b3c64fd18666296efc1be86f90fc57f02ac5b46ed46d4489"})
 		}, "input-access mismatch"},
 		{"a planner result the plan does not produce", func(r *walltime.Stage2Receipt) {
 			r.PlannerResult = "k=99 buckets=99 units=99"
@@ -195,7 +195,7 @@ func TestStage2RecordsTheImplementationsThatRan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:stage1"}))
+	res, err := Plan(context.Background(), withClaim(t, PlanOptions{Bundle: b, Stage1: "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f"}))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
