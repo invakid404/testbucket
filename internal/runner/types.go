@@ -132,4 +132,21 @@ type Invocation struct {
 	Env  map[string]string `json:"env,omitempty"`
 	Args []string          `json:"args"`
 	Desc string            `json:"desc"`
+	// Units is the ids of the scheduled units this one call covers. The
+	// adapter knows the grouping — which units merged into a shared command
+	// and which had to be their own — and nothing downstream can re-derive it
+	// reliably, since two name slices of one file are indistinguishable from
+	// their descriptions alone. The audit and the predictor projection both
+	// read it.
+	Units []string `json:"units,omitempty"`
+	// Selector is the test SELECTION this call applies: the path tokens it
+	// passes and any name filter. It is recorded separately from Args because
+	// the measured wrapper digests it as the invocation's selector identity,
+	// and re-deriving a selection from a human description would lose exactly
+	// the name filter that distinguishes two slices of one file.
+	Selector []string `json:"selector,omitempty"`
+	// Atoms is the co-scheduling keys of the targets this call covers, sorted.
+	// An atom split is terminal, so the identity of what rode together is
+	// bound rather than inferred.
+	Atoms []string `json:"atoms,omitempty"`
 }

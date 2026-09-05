@@ -1,6 +1,7 @@
 package vitestrunner
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -653,5 +654,55 @@ func TestLoadLivePackagesRejectsMalformed(t *testing.T) {
 	ws := write("ws.json", `[{"id":"   ","has_tests":true}]`)
 	if _, err := LoadLivePackages(dir, ws); err == nil {
 		t.Error("a whitespace-only id was accepted")
+	}
+}
+
+// TestFrozenRunnerRunsNoSubprocess is the one-shot acquisition rule expressed
+// as a test: once a bundle is frozen, NOTHING may take a second observation.
+// A live discovery here would be an input nobody bound, and it could disagree
+// with the bytes the plan was digested over.
+func TestFrozenRunnerRunsNoSubprocess(t *testing.T) {
+	const discovery = `[{"file":"a.spec.ts","projectName":"unit"},{"file":"b.spec.ts","projectName":"e2e"}]`
+	r, err := New(Options{
+		Root: t.TempDir(),
+		// A command that cannot exist: if any code path shells out, the test
+		// fails with a spawn error rather than passing quietly.
+		Command: []string{"/nonexistent/vitest-must-not-run"},
+		Frozen: &FrozenInputs{
+			Discovery: []byte(discovery),
+			Runnables: map[string][]byte{
+				"a.spec.ts": []byte(`[{"name":"one","file":"a.spec.ts"}]`),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	live, err := r.Discover(ctx)
+	if err != nil {
+		t.Fatalf("frozen discovery ran a subprocess or failed: %v", err)
+	}
+	if len(live) != 2 {
+		t.Fatalf("discovered %d targets, want 2", len(live))
+	}
+	// Project scoping is the path that used to take a second listing.
+	project, err := r.projectFor(ctx, "b.spec.ts")
+	if err != nil {
+		t.Fatalf("frozen project resolution ran a subprocess or failed: %v", err)
+	}
+	if project != "e2e" {
+		t.Errorf("project = %q, want %q", project, "e2e")
+	}
+	names, err := r.Runnables(ctx, runner.LivePackage{ID: "a.spec.ts", HasTests: true})
+	if err != nil {
+		t.Fatalf("frozen runnable listing ran a subprocess or failed: %v", err)
+	}
+	if len(names) != 1 || names[0] != "one" {
+		t.Errorf("names = %v, want [one]", names)
+	}
+	// And a target with no frozen listing is refused rather than listed live.
+	if _, err := r.Runnables(ctx, runner.LivePackage{ID: "b.spec.ts", HasTests: true}); err == nil {
+		t.Errorf("a target with no frozen listing was listed anyway")
 	}
 }

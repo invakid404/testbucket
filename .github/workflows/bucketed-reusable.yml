@@ -4,7 +4,7 @@ name: testbucket bucketed (reusable)
 #
 #   jobs:
 #     tests:
-#       uses: invakid404/testbucket/.github/workflows/bucketed-reusable.yml@v1
+#       uses: invakid404/testbucket/.github/workflows/bucketed-reusable.yml@<full-40-hex-sha>
 #       with:
 #         runner: go       # or vitest
 #         k: "6"
@@ -17,14 +17,70 @@ name: testbucket bucketed (reusable)
 # gate inside `plan` is what makes the fan-out safe: it refuses to emit a matrix
 # unless every live target lands in exactly one bucket.
 #
-# The composite actions are referenced with the `$/` self-repository syntax, so
-# they resolve to THIS repo at the SAME ref the reusable workflow was called with
-# — the pinned actions for an external `@v1` consumer, and the local checkout for
-# testbucket's own pre-release dogfood. Plain `./` would resolve against the
-# CALLER's repo and break every external consumer.
+# The composite actions are referenced with the `$/` SELF-REPOSITORY syntax, so
+# they resolve to THIS repo at the SAME ref the reusable workflow was called
+# with — the pinned actions for an external `@v0` consumer, and the local
+# checkout for testbucket's own pre-release dogfood.
+#
+# Plain `./` would resolve against the WORKSPACE, which for a called reusable
+# workflow is the CALLER's checkout: an external consumer would look for
+# `.github/actions/plan` in its own repository and not find it. The internal
+# dogfood would still pass, which is exactly what makes that mistake expensive.
+#
+# `$/` requires a GitHub-hosted runner or a self-hosted runner >= 2.336.0 (see
+# the 2026-07-30 self-repository-syntax changelog). actionlint does not yet know
+# the spelling and reports "ref is missing"; that diagnostic is suppressed for
+# this file in .github/actionlint.yaml, with the same reasoning written there.
 
 on:
+  # CALLER PERMISSIONS — REQUIRED, not advisory.
+  #
+  # Each job below declares its own least-privilege token, and a called
+  # workflow may only retain or reduce what its caller granted. So a caller
+  # grants exactly:
+  #
+  #     permissions:
+  #       contents: read
+  #       actions: read
+  #
+  # `contents: read` is what checkout and the same-run artifact steps need.
+  # `actions: read` is what the `test` job's A_GH collector needs to read that
+  # job's own step timestamps back, and it is the ONLY thing in this workflow
+  # that needs more than `contents`.
+  #
+  # A caller that grants less no longer merely loses A_GH: the `test` job
+  # declares the permission, so the run fails at startup instead of proceeding
+  # with a token nobody bounded. That is a deliberate, versioned break — see
+  # EXPLICIT, EXECUTABLE JOB PERMISSIONS below, which says who it reaches and
+  # when.
   workflow_call:
+    secrets:
+      planner-claim-store-attestation:
+        description: >-
+          The campaign authority's signature over the planner claim store's
+          identity. It is what makes the store DURABLE rather than merely
+          configured, and a scored derivation refuses to plan without it.
+        required: false
+      # Declared by NAME so an external caller can pass them. Without a
+      # `secrets:` block a called workflow receives none, and `secrets: inherit`
+      # only works when the caller is in the same organisation or repository —
+      # so an external consumer had no way to supply either of these, and no way
+      # to produce an eligible scored row.
+      #
+      # Both are optional: an unmeasured or unscored caller passes neither and
+      # is unaffected.
+      run-key:
+        description: >-
+          The RUN KEY: the ed25519 private key that signs each bucket's signer
+          roster and closing seal. The workflow binds it to exactly two steps of
+          the run-bucket action, `wall begin` and `wall end`, and to neither the
+          setup command nor the measured bucket script.
+        required: false
+      verifier-key:
+        description: >-
+          The verifier's own ed25519 signing key, used to sign the
+          machine-readable verdict so a campaign can attribute the row.
+        required: false
     inputs:
       runner:
         description: 'Test-runner adapter: go or vitest.'
@@ -56,9 +112,66 @@ on:
         type: string
         default: default
       testbucket-version:
-        description: 'Which testbucket binary the actions install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
+        description: >-
+          Which testbucket binary the actions install: the moving `v0` alias
+          (the default — this project is deliberately pre-1.0), an exact
+          `vX.Y.Z`, or "local" to build from the checked-out source. A scored
+          arm must pin an exact `vX.Y.Z`.
         type: string
-        default: v1
+        default: v0
+      candidate-binary-digest:
+        description: >-
+          The `sha256:<64-hex>` of the testbucket BINARY a `candidate:` pin
+          delivers. The installer refuses a pre-publication candidate whose
+          binary digest nobody stated in advance, and this is the typed input
+          that states it — so the supported scored route can actually deliver
+          one. It is NOT taken on trust: the plan job derives the same value
+          from the signed Stage-1 manifest and refuses a caller-supplied digest
+          that disagrees, so supplying it is a declaration to be checked rather
+          than a way to choose which bytes run. Leave empty and the derived
+          value is used on its own.
+        type: string
+        default: ""
+      release-pins-ref:
+        description: >-
+          Full 40-hex commit SHA of the testbucket repository carrying the
+          precommitted binary digest for a release published AFTER the action
+          source this workflow resolves to.
+
+          A release cannot contain its own digest — GoReleaser embeds the tag
+          commit and its timestamp in the binary — so the pin for the newest
+          release lives in the commit that comes after it, proposed by the
+          `pin-release` workflow and merged under review. Without this input
+          the reusable route could reach every composite action's
+          `release-pins-ref` through none of them, and a caller could not
+          install such a release at all: GitHub rejects an undeclared
+          reusable-workflow input, so README guidance alone was unusable.
+
+          Only a full commit SHA is accepted, by the installer: a branch or a
+          tag would put the pin back under the control of whoever can move it.
+        type: string
+        default: ""
+      candidate-resolver-version:
+        description: >-
+          The PUBLISHED, IMMUTABLE testbucket release that READS the Stage-1
+          manifest when `testbucket-version` is a `candidate:` pin — an exact
+          `vMAJOR.MINOR.PATCH`.
+
+          There is deliberately NO DEFAULT. It used to default to the moving
+          `v0` alias, which resolves to a published release that has no
+          wall-time implementation at all: the advertised route failed with
+          `unknown subcommand "wall"`, so the check the installer insists on
+          could not be satisfied through it. A default that cannot do the job
+          is worse than no default, because it reads as one that can.
+
+          `local`, `source`, a `candidate:` pin and a moving `vX`/`vX.Y` alias
+          are all refused — the first three because on a candidate run they ARE
+          the candidate, and the last because whoever may move an alias chooses
+          the resolver. Until a release implementing `wall stage1-binary` is
+          published there is no capable resolver, and a scored candidate
+          delivery is refused rather than resolved by the candidate itself.
+        type: string
+        default: ""
       go-version:
         description: 'Go toolchain version (runner: go).'
         type: string
@@ -83,22 +196,305 @@ on:
         description: 'Forwarded to plan + test: a shell command run once per job, in the working-directory, before the plan/test command — a per-runner provisioning seam (DB binaries, codegen, toolchains). Empty = no setup step.'
         type: string
         default: ""
+      wall-time-dir:
+        description: >-
+          Forwarded to plan + test (runner: vitest): records directory for
+          complete-action wall-time measurement. When set, the whole Run-bucket
+          action runs inside a physical envelope with its own containment peer
+          and independent trace, and each invocation gets one of its own. Empty
+          = no measurement ⇒ unchanged behavior.
+          NOTE: a SCORED arm also needs the caller to grant `actions: read`, so
+          the A_GH step diagnostic can be read back from the Actions API. This
+          workflow cannot request it for you — a called workflow may only
+          narrow the caller's permissions — and without it the row is reported
+          ineligible rather than failing the job.
+        type: string
+        default: ""
+      cgroup-root:
+        description: >-
+          Delegated cgroup-v2 subtree the wrapper may create containments under.
+          Without it the run is recorded in full and reported INELIGIBLE rather
+          than scored: a process group cannot prove that no descendant escaped.
+        type: string
+        default: ""
+      workload-user:
+        description: >-
+          The account the MEASURED WORK runs under, distinct from the account
+          the wrapper runs as. This is the privilege boundary: the wrapper must
+          be able to write the delegated cgroup subtree to create and admit
+          containments, and the measured work must not, because on cgroup-v2
+          `cgroup.procs` is the process-migration control. Establish the
+          account, the wrapper group and the subtree ownership in a PRIOR step
+          of the calling job; left empty the row is recorded in full and
+          reported INELIGIBLE rather than scored.
+        type: string
+        default: ""
+      script-user:
+        description: >-
+          The account the measured BUCKET SCRIPT runs under, distinct both from
+          the wrapper's account and from workload-user. There are two measured
+          parties: the harness-generated bucket script, which starts the
+          nested invocation wrappers that ASK the script-level wrapper to
+          create and measure each invocation, and the test code, which holds
+          less still. Running the script as the wrapper made that level
+          unscorable by the wrapper's own rule.
+          Establish the account alongside workload-user in a PRIOR step of the
+          calling job; left empty the script level is recorded in full and
+          reported INELIGIBLE rather than scored.
+        type: string
+        default: ""
+      workload-uid:
+        description: >-
+          ADDITIONAL uids the measured workload may run as, comma-separated,
+          when it runs under credentials other than the wrapper's. On cgroup-v2
+          `cgroup.procs` is the process-migration control, so a delegated
+          subtree owned by the same uid as the workload lets the workload move
+          itself between containments; such a row is recorded in full and
+          reported INELIGIBLE rather than scored.
+
+          This input cannot create that boundary and is not trusted to: a
+          declaration only WIDENS the set of credentials known to lack it, and
+          the wrapper's own uid still counts as the workload's alongside
+          anything named here. A scored arm needs the subtree owned by a
+          credential the measured work does not run as, which is what
+          workload-user and script-user establish — and only when such an
+          account is actually resolved and dropped to does the wrapper's uid
+          stop counting as the workload's. The nesting beneath the script
+          containment is done by the script-level wrapper on request rather
+          than by the measured script, whose containment is never delegated
+          to it.
+        type: string
+        default: ""
+      campaign-authority-keys:
+        description: >-
+          Comma-separated PREDECLARED campaign-authority public keys. The claim
+          store's durability attestation is verified against these; a signature
+          checked against whatever signed it is one anybody can mint.
+        type: string
+        default: ""
+      planner-claim-store:
+        description: >-
+          DURABLE directory for the one-shot planner claim. The contract allows
+          one planner execution and refuses a replan, retry or second
+          invocation. The claim is keyed by the Stage-1 and bundle digests and
+          taken before the planner runs.
+
+          Point this at a store that survives a job rerun. The claim is always
+          also taken in a machine-local store, so leaving this empty weakens the
+          cross-runner guarantee without removing the same-machine one — but a
+          SCORED derivation refuses to plan without a durable store, because a
+          guarantee that cannot survive a rerun is not the one the contract
+          asks for.
+        type: string
+        default: ""
+      campaign-id:
+        description: 'Campaign identity stamped on every wall-time record.'
+        type: string
+        default: ""
+      stage1-digest:
+        description: >-
+          Digest of the signed Stage-1 input manifest that authorised the plan.
+          Every record binds it; without it the records name no authorised
+          inputs and the run is reported INELIGIBLE.
+        type: string
+        default: ""
+      stage2-digest:
+        description: 'Digest of the Stage-2 derived-plan receipt this matrix was fanned out from.'
+        type: string
+        default: ""
+      registry-digest:
+        description: 'Digest of the frozen Aeta component-registry template in force.'
+        type: string
+        default: ""
+      verifier-id:
+        description: 'Delivery-bound verifier identity recorded on every record.'
+        type: string
+        default: ""
+      verify-require:
+        description: >-
+          What `wall verify` must be able to say before a bucket passes:
+          `complete` or `eligible`. A campaign arm uses `eligible`, which also
+          requires an immutable testbucket-version identity.
+        type: string
+        default: complete
+      authority:
+        description: 'Protected environment name the Stage-1 manifest must name.'
+        type: string
+        default: ""
+      authority-key:
+        description: >-
+          PREDECLARED authority public key (hex). It is used TWICE and both
+          uses are load-bearing: the plan job verifies the Stage-1 signature
+          before it derives a plan, and each bucket verifies the same signature
+          in its pre-flight before `wall begin` opens the action envelope. The
+          verifier will not treat a Stage-1 signature as authority approval
+          without one. It is a public key, so it is an input rather than a
+          secret.
+        type: string
+        default: ""
+      run-key-secret:
+        description: >-
+          Name of a secret holding the RUN KEY: the ed25519 private key that
+          signs each bucket's signer roster and closing seal. Required for an
+          eligible scored row — without it both attestations are written
+          unsigned and every verdict is WT-023 ineligible, because records
+          authenticated only by the keys they carry are what a forger would
+          also produce.
+
+          The workflow binds it to exactly two steps of the run-bucket action,
+          `wall begin` and `wall end`, and to neither the setup command nor the
+          measured bucket script. A step-scoped value is invisible to other
+          steps, which is precisely why the measured work cannot mint a roster,
+          cannot mint a seal, and cannot alter either after the seal exists.
+        type: string
+        default: ""
+      record-signer:
+        description: >-
+          The PUBLIC half of that run key, handed to the verifier so it has
+          something to check the roster and seal against. The authority-signed
+          Stage-1 manifest is the authoritative source and WINS OUTRIGHT: when
+          it declares any signer, a key passed here is IGNORED rather than
+          added to it, so do not expect a key stated only here to be admitted.
+          It is used only when Stage 1 declares none. It is public, so it is an
+          input rather than a secret.
+        type: string
+        default: ""
+      verifier-key-secret:
+        description: >-
+          Name of a secret holding the verifier''s ed25519 signing key, used to
+          sign each bucket''s verdict. A campaign counts a row only if its
+          verdict is attributable; without this the verdicts are written
+          unsigned and every campaign refuses them.
+        type: string
+        default: ""
+      frozen-inputs-artifact:
+        description: >-
+          Name of an artifact holding the frozen PLANNING INPUTS: the
+          planning-input bundle (`bundle.json`), the signed Stage-1 manifest
+          authorising it (`stage1.json`), the Aeta component registry
+          (`registry.json`) and, when the arm allocates by a frozen model, the
+          scorer named by `frozen-scorer-file`.
+
+          When set, the plan job derives the matrix from those EXACT bytes
+          rather than from the live tree and the restored store, writes the
+          Stage-2 receipt and every per-bucket document, and uploads them as
+          `testbucket-derived-<cache-scope>`. That is what the exactly-once
+          frozen handoff means: without it the matrix a scored pair compares is
+          two derivations of different inputs, however carefully the rest is
+          measured. Empty leaves planning byte-identical to before.
+        type: string
+        default: ""
+      frozen-scorer-file:
+        description: >-
+          File name of the frozen scorer inside `frozen-inputs-artifact`. The
+          partition then packs by Palloc; without it the split uses the store's
+          measured weights, which is a good split and is not campaign eligible.
+        type: string
+        default: ""
+      frozen-training-set-file:
+        description: >-
+          File name of the SEALED TRAINING RECEIPT SET inside
+          `frozen-inputs-artifact` — the exact offline surface the frozen
+          scorer was fitted from. The verifier revalidates it under the
+          training authority the Stage-1 manifest predeclares and REFITS the
+          scorer from it, so a model whose coefficients did not come from this
+          evidence is refused rather than believed.
+
+          Without it a scored row is INELIGIBLE: the scorer's lineage would
+          then be a digest the scorer states about itself, and an
+          independently written model could claim any sealed set at all.
+        type: string
+        default: ""
+      frozen-documents-artifact:
+        description: >-
+          Name of an artifact holding the frozen documents a scored row needs:
+          the signed Stage-1 manifest (`stage1.json`), the Stage-2 derived-plan
+          receipt (`stage2.json`), the independent replay attestation
+          (`replay.json`), the Aeta component registry (`registry.json`), and
+          per-bucket `aeta-<n>.json`, `pcheck-<n>.json` and
+          `invocations-<n>.json`. The campaign harness produces and uploads it;
+          this workflow downloads it and hands each bucket its own files.
+          A_GH is deliberately NOT in it: `step-attempt.json` describes the
+          bucket step, which has not finished when the artifact is built, so
+          this workflow collects it from the Actions API after the run instead.
+          Without the artifact `verify-require: eligible` fails closed, because
+          the verifier is being asked to prove something it has not been
+          given.
+        type: string
+        default: ""
       runs-on:
-        description: 'Runner label for every job.'
+        description: >-
+          Runner label for every job. The default `ubuntu-latest` is a MOVING
+          ALIAS and is fine for an unscored lane.
+
+          A SCORED arm must name an immutable image instead — a value ending in
+          a complete `@sha256:<64 hex>` or `@sha512:<128 hex>` digest — because
+          the Stage-1 manifest binds a runner image and the pair's equality
+          check compares that binding. Two arms scheduled through
+          `ubuntu-latest` can execute on two different physical images while
+          both signed manifests claim the same identity. The plan job refuses a
+          scored request whose runner is an alias, before anything is planned.
+
+          RESIDUAL, DISCLOSED: GitHub does not report the image it actually
+          selected back to the job, so nothing inside the run can compare the
+          executing runner with `Consumer.RunnerImage`. Refusing an alias makes
+          the asserted identity at least unambiguous and immutable; it does not
+          make it mechanically verified. Closing that needs an attested runner
+          identity GitHub does not currently expose.
         type: string
         default: ubuntu-latest
 
-permissions:
-  contents: read
+# EXPLICIT, EXECUTABLE JOB PERMISSIONS — and a versioned boundary.
+#
+# There is no workflow-level block, because the three jobs do not need the same
+# token and a single block would give the widest of them to all three:
+#
+#   plan     contents: read
+#   test     contents: read, actions: read
+#   record   contents: read
+#
+# Only `test` needs `actions: read`, for the A_GH collector that reads this
+# job's own step timestamps back through the Actions API. `plan` and `record`
+# check out and move same-run artifacts, which the artifact service scopes for
+# itself; neither reads the Actions API.
+#
+# THIS IS A BREAKING CHANGE FOR CALLERS, ON PURPOSE.
+#
+# A called workflow may only retain or reduce what its caller granted, so a
+# `test` job declaring `actions: read` fails at startup for a caller that
+# grants less. That regression shipped once, at a127cb5e, and CI caught it —
+# and the answer then was to declare nothing at all and write the requirement
+# in a comment. That answer does not bound anything: with no declaration these
+# jobs inherit whatever the caller's repository default is, which on many
+# repositories is a write-scoped token. A comment asking for two read scopes is
+# not a permissions boundary, and "the consumer might grant too much" is the
+# case the declaration exists to prevent.
+#
+# So the boundary is VERSIONED rather than left unenforced. The moving `v0`
+# alias does not move — it stays pinned at v0.2.2 — so no consumer resolving
+# `@v0`, `@v0.2.2` or any full SHA sees this change; it reaches a consumer only
+# when that consumer deliberately re-pins to a release carrying it, and that
+# release's notes state the new caller requirement. Every caller inside THIS
+# repository is migrated in the same commit, and a test refuses a caller that
+# grants less than a called job declares, so the two halves cannot drift apart
+# again.
 
 jobs:
   # 1/3 — PLAN. Cheap, and the gate for everything downstream.
   plan:
     runs-on: ${{ inputs.runs-on }}
+    # Checkout, the timing-store cache and same-run artifacts. It never reads
+    # the Actions API, so `actions` stays none.
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      # Derived ONCE, here, from the signed Stage-1 manifest, and consumed by
+      # every downstream job that installs the candidate. One derivation is the
+      # point: a value each job resolved for itself could differ between them.
+      candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -106,13 +502,13 @@ jobs:
       # the plan action always does when version==local), regardless of adapter.
       - name: Set up Go
         if: inputs.runner == 'go' || inputs.testbucket-version == 'local'
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ inputs.go-version }}
 
       - name: Set up Node
         if: inputs.runner == 'vitest'
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
 
@@ -122,12 +518,138 @@ jobs:
         run: npm ci
 
       - name: Restore the timing store
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/testbucket-store
           key: testbucket-timings-${{ inputs.cache-scope }}-v1-${{ github.sha }}
           restore-keys: |
             testbucket-timings-${{ inputs.cache-scope }}-v1-
+
+      # BEFORE the plan, not after it. A scored row's matrix has to come from
+      # the frozen planning-input bundle, and the ordinary plan path reads the
+      # live tree and the restored store at the moment it runs — so a pair
+      # planned that way would be comparing two derivations of different
+      # inputs, however carefully the rest is measured.
+      - name: Download the frozen planning inputs
+        if: inputs.frozen-inputs-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.frozen-inputs-artifact }}
+          path: ${{ runner.temp }}/testbucket-frozen-inputs
+
+      # THE PLAN-JOB AUTHORITY GATE. The contract requires the protected
+      # environment's approval BEFORE either role plans, and this job is where
+      # the frozen planner runs — so the exact label has to be refused here,
+      # not in the downstream bucket job. By the time that job's guard runs,
+      # the matrix and the Stage-2 material already exist.
+      #
+      # It is scoped to the frozen/scored path. An ordinary unscored plan has
+      # no Stage-1 manifest to approve and is unaffected.
+      - name: Refuse a frozen plan without the exact protected authority
+        if: inputs.frozen-inputs-artifact != '' || inputs.verify-require == 'eligible'
+        shell: bash
+        env:
+          TB_AUTHORITY: ${{ inputs.authority }}
+          TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+          TB_FROZEN_INPUTS: ${{ inputs.frozen-inputs-artifact }}
+          TB_VERIFY_REQUIRE: ${{ inputs.verify-require }}
+          TB_RUNS_ON: ${{ inputs.runs-on }}
+        run: |
+          set -euo pipefail
+          fail=0
+          say() { echo "frozen plan — $1" >&2; fail=1; }
+          # THE INPUTS THEMSELVES, before the authority that approves them.
+          #
+          # An authority cannot approve inputs that do not exist. Without the
+          # frozen artifact the download step is skipped, `Plan the buckets`
+          # receives an empty bundle and stage1, and the ORDINARY live planner
+          # runs over the working tree and the restored store — deriving a
+          # matrix from inputs no Stage-1 manifest ever authorised. The matrix
+          # job refuses afterwards, but that refusal can only stop AT_start; it
+          # cannot make the plan that already happened a frozen one.
+          if [ -z "$TB_FROZEN_INPUTS" ]; then
+            say "verify-require=$TB_VERIFY_REQUIRE needs frozen-inputs-artifact. Without it there is no planning-input bundle and no Stage-1 manifest, so this job would plan LIVE from the working tree and the restored store — and the contract puts the authority's approval of the frozen inputs before either role plans. A downstream refusal cannot un-derive that matrix."
+          fi
+          if [ -z "$TB_AUTHORITY_KEY" ]; then
+            say "needs authority-key. An owner-authority signature must be VERIFIED before the plan exists, and a signature checked against whatever signed it accepts any self-generated key."
+          fi
+          if [ "$TB_AUTHORITY" != "ewj2-campaign" ]; then
+            say "needs authority=ewj2-campaign. The frozen contract names exactly one protected environment that may approve Stage-1 inputs before either role plans. A key signs under any label it is given, so checking the key alone lets a manifest approved elsewhere drive the frozen planner — and a downstream refusal cannot un-derive the matrix this job is about to produce."
+          fi
+          # THE RUNNER IMAGE IS PART OF THE PAIR'S IDENTITY.
+          #
+          # Stage 1 binds a runner image and the pair's allowed-difference check
+          # compares that binding, but every job here is scheduled from one
+          # `runs-on` input whose default is the moving `ubuntu-latest`. Two
+          # arms resolved through an alias can execute on two different physical
+          # images while both signed manifests claim the same identity, and
+          # nothing downstream can tell. Refuse the alias here, before the
+          # matrix exists.
+          #
+          # This does not close the gap, and does not pretend to: GitHub does
+          # not report the image it actually selected back to the job, so the
+          # binding stays asserted rather than mechanically verified. What it
+          # removes is the ambiguity — a scored arm names one immutable image.
+          # THE SAME RULE THE MANIFEST APPLIES, NOT A WEAKER SPELLING OF IT.
+          #
+          # This used to accept anything CONTAINING "@sha256:" or "@sha512:",
+          # so an empty, one-character or non-hex suffix passed the pre-plan
+          # gate while the Go validator would later refuse the same value. A
+          # gate that accepts more than the check it stands in for is not a
+          # gate; it is a delay. The pattern below is `isImmutableImage`:
+          # a non-empty image with no whitespace, then a terminal
+          # sha256/64-hex or sha512/128-hex digest in lower case.
+          #
+          # `grep -q` is line-oriented, so a value spanning two lines is
+          # refused outright rather than allowed to satisfy the pattern on a
+          # second line.
+          case "$TB_RUNS_ON" in
+            *[[:space:]]*)
+              say "needs a single-line immutable runs-on for a scored arm; '$TB_RUNS_ON' carries whitespace."
+              ;;
+            *)
+              if ! printf '%s' "$TB_RUNS_ON" | grep -Eq '^[^[:space:]]+@(sha256:[0-9a-f]{64}|sha512:[0-9a-f]{128})$'; then
+                say "needs an immutable runs-on for a scored arm, not '$TB_RUNS_ON'. Stage 1 binds a runner image and the pair equality check compares it; two arms resolved through an alias — or through an alias with a decorative digest suffix — can run on two different images while both manifests claim the same identity."
+              fi
+              ;;
+          esac
+          [ "$fail" -eq 0 ] || exit 1
+          echo "frozen plan: the frozen inputs, the protected authority and its key are all bound before planning"
+
+      # THE MANDATORY CANDIDATE BINARY DIGEST IS DERIVED, NOT TYPED.
+      #
+      # The installer refuses a `candidate:` pin whose binary digest nobody
+      # stated in advance. That rule was unusable through the supported route:
+      # nothing produced the value, so the only way to supply it was to type
+      # one in — and a digest the caller typed names the bytes the caller
+      # wanted to run, not the bytes an authority approved.
+      #
+      # So it is read out of the signed Stage-1 manifest, which is already the
+      # authority on it: validating that manifest verifies the builder's
+      # attestation for the delivered binary against the manifest's own
+      # predeclared builder keys, requires the verifier's countersignature over
+      # the same subject, and requires the delivered binary, the attested
+      # subject and the approved physical wrapper to be one digest.
+      #
+      # It is read by a PUBLISHED release installed for that purpose. Asking
+      # the candidate to produce its own approval would be the delivery
+      # vouching for itself.
+      # The resolution is its OWN action, so the shell that decides which
+      # resolver may be trusted is a reviewed, tested file rather than an
+      # inline block. The previous inline guard rejected only a `candidate:`
+      # spelling and let `local` through — and `local` BUILDS THE CHECKED-OUT
+      # TREE, which on a candidate run is the candidate, so the delivery
+      # authenticated itself through the one route the guard existed to close.
+      - name: Resolve the attested candidate binary digest
+        id: candidate-binary
+        if: startsWith(inputs.testbucket-version, 'candidate:')
+        uses: $/.github/actions/candidate-digest
+        with:
+          resolver-version: ${{ inputs.candidate-resolver-version }}
+          stage1-file: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
+          authority: ${{ inputs.authority }}
+          authority-key: ${{ inputs.authority-key }}
+          expect: ${{ inputs.candidate-binary-digest }}
 
       - name: Plan the buckets
         id: plan
@@ -141,15 +663,62 @@ jobs:
           events-dir: /tmp/testbucket-events
           shard-plan: ${{ runner.temp }}/shard-plan.json
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
+          candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
           node-prefixes: ${{ inputs.node-prefixes }}
           exclude-module: ${{ inputs.exclude-module }}
           setup-command: ${{ inputs.setup-command }}
+          wall-time-dir: ${{ inputs.wall-time-dir }}
+          # With a bundle the matrix is derived by the frozen planner over
+          # those exact bytes, and every per-bucket document is derived and
+          # bound into the Stage-2 receipt in the same step. Empty leaves the
+          # ordinary path byte-identical.
+          bundle: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-frozen-inputs/bundle.json', runner.temp) || '' }}
+          stage1: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-frozen-inputs/stage1.json', runner.temp) || '' }}
+          stage2-out: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/stage2.json', runner.temp) || '' }}
+          scorer: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
+          registry: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-frozen-inputs/registry.json', runner.temp) || '' }}
+          derived-out: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived', runner.temp) || '' }}
+          # The one-shot planner claim. Taken BEFORE the planner runs and keyed
+          # by the Stage-1 and bundle digests, so a second invocation is
+          # refused rather than performed and rejected afterwards.
+          #
+          # planner-claim-dir must name storage that OUTLIVES one runner for
+          # the guard to reach a job rerun, which gets a fresh filesystem. Left
+          # empty it falls back to the runner-local derived directory, which
+          # guards a second invocation within one runner and cannot see an
+          # earlier attempt; the command says so on stderr. A cross-runner
+          # claim needs the same durable external channel the campaign
+          # evidence handoff needs.
+          claim-store: ${{ inputs.frozen-inputs-artifact != '' && inputs.planner-claim-store || '' }}
+          # The authority's signed statement that the store outlives a runner,
+          # and the predeclared keys it verifies against. Without both, a
+          # SCORED derivation refuses to plan: a configured pathname is
+          # something the planner can choose for itself, and the planner is the
+          # party whose one-shot behaviour is being constrained.
+          claim-store-attestation: ${{ secrets.planner-claim-store-attestation }}
+          campaign-authority-keys: ${{ inputs.campaign-authority-keys }}
+          authority-key: ${{ inputs.authority-key }}
+          authority: ${{ inputs.authority }}
+
+      # The Stage-2 receipt and the per-bucket documents the frozen planner
+      # just derived. A bucket downloads them and is verified against them;
+      # without this they would have to be produced somewhere else, which is
+      # exactly the unbound handoff the binding exists to close.
+      - name: Upload the derived plan documents
+        if: always() && inputs.frozen-inputs-artifact != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: testbucket-derived-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/testbucket-derived
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload the shard plan
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: testbucket-shard-plan-${{ inputs.cache-scope }}
           path: ${{ runner.temp }}/shard-plan.json
@@ -160,23 +729,125 @@ jobs:
   test:
     needs: plan
     runs-on: ${{ inputs.runs-on }}
+    # The ONE job that reads the Actions API: the A_GH collector reads this
+    # job's own step timestamps back, and without `actions: read` it gets a 403
+    # and no invocation can ever produce an eligible row. Everything else this
+    # job does needs `contents: read` and nothing more.
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      # A scored arm must actually be measured. Deriving `scored` from
+      # verify-require while running verification only when a records directory
+      # is set would let `verify-require: eligible` finish green having proven
+      # nothing, so the contradiction is refused here, before any bucket runs.
+      # Every precondition an ELIGIBLE request must satisfy, refused BEFORE
+      # anything runs. Each one used to be caught later — by the verifier,
+      # after an envelope had already opened over an unauthorised plan and the
+      # tests had already executed. Failing after running is fail-later, not
+      # the pre-action control the pre-flight action promises.
+      - name: Refuse an eligible request that cannot be pre-flighted
+        if: inputs.verify-require == 'eligible'
+        shell: bash
+        env:
+          TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+          TB_FROZEN_INPUTS: ${{ inputs.frozen-inputs-artifact }}
+          TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+          # The RESOLVED run key, not the fact that a selector was typed.
+          # `run-key-secret` names a secret; a direct external caller can name
+          # one that maps to nothing here, and then the name is nonempty while
+          # `secrets[<name>]` — the value `run-bucket` is actually given below
+          # — is empty. Testing the NAME let exactly that request pass this
+          # guard, pre-flight the plan, open the action envelope and run the
+          # tests, only to be refused WT-023 afterwards: fail-later, which is
+          # the one thing this step exists to prevent. So the predicate is the
+          # SAME expression the `run-key:` input of `run-bucket` is given,
+          # compared against empty. It yields `yes` or `no` and never the key.
+          TB_RUN_KEY_SET: ${{ (secrets.run-key != '' && secrets.run-key || (inputs.run-key-secret != '' && secrets[inputs.run-key-secret] || '')) != '' && 'yes' || 'no' }}
+          # The RESOLVED verifier key, for exactly the same reason, and it was
+          # missing. `verify-wall` runs the human verification first and exits
+          # on its status; the JSON invocation that follows deliberately emits
+          # an UNSIGNED verdict when this key is empty, and the step's exit
+          # code never reflects that. So a scored arm with an unresolved
+          # verifier secret consumed the whole measurement, finished green, and
+          # uploaded a verdict no campaign can count — refused only much later
+          # by `wall campaign`. That is the fail-late shape the run-key
+          # predicate above exists to prevent, and this is the SAME expression
+          # the `verifier-key:` input of `verify-wall` is given, compared
+          # against empty. It yields `yes` or `no` and never the key.
+          TB_VERIFIER_KEY_SET: ${{ (secrets.verifier-key != '' && secrets.verifier-key || (inputs.verifier-key-secret != '' && secrets[inputs.verifier-key-secret] || '')) != '' && 'yes' || 'no' }}
+          # The four identities run-bucket stamps onto every measured record.
+          # They are resolved caller VALUES, so they are checked here for the
+          # same reason the run key is: the pre-flight appends its --expect-*
+          # flags only for values that are non-empty, so an omitted one is a
+          # comparison that never happens rather than one that fails.
+          TB_STAGE1_DIGEST: ${{ inputs.stage1-digest }}
+          TB_STAGE2_DIGEST: ${{ inputs.stage2-digest }}
+          TB_REGISTRY_DIGEST: ${{ inputs.registry-digest }}
+          TB_VERIFIER_ID: ${{ inputs.verifier-id }}
+          TB_FROZEN_DOCS: ${{ inputs.frozen-documents-artifact }}
+          # The protected environment that must have approved Stage 1. The
+          # contract names exactly one, and a scored row approved under any
+          # other label is not a row this campaign authorised.
+          TB_AUTHORITY: ${{ inputs.authority }}
+        run: |
+          set -euo pipefail
+          fail=0
+          say() { echo "verify-require: eligible — $1" >&2; fail=1; }
+
+          if [ -z "$TB_WALL_DIR" ]; then
+            say "needs wall-time-dir. An eligible row is a MEASURED row, and with no records directory this workflow would verify nothing and pass."
+          fi
+          if [ -z "$TB_FROZEN_INPUTS" ]; then
+            say "needs frozen-inputs-artifact. Without it there is no bundle, no Stage-1 manifest and no issued receipt, so the pre-flight cannot re-derive the plan or check its authority approval — and the bucket would open an envelope over a plan nobody authorised."
+          fi
+          if [ -z "$TB_AUTHORITY_KEY" ]; then
+            say "needs authority-key. A Stage-1 signature checked against whatever signed it accepts any self-generated key, which is the same as not checking."
+          fi
+          if [ "$TB_RUN_KEY_SET" != "yes" ]; then
+            say "needs a run key that RESOLVES here (the run-key secret, or run-key-secret naming one this workflow can actually read). Without a value the signer roster and the closing seal are written unsigned and every row is WT-023 ineligible; a secret name that maps to nothing is no key at all."
+          fi
+          if [ "$TB_VERIFIER_KEY_SET" != "yes" ]; then
+            say "needs a verifier key that RESOLVES here (the verifier-key secret, or verifier-key-secret naming one this workflow can actually read). Without a value the whole measurement runs, the step finishes green, and the JSON verdict it uploads is UNSIGNED — so no campaign can count the row and the failure surfaces only when the campaign gate authenticates it, long after the time was spent."
+          fi
+          if [ -z "$TB_STAGE1_DIGEST" ]; then
+            say "needs stage1-digest. run-bucket stamps it onto every record; unsupplied, the pre-flight has nothing to compare and the row carries an identity nobody bound."
+          fi
+          if [ -z "$TB_STAGE2_DIGEST" ]; then
+            say "needs stage2-digest. A record that names no Stage-2 receipt might have measured a plan nobody authorised."
+          fi
+          if [ -z "$TB_REGISTRY_DIGEST" ]; then
+            say "needs registry-digest. Without it the Aeta registry stamped on the records is unbound to the one the plan was instantiated from."
+          fi
+          if [ -z "$TB_VERIFIER_ID" ]; then
+            say "needs verifier-id. A record that names no verifier identity is attributable to nobody."
+          fi
+          if [ -z "$TB_FROZEN_DOCS" ]; then
+            say "needs frozen-documents-artifact. It carries the signed independent replay attestation: without it the pre-flight can only check that verifier-id is non-blank, so a different resolved identity would open the envelope and be refused only after the bucket had run — and verification would then find no replay to score the row against at all."
+          fi
+          if [ "$TB_AUTHORITY" != "ewj2-campaign" ]; then
+            say "needs authority=ewj2-campaign. The frozen contract names exactly one protected environment that may approve Stage-1 inputs; a correctly KEYED manifest approved under any other label is not one this campaign authorised, and the pre-flight cannot refuse a label nobody told it to require."
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "eligible request: wall directory, frozen inputs, authority key and label, run key and all four record identities are present"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
-        if: inputs.runner == 'go'
-        uses: actions/setup-go@v7.0.0
+        # Also for a MEASURED bucket built from source: the wrapper is
+        # installed below, and `local` means `go build`.
+        if: inputs.runner == 'go' || (inputs.wall-time-dir != '' && inputs.testbucket-version == 'local')
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ inputs.go-version }}
 
       - name: Set up Node
         if: inputs.runner == 'vitest' || matrix.needs_node
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
 
@@ -185,23 +856,248 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         run: npm ci
 
+      # A scored row is verified against documents this workflow does not
+      # produce: the signed manifest, the one authorised Stage-2 receipt, the
+      # independent replay attestation, and this bucket's own forecast and
+      # projection. They are downloaded here so the verifier has them, rather
+      # than the bucket claiming eligibility it cannot demonstrate.
+      - name: Download the frozen documents
+        if: inputs.frozen-documents-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.frozen-documents-artifact }}
+          path: ${{ runner.temp }}/testbucket-frozen
+
+      # The Stage-2 receipt and per-bucket documents the frozen planner
+      # derived, and the plan itself. The plan is what the coverage audit
+      # compares this bucket's events against: a wall-time envelope records how
+      # long something took and can never record what it skipped.
+      - name: Download the derived plan documents
+        if: inputs.frozen-inputs-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: testbucket-derived-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/testbucket-derived
+
+      # The frozen scorer travels with the inputs, not the outputs: the
+      # verifier re-derives every Palloc value by running it, and a projection
+      # checked only against its own arithmetic is satisfied by an allocation
+      # map no model produced.
+      - name: Download the frozen planning inputs
+        if: inputs.frozen-inputs-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.frozen-inputs-artifact }}
+          path: ${{ runner.temp }}/testbucket-frozen-inputs
+
+      - name: Download the shard plan
+        if: inputs.wall-time-dir != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: testbucket-shard-plan-${{ inputs.cache-scope }}
+          path: ${{ runner.temp }}/testbucket-plan
+
+      # PRE-FLIGHT, before `wall begin` opens the action envelope.
+      #
+      # The contract puts an independent re-derivation of the plan, and the
+      # authority approval of its inputs, BEFORE AT_start. Verification after
+      # the action can refuse the row; it cannot un-run it. This step re-plans
+      # from the frozen bundle, checks it reproduces the issued receipt exactly
+      # — bindings and pre-plan approval included — and fails the bucket closed
+      # if it does not, so no envelope opens over an unauthorised plan.
+      - name: Pre-flight the frozen plan
+        # MANDATORY for an eligible request. The guard at the top of this job
+        # has already refused an eligible request with no frozen inputs, so
+        # this cannot be skipped into for a scored row.
+        if: inputs.wall-time-dir != '' && (inputs.frozen-inputs-artifact != '' || inputs.verify-require == 'eligible')
+        uses: $/.github/actions/preflight
+        with:
+          version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
+          bundle: ${{ runner.temp }}/testbucket-frozen-inputs/bundle.json
+          stage1: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
+          stage2: ${{ runner.temp }}/testbucket-derived/stage2.json
+          registry: ${{ runner.temp }}/testbucket-frozen-inputs/registry.json
+          scorer: ${{ inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
+          authority-key: ${{ inputs.authority-key }}
+          # The EXACT protected environment, not just its key. A key can sign
+          # under any label, and which environment approved is the question the
+          # contract asks before AT_start.
+          authority: ${{ inputs.authority }}
+          # The four identities run-bucket stamps onto every measured record,
+          # compared here with what the replay derives. Without them a
+          # mismatched or empty record identity opened the envelope, ran the
+          # tests, and was refused only by verification afterwards.
+          stage1-digest: ${{ inputs.stage1-digest }}
+          stage2-digest: ${{ inputs.stage2-digest }}
+          registry-digest: ${{ inputs.registry-digest }}
+          verifier-id: ${{ inputs.verifier-id }}
+          # The signed replay this row will be verified against, so the
+          # verifier identity above is compared with the one that actually
+          # attested the plan — here, rather than after the bucket has run.
+          replay-attestation: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/replay.json', runner.temp) || '' }}
+
+      # The wrapper is installed BEFORE the measured action, by the caller.
+      # The physical action envelope opens on run-bucket's first owned
+      # operation and the wrapper cannot read a clock before it exists, so
+      # installing inside that action would put action-owned work outside A
+      # permanently.
+      - name: Install testbucket for the measured action
+        if: inputs.wall-time-dir != ''
+        uses: $/.github/actions/install
+        with:
+          version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
+
       - name: Run bucket ${{ matrix.bucket }}
+        id: run-bucket
         uses: $/.github/actions/run-bucket
         with:
           runner: ${{ inputs.runner }}
           script: ${{ matrix.script }}
           name: ${{ matrix.name }}
+          # Bound by the ACTION to `wall begin` and `wall end` only. It must
+          # never reach the setup command or the measured script: those are the
+          # work being attested, and a signer set the measured work can produce
+          # attests nothing.
+          # The declared secret first, so an EXTERNAL caller can supply it;
+          # the named-lookup form second, which is how an in-org caller using
+          # `secrets: inherit` passes it. Either works, neither is required.
+          run-key: ${{ secrets.run-key != '' && secrets.run-key || (inputs.run-key-secret != '' && secrets[inputs.run-key-secret] || '') }}
           est-seconds: ${{ matrix.est_seconds }}
           events-dir: /tmp/testbucket-events
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           working-directory: ${{ inputs.working-directory }}
           setup-command: ${{ inputs.setup-command }}
+          wall-time-dir: ${{ inputs.wall-time-dir }}
+          cgroup-root: ${{ inputs.cgroup-root }}
+          workload-uid: ${{ inputs.workload-uid }}
+          workload-user: ${{ inputs.workload-user }}
+          script-user: ${{ inputs.script-user }}
+          campaign-id: ${{ inputs.campaign-id }}
+          stage1-digest: ${{ inputs.stage1-digest }}
+          stage2-digest: ${{ inputs.stage2-digest }}
+          registry-digest: ${{ inputs.registry-digest }}
+          verifier-id: ${{ inputs.verifier-id }}
+          scored: ${{ inputs.verify-require == 'eligible' }}
+
+      # A_GH can only be collected AFTER the step it describes: it is that
+      # step's own start and completion, and while the step is running they do
+      # not exist yet. So the frozen-documents artifact cannot carry it — it is
+      # read back from the Actions API here, between the action and its
+      # verification.
+      #
+      # A failure to collect is NOT fatal: the diagnostic is non-gating, and a
+      # missing one already makes the row ineligible through the verifier
+      # rather than through a red step. Fabricating one would be worse than
+      # not having it.
+      - name: Collect the A_GH step diagnostic
+        if: always() && inputs.wall-time-dir != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+          TB_STEP_NAME: Run bucket ${{ matrix.bucket }}
+        run: |
+          set -uo pipefail
+          out="$TB_WALL_DIR/step-attempt.json"
+          jobs_url="/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs"
+
+          # Identify THIS job by the runner executing it: a matrix job's API
+          # name is not the workflow's job id, and every leg of one matrix
+          # shares the same name shape.
+          job=$(gh api --paginate "$jobs_url" \
+                  --jq ".jobs[] | select(.runner_name == \"${RUNNER_NAME:-}\")" 2>/dev/null | tail -c 400000)
+          if [ -z "$job" ]; then
+            echo "could not identify this job from the Actions API; A_GH will be absent and the row unscorable" >&2
+            exit 0
+          fi
+
+          printf '%s' "$job" | jq \
+            --arg step "$TB_STEP_NAME" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg run "${GITHUB_RUN_ID}" \
+            --arg job_name "${GITHUB_JOB}" \
+            --arg attempt "${GITHUB_RUN_ATTEMPT}" \
+            '.steps[] | select(.name == $step) |
+             {kind: "tb.walltime.step-attempt/v1",
+              attempt: {repository: $repo, workflow_run: $run, job: $job_name,
+                        step: "run-bucket", attempt: $attempt, precision: "1s",
+                        started_at: .started_at, completed_at: .completed_at}}' \
+            > "$out" 2>/dev/null
+          if [ ! -s "$out" ]; then
+            rm -f "$out"
+            echo "the '$TB_STEP_NAME' step was not found in this job's API record; A_GH will be absent and the row unscorable" >&2
+            exit 0
+          fi
+          echo "collected A_GH for '$TB_STEP_NAME':"
+          cat "$out"
+
+      # Verification is its OWN action, run after run-bucket rather than inside
+      # it. The contract puts AT_end after the final action epilogue, so a
+      # verification step inside the run-bucket action would be action-owned
+      # work after the interval that claims to contain it.
+      - name: Verify bucket ${{ matrix.bucket }}
+        if: always() && inputs.wall-time-dir != ''
+        uses: $/.github/actions/verify-wall
+        with:
+          wall-time-dir: ${{ inputs.wall-time-dir }}
+          require: ${{ inputs.verify-require }}
+          version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
+          authority: ${{ inputs.authority }}
+          authority-key: ${{ inputs.authority-key }}
+          records-artifact: testbucket-wall-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
+          verdict-file: ${{ inputs.wall-time-dir }}/verdict.json
+          verifier-key: ${{ secrets.verifier-key != '' && secrets.verifier-key || (inputs.verifier-key-secret != '' && secrets[inputs.verifier-key-secret] || '') }}
+          record-signer: ${{ inputs.record-signer }}
+          stage1-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage1.json', runner.temp) || '' }}
+          # The derived documents come from the PLANNER when the arm was
+          # planned from a frozen bundle: they are the one authorised plan's
+          # own output, bound into its Stage-2 receipt by digest. The
+          # frozen-documents artifact remains the path for an arm whose plan
+          # was derived elsewhere.
+          stage2-file: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/stage2.json', runner.temp) || (inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/stage2.json', runner.temp) || '') }}
+          replay-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/replay.json', runner.temp) || '' }}
+          registry-file: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/registry.json', runner.temp) || '' }}
+          aeta-file: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/aeta-{1}.json', runner.temp, matrix.bucket) || (inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/aeta-{1}.json', runner.temp, matrix.bucket) || '') }}
+          pcheck-file: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/pcheck-{1}.json', runner.temp, matrix.bucket) || (inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/pcheck-{1}.json', runner.temp, matrix.bucket) || '') }}
+          invocations-file: ${{ inputs.frozen-inputs-artifact != '' && format('{0}/testbucket-derived/invocations-{1}.json', runner.temp, matrix.bucket) || (inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/invocations-{1}.json', runner.temp, matrix.bucket) || '') }}
+          step-attempt-file: ${{ inputs.wall-time-dir != '' && format('{0}/step-attempt.json', inputs.wall-time-dir) || '' }}
+          # Exact-run coverage. Without these the verifier can say the
+          # measurement was well formed and nothing more: a script that skipped
+          # half its targets produces a shorter, perfectly attested envelope.
+          runner: ${{ inputs.runner }}
+          shard-plan-file: ${{ inputs.wall-time-dir != '' && format('{0}/testbucket-plan/shard-plan.json', runner.temp) || '' }}
+          events-dir: /tmp/testbucket-events
+          scorer-file: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
+          training-set-file: ${{ inputs.frozen-inputs-artifact != '' && inputs.frozen-training-set-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-training-set-file) || '' }}
+
+      # The raw records and the verdict ARE the evidence: a campaign assembles
+      # its population from them, and a row whose records were discarded with
+      # the runner cannot be re-verified by anyone.
+      # The records AND the verdict derived from them travel together: a
+      # campaign assembles its population from verdicts, and a verdict with no
+      # records behind it cannot be re-checked by anyone.
+      - name: Upload the wall-time records and verdict
+        if: always() && inputs.wall-time-dir != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: testbucket-wall-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
+          path: ${{ inputs.wall-time-dir }}
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Upload timing events
         # if: always() so a red bucket still contributes what it measured;
         # ingest drops a failed unit's weight and keeps the rest.
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: testbucket-events-${{ inputs.cache-scope }}-bucket-${{ matrix.bucket }}
           path: /tmp/testbucket-events/
@@ -216,8 +1112,13 @@ jobs:
     # consumer's default branch is authoritative for the shared store.
     if: ${{ !cancelled() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ${{ inputs.runs-on }}
+    # Checkout, same-run artifacts and the timing-store cache. The store is
+    # written back through the cache, not through the repository, so `contents`
+    # stays read and nothing here needs the Actions API.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -225,13 +1126,13 @@ jobs:
       # the record action always does when version==local), regardless of adapter.
       - name: Set up Go
         if: inputs.runner == 'go' || inputs.testbucket-version == 'local'
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ inputs.go-version }}
 
       - name: Set up Node
         if: inputs.runner == 'vitest'
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
 
@@ -241,20 +1142,20 @@ jobs:
         run: npm ci
 
       - name: Download timing events
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: testbucket-events-${{ inputs.cache-scope }}-bucket-*
           merge-multiple: true
           path: /tmp/testbucket-events
 
       - name: Download the shard plan
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: testbucket-shard-plan-${{ inputs.cache-scope }}
           path: ${{ runner.temp }}/plan
 
       - name: Restore the previous timing store
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/testbucket-store
           key: testbucket-timings-${{ inputs.cache-scope }}-v1-${{ github.sha }}
@@ -271,6 +1172,8 @@ jobs:
           events-dir: /tmp/testbucket-events
           shard-plan: ${{ runner.temp }}/plan/shard-plan.json
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
+          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
           exclude-module: ${{ inputs.exclude-module }}
@@ -279,14 +1182,14 @@ jobs:
         # Writes on a new default-branch commit; on a same-SHA re-run the entry
         # already exists and the action warns instead of overwriting, keeping the
         # split deterministic for a given SHA.
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/testbucket-store
           key: testbucket-timings-${{ inputs.cache-scope }}-v1-${{ github.sha }}
 
       - name: Upload the timing store
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: testbucket-timing-store-${{ inputs.cache-scope }}
           path: ${{ runner.temp }}/testbucket-store/test-timings.json

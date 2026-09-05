@@ -117,6 +117,11 @@ func renderBucket(b runner.Bucket, cfg renderConfig) runner.Rendered {
 		}
 		sort.Strings(g.ids)
 		inv.Desc = strings.Join(g.ids, " ")
+		inv.Units = append([]string(nil), g.ids...)
+		// The Go adapter records the same selection identity, so the neutral
+		// seam means one thing for both adapters. It is data only: the Go
+		// renderer's emitted bytes are unchanged.
+		inv.Selector = append(append([]string(nil), g.run...), g.paths...)
 		out.Invocations = append(out.Invocations, inv)
 		lines = append(lines, shellLine(inv, cfg, b.Index, len(lines)))
 	}

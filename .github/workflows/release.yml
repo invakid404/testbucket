@@ -3,8 +3,10 @@ name: Release
 # Cut a release from a version tag. Pushing `vX.Y.Z` builds the cross-platform
 # CLI binaries (linux/darwin x amd64/arm64) with goreleaser, publishes a GitHub
 # Release with the tar.gz archives + a checksums file, and points the
-# `v<major>` alias tag (e.g. v1) at the HIGHEST stable release of that major so
-# consumers can pin the reusable actions at @v1 — the standard convention.
+# `v<major>` alias tag at the HIGHEST stable release of that major so consumers
+# can pin the reusable actions at that alias — the standard convention. While
+# this project is pre-1.0 that alias is `v0`, which is what every action's
+# `version` input defaults to.
 #
 # Validate the build WITHOUT publishing at any time:
 #   goreleaser release --snapshot --clean
@@ -32,46 +34,796 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # READ ONLY. This job builds and attests; nothing it produces reaches
+    # GitHub until an independent verifier has countersigned it and the
+    # publish job has re-checked both signatures.
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # goreleaser needs the full history and all tags for the version and
           # changelog.
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.1"
 
-      - name: Run goreleaser
-        # Pinned to a reviewed commit SHA (third-party code with a write token);
-        # bump via an explicit PR. goreleaser itself is pinned to an exact
-        # version in the same spirit.
+      # BUILD THE ACTUAL RELEASE ARTIFACTS — but publish nothing yet.
+      #
+      # This is the same goreleaser invocation that used to publish, with the
+      # publishing half skipped. It produces the four platform binaries, their
+      # four archives and the checksums file in ./dist from the tagged tree,
+      # with the real release ldflags — the exact bytes that will be uploaded.
+      - name: Build the release artifacts (no publish)
+        # Pinned to a reviewed commit SHA (third-party code); bump via an
+        # explicit PR. goreleaser itself is pinned to an exact version in the
+        # same spirit.
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "2.18.0"
-          # --clean is safe to re-run: replace_existing_artifacts is enabled in
-          # .goreleaser.yaml, so a rerun after a transient failure replaces the
-          # assets instead of failing with `already_exists`.
-          args: release --clean
+          # --clean is safe to re-run. --skip=publish,announce stops after the
+          # artifacts exist: nothing reaches GitHub until the gate below has
+          # passed over these exact bytes.
+          args: release --clean --skip=publish,announce
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # DERIVE THE PUBLISH SET, ONCE.
+      #
+      # Everything downstream reads this one document: the gate checks it, the
+      # publisher uploads exactly the assets it names. That is the whole point.
+      # The gate used to select files by goreleaser artifact TYPE while the
+      # publisher selected them by GLOB, so the two sets differed by exactly
+      # the four raw platform binaries — gated, never uploaded, and therefore
+      # able to satisfy the campaign's delivered-binary match with a file no
+      # consumer ever receives.
+      #
+      # `wall release-manifest` reads goreleaser's own manifest (never a glob,
+      # which could miss a produced file), hashes every asset a release
+      # uploads, and hashes every file INSIDE each archive. The members matter:
+      # the campaign binds the measured executable and a release ships
+      # archives, so the only honest way for those two facts to meet is through
+      # the archive that actually carries the binary.
+      - name: Derive the canonical publish set
+        env:
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/testbucket-gate" ./cmd/testbucket
+          "$RUNNER_TEMP/testbucket-gate" wall release-manifest \
+            --dist dist --root . --out "$TB_RELEASE_MANIFEST"
+
+      # ATTEST THE EXACT BYTES, before anything gates or publishes them.
+      #
+      # Stage 1 requires a signed build attestation for the delivered binary,
+      # and the release path produced none: `wall attest` existed as a
+      # subcommand that the workflow building the artifacts never invoked, so
+      # the exact goreleaser output was never attested on the path that
+      # actually ships it.
+      #
+      # This is the BUILDER'S HALF ONLY. It states the subject, the source and
+      # the builder's own identity, signed with the builder key. It does NOT
+      # state that anything was verified: the verifier id, the verifier binary,
+      # the instant and the result used to be written here too, all chosen by
+      # the builder and signed with the builder's key, which is a build
+      # vouching for itself. The `verify` job below is the second party, and
+      # `publish` will not run without its countersignature.
+      - name: Attest the release artifacts (builder half)
+        env:
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+          TB_ATTESTATION_DIR: ${{ runner.temp }}/attestations
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_WALL_BUILDER_KEY: ${{ secrets.TB_WALL_BUILDER_KEY }}
+          TB_BUILDER_ID: ${{ github.repository }}/${{ github.workflow_ref }}
+          TB_ISSUER: https://token.actions.githubusercontent.com
+          TB_RUN: ${{ github.run_id }}
+          TB_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TB_WALL_BUILDER_KEY:-}" ]; then
+            echo "REFUSED: no builder signing key (secret TB_WALL_BUILDER_KEY)." >&2
+            echo "Stage 1 requires a SIGNED build attestation for the delivered binary," >&2
+            echo "and an unsigned claim about a build is prose." >&2
+            exit 1
+          fi
+          mkdir -p "$TB_ATTESTATION_DIR"
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_RELEASE_MANIFEST")
+          for a in "${assets[@]}"; do
+            name="$(basename "$a")"
+            "$RUNNER_TEMP/testbucket-gate" wall attest \
+              --subject "$a" \
+              --subject-name "$name" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-commit "$TB_RELEASE_SHA" \
+              --builder-id "$TB_BUILDER_ID" \
+              --issuer "$TB_ISSUER" \
+              --build-run "$TB_RUN" \
+              --build-attempt "$TB_ATTEMPT" \
+              --out "$TB_ATTESTATION_DIR/$name.attestation.json"
+          done
+          echo "attested ${#assets[@]} released asset(s) from $TB_RELEASE_SHA"
+          echo "NOT YET VERIFIED: the verify job must countersign these before publish runs"
+
+      # STAGE THE THREE INPUTS UNDER ONE ROOT.
+      #
+      # upload-artifact roots a multi-path upload at the LEAST COMMON ANCESTOR
+      # of its inputs, and these three did not share one: `dist` is in the
+      # workspace and the manifest and attestations are under RUNNER_TEMP, so
+      # the common ancestor was /home/runner/work and the download produced
+      # `testbucket/testbucket/dist` and `_temp/release-manifest.json` — while
+      # the verify and publish jobs both read a flat `$TB_BUILD/dist` and
+      # `$TB_BUILD/release-manifest.json`. The release stopped there, before
+      # any independent check or campaign gate ran.
+      #
+      # Copying them into one staging directory first makes that directory the
+      # artifact root, so what is downloaded is exactly the layout the two
+      # consumers address.
+      - name: Stage the built artifacts under one root
+        env:
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/release-manifest.json
+          TB_ATTESTATION_DIR: ${{ runner.temp }}/attestations
+          TB_STAGING: ${{ runner.temp }}/release-staging
+        run: |
+          set -euo pipefail
+          rm -rf "$TB_STAGING"
+          mkdir -p "$TB_STAGING"
+          cp -R dist "$TB_STAGING/dist"
+          cp "$TB_RELEASE_MANIFEST" "$TB_STAGING/release-manifest.json"
+          cp -R "$TB_ATTESTATION_DIR" "$TB_STAGING/attestations"
+          # The manifest names asset paths relative to the workspace (dist/...)
+          # and every consumer resolves them against the staging root, so the
+          # two must agree. Fail here rather than half-way through publication.
+          for a in $(jq -r '.assets[].path' "$TB_STAGING/release-manifest.json"); do
+            if [ ! -f "$TB_STAGING/$a" ]; then
+              echo "REFUSED: the manifest names $a, which is not under the staged root." >&2
+              exit 1
+            fi
+          done
+          echo "staged $(jq -r '.assets | length' "$TB_STAGING/release-manifest.json") asset(s), the manifest and their attestations"
+
+      # HAND THE EXACT BYTES TO THE NEXT JOB.
+      #
+      # The verifier must obtain the artifact for itself rather than be told
+      # its digest, and the publisher must upload the bytes that were gated —
+      # so dist, the manifest and the builder attestations travel as ONE PATH
+      # and every later job works from what it downloaded.
+      - name: Upload the built artifacts for verification
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/release-staging
+          if-no-files-found: error
+          retention-days: 7
+
+  # THE INDEPENDENT VERIFIER.
+  #
+  # A separate job, a separate key and a separate copy of the artifact. It
+  # downloads what the builder produced, RE-DERIVES each asset's digest for
+  # itself, and signs what it concluded under TB_WALL_VERIFIER_KEY — which the
+  # builder job is never given. `wall countersign` refuses a verifier identity
+  # equal to the builder's, refuses a verifier key equal to the builder's, and
+  # refuses bytes whose digest is not the one the builder attested.
+  #
+  # This is what "verified" now means. It used to mean a string in a repository
+  # variable that the builder wrote into its own document.
+  verify:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      # actions: read is what lets this job DOWNLOAD the build artifacts it
+      # verifies. Declaring any permission makes every undeclared one `none`,
+      # so the download was relying on this repository being public — which is
+      # not a declaration and fails on a private or protected installation.
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the built artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/build
+
+      # THE TRUSTED VERIFIER, WHICH IS NOT THIS CANDIDATE.
+      #
+      # This job used to `go build ./cmd/testbucket` from the release
+      # candidate's own checkout and hand that binary the verifier private key.
+      # A candidate that decides whether it is acceptable, signs the answer,
+      # and reports its own hash as the "verifier binary" has verified nothing:
+      # the trust boundary was circular, and a defective or hostile candidate
+      # could countersign itself.
+      #
+      # The verifier is therefore a SEPARATELY PINNED, PREVIOUSLY PUBLISHED
+      # release, named by an exact tag and an exact SHA-256 that this workflow
+      # does not compute. Both come from repository variables a release cannot
+      # edit; the checksum is checked before the binary is executed, and an
+      # unset or mismatching pin fails closed. It is deliberately NOT the
+      # moving `v0` alias: an alias the release process can move is not a
+      # separate root of trust.
+      # THE BOOTSTRAP TREE, checked out at its own pinned commit.
+      #
+      # It is a SEPARATE checkout into a separate path: the adjudicator is
+      # built from that tree, never from the candidate's. When the released
+      # asset pin is used instead this checks out nothing.
+      - name: Check out the pinned bootstrap adjudicator source
+        if: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT }}
+          path: ${{ runner.temp }}/trusted-src
+
+      # Go is set up ONLY for the bootstrap route, and only to build that
+      # separate tree. The released-asset route runs a downloaded binary and
+      # needs no toolchain at all.
+      - name: Set up Go for the bootstrap adjudicator
+        if: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+
+      - name: Obtain the pinned trusted adjudicator
+        env:
+          TB_TRUSTED_VERIFIER_TAG: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_TAG }}
+          TB_TRUSTED_VERIFIER_SHA256: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_SHA256 }}
+          TB_TRUSTED_VERIFIER_COMMIT: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT }}
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_TRUSTED_OUT: ${{ runner.temp }}/testbucket-verifier
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # EXACTLY ONE OF THE TWO PINS, and never both: two roots of trust
+          # where the workflow chooses between them is one root of trust the
+          # workflow chooses.
+          if [ -n "${TB_TRUSTED_VERIFIER_TAG:-}" ] && [ -n "${TB_TRUSTED_VERIFIER_COMMIT:-}" ]; then
+            echo "REFUSED: both a released-asset pin and a bootstrap-commit pin are set." >&2
+            echo "Set exactly one; a workflow that picks between two roots of trust is its own root." >&2
+            exit 1
+          fi
+
+          if [ -n "${TB_TRUSTED_VERIFIER_TAG:-}" ]; then
+            # THE RELEASED-ASSET PIN: a previously published release, named by
+            # an exact stable tag and an exact asset digest this workflow does
+            # not compute.
+            if [ -z "${TB_TRUSTED_VERIFIER_SHA256:-}" ]; then
+              echo "REFUSED: TB_RELEASE_TRUSTED_VERIFIER_TAG is set without TB_RELEASE_TRUSTED_VERIFIER_SHA256." >&2
+              echo "A tag names a release; only the digest names the bytes." >&2
+              exit 1
+            fi
+            # EXACT STABLE SemVer, by regex rather than by shell glob. In shell
+            # patterns `*` is unrestricted, so `v[0-9]*.[0-9]*.[0-9]*` also
+            # matched `v1x.2y.3junk` and `v1.2.3-rc.1`: a prerelease is a build
+            # the project has not stood behind and a malformed segment is not a
+            # version at all. This is the expression the alias job uses.
+            if ! printf '%s' "$TB_TRUSTED_VERIFIER_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "REFUSED: the trusted adjudicator pin '$TB_TRUSTED_VERIFIER_TAG' is not an exact stable release tag (vMAJOR.MINOR.PATCH)." >&2
+              echo "A moving alias can be repointed by the very process being verified." >&2
+              exit 1
+            fi
+            if [ "$TB_TRUSTED_VERIFIER_TAG" = "${GITHUB_REF_NAME:-}" ]; then
+              echo "REFUSED: the trusted adjudicator pin is the tag being released." >&2
+              exit 1
+            fi
+            # THE ASSET NAME IS goreleaser's, not uname's. The archives are
+            # named {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }} —
+            # `testbucket_0.2.2_linux_amd64.tar.gz`. The previous selector
+            # built `testbucket_Linux_x86_64.tar.gz` from `uname`, which
+            # matches no published asset at any tag, so this step could never
+            # obtain an adjudicator at all.
+            version="${TB_TRUSTED_VERIFIER_TAG#v}"
+            case "$(uname -m)" in
+              x86_64|amd64) arch=amd64 ;;
+              aarch64|arm64) arch=arm64 ;;
+              *) echo "REFUSED: no published asset for machine $(uname -m)." >&2; exit 1 ;;
+            esac
+            os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+            asset="testbucket_${version}_${os}_${arch}.tar.gz"
+            mkdir -p "$RUNNER_TEMP/trusted"
+            gh release download "$TB_TRUSTED_VERIFIER_TAG" \
+              --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/trusted"
+            echo "$TB_TRUSTED_VERIFIER_SHA256  $RUNNER_TEMP/trusted/$asset" | sha256sum -c -
+            tar -xzf "$RUNNER_TEMP/trusted/$asset" -C "$RUNNER_TEMP/trusted" testbucket
+            install -m 0755 "$RUNNER_TEMP/trusted/testbucket" "$TB_TRUSTED_OUT"
+            echo "trusted adjudicator: released asset $asset from $TB_TRUSTED_VERIFIER_TAG"
+          elif [ -n "${TB_TRUSTED_VERIFIER_COMMIT:-}" ]; then
+            # THE BOOTSTRAP PIN, and why it exists.
+            #
+            # The released-asset route cannot start: no published release
+            # carries the `wall` adjudication subcommands, and this step
+            # refuses the tag being released — so the first wall-capable
+            # release had no adjudicator it could ever obtain. The bootstrap is
+            # an exact 40-hex COMMIT of this repository, predeclared in a
+            # repository variable, checked out separately and built there.
+            #
+            # It is a real independence boundary and a weaker one than a
+            # published asset, and it is written down as such: the commit is
+            # not the candidate, it is fixed before the release runs, and it is
+            # a distinct tree from the one being judged. It is not
+            # reproducibly-attested bytes. Move to the asset pin as soon as one
+            # wall-capable release exists, and record that ceremony where the
+            # variable is set.
+            if ! printf '%s' "$TB_TRUSTED_VERIFIER_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "REFUSED: the bootstrap adjudicator pin is not a full 40-hex commit." >&2
+              exit 1
+            fi
+            if [ "$TB_TRUSTED_VERIFIER_COMMIT" = "$TB_RELEASE_SHA" ]; then
+              echo "REFUSED: the bootstrap adjudicator pin is the commit being released." >&2
+              echo "A candidate that adjudicates itself has been adjudicated by nobody." >&2
+              exit 1
+            fi
+            if [ ! -x "$RUNNER_TEMP/trusted-src/cmd/testbucket" ] && [ ! -d "$RUNNER_TEMP/trusted-src/cmd/testbucket" ]; then
+              echo "REFUSED: the bootstrap checkout is missing; the separate checkout step must run first." >&2
+              exit 1
+            fi
+            ( cd "$RUNNER_TEMP/trusted-src" && go build -o "$TB_TRUSTED_OUT" ./cmd/testbucket )
+            echo "trusted adjudicator: BOOTSTRAP build from $TB_TRUSTED_VERIFIER_COMMIT (not the candidate $TB_RELEASE_SHA)"
+          else
+            echo "REFUSED: no pinned trusted adjudicator." >&2
+            echo "Set TB_RELEASE_TRUSTED_VERIFIER_TAG + _SHA256 to an exact previously published" >&2
+            echo "release and asset digest, or — until a wall-capable release exists —" >&2
+            echo "TB_RELEASE_TRUSTED_VERIFIER_COMMIT to an exact 40-hex reviewed commit that is" >&2
+            echo "not the one being released. An adjudicator built from the candidate it judges" >&2
+            echo "is the candidate judging itself." >&2
+            exit 1
+          fi
+          "$TB_TRUSTED_OUT" version
+
+      - name: Countersign every asset independently
+        env:
+          TB_WALL_VERIFIER_KEY: ${{ secrets.TB_WALL_VERIFIER_KEY }}
+          TB_BUILDER_PUBLIC_KEY: ${{ vars.TB_RELEASE_BUILDER_PUBLIC_KEY }}
+          TB_VERIFIER_ID: ${{ vars.TB_RELEASE_VERIFIER_ID }}
+          TB_BUILDER_ID: ${{ github.repository }}/${{ github.workflow_ref }}
+          TB_BUILD: ${{ runner.temp }}/build
+          TB_VERIFIED_DIR: ${{ runner.temp }}/verified
+        run: |
+          set -euo pipefail
+          if [ -z "${TB_WALL_VERIFIER_KEY:-}" ]; then
+            echo "REFUSED: no verifier signing key (secret TB_WALL_VERIFIER_KEY)." >&2
+            echo "The verifier signs under its own key, or it is not a second party." >&2
+            exit 1
+          fi
+          if [ -z "${TB_BUILDER_PUBLIC_KEY:-}" ]; then
+            echo "REFUSED: no predeclared builder public key (variable TB_RELEASE_BUILDER_PUBLIC_KEY)." >&2
+            echo "An attestation authenticated against whatever signed it is one anybody can mint." >&2
+            exit 1
+          fi
+          if [ -z "${TB_VERIFIER_ID:-}" ] || [ "${TB_VERIFIER_ID:-}" = "$TB_BUILDER_ID" ]; then
+            echo "REFUSED: no INDEPENDENT verifier identity (variable TB_RELEASE_VERIFIER_ID)." >&2
+            echo "A build attestation whose builder and verifier are the same identity is a build" >&2
+            echo "vouching for itself, which the frozen contract makes ineligible." >&2
+            exit 1
+          fi
+          mkdir -p "$TB_VERIFIED_DIR"
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_BUILD/release-manifest.json")
+          for a in "${assets[@]}"; do
+            name="$(basename "$a")"
+            "$RUNNER_TEMP/testbucket-verifier" wall countersign \
+              --attestation "$TB_BUILD/attestations/$name.attestation.json" \
+              --subject "$TB_BUILD/$a" \
+              --verifier-id "$TB_VERIFIER_ID" \
+              --verified-at "$now" \
+              --builder-key "$TB_BUILDER_PUBLIC_KEY" \
+              --out "$TB_VERIFIED_DIR/$name.attestation.json"
+          done
+          echo "countersigned ${#assets[@]} asset(s) as $TB_VERIFIER_ID"
+
+      - name: Upload the countersigned attestations
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-verified
+          path: ${{ runner.temp }}/verified
+          if-no-files-found: error
+          retention-days: 7
+
+  # THE PUBLISHER, which runs only after an independent party has signed.
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      # contents: write uploads the release. actions: read is what lets this
+      # job DOWNLOAD the campaign evidence artifact it gates on.
+      #
+      # Declaring any permission makes every undeclared one `none`, so the
+      # `gh run download` below was relying on this repository being public:
+      # public artifacts can be read unauthenticated, which masks the omission
+      # here and fails on a private or protected installation. A handoff that
+      # only works because the repository happens to be public is not the
+      # authenticated handoff the gate claims to perform.
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download the built artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/build
+
+      - name: Download the countersigned attestations
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-verified
+          path: ${{ runner.temp }}/verified
+
+      # THE SAME PINNED TRUSTED IMPLEMENTATION ADJUDICATES THE RELEASE.
+      #
+      # This job built its gate from the candidate too, so the program deciding
+      # whether the candidate may be published was the candidate. Both
+      # decisions it makes — that every asset carries an independently
+      # countersigned attestation, and that a passing campaign authorises this
+      # exact delivery — are now taken by a previously published release named
+      # by an exact tag and an exact digest this workflow does not compute.
+      #
+      # The pin must be advanced deliberately when the evidence format changes:
+      # an older adjudicator cannot enforce a gate it does not know about, and
+      # that trade-off belongs to whoever moves the pin rather than to the
+      # release being judged.
+      # THE BOOTSTRAP TREE, checked out at its own pinned commit.
+      #
+      # It is a SEPARATE checkout into a separate path: the adjudicator is
+      # built from that tree, never from the candidate's. When the released
+      # asset pin is used instead this checks out nothing.
+      - name: Check out the pinned bootstrap adjudicator source
+        if: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT }}
+          path: ${{ runner.temp }}/trusted-src
+
+      # Go is set up ONLY for the bootstrap route, and only to build that
+      # separate tree. The released-asset route runs a downloaded binary and
+      # needs no toolchain at all.
+      - name: Set up Go for the bootstrap adjudicator
+        if: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+
+      - name: Obtain the pinned trusted adjudicator
+        env:
+          TB_TRUSTED_VERIFIER_TAG: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_TAG }}
+          TB_TRUSTED_VERIFIER_SHA256: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_SHA256 }}
+          TB_TRUSTED_VERIFIER_COMMIT: ${{ vars.TB_RELEASE_TRUSTED_VERIFIER_COMMIT }}
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_TRUSTED_OUT: ${{ runner.temp }}/testbucket-gate
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # EXACTLY ONE OF THE TWO PINS, and never both: two roots of trust
+          # where the workflow chooses between them is one root of trust the
+          # workflow chooses.
+          if [ -n "${TB_TRUSTED_VERIFIER_TAG:-}" ] && [ -n "${TB_TRUSTED_VERIFIER_COMMIT:-}" ]; then
+            echo "REFUSED: both a released-asset pin and a bootstrap-commit pin are set." >&2
+            echo "Set exactly one; a workflow that picks between two roots of trust is its own root." >&2
+            exit 1
+          fi
+
+          if [ -n "${TB_TRUSTED_VERIFIER_TAG:-}" ]; then
+            # THE RELEASED-ASSET PIN: a previously published release, named by
+            # an exact stable tag and an exact asset digest this workflow does
+            # not compute.
+            if [ -z "${TB_TRUSTED_VERIFIER_SHA256:-}" ]; then
+              echo "REFUSED: TB_RELEASE_TRUSTED_VERIFIER_TAG is set without TB_RELEASE_TRUSTED_VERIFIER_SHA256." >&2
+              echo "A tag names a release; only the digest names the bytes." >&2
+              exit 1
+            fi
+            # EXACT STABLE SemVer, by regex rather than by shell glob. In shell
+            # patterns `*` is unrestricted, so `v[0-9]*.[0-9]*.[0-9]*` also
+            # matched `v1x.2y.3junk` and `v1.2.3-rc.1`: a prerelease is a build
+            # the project has not stood behind and a malformed segment is not a
+            # version at all. This is the expression the alias job uses.
+            if ! printf '%s' "$TB_TRUSTED_VERIFIER_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "REFUSED: the trusted adjudicator pin '$TB_TRUSTED_VERIFIER_TAG' is not an exact stable release tag (vMAJOR.MINOR.PATCH)." >&2
+              echo "A moving alias can be repointed by the very process being verified." >&2
+              exit 1
+            fi
+            if [ "$TB_TRUSTED_VERIFIER_TAG" = "${GITHUB_REF_NAME:-}" ]; then
+              echo "REFUSED: the trusted adjudicator pin is the tag being released." >&2
+              exit 1
+            fi
+            # THE ASSET NAME IS goreleaser's, not uname's. The archives are
+            # named {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }} —
+            # `testbucket_0.2.2_linux_amd64.tar.gz`. The previous selector
+            # built `testbucket_Linux_x86_64.tar.gz` from `uname`, which
+            # matches no published asset at any tag, so this step could never
+            # obtain an adjudicator at all.
+            version="${TB_TRUSTED_VERIFIER_TAG#v}"
+            case "$(uname -m)" in
+              x86_64|amd64) arch=amd64 ;;
+              aarch64|arm64) arch=arm64 ;;
+              *) echo "REFUSED: no published asset for machine $(uname -m)." >&2; exit 1 ;;
+            esac
+            os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+            asset="testbucket_${version}_${os}_${arch}.tar.gz"
+            mkdir -p "$RUNNER_TEMP/trusted"
+            gh release download "$TB_TRUSTED_VERIFIER_TAG" \
+              --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/trusted"
+            echo "$TB_TRUSTED_VERIFIER_SHA256  $RUNNER_TEMP/trusted/$asset" | sha256sum -c -
+            tar -xzf "$RUNNER_TEMP/trusted/$asset" -C "$RUNNER_TEMP/trusted" testbucket
+            install -m 0755 "$RUNNER_TEMP/trusted/testbucket" "$TB_TRUSTED_OUT"
+            echo "trusted adjudicator: released asset $asset from $TB_TRUSTED_VERIFIER_TAG"
+          elif [ -n "${TB_TRUSTED_VERIFIER_COMMIT:-}" ]; then
+            # THE BOOTSTRAP PIN, and why it exists.
+            #
+            # The released-asset route cannot start: no published release
+            # carries the `wall` adjudication subcommands, and this step
+            # refuses the tag being released — so the first wall-capable
+            # release had no adjudicator it could ever obtain. The bootstrap is
+            # an exact 40-hex COMMIT of this repository, predeclared in a
+            # repository variable, checked out separately and built there.
+            #
+            # It is a real independence boundary and a weaker one than a
+            # published asset, and it is written down as such: the commit is
+            # not the candidate, it is fixed before the release runs, and it is
+            # a distinct tree from the one being judged. It is not
+            # reproducibly-attested bytes. Move to the asset pin as soon as one
+            # wall-capable release exists, and record that ceremony where the
+            # variable is set.
+            if ! printf '%s' "$TB_TRUSTED_VERIFIER_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "REFUSED: the bootstrap adjudicator pin is not a full 40-hex commit." >&2
+              exit 1
+            fi
+            if [ "$TB_TRUSTED_VERIFIER_COMMIT" = "$TB_RELEASE_SHA" ]; then
+              echo "REFUSED: the bootstrap adjudicator pin is the commit being released." >&2
+              echo "A candidate that adjudicates itself has been adjudicated by nobody." >&2
+              exit 1
+            fi
+            if [ ! -x "$RUNNER_TEMP/trusted-src/cmd/testbucket" ] && [ ! -d "$RUNNER_TEMP/trusted-src/cmd/testbucket" ]; then
+              echo "REFUSED: the bootstrap checkout is missing; the separate checkout step must run first." >&2
+              exit 1
+            fi
+            ( cd "$RUNNER_TEMP/trusted-src" && go build -o "$TB_TRUSTED_OUT" ./cmd/testbucket )
+            echo "trusted adjudicator: BOOTSTRAP build from $TB_TRUSTED_VERIFIER_COMMIT (not the candidate $TB_RELEASE_SHA)"
+          else
+            echo "REFUSED: no pinned trusted adjudicator." >&2
+            echo "Set TB_RELEASE_TRUSTED_VERIFIER_TAG + _SHA256 to an exact previously published" >&2
+            echo "release and asset digest, or — until a wall-capable release exists —" >&2
+            echo "TB_RELEASE_TRUSTED_VERIFIER_COMMIT to an exact 40-hex reviewed commit that is" >&2
+            echo "not the one being released. An adjudicator built from the candidate it judges" >&2
+            echo "is the candidate judging itself." >&2
+            exit 1
+          fi
+          "$TB_TRUSTED_OUT" version
+
+      - name: Refuse an asset with no independently verified attestation
+        env:
+          TB_BUILD: ${{ runner.temp }}/build
+          TB_VERIFIED: ${{ runner.temp }}/verified
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_BUILDER_PUBLIC_KEY: ${{ vars.TB_RELEASE_BUILDER_PUBLIC_KEY }}
+          TB_VERIFIER_PUBLIC_KEY: ${{ vars.TB_RELEASE_VERIFIER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TB_BUILDER_PUBLIC_KEY:-}" ] || [ -z "${TB_VERIFIER_PUBLIC_KEY:-}" ]; then
+            echo "REFUSED: both predeclared public keys are required" >&2
+            echo "(variables TB_RELEASE_BUILDER_PUBLIC_KEY and TB_RELEASE_VERIFIER_PUBLIC_KEY)." >&2
+            exit 1
+          fi
+          if [ "$TB_BUILDER_PUBLIC_KEY" = "$TB_VERIFIER_PUBLIC_KEY" ]; then
+            echo "REFUSED: the builder and verifier keys are the same key; one party with two labels" >&2
+            echo "is not independent verification." >&2
+            exit 1
+          fi
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_BUILD/release-manifest.json")
+          for a in "${assets[@]}"; do
+            name="$(basename "$a")"
+            "$RUNNER_TEMP/testbucket-gate" wall verify-attestation \
+              --attestation "$TB_VERIFIED/$name.attestation.json" \
+              --subject "$TB_BUILD/$a" \
+              --source-commit "$TB_RELEASE_SHA" \
+              --key "$TB_BUILDER_PUBLIC_KEY" \
+              --key "$TB_VERIFIER_PUBLIC_KEY"
+          done
+          echo "every one of ${#assets[@]} asset(s) carries an independently countersigned attestation"
+
+      # THE CAMPAIGN GATE. The frozen acceptance contract prohibits release
+      # until an authenticated five-pair / ten-run / eighty-action-row campaign
+      # across at least three UTC dates has passed, assembled from eligible
+      # verifier verdicts. Without this step the rule lived only in documents,
+      # and any `v*` tag push published a release regardless.
+      #
+      # It fails CLOSED: absent evidence, unreadable evidence and a campaign
+      # whose gates did not pass are all refusals. `wall campaign --index`
+      # assembles its population from signed verdicts and exits non-zero unless
+      # every frozen gate passes, so this delegates the decision to the same
+      # code a validator runs rather than reimplementing it here.
+      #
+      # It is bound to THIS release, by identity and by bytes. `--release-sha`
+      # is the immutable commit the tag resolves to, and `--release-manifest`
+      # is the publish set derived above — re-verified against the files on
+      # disk before it is believed, so an edited manifest cannot claim the
+      # campaign's binary is inside an archive that does not contain it.
+      - name: Refuse a release with no passing campaign
+        env:
+          # WHERE THE CAMPAIGN EVIDENCE COMES FROM.
+          #
+          # It cannot come from the tagged tree. An index that binds the release
+          # SHA cannot be part of the bytes that SHA is computed over: inserting
+          # it changes the tree and therefore the commit, and regenerating it
+          # changes it again. Reading a fixed in-tree path was a gate no
+          # compliant campaign could ever satisfy.
+          #
+          # So the evidence is produced outside the commit and fetched here by
+          # IMMUTABLE identity — the workflow run that produced it and the
+          # artifact name within that run, neither of which can be moved the way
+          # a tag can — and pinned by digest, which is what makes the download
+          # evidence rather than a file the publisher happened to find.
+          #
+          # There is still deliberately no skip. All three are required, and the
+          # gate refuses when any is missing, exactly as it refused a missing
+          # in-tree index.
+          TB_CAMPAIGN_RUN: ${{ vars.TB_CAMPAIGN_EVIDENCE_RUN }}
+          TB_CAMPAIGN_ARTIFACT: ${{ vars.TB_CAMPAIGN_EVIDENCE_ARTIFACT }}
+          TB_CAMPAIGN_INDEX_DIGEST: ${{ vars.TB_CAMPAIGN_EVIDENCE_DIGEST }}
+          TB_CAMPAIGN_INDEX: ${{ runner.temp }}/campaign-evidence/index.json
+          GH_TOKEN: ${{ github.token }}
+          TB_CAMPAIGN_AUTHORITY: ewj2-campaign
+          TB_CAMPAIGN_AUTHORITY_KEY: ${{ vars.TB_CAMPAIGN_AUTHORITY_KEY }}
+          # The immutable commit this tag resolves to. github.sha on a tag push
+          # is the tagged commit, and it is read here rather than derived from
+          # the tag NAME: a tag is descriptive metadata that can be moved, and
+          # a moved tag must not inherit another commit's evidence.
+          TB_RELEASE_SHA: ${{ github.sha }}
+          # The manifest and the assets are the ones this job DOWNLOADED, which
+          # are the bytes the verifier countersigned and the bytes about to be
+          # uploaded. Gating a copy the publisher does not hold would gate a
+          # different set.
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/build/release-manifest.json
+          TB_BUILD: ${{ runner.temp }}/build
+        run: |
+          set -euo pipefail
+          if [ -z "$TB_CAMPAIGN_RUN" ] || [ -z "$TB_CAMPAIGN_ARTIFACT" ] || [ -z "$TB_CAMPAIGN_INDEX_DIGEST" ]; then
+            echo "REFUSED: no addressed campaign evidence." >&2
+            echo "Set TB_CAMPAIGN_EVIDENCE_RUN, TB_CAMPAIGN_EVIDENCE_ARTIFACT and" >&2
+            echo "TB_CAMPAIGN_EVIDENCE_DIGEST to the workflow run, artifact name and sha256 of" >&2
+            echo "the campaign index produced for this exact commit." >&2
+            echo "The frozen acceptance contract prohibits a release until an authenticated" >&2
+            echo "five-pair / ten-run / eighty-action-row campaign across at least three UTC" >&2
+            echo "dates has passed. Tagging does not satisfy that rule; producing the evidence does." >&2
+            exit 1
+          fi
+          # Fetched by immutable run identity, into the publisher's own
+          # directory. `gh run download` addresses a specific upload of a
+          # specific run; it cannot be pointed at a later one by moving a ref.
+          mkdir -p "$(dirname "$TB_CAMPAIGN_INDEX")"
+          gh run download "$TB_CAMPAIGN_RUN" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$TB_CAMPAIGN_ARTIFACT" \
+            --dir "$(dirname "$TB_CAMPAIGN_INDEX")"
+          if [ ! -f "$TB_CAMPAIGN_INDEX" ]; then
+            echo "REFUSED: artifact $TB_CAMPAIGN_ARTIFACT of run $TB_CAMPAIGN_RUN holds no index.json." >&2
+            exit 1
+          fi
+          if [ -z "$TB_CAMPAIGN_AUTHORITY_KEY" ]; then
+            echo "REFUSED: no predeclared campaign authority key (repository variable TB_CAMPAIGN_AUTHORITY_KEY)." >&2
+            echo "A campaign verified against whatever signed it accepts any self-generated key." >&2
+            exit 1
+          fi
+          # Non-zero unless every frozen gate passes over the full population
+          # AND every candidate arm of that population reviewed, was released
+          # from, and delivered a binary this release actually publishes.
+          "$RUNNER_TEMP/testbucket-gate" wall campaign \
+            --index "$TB_CAMPAIGN_INDEX" \
+            --index-digest "$TB_CAMPAIGN_INDEX_DIGEST" \
+            --index-origin "run/$TB_CAMPAIGN_RUN/artifact/$TB_CAMPAIGN_ARTIFACT" \
+            --authority "$TB_CAMPAIGN_AUTHORITY" \
+            --authority-key "$TB_CAMPAIGN_AUTHORITY_KEY" \
+            --release-sha "$TB_RELEASE_SHA" \
+            --release-manifest "$TB_RELEASE_MANIFEST" \
+            --release-dist "$TB_BUILD"
+          echo "campaign gate: the frozen decision rule passes over the retained population,"
+          echo "and that population authorises exactly $TB_RELEASE_SHA and these exact assets"
+
+      # PUBLISH THE GATED SET. Not a second goreleaser run — a rebuild would
+      # publish artifacts the gate never saw — and not a glob either: the asset
+      # list is read back out of the manifest the gate just verified, so the
+      # set that was checked and the set that is uploaded are the same set by
+      # construction.
+      #
+      # Rerunning after a transient upload failure is safe: `gh release upload
+      # --clobber` replaces same-named assets, which is what
+      # `replace_existing_artifacts` did for goreleaser.
+      - name: Publish the gated assets
+        env:
+          TAG: ${{ github.ref_name }}
+          TB_RELEASE_SHA: ${{ github.sha }}
+          TB_RELEASE_MANIFEST: ${{ runner.temp }}/build/release-manifest.json
+          TB_BUILD: ${{ runner.temp }}/build
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(jq -r '.assets[].path' "$TB_RELEASE_MANIFEST" | sed "s|^|$TB_BUILD/|")
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "REFUSED: the verified publish set names no asset." >&2
+            exit 1
+          fi
+          for a in "${assets[@]}"; do
+            if [ ! -f "$a" ]; then
+              echo "REFUSED: the verified publish set names $a, which does not exist." >&2
+              exit 1
+            fi
+          done
+          echo "publishing ${#assets[@]} gated asset(s):"
+          printf '  %s\n' "${assets[@]}"
+
+          # RE-RESOLVE THE TAG, immediately before publishing.
+          #
+          # The campaign gate binds github.sha — the commit the workflow was
+          # triggered for. Publication addresses the tag by NAME, and a tag is
+          # mutable: one moved between the gate and this step would publish a
+          # different commit's work under gated evidence. GitHub also ignores
+          # --target when the tag already exists, so the create path's target
+          # is no defence and the upload path never had one.
+          #
+          # An annotated tag object is dereferenced to the commit it points at,
+          # because that is what a release actually ships.
+          ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha + " " + .object.type')"
+          tag_sha="${ref%% *}"
+          tag_type="${ref##* }"
+          if [ "$tag_type" = "tag" ]; then
+            tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          if [ "$tag_sha" != "$TB_RELEASE_SHA" ]; then
+            echo "REFUSED: $TAG now resolves to $tag_sha, but the campaign gated $TB_RELEASE_SHA." >&2
+            echo "A tag moved after the gate would publish a commit no campaign authorised." >&2
+            exit 1
+          fi
+          echo "tag recheck: $TAG still resolves to the gated $TB_RELEASE_SHA"
+
+          # A pre-release tag (v1.2.3-rc.1) publishes as a prerelease, which is
+          # what `prerelease: auto` did.
+          prerelease=()
+          if printf '%s' "$TAG" | grep -q -- '-'; then
+            prerelease=(--prerelease)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # An existing release is published from the tag, and GitHub will
+            # not retarget it. The only safe answer is to require that the tag
+            # it is built on is still the gated commit — which the recheck
+            # above has just established — and to refuse if the release was
+            # somehow cut from something else.
+            existing="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.target_commitish')"
+            if [ "$existing" != "$TB_RELEASE_SHA" ] && [ "$existing" != "$TAG" ]; then
+              echo "REFUSED: the existing $TAG release targets $existing, not the gated $TB_RELEASE_SHA." >&2
+              exit 1
+            fi
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --title "$TAG" \
+              --target "$TB_RELEASE_SHA" \
+              --generate-notes \
+              "${prerelease[@]}"
+          fi
+          echo "published $TAG from $TB_RELEASE_SHA with ${#assets[@]} gated asset(s)"
 
   # The major alias (v1) is a SEPARATE, independently-retryable job: if the
   # release published but this failed transiently, rerunning just recomputes and
   # re-points — it never rebuilds or re-uploads.
   alias:
-    needs: release
+    needs: publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -89,6 +841,36 @@ jobs:
             exit 0
           fi
           major="${TAG%%.*}"   # v1
+
+          # THE v0 ALIAS IS FROZEN, AND THIS JOB IS WHERE THAT PROMISE IS KEPT.
+          #
+          # The reusable workflow's jobs now declare their own least-privilege
+          # tokens, which REQUIRES a caller to grant `actions: read` as well as
+          # `contents: read`. That is a breaking change for a caller, and the
+          # compatibility contract handles it by versioning the boundary: the
+          # reusable workflow and the README both promise that `v0` stays at
+          # v0.2.2, so an existing `@v0` consumer receives the new requirement
+          # only after a deliberate re-pin.
+          #
+          # This job would have broken that promise on the first successful
+          # v0.3.x publish: it derives the alias from the tag and force-moves it
+          # to the highest published release of that major, so `v0` would have
+          # delivered the held-back requirement to every `@v0` consumer at once.
+          # The absence of v0.3.0 today means the bug had not fired, not that
+          # the source preserved the boundary.
+          #
+          # So the freeze is executable rather than documentary. While a 0.x
+          # release carries the breaking caller-permission requirement, `v0` is
+          # not moved by this workflow at all; the release still publishes, and
+          # the exact vMAJOR.MINOR.PATCH tag is the delivery identity a consumer
+          # re-pins to. Lifting this is a deliberate edit here, made together
+          # with the README and the reusable workflow's compatibility text —
+          # never a side effect of publishing.
+          if [ "$major" = "v0" ]; then
+            echo "alias v0 is FROZEN at v0.2.2 across the caller-permission breaking boundary; $TAG published, v0 deliberately not moved"
+            echo "Consumers adopt this release by pinning ${TAG} explicitly. See the compatibility note in .github/workflows/bucketed-reusable.yml and README.md."
+            exit 0
+          fi
 
           compute_target() {
             # The highest stable vMAJOR.*.* release that has actually PUBLISHED —

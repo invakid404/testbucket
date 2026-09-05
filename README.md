@@ -40,6 +40,7 @@ testbucket plan   [flags]   compute K buckets and emit a GH-Actions matrix
 testbucket ingest [flags]   fold a run's timings back into the store
 testbucket whales [flags]   show the per-runnable distribution behind each split
 testbucket audit  [flags]   check a finished run's events against its plan
+testbucket wall   <sub>     complete-action wall-time measurement (opt-in)
 ```
 
 A run of the loop, by hand:
@@ -59,6 +60,12 @@ testbucket audit --shard-plan plan.json /tmp/ev/*.ndjson
 ```
 
 `--k` is the **single knob**: adding a lane is bumping K and nothing else.
+
+The matrix and shard-plan JSON are **additive**: every field a consumer reads
+today (`bucket`, `name`, numeric one-decimal `est_seconds`, `needs_node`,
+`script`, `units`, `invocations`) keeps its meaning. Each `invocation` gained
+`units`, `selector` and `atoms`, which is worth knowing if you validate the
+plan artifact against a strict schema.
 
 ## How it works
 
@@ -300,13 +307,516 @@ subcommand and flags; testbucket appends nothing) and must print the same
 `[{file}]` / `[{name,file}]` JSON on stdout — letting a run-wrapper be paired with
 a separate discovery command without a second façade.
 
+## Complete-action wall time
+
+Everything above balances buckets by the timing store: a rolling EWMA of what
+the *reporter* said each file took. That is a good split and a bad measurement.
+It cannot tell you how long the **action** took — install, setup, script
+preparation, every invocation and its whole process tree, the gaps between
+them, the epilogue — and a number that leaves work out cannot be the thing you
+optimise.
+
+`testbucket wall` measures the complete action, and it is **opt-in**: without
+`--wall-dir` / `wall-time-dir`, every rendered byte, every matrix field and
+every action step is exactly what it was.
+
+### What it records
+
+Three producers, three ledgers, one lifecycle, at each of three levels:
+
+| Level | Physical envelope | Containment peer | Independent trace |
+| --- | --- | --- | --- |
+| the whole action | `AT` | `CPA` | `VTA` |
+| the generated bucket script | `VB` | `CPB` | `VTB` |
+| each rendered invocation | `V` | `CPV` | `VT` |
+
+The **physical wrapper** owns the complete envelope, including every cost
+inside it: creating the containment, starting the two observers, waiting,
+reaping, flushing. The **containment peer** and the **trace collector** are
+separate processes with their own signing keys; each takes its own
+`clock_gettime(CLOCK_MONOTONIC)` reads and its own raw `cgroup.events`
+observations, and neither can see the other's records. The wrapper drives them
+in an order that makes the endpoint containment hold by construction:
+
+```text
+AT_start <= CPA_start <= VTA_start <= VTA_end <= CPA_end <= AT_end
+```
+
+The reconciliation gate then compares **like for like** — a trace against its
+own peer, both bracketing the same admission-to-verified-empty lifecycle —
+never a trace against the longer physical envelope, which would fail a
+correctly instrumented run for the crime of accounting for its own bootstrap.
+
+### What an eligible scored row requires, and what still fails closed
+
+A scored row needs two things the wrapper cannot give itself, and both are now
+shipped rather than deferred. What has not changed is the refusal: a deployment
+that does not provide them is recorded in full and reported INELIGIBLE.
+
+1. **A party that can authorize a lower-level signer.** Script- and
+   invocation-level physical, peer and trace keys are minted at runtime, during
+   the measured step, where the run key deliberately is not. `wall begin` — which
+   does hold it — signs a SIGNER DELEGATION naming a fresh key, bounded to one
+   complete run identity and to levels-with-sequences (script and invocation
+   from 0, the action-owned children from 1, never the action envelope's own
+   signers at 0, which stay with the roster). The private half is printed on
+   stdout and handed to the measured step alone through a step output; it is
+   never written into the evidence directory, and it is scrubbed from every
+   observer and from every consumer-supplied command.
+
+2. **A party that owns the containment the measured work cannot write.** On
+   cgroup-v2 `cgroup.procs` is the process-migration control, and placing a
+   process into a sub-cgroup requires write access to the common ancestor's —
+   so a measured script that could create its own nested containments could
+   also rewrite the membership its envelope rests on. It does not create them:
+   the script-level wrapper stays alive as a CONTROLLER and creates, admits,
+   measures and records each invocation on request, authenticating every
+   requester with `SO_PEERCRED`. The measured script asks and holds nothing,
+   and its own containment stays owned by the wrapper.
+
+Both need a deployment where the wrapper and the measured work are **different
+uids** — `workload-user` for the test code, `script-user` for the generated
+bucket script — plus a cgroup root the wrapper owns and an evidence parent that
+is setgid to the script group with an explicit owner. The run-bucket action's
+`workload-user` input documents the exact provisioning, including the two
+things that silently do not work: `usermod -aG` does not change a runner
+process that is already running, and `install -d` without `-o` leaves a
+root-owned parent the wrapper cannot write.
+
+On a runner where the wrapper and the measured workload share one uid — which
+is what this action does by default — no scored row can be produced, and the
+verifier says so rather than pretending otherwise. `--require eligible` fails
+closed and the campaign gate has nothing to count. That is the intended
+behaviour of a system that refuses to assert a boundary it does not have.
+
+### It fails closed
+
+- No delegated cgroup-v2 subtree (`TB_WALL_CGROUP_ROOT`)? The run is recorded
+  in full and reported **INELIGIBLE**. A process group cannot prove that no
+  descendant escaped.
+- Not Linux? Same answer, for the same reason, plus a clock that is not
+  `CLOCK_MONOTONIC`.
+- A missing endpoint is a **missing interval**, never a shorter one. A crash, a
+  cancellation, an escaped descendant, or a root that exited with live children
+  stays terminal and retained; it never becomes a duration.
+- Cancellation is **bounded and reaped**. A signal or the deadline sends
+  SIGTERM to the whole containment, a 30s grace follows, and anything still
+  alive is killed and reaped within 10s. A root that ignores TERM no longer
+  hangs the job, and a descendant that outlived its root is killed rather than
+  merely labelled — the escape stays terminal either way.
+- Every record repeats the **full delivery identity**, and the verifier
+  compares all of it across every record, the signer roster and the closing
+  seal. A stream that is intact, signed and sealed but names another run,
+  bucket, attempt, job or plan is two measurements in one directory, not one.
+- A rewritten record breaks a hash chain the verifier recomputes.
+- `wall verify --require complete` asks whether the records are well formed;
+  `--require eligible` asks whether this **row** may be scored, which
+  additionally needs a real clock, a real containment, signatures, the frozen
+  Stage-1 and Stage-2 documents re-derived rather than believed, and every
+  row-scope gate inside its threshold. Absent evidence never passes either.
+- Gates carry a **scope**. An individual error limit is decided by one row; a
+  mean over eighty rows is not, and `wall verify` reports those as
+  `campaign`-scope without ever passing them. `wall campaign` decides those,
+  and it checks the population first: five pairs, ten runs, eighty action rows
+  at eight buckets each, three UTC dates inside fourteen days, every run
+  retained with its terminal state, and one verifier verdict named per row.
+  Five pairs of half-sized runs is not most of a campaign — it is a different
+  denominator, and it fails.
+- Authority approval needs a **predeclared** key AND the **exact protected
+  environment**. Verifying a signature against whatever signed the document
+  accepts any self-generated key, so a run with no predeclared authority is
+  reported ineligible rather than trusted — and a key can sign under any label,
+  so `wall replay --stage1` and `plan --wall-bundle` both require
+  `--authority`, and BOTH the plan job and the bucket job refuse anything but
+  exactly `ewj2-campaign`. Checking the key alone would accept a correctly
+  keyed manifest approved by some other environment. An empty expected
+  authority is not a wildcard: a caller that cannot say which protected
+  environment must have approved is not in a position to accept the approval.
+  The plan-job gate matters separately from the bucket-job one — the contract
+  puts approval before either role PLANS, and a refusal afterwards cannot
+  un-derive the matrix.
+- Scoring needs an **invocation manifest** and a **step attempt**. The first
+  says what the authorised plan rendered, so the measured argv, selector, unit
+  membership and atom closure are compared to it rather than merely recorded —
+  two legal name slices of one file share a description and differ only there.
+  The second is A_GH: GitHub reports whole seconds, so it is never a gate, but
+  it says which step a ledger measured and accounts for the wrapper install
+  that necessarily precedes AT_start.
+- The frozen profile is **enforced, not assumed**. Stage-1 validation requires
+  the source profile, the consumer identity and the bundle source to be exactly
+  `mandel-ai/mandel@d9ae1d43…`. Internal agreement among caller-supplied fields
+  proves a manifest describes one workload; only this proves it describes the
+  one the contract froze, and an authority signature does not rescue a manifest
+  for another.
+- A refused observer launch **leaves nothing running**. Every failure after
+  `cmd.Start` — the key write, the key close, the key-log registration —
+  terminates and reaps the child before the error returns, because the caller
+  gets no handle and an observer from a refused launch would otherwise watch
+  the containment for its whole timeout.
+- Scoring needs an **independent replay**. The Stage-2 receipt is the planner's
+  own account of what it produced, and checking it against itself proves
+  nothing, so `wall verify --replay` requires a signed attestation from a
+  separate party that re-derived the same plan from the same frozen bytes
+  (`wall replay --attest`). That attestation is retained and signed under the
+  REPLAYING PARTY's identity, not the campaign authority's: naming the
+  authority there would erase the very distinction the attestation exists to
+  establish. Every signed claim it carries is checked — including its own
+  top-level bundle digest, which a validly signed document could otherwise
+  contradict in the receipt it encloses — and its verifier identity must be
+  both the identity that signed it and the verifier the measured records were
+  delivered against. A non-empty string is presentation, not attribution.
+- `wall campaign --index` assembles its population from **verifier verdicts**,
+  not from durations in a file: every row must be an `eligible: true` verdict
+  that names the same campaign, run and Stage-1 manifest, and each pair's two
+  signed manifests are compared field by field and may differ only in the
+  enumerated candidate tuple. `--in` still runs the arithmetic on a
+  hand-written file and always exits non-zero, because a number in a JSON file
+  is not an observation.
+- A campaign authorises the **delivery it was produced for**, by identity and
+  by bytes. `wall release-manifest` derives the publish set ONCE from
+  goreleaser's own artifact manifest — every asset a release uploads, hashed,
+  plus the digest of every file inside each archive — and both the gate and the
+  publisher read that one document. `wall campaign --release-sha …
+  --release-manifest …` re-verifies it against the files on disk and requires
+  every pair's candidate arm to have reviewed, been released from, and
+  delivered a binary this release actually publishes: an asset itself, or a
+  file inside one. A raw build intermediate that nothing uploads does not
+  count. With no publish set supplied the gate does not pass: historical
+  evidence stays auditable, and authorises nothing else.
+- Scoring needs the **sealed training set**, not a digest of it. `wall verify
+  --training-set` revalidates it under the training authority the Stage-1
+  manifest predeclares and REFITS the scorer from it. A model that cites this
+  evidence and a model built from it are otherwise indistinguishable, because
+  the receipt-set digest is a string the model states about itself.
+- The delivered binary needs a **signed build attestation**, not a sentence.
+  Stage 1 verifies its subject digest against the binary it delivers, its
+  source commit against the reviewed tip, its signature against a predeclared
+  builder key, its signer against the builder it names, and its retained result
+  against the only value that admits a delivery. The GitHub run and attempt are
+  required, because a result bound to nothing is not provenance. `wall attest`
+  produces one, and the release workflow attests every published asset.
+- Every signature covers the **authority label recorded beside it**. The label
+  used to sit outside the signed bytes, so a valid approval from an
+  unprotected context could be relabelled as the protected campaign authority
+  after the fact and every later comparison read a field its own signature did
+  not cover.
+- Signed documents are decoded **strictly**: unknown fields and trailing
+  content are refused. Both are the same hazard — anything the decoder drops is
+  outside the canonical digest, outside the signature, and invisible to every
+  check downstream. For a training label, whose receipt hash addresses exact
+  bytes, an appended second JSON value changes the hash the sealed set admits
+  while the inner signature still covers only the first.
+- Three roles, three key sets, none of them caller-supplied. The campaign
+  authority approves Stage-1 inputs; the **verdict signers** Stage 1 declares
+  sign verifier verdicts; the run signers it declares sign the roster and seal.
+  A caller can no longer enlarge the signer set, and a verdict key cannot
+  approve the inputs it judges.
+- Every private signing capability is **scrubbed from observers**, and a test
+  scans the whole tree for `TB_WALL_*KEY` rather than reading the denylist, so
+  a capability introduced elsewhere and forgotten by the list is caught at the
+  commit that introduces it.
+- The **pre-flight** compares the Stage-1, Stage-2, registry and verifier
+  identities the action will stamp on every record with the ones it derives
+  itself, and fails the bucket before `wall begin`. All four are required, and
+  the eligible guard refuses a scored request that omits any of them: an
+  identity nobody supplied is not an identity that agrees. Refusing after the tests
+  have run can invalidate a row; it cannot un-measure it.
+- The publisher **re-resolves the release tag** immediately before uploading
+  and refuses unless it still points at the campaign-gated commit. A tag is
+  mutable, and GitHub ignores `--target` for a tag that already exists.
+- Every training label carries the **exact bytes** of its physical-V receipt,
+  its selected work and its topology validation — not three digests. The
+  verifier hashes them, checks each against the reference that names it,
+  verifies their signatures against the evidence authority the sealed set
+  predeclares, and requires the receipt itself to be a passed, invocation-level,
+  physical, containment-delimited observation of that unit at that duration.
+  Refitting proves the coefficients follow the rows; only the evidence proves
+  the rows are observations. Exclusions are matched against every identity a
+  label carries — campaign, candidate, run and holdout, all in the signed
+  receipt — and evidence decoding refuses unknown fields, so an identity the
+  schema does not model cannot slip past the checks that read it.
+- The bundle binds the **implementations that will run**, not labels for them.
+  Every stage the contract names — discovery, runnable parsing, lock, stale
+  policy, unit expansion, suffix collision, coverage, selection, rendering and
+  the store schema — has an identity whose digest is the binary about to
+  execute, and the planner and the independent replay both compare every claim
+  against that before deriving anything. Stage 2 records the implementations
+  that ran rather than echoing the bundle. Digests of label strings identified
+  a parser's NAME and said nothing about its bytes.
+- Every frozen listing binds the **closure of its own argv**: the exact
+  command, cwd, planning-relevant environment, resolved executable path and a
+  complete tool/version/integrity closure. An unresolved or empty identity is a
+  bound fact about a failure, and `wall bundle` refuses to freeze one rather
+  than planning on it. A launcher binds what it LAUNCHES: `pnpm exec tsx …`
+  resolves the package-selected `tsx` shim from the project's own
+  `node_modules/.bin`, because that is the program the façade actually runs. The source profile carries the exact façade, config and
+  lockfile bytes, and its package closure is re-derived from the lock instead
+  of read back from the receipt — the WHOLE closure, not the Vitest family
+  within it, because a substituted transitive dependency changes what ran and a
+  receipt that may omit it cannot tell the two trees apart. The closure is a
+  multiset of resolved NODES keyed by the lock's own identity — both pnpm
+  sections, so every peer context in `snapshots:` is a node of its own — and a
+  version comes from the entry's own field rather than from its key. A node the
+  lock does not pin is refused unless the receipt declares that exception and
+  names the tarball. The parser identity in the receipt must be the identity of
+  the parser that actually ran. The real adapter fixture is pinned to that same frozen
+  version, and a test reads the committed manifest and lockfile so the pin
+  cannot drift away from it.
+
+### A reproducible plan
+
+```sh
+# Freeze every planning input — the canonical instant, the raw discovery and
+# runnable bytes (and the names they parse to), the store bytes, the
+# acquisition closure. This is the ONLY live read in the whole path.
+testbucket wall bundle --out bundle.json --root . --k 8 --wall-dir /tmp/tb-wall
+
+# Authorise it. Every identity the contract needs bound before either arm
+# plans is required here, not discovered at verification time. The signing key
+# comes from TB_WALL_AUTHORITY_KEY, never a flag.
+testbucket wall stage1 --bundle bundle.json --out stage1.json --role candidate \
+  --action-commit "$SHA" --review-tip "$SHA" --release-sha "$SHA" \
+  --binary ./testbucket --build-attestation "$ATTESTATION" \
+  --source-profile profile.json --store-receipt store-receipt.json \
+  --scorer scorer.json --training-set training-set.json \
+  --training-authority-key "$TRAINING_KEY" --registry registry.json \
+  --runner-image "ubuntu-24.04@sha256:…" --consumer-repository owner/repo \
+  --consumer-commit "$CONSUMER_SHA" --caller-workflow-sha "$WORKFLOW_SHA" \
+  --downstream-ref "$REF"
+
+# Plan from the bundle and nothing else: no clock, no discovery, no listing.
+testbucket plan --wall-bundle bundle.json --wall-stage1 stage1.json \
+  --wall-stage2 stage2.json --shard-plan plan.json --json > matrix.json
+
+# Replay it independently and ATTEST the result. `wall verify` requires this:
+# the receipt above is the planner's own account of its own output.
+testbucket wall replay --bundle bundle.json --stage2 stage2.json \
+  --stage1 stage1.json --authority-key "$KEY" --authority ewj2-campaign \
+  --attest replay.json --verifier-id independent-verifier
+```
+
+Two plan digests are recorded because they answer different questions. Moving
+the canonical instant three days changes the **full-document** digest (the
+store is older and the summary says so) and leaves the **semantic projection**
+identical; renaming one discovered file changes both.
+
+The Stage-2 receipt is written with `O_EXCL`. That is the exactly-once rule
+made mechanical: the bound planner runs once, and a second run that quietly
+replaced the first receipt would be indistinguishable from the first.
+
+### Allocation, forecast and audit are three different numbers
+
+- **`Palloc`** is the allocation score: `frozen_scorer(frozen_preplan_features)`,
+  and nothing else. It is fitted offline from a sealed set of historical,
+  wrapper-qualified `V` receipts (`wall train`); at runtime it may read no
+  label and no outcome — including the timing store's own EWMA weight, which is
+  reporter-derived and would leak an outcome into allocation through the side
+  door. Pass `--palloc-scorer` and KK packs by it.
+- **`est_seconds`** is unchanged: the store's measured weights, one decimal,
+  numeric. Consumers read it; the split no longer has to.
+- **`Pcheck`** is the post-render audit projection of those same frozen values
+  over the renderer's membership. It cannot re-plan.
+- **`Aeta`** is the pre-action forecast: a Stage-1 component template
+  instantiated per bucket before the action starts. A phase nobody predicted is
+  an ETA-completeness failure even when the trace agreed with itself to the
+  microsecond.
+
+### In a workflow
+
+```yaml
+uses: invakid404/testbucket/.github/workflows/bucketed-reusable.yml@<sha>
+with:
+  runner: vitest
+  wall-time-dir: /tmp/testbucket-wall
+  cgroup-root: ${{ env.TB_WALL_CGROUP_ROOT }}   # delegated in a prior step
+```
+
+**The cgroup root must be *delegated*, not merely owned.** cgroup-v2 moves a
+process between cgroups only if it can write the *common ancestor's*
+`cgroup.procs`, so `/sys/fs/cgroup/testbucket` chowned to the runner user does
+not work: its common ancestor with the runner's own cgroup is the root cgroup,
+which belongs to root, and even the action root cannot be admitted. Hang the
+root off the runner's own cgroup in a prior step:
+
+```yaml
+- name: Delegate a cgroup-v2 subtree
+  run: |
+    own=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+    sudo mkdir -p "/sys/fs/cgroup${own}/testbucket"
+    sudo chown "$(id -un)" "/sys/fs/cgroup${own}" "/sys/fs/cgroup${own}/cgroup.procs"
+    sudo chown -R "$(id -un)" "/sys/fs/cgroup${own}/testbucket"
+    echo "TB_WALL_CGROUP_ROOT=/sys/fs/cgroup${own}/testbucket" >>"$GITHUB_ENV"
+- name: Check it before relying on it
+  run: testbucket wall check-delegation --root "$TB_WALL_CGROUP_ROOT"
+```
+
+On a self-hosted runner the durable form is supervisor delegation — a systemd
+drop-in with `Delegate=yes` on the runner service — which gives the service its
+own delegated subtree and needs no per-job chown. Either way,
+`wall check-delegation` answers whether it worked, and `wall begin` runs the
+same check before opening an envelope rather than failing later with a bare
+permission error.
+
+Each bucket's records are uploaded as their own artifact, because the records
+are the evidence: a row whose records went away with the runner cannot be
+re-verified by anyone.
+
+The reusable workflow references its own composite actions with GitHub's `$/`
+self-repository syntax, so they resolve to **this** repository at the ref you
+called — not to your checkout. Plain `./` would resolve against the workspace,
+which for a called reusable workflow is *yours*. That needs a GitHub-hosted
+runner or a self-hosted runner ≥ 2.336.0.
+
+For a **scored** arm, add the campaign identities and hand the workflow BOTH
+frozen artifacts: the planning INPUTS the plan is derived from (the bundle, the
+signed Stage-1 manifest, the registry, the scorer) and the frozen DOCUMENTS the
+buckets are verified against (the one authorised Stage-2 receipt, the
+independent replay attestation, and each bucket's forecast and projection).
+
+Both are required, and the inputs artifact is required *first*: without it the
+plan job would derive its matrix live from the working tree and the restored
+store, and an authority cannot approve inputs that do not exist. The plan job
+refuses that before it plans.
+
+```yaml
+with:
+  runner: vitest
+  wall-time-dir: /tmp/testbucket-wall
+  cgroup-root: ${{ env.TB_WALL_CGROUP_ROOT }}
+  verify-require: eligible          # refuses an unmeasured or mutably-delivered row
+  testbucket-version: v0.3.0        # an EXACT published tag; never an alias
+  campaign-id: ewj2
+  stage1-digest: sha256:…
+  stage2-digest: sha256:…
+  registry-digest: sha256:…
+  verifier-id: ewj2-verifier
+  authority: ewj2-campaign
+  authority-key: <hex public key>
+  frozen-inputs-artifact: testbucket-frozen-inputs-candidate
+  frozen-documents-artifact: testbucket-frozen-candidate
+```
+
+Without `frozen-inputs-artifact`, `verify-require: eligible` fails closed **in
+the plan job, before anything is planned** — there is no bundle and no Stage-1
+manifest, so the alternative is planning live from inputs nobody authorised,
+and a later refusal cannot un-derive that matrix. Without
+`frozen-documents-artifact` it fails closed at verification: the verifier is
+being asked to prove something it has not been given, and saying so is the
+right answer. So does an `eligible` request with no `wall-time-dir`: an
+eligible row is a *measured* row, and the workflow refuses that contradiction
+before any bucket runs rather than finishing green having proven nothing.
+
+A_GH is not in that artifact and cannot be: `step-attempt.json` describes the
+bucket step, which has not finished when the artifact is built. The workflow
+reads it back from the Actions API after the run and hands it to the verifier,
+which is why the `test` job needs `actions: read`.
+
+**Every caller grants both scopes:**
+
+```yaml
+permissions:
+  contents: read
+  actions: read
+```
+
+The called jobs declare their own least-privilege tokens — `contents: read` for
+`plan` and `record`, `contents: read` plus `actions: read` for `test` — and a
+called workflow may only retain or reduce what its caller granted. A caller
+granting less therefore fails at startup rather than running on whatever the
+repository default happens to be.
+
+That is a deliberate break, and it is versioned: the moving `v0` alias stays
+pinned at v0.2.2, so a consumer on `@v0`, `@v0.2.2` or any full SHA is
+unaffected until it re-pins to a release that carries the declarations. Earlier
+releases state the requirement as advice instead; on those, a caller granting
+only `contents: read` loses A_GH, the collector says so and exits 0, and the
+verifier reports the row ineligible.
+
+**Delivering a pre-publication candidate.** A scored arm has to run the exact
+binary being proposed, which by definition has no release yet. It is delivered
+as an immutable, digest-pinned build artifact:
+
+```yaml
+with:
+  testbucket-version: candidate:<run-id>/<artifact-name>@sha256:<64-hex>
+  candidate-resolver-version: v0.3.0   # an exact PUBLISHED release
+```
+
+The installer refuses a candidate whose *binary* digest nobody attested — the
+archive digest says which archive was downloaded, the binary digest says which
+bytes are about to execute, and Stage 1 binds the second. That value is
+**derived, not typed**: the plan job installs `candidate-resolver-version` and
+runs `testbucket wall stage1-binary` against the signed Stage-1 manifest, so it
+comes from the builder's attestation, the verifier's countersignature and the
+campaign authority's signature. Pass `candidate-binary-digest` if you want to
+declare what you expect; it is checked against the derived value and may not
+replace it.
+
+The resolver must be an exact published `vMAJOR.MINOR.PATCH`. `local`,
+`source`, a `candidate:` pin and a moving `vX`/`vX.Y` alias are refused: the
+first three build or fetch the candidate, so the delivery would authenticate
+itself, and an alias lets whoever may move it choose the resolver. There is no
+default — and until a release implementing `wall stage1-binary` is published
+there is no capable resolver, so a scored candidate delivery is refused rather
+than resolved by the candidate.
+
+**Released binaries are pinned outside the release.** The archive and its
+`checksums.txt` are both assets of the same release and cannot authenticate
+each other, so `.github/actions/released-binary-digests.tsv` — committed to
+this repository, under review — names the digest of the binary inside each
+published archive, and the installer refuses a mismatch or an unpinned tag.
+
+A release cannot contain its own digest: GoReleaser embeds the tag commit and
+its timestamp in the binary, so the bytes do not exist until the tag does. The
+lifecycle is two phases. `release.yml` publishes; the `pin-release` workflow
+then reads the published assets, prints the four lines, and commits nothing —
+a person reviews and merges them. Until that commit is colocated with the
+action you use, pass it explicitly:
+
+```yaml
+with:
+  version: v0.3.0
+  release-pins-ref: <full 40-hex commit SHA carrying the v0.3.0 pin>
+```
+
+Only a full commit SHA is accepted. A branch or a tag would put the pin back
+under the control of whoever can move that ref, which is the property the pin
+exists for.
+
+`release-pins-ref` is a declared input of the reusable workflow as well as of
+every composite action, and the workflow forwards it to each job that installs
+testbucket — so the reusable route reaches the same check. It is optional and
+empty by default: a release already pinned in the action source you resolve
+needs nothing.
+
+**A scored arm needs its runner attested.** Stage 1 binds a runner image and
+the pair equality check compares it, but `--runner-image` is text until someone
+says the host was booted from it. A scored arm must carry a fleet attestation
+(`testbucket wall attest-runner`, signed with `TB_WALL_RUNNER_KEY` by whoever
+provisions the runners) naming the image, the host, and the exact run — verified
+against keys the manifest predeclares. GitHub's runner context does not report
+the selected image, so **a hosted-runner lane cannot produce one and is
+unsupported for scoring**; it is refused rather than scored on an assertion.
+Unscored lanes are unaffected.
+
+**On `version`:** every action defaults to the moving `v0` alias, which
+resolves to the highest published 0.x release — this project is deliberately
+pre-1.0. A scored arm *must* pin an exact `vX.Y.Z`: an alias is descriptive
+metadata rather than a delivery identity, and the installer downloads and
+checksum-verifies a release asset, so a commit SHA — which has no asset — is
+refused rather than advertised as deliverable.
+
+Wall-time measurement is Vitest-only today. `--wall-dir` with `--runner go` is
+**refused**, not ignored: a flag that silently does nothing is how a consumer
+ends up believing a campaign was instrumented when it was not.
+
 ## Development
 
 ```sh
 gofmt -l .          # formatting
 go vet ./...        # vet
 go build ./...      # build
-go test ./... -race # the full suite (~124 tests)
+go test ./... -race # the full suite (~210 tests)
 ```
 
 ## License

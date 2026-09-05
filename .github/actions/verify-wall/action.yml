@@ -1,0 +1,252 @@
+name: testbucket verify-wall
+description: >-
+  Verify a bucket's wall-time records against the frozen documents. It is a
+  SEPARATE action from run-bucket on purpose: the contract puts AT_end after
+  the final action epilogue, so verification cannot be a later step of the
+  action whose envelope it is checking — that would put action-owned work after
+  the interval that claims to contain it.
+
+inputs:
+  wall-time-dir:
+    description: 'Records directory the run-bucket action wrote (required).'
+    required: true
+  require:
+    description: >-
+      What the verifier must be able to say before this step passes: `complete`
+      (the records are well formed) or `eligible` (this row is scorable — which
+      additionally needs a real containment and clock, every frozen document
+      below, and every row-scope gate inside its threshold). A campaign arm
+      uses `eligible`.
+    default: complete
+  version:
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. The default is
+      the moving `v0` alias, which resolves to the highest published 0.x
+      release — this project is deliberately pre-1.0. A scored arm must pin an
+      exact `vX.Y.Z` instead: an alias is descriptive metadata, not a delivery
+      identity.
+    default: v0
+  release-pins-ref:
+    description: >-
+      Full 40-hex commit SHA of this repository carrying the precommitted
+      binary digest for a release published AFTER this action's own commit.
+
+      A release cannot contain its own digest: GoReleaser embeds the tag commit
+      and its timestamp in the binary, so the hash cannot exist before the tag
+      that produces it. The colocated pin file therefore covers releases
+      published earlier, and the newest one is pinned by the commit that comes
+      after it — proposed by the `pin-release` workflow and merged under review.
+      Only a full commit SHA is accepted: a branch or a tag would put the pin
+      back under the control of whoever can move that ref.
+    default: ""
+  candidate-binary-digest:
+    description: >-
+      The `sha256:<64-hex>` of the testbucket BINARY the campaign authorised,
+      as the signed Stage-1 manifest binds it. REQUIRED whenever `version` is a
+      `candidate:<run-id>/<artifact>@sha256:<64-hex>` pin: the archive digest
+      says which archive was downloaded, this says which binary is about to
+      execute, and Stage 1 binds the second. Do not type it in. Derive it with
+      `testbucket wall stage1-binary --file stage1.json` run from a PUBLISHED
+      release — that command validates the manifest, so the value comes from
+      the builder's attestation, the verifier's countersignature and the
+      campaign authority's own signature rather than from whoever wired the
+      job. Empty for a published release, whose bytes are checksum-verified
+      against the release manifest instead.
+    default: ""
+  stage1-file:
+    description: 'The signed Stage-1 input manifest.'
+    default: ""
+  stage2-file:
+    description: 'The Stage-2 derived-plan receipt.'
+    default: ""
+  replay-file:
+    description: >-
+      The independent Stage-2 replay attestation (`wall replay --attest`). A
+      scored row needs one: comparing the planner''s account of its own output
+      to itself proves nothing.
+    default: ""
+  registry-file:
+    description: 'The frozen Aeta component-registry template.'
+    default: ""
+  aeta-file:
+    description: 'This bucket''s instantiated pre-action Aeta.'
+    default: ""
+  pcheck-file:
+    description: 'This bucket''s post-render Pcheck projection.'
+    default: ""
+  invocations-file:
+    description: >-
+      This bucket''s invocation manifest: what the authorised plan rendered.
+      Without it the measured argv, selector, unit membership and atom closure
+      are not checked against the plan, and two legal name slices of one file
+      cannot be told apart.
+    default: ""
+  step-attempt-file:
+    description: >-
+      The GitHub step-attempt diagnostic (A_GH). Non-gating — GitHub reports
+      whole seconds — but the contract requires it for identity sanity, and it
+      is what accounts for the wrapper install that necessarily precedes
+      AT_start. A campaign harness produces it after the job, e.g.
+      `gh api /repos/{owner}/{repo}/actions/jobs/{job_id}` reshaped into
+      {"kind":"tb.walltime.step-attempt/v1","attempt":{...}}.
+    default: ""
+  authority:
+    description: 'Protected environment the Stage-1 manifest must name.'
+    default: ""
+  authority-key:
+    description: >-
+      PREDECLARED authority public key (hex). The verifier will not treat a
+      Stage-1 signature as authority approval without one: a self-generated key
+      would otherwise pass.
+    default: ""
+  verdict-file:
+    description: >-
+      Write the machine-readable verdict here. A campaign assembles its
+      population from these, so a row whose verdict was never written cannot be
+      counted — which is the correct outcome, not a gap to paper over.
+    default: ""
+  record-signer:
+    description: >-
+      The PUBLIC half of the run key that signed this measurement's signer
+      roster and closing seal. The authority-signed Stage-1 manifest is the
+      authoritative source and WINS OUTRIGHT: when it declares any signer, a
+      key passed here is IGNORED rather than added to it. Expect a key stated
+      only here to be refused whenever Stage 1 declares its own. It is used
+      only when Stage 1 declares no signer at all — a case whose row is
+      ineligible on other grounds anyway.
+
+      The precedence is deliberate: `record-signer` is a caller input, so
+      unioning it would let a caller admit a roster and seal key the authority
+      never declared, while holding the matching run-key secret itself.
+
+      It is a public key, so it is an input rather than a secret. Its private
+      half is bound only to run-bucket's `wall begin` and `wall end` steps and
+      never to the measured script.
+    default: ""
+  verifier-key:
+    description: >-
+      The verifier''s own ed25519 signing key. A campaign counts a row only if
+      its verdict is attributable to the approved verifier, so the
+      machine-readable verdict is signed with this. Without it the verdict is
+      still written and every campaign will refuse it — loudly, which beats a
+      silently uncountable row. Pass a secret, never a literal.
+    default: ""
+  scorer-file:
+    description: >-
+      The frozen scorer the Pcheck projection claims. The verifier re-derives
+      every Palloc value by RUNNING it over the projection's own feature
+      vectors; without it the projection is checked only against its own
+      arithmetic, which an allocation map no model produced satisfies
+      perfectly.
+    default: ""
+  training-set-file:
+    description: >-
+      The EXACT sealed training receipt set the scorer was fitted from. The
+      verifier revalidates it under the training authority the Stage-1 manifest
+      predeclares and REFITS the scorer from it, so a model whose coefficients
+      did not come from this evidence is refused. Without it the scorer's
+      lineage is a digest the scorer states about itself, and the row is
+      ineligible — which is the correct answer, not a gap to paper over.
+    default: ""
+  shard-plan-file:
+    description: >-
+      The authorised plan artifact, for the exact-run coverage audit. With
+      `events-dir` it is what proves this bucket ran the targets, count-shards
+      and name slices the plan gave it. A wall-time envelope records how long
+      something took; it can never record what was skipped, so without these
+      two a row can be eligible having measured a script that did half its
+      work.
+    default: ""
+  events-dir:
+    description: >-
+      This bucket's runner events directory, for the coverage audit above.
+    default: ""
+  runner:
+    description: >-
+      Which adapter's event parser reads `events-dir`: go or vitest.
+    default: go
+  records-artifact:
+    description: >-
+      Name the caller uploads the records under, echoed into the log so a
+      reader can find the evidence this verdict was derived from.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install testbucket
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+        TB_CANDIDATE_BINARY_DIGEST: ${{ inputs.candidate-binary-digest }}
+        TB_RELEASE_PINS_REF: ${{ inputs.release-pins-ref }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    - name: Verify the wall-time records
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_REQUIRE: ${{ inputs.require }}
+        TB_STAGE1_FILE: ${{ inputs.stage1-file }}
+        TB_STAGE2_FILE: ${{ inputs.stage2-file }}
+        TB_REPLAY_FILE: ${{ inputs.replay-file }}
+        TB_REGISTRY_FILE: ${{ inputs.registry-file }}
+        TB_AETA_FILE: ${{ inputs.aeta-file }}
+        TB_PCHECK_FILE: ${{ inputs.pcheck-file }}
+        TB_INVOCATIONS_FILE: ${{ inputs.invocations-file }}
+        TB_STEP_ATTEMPT_FILE: ${{ inputs.step-attempt-file }}
+        TB_SCORER_FILE: ${{ inputs.scorer-file }}
+        TB_TRAINING_SET_FILE: ${{ inputs.training-set-file }}
+        TB_SHARD_PLAN_FILE: ${{ inputs.shard-plan-file }}
+        TB_EVENTS_DIR: ${{ inputs.events-dir }}
+        TB_RUNNER: ${{ inputs.runner }}
+        TB_AUTHORITY: ${{ inputs.authority }}
+        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_VERDICT_FILE: ${{ inputs.verdict-file }}
+        TB_WALL_VERIFIER_KEY: ${{ inputs.verifier-key }}
+        TB_RECORD_SIGNER: ${{ inputs.record-signer }}
+        TB_RECORDS_ARTIFACT: ${{ inputs.records-artifact }}
+      run: |
+        set -euo pipefail
+        # `if` blocks rather than `[ -n x ] && args+=(...)`: under `set -e` a
+        # trailing test that is false makes the whole step fail, which would
+        # turn "this consumer passed no Aeta file" into a red bucket.
+        args=(--dir "$TB_WALL_DIR" --require "$TB_REQUIRE")
+        if [ -n "$TB_STAGE1_FILE" ]; then args+=(--stage1 "$TB_STAGE1_FILE"); fi
+        if [ -n "$TB_STAGE2_FILE" ]; then args+=(--stage2 "$TB_STAGE2_FILE"); fi
+        if [ -n "$TB_REPLAY_FILE" ]; then args+=(--replay "$TB_REPLAY_FILE"); fi
+        if [ -n "$TB_REGISTRY_FILE" ]; then args+=(--registry "$TB_REGISTRY_FILE"); fi
+        if [ -n "$TB_AETA_FILE" ]; then args+=(--aeta "$TB_AETA_FILE"); fi
+        if [ -n "$TB_PCHECK_FILE" ]; then args+=(--pcheck "$TB_PCHECK_FILE"); fi
+        if [ -n "$TB_INVOCATIONS_FILE" ]; then args+=(--invocations "$TB_INVOCATIONS_FILE"); fi
+        if [ -n "$TB_STEP_ATTEMPT_FILE" ]; then args+=(--step-attempt "$TB_STEP_ATTEMPT_FILE"); fi
+        if [ -n "$TB_SCORER_FILE" ]; then args+=(--scorer "$TB_SCORER_FILE"); fi
+        if [ -n "$TB_TRAINING_SET_FILE" ]; then args+=(--training-set "$TB_TRAINING_SET_FILE"); fi
+        if [ -n "$TB_SHARD_PLAN_FILE" ]; then args+=(--shard-plan "$TB_SHARD_PLAN_FILE"); fi
+        if [ -n "$TB_EVENTS_DIR" ]; then args+=(--events "$TB_EVENTS_DIR" --runner "$TB_RUNNER"); fi
+        if [ -n "$TB_AUTHORITY" ]; then args+=(--authority "$TB_AUTHORITY"); fi
+        if [ -n "$TB_AUTHORITY_KEY" ]; then args+=(--authority-key "$TB_AUTHORITY_KEY"); fi
+        if [ -n "$TB_RECORD_SIGNER" ]; then args+=(--record-signer "$TB_RECORD_SIGNER"); fi
+        if [ -n "$TB_RECORDS_ARTIFACT" ]; then
+          echo "the records this verdict is derived from are uploaded as: $TB_RECORDS_ARTIFACT"
+        fi
+
+        # The human report always reaches the log. The machine verdict is
+        # written separately when asked for, because a campaign assembles its
+        # population from verdicts and cannot read a log.
+        #
+        # The verdict is written even when verification FAILS: campaign
+        # retention is intention-to-treat, so an ineligible row stays in the
+        # population as the reason a pair does not pass rather than vanishing.
+        # The step still fails.
+        status=0
+        testbucket wall verify "${args[@]}" || status=$?
+        if [ -n "$TB_VERDICT_FILE" ]; then
+          mkdir -p "$(dirname "$TB_VERDICT_FILE")"
+          testbucket wall verify "${args[@]}" --json > "$TB_VERDICT_FILE" || true
+        fi
+        exit "$status"

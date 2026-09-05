@@ -104,6 +104,20 @@ type PlanOptions struct {
 	// Token is the adapter's opaque comparability token. The core treats it as
 	// a key: the store cold-starts when it disagrees. It never inspects it.
 	Token string
+	// AllocationScore optionally replaces the SCHEDULING score of each unit.
+	//
+	// It exists because the weight a partition packs to and the estimate a
+	// human reads are two different numbers. The store's rolling EWMA is
+	// reporter-derived, which makes it fine for an estimate and inadmissible as
+	// a campaign's allocation input; a frozen pre-plan scorer is the opposite.
+	// When this is set, KK packs by its value while every reported est_seconds
+	// keeps summing the store weights, so the matrix a consumer reads is
+	// unchanged.
+	//
+	// It returns an error rather than a fallback: a unit the scorer cannot
+	// score must fail the plan, because silently packing it by a different
+	// rule is exactly the leak the separation exists to prevent.
+	AllocationScore func(u runner.Unit) (float64, error)
 	// Runnables optionally overrides where the core resolves a name-sliced
 	// target's runnable set. Production leaves it nil and the adapter's
 	// Runnables method is used; it is an injection seam for tests that drive
@@ -175,7 +189,15 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 	items := make([]Item, 0, len(ex.Units))
 	byID := make(map[string]runner.Unit, len(ex.Units))
 	for _, u := range ex.Units {
-		items = append(items, itemOf(u))
+		it := itemOf(u)
+		if opt.AllocationScore != nil {
+			score, err := opt.AllocationScore(u)
+			if err != nil {
+				return nil, fmt.Errorf("allocation score for %s: %w", u.ID, err)
+			}
+			it.Weight = score
+		}
+		items = append(items, it)
 		byID[u.ID] = u
 	}
 	groups := karmarkarKarp(items, opt.K)
@@ -211,6 +233,13 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 		StorePath: storeName(opt.StorePath),
 		UpdatedAt: st.UpdatedAt,
 		Notes:     ex.Notes,
+	}
+	if opt.AllocationScore != nil {
+		// Say so out loud: a reader comparing bucket estimates against the
+		// balance would otherwise wonder why the split does not follow them.
+		doc.Algorithm = "karmarkar-karp (packed by the frozen allocation score)"
+		doc.Notes = append(doc.Notes,
+			"buckets were packed by the frozen pre-plan allocation score; est_seconds still reports the store's measured weights")
 	}
 	for _, b := range buckets {
 		doc.Buckets = append(doc.Buckets, renderPlanBucket(b, rnr.Render(b)))

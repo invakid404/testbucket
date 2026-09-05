@@ -25,8 +25,42 @@ inputs:
       before the run so the script's `tee` has somewhere to write.
     default: /tmp/testbucket-events
   version:
-    description: 'testbucket binary to install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
-    default: v1
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. The default is
+      the moving `v0` alias, which resolves to the highest published 0.x
+      release — this project is deliberately pre-1.0. A scored arm must pin an
+      exact `vX.Y.Z` instead: an alias is descriptive metadata, not a delivery
+      identity. A scored row requires an
+      exact `vX.Y.Z`.
+    default: v0
+  release-pins-ref:
+    description: >-
+      Full 40-hex commit SHA of this repository carrying the precommitted
+      binary digest for a release published AFTER this action's own commit.
+
+      A release cannot contain its own digest: GoReleaser embeds the tag commit
+      and its timestamp in the binary, so the hash cannot exist before the tag
+      that produces it. The colocated pin file therefore covers releases
+      published earlier, and the newest one is pinned by the commit that comes
+      after it — proposed by the `pin-release` workflow and merged under review.
+      Only a full commit SHA is accepted: a branch or a tag would put the pin
+      back under the control of whoever can move that ref.
+    default: ""
+  candidate-binary-digest:
+    description: >-
+      The `sha256:<64-hex>` of the testbucket BINARY the campaign authorised,
+      as the signed Stage-1 manifest binds it. REQUIRED whenever `version` is a
+      `candidate:<run-id>/<artifact>@sha256:<64-hex>` pin: the archive digest
+      says which archive was downloaded, this says which binary is about to
+      execute, and Stage 1 binds the second. Do not type it in. Derive it with
+      `testbucket wall stage1-binary --file stage1.json` run from a PUBLISHED
+      release — that command validates the manifest, so the value comes from
+      the builder's attestation, the verifier's countersignature and the
+      campaign authority's own signature rather than from whoever wired the
+      job. Empty for a published release, whose bytes are checksum-verified
+      against the release manifest instead.
+    default: ""
   working-directory:
     description: 'Directory to run the bucket in.'
     default: "."
@@ -37,38 +71,449 @@ inputs:
       per-runner provisioning (DB binaries, codegen, toolchains). Runs as a bash
       block; a failure fails the bucket before any test runs. Empty = no setup
       step ⇒ unchanged behavior.
+
+      UNDER MEASUREMENT it runs through `wall run`, which strips both the
+      wall-time capabilities and the GitHub file-command channels
+      ($GITHUB_OUTPUT, $GITHUB_ENV, $GITHUB_PATH, $GITHUB_STEP_SUMMARY,
+      $GITHUB_STATE) from its environment. A setup command that sets step
+      outputs or job-wide variables therefore has no effect on a measured
+      bucket: those channels are how the signer delegate reaches the measured
+      step, and consumer-supplied code must not be able to read or write them.
+      Do that provisioning in a prior step of the caller's own job instead.
+    default: ""
+  wall-time-dir:
+    description: >-
+      Optional records directory for complete-action wall-time measurement
+      (--runner vitest). When set, the whole action runs inside a physical
+      envelope with its own containment peer and independent trace: `wall begin`
+      opens it before setup, the setup command and the bucket script run inside
+      the action containment, and `wall end` closes it after verified-empty
+      containment. It MUST match the --wall-dir the plan baked into the script.
+      Empty = no measurement ⇒ byte-identical behavior to before.
+    default: ""
+  cgroup-root:
+    description: >-
+      Delegated cgroup-v2 subtree the wrapper may create containments under
+      (TB_WALL_CGROUP_ROOT). Without it the run is recorded in full and reported
+      INELIGIBLE rather than scored — a process group cannot prove that no
+      descendant escaped.
+
+      IT MUST BE DELEGATED, NOT MERELY OWNED. On cgroup-v2 a process moves
+      between cgroups only if it can write the COMMON ANCESTOR's
+      `cgroup.procs`, so a root created beside the runner's own cgroup —
+      `/sys/fs/cgroup/testbucket`, chowned to the runner user — has the ROOT
+      cgroup as that ancestor, and the root cgroup belongs to root. Owning the
+      destination does not admit the action root into it, and the first
+      migration fails with `admit the action root .../cgroup.procs: permission
+      denied`. Put the root INSIDE a subtree this credential may migrate
+      within:
+
+          # The runner's own cgroup is the ancestor every containment will
+          # share with it, so delegate THAT and hang the root off it.
+          own=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+          sudo mkdir -p "/sys/fs/cgroup${own}/testbucket"
+          sudo chown "$(id -un)" "/sys/fs/cgroup${own}" "/sys/fs/cgroup${own}/cgroup.procs"
+          sudo chown -R "$(id -un)" "/sys/fs/cgroup${own}/testbucket"
+          echo "TB_WALL_CGROUP_ROOT=/sys/fs/cgroup${own}/testbucket" >>"$GITHUB_ENV"
+
+      On a SELF-HOSTED runner the durable form is supervisor delegation, which
+      needs no per-job chown at all — a systemd drop-in for the runner service:
+
+          # /etc/systemd/system/actions.runner.<name>.service.d/delegate.conf
+          [Service]
+          Delegate=yes
+
+      `Delegate=yes` gives the service its own delegated subtree, chowned to
+      the service user, so the runner and every containment it creates already
+      share a writable ancestor.
+
+      VERIFY IT RATHER THAN ASSUME IT. After testbucket is installed and before
+      any measured action:
+
+          testbucket wall check-delegation --root "$TB_WALL_CGROUP_ROOT"
+
+      It creates a containment under the root, removes it, and checks the
+      common ancestor's membership file — the two capabilities the envelope
+      actually needs — and exits non-zero naming the missing one. `wall begin`
+      runs the same check before it opens an envelope, so a misconfigured
+      delegation is refused with the reason instead of a bare permission error.
+
+      That setup is NOT sufficient for a scored row, and the verifier now says
+      so instead of trusting Stage 1's word for it. On cgroup-v2 `cgroup.procs`
+      is the process-migration control, so a subtree owned by the runner uid is
+      writable by the measured workload too — it can move itself or a
+      descendant between the action, script, invocation and sibling
+      containments, and the nested membership the envelope records proves
+      nothing. Each containment now carries the membership-control model its
+      producer read off the filesystem, and a workload-writable one is recorded
+      in full and reported INELIGIBLE.
+
+      A scored row needs the subtree owned by a credential the measured
+      workload does NOT run as. The controller is what makes that possible: the
+      script-level wrapper keeps the credential and creates, admits and
+      measures each nested invocation on request, so the subtree never has to
+      be writable by anything measured. On a SAME-UID runner — no workload-user
+      and no script-user — there is still no boundary, and those rows are
+      recorded in full and reported INELIGIBLE rather than scored on an absent
+      one.
+    default: ""
+  workload-user:
+    description: >-
+      The account the MEASURED WORK runs under, distinct from the account this
+      action runs as.
+
+      This is the whole privilege boundary. The wrapper must be able to create,
+      freeze, admit into and destroy containments, so it must be able to write
+      the delegated cgroup subtree; the measured work must NOT, because on
+      cgroup-v2 `cgroup.procs` is the process-migration control and a workload
+      that can write it can move itself between containments and rewrite the
+      membership history the envelope records. Both cannot be one credential,
+      so the wrapper executes the measured command as this account and stays
+      where it is.
+
+      Establish it in a PRIOR step of the caller's job, not here — anything
+      this action does before `wall begin` is action-owned work outside the
+      interval that claims to contain it. For example:
+
+          sudo useradd --system --create-home --shell /bin/bash tb-workload
+          sudo useradd --system --create-home --shell /bin/bash tb-script
+
+          # THE WRAPPER'S CGROUP ACCESS IS AN OWNERSHIP, NOT A GROUP IT JOINS.
+          #
+          # `usermod -aG` does NOT change a process that is already running.
+          # The GitHub runner and every step it starts were created before any
+          # setup step could run, so their supplementary groups are already
+          # fixed: adding the runner user to a new group leaves the live
+          # wrapper without it, and the cgroup root stays unwritable however
+          # correct /etc/group looks. Give the delegated subtree to the runner
+          # user itself, which needs no group refresh, and the wrapper can
+          # write it in the very next step.
+          #
+          # (If a group is preferred, membership must be established BEFORE the
+          # runner process starts — a self-hosted image built with it — or each
+          # wrapper invocation must enter it in a NEW process, e.g.
+          # `sg tb-wrapper -c '...'`. A `usermod` in a setup step cannot do it.)
+          # AND IT MUST BE A DELEGATED SUBTREE, NOT A DIRECTORY THE RUNNER
+          # HAPPENS TO OWN. See `cgroup-root` above: cgroup-v2 migration needs
+          # the common ancestor's `cgroup.procs`, so the root goes underneath
+          # the runner's own cgroup — otherwise that ancestor is the root
+          # cgroup and even the action root cannot be admitted.
+          own=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+          sudo mkdir -p "/sys/fs/cgroup${own}/testbucket"
+          sudo chown "$(id -un)" "/sys/fs/cgroup${own}" "/sys/fs/cgroup${own}/cgroup.procs"
+          sudo chown "$(id -un)" "/sys/fs/cgroup${own}/testbucket"
+          sudo chmod 0755 "/sys/fs/cgroup${own}/testbucket"
+          echo "TB_WALL_CGROUP_ROOT=/sys/fs/cgroup${own}/testbucket" >>"$GITHUB_ENV"
+
+          # THE EVIDENCE PARENT IS OWNED BY THE WRAPPER AND setgid TO THE
+          # SCRIPT GROUP.
+          #
+          # `wall begin` creates the wall directory inside this parent and then
+          # sets its mode; it does NOT change its group, because an
+          # unprivileged owner may only set a group it is itself in and the
+          # wrapper is deliberately not in the script's. setgid on the parent
+          # makes the kernel assign that group instead. The `-o` matters as
+          # much as the `-g`: without an explicit owner the parent belongs to
+          # root and the wrapper's own mkdir inside it fails with permission
+          # denied, before any explanatory refusal can run.
+          sudo install -d -m 2775 -o "$(id -un)" -g tb-script "$RUNNER_TEMP/testbucket-wall-parent"
+
+          sudo chown -R tb-workload "$GITHUB_WORKSPACE"
+          # The wrapper may become either measured account; neither may become
+          # anything. Two accounts because there are two measured parties —
+          # see script-user.
+          printf '%%s ALL=(tb-script,tb-workload) NOPASSWD: ALL\n' "$(id -un)" \
+            | sudo tee /etc/sudoers.d/testbucket-wall >/dev/null
+          printf 'tb-script ALL=(tb-workload) NOPASSWD: ALL\n' \
+            | sudo tee -a /etc/sudoers.d/testbucket-wall >/dev/null
+          # `sudo -n` must EXEC the command, not supervise it through a pty:
+          # a monitor process would leave the wrapper watching sudo's pid
+          # rather than the workload's, and the drop would not be observable
+          # on the measured process — which this wrapper refuses to score.
+          printf 'Defaults:%%s !use_pty\n' "$(id -un)" \
+            | sudo tee -a /etc/sudoers.d/testbucket-wall >/dev/null
+          printf 'Defaults:tb-script !use_pty\n' \
+            | sudo tee -a /etc/sudoers.d/testbucket-wall >/dev/null
+
+      tb-workload must be in NO sudo group: a workload that could sudo would
+      take every capability back. Left empty, the measured work runs as this
+      action's own user, `membershipControl` reports the containment as
+      workload-writable, and the row is recorded in full and reported
+      INELIGIBLE rather than scored.
+    default: ""
+  script-user:
+    description: >-
+      The account the measured BUCKET SCRIPT runs under, distinct both from the
+      account this action runs as and from workload-user.
+
+      There are two measured parties, and one account cannot be both. The
+      bucket script is harness-generated: it writes the invocation specs and
+      starts the nested `wall exec` wrappers, which ASK the script-level
+      wrapper to create, admit and measure each invocation. The script itself
+      creates no containment and writes no ledger, so its own containment stays
+      owned by the wrapper — which is what makes the level scorable. The test
+      code the invocations run holds less still.
+
+      Running the script as this action's own user instead made the script
+      level unscorable by the wrapper's own rule, because the measured process
+      was then the credential owning its own containment; that contradiction
+      is why this input exists. The script containment is NOT delegated to
+      this account, and neither is the enclosing ACTION containment: giving
+      the measured script write access to its own `cgroup.procs` is precisely
+      the arrangement the membership rule exists to refuse, and it made every
+      complete-script row ineligible. The script asks the script-level wrapper
+      to create and admit each nested containment over the controller channel,
+      which authenticates the asker by the kernel's SO_PEERCRED answer rather
+      than by anything the caller claims. So the script arranges nothing
+      itself and cannot leave the lifecycle that brackets it.
+
+      Set up alongside workload-user in the same prior step (see the example
+      above). tb-script may sudo to tb-workload and to nothing else; left
+      empty, the script level is recorded in full and reported INELIGIBLE
+      rather than scored.
+    default: ""
+  workload-uid:
+    description: >-
+      ADDITIONAL uids the measured workload may run as
+      (TB_WALL_WORKLOAD_UID), comma-separated, when the caller runs it under
+      credentials other than this action's.
+
+      It cannot create the membership boundary, and it is not trusted to. A
+      declaration is a caller-controlled string, so this input only WIDENS the
+      set of credentials known to lack the boundary: the wrapper's own uid
+      still counts as the workload's alongside whatever is named here, and a
+      row whose `cgroup.procs` is owned by the wrapper's uid is recorded in
+      full and reported INELIGIBLE however this input is set.
+
+      What does move the boundary is workload-user, not this input. When that
+      account is resolved and dropped to, the measured child genuinely runs as
+      someone else and the wrapper's uid stops counting as the workload's.
+      A number named here never has that effect.
+
+      A genuinely scored deployment needs the subtree owned by a credential
+      the measured work does not run as. The script-level wrapper is the party
+      that creates and admits the nested containments on the measured script's
+      behalf, so no separate privileged daemon is needed — but on a same-uid
+      runner, where nothing drops, every scored row is still ineligible:
+      deliberately, because the alternative is asserting a boundary that is not
+      there.
+    default: ""
+  scored:
+    description: >-
+      Set to "true" for a campaign arm. It refuses a bucket that is not
+      measured (no `wall-time-dir`) and one that is not immutably delivered
+      (anything but an exact published `vX.Y.Z`), because a scored row must
+      have produced evidence and must say which bytes produced it.
+      Verification itself is a SEPARATE action (`verify-wall`) run after this
+      one: the contract puts AT_end after the final action epilogue, so
+      verification cannot be a later step of the same action.
+    default: "false"
+  run-key:
+    description: >-
+      The run key: the ed25519 signing key that attests this measurement's
+      signer ROSTER and its closing SEAL. Required for an eligible scored row —
+      without it both documents are written unsigned and the verifier reports
+      WT-023, because a record set authenticated only by the keys it carries is
+      what a forger would also produce.
+
+      It is bound to exactly two steps of this action, `wall begin` and
+      `wall end`, and to NEITHER the setup command nor the measured bucket
+      script. That is not tidiness, it is the entire mechanism: a step-scoped
+      `env:` is not visible to other steps, so the work being measured cannot
+      produce a roster, cannot produce a seal, and cannot alter either once the
+      seal exists. Widening this to the run step would make the whole signer
+      set forgeable by the thing it is meant to attest.
+
+      Pass a secret, never a literal. The corresponding PUBLIC key must be
+      declared in the Stage-1 manifest's record-signers and handed to
+      `verify-wall`, or the verifier has nothing to check the attestations
+      against.
+    default: ""
+  campaign-id:
+    description: 'Campaign identity stamped on every record.'
+    default: ""
+  stage1-digest:
+    description: >-
+      Digest of the signed Stage-1 input manifest that authorised this plan
+      (`testbucket wall digest --file stage1.json`). Every record binds it.
+      Without it the records name no authorised inputs and the verifier reports
+      the run INELIGIBLE, which is correct but unscorable.
+    default: ""
+  stage2-digest:
+    description: >-
+      Digest of the Stage-2 derived-plan receipt this bucket was fanned out
+      from. Every record binds it, so a measurement can be tied to exactly one
+      authorised plan.
+    default: ""
+  registry-digest:
+    description: 'Digest of the frozen Aeta component-registry template in force.'
+    default: ""
+  verifier-id:
+    description: 'Delivery-bound verifier identity recorded on every record.'
     default: ""
 
 runs:
   using: composite
   steps:
-    # Only the Go runner needs the binary here (for `testbucket render`); a Vitest
-    # bucket's script prints its own default-reporter log, so it needs no binary —
-    # and therefore no Go on a Vitest runner even in local-install mode.
+    # A scored row needs an immutable delivery identity: the contract is
+    # explicit that a moving tag is descriptive metadata, not an identity. The
+    # opt-in measured run may still use the alias, because it only ever claims
+    # `complete`.
+    # A scored row that cannot be measured is a contradiction, and this is the
+    # only configuration in which refusing it costs nothing: there is no
+    # envelope to be inside, because none will ever open. Every other scored
+    # precondition is checked INSIDE the envelope, where a failure is retained
+    # as a terminal record rather than vanishing.
+    - name: Refuse an unmeasurable scored row
+      if: inputs.scored == 'true' && inputs.wall-time-dir == ''
+      shell: bash
+      run: |
+        echo "scored=true needs a wall-time-dir: a scored row is a MEASURED row, and with no records directory this bucket produces no evidence to verify." >&2
+        exit 1
+
+    # The Go runner needs the binary for `testbucket render`; a Vitest bucket's
+    # script prints its own default-reporter log, so it needs no binary.
+    #
+    # A MEASURED bucket needs it too — and must NOT install it here. The
+    # physical action envelope opens on the first action-owned operation, and
+    # the wrapper cannot read a clock before it exists, so installing inside
+    # this action would put action-owned work before AT_start permanently. A
+    # measured caller runs the `install` action first; the envelope step below
+    # is then this action's first operation.
     - name: Install testbucket
-      if: inputs.runner == 'go'
+      if: inputs.runner == 'go' && inputs.wall-time-dir == ''
       shell: bash
       env:
         TB_VERSION: ${{ inputs.version }}
+        TB_CANDIDATE_BINARY_DIGEST: ${{ inputs.candidate-binary-digest }}
+        TB_RELEASE_PINS_REF: ${{ inputs.release-pins-ref }}
         TB_REPO: invakid404/testbucket
         TB_BINDIR: ${{ runner.temp }}/testbucket-bin
         GH_TOKEN: ${{ github.token }}
       run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    # AT_start. This is the FIRST action-owned operation, and it is first in
+    # the step list for that reason: the containment, the two observer
+    # processes and their admission handshakes are all real action time, and
+    # anything this action did before them would be action-owned work outside
+    # the interval that claims to contain it.
+    #
+    # The wrapper must therefore already be on PATH — a measured caller runs
+    # the `install` action first. A missing wrapper fails here, before the
+    # envelope opens, which is a precondition rather than unmeasured work.
+    - name: Open the wall-time action envelope
+      id: begin
+      if: inputs.wall-time-dir != ''
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
+        # The account the MEASURED WORK runs under. The wrapper stays as this
+        # step's user, which may write the delegated subtree; the measured
+        # command is executed as this account, which may not. Empty means no
+        # boundary was established, and the row is recorded in full and
+        # reported INELIGIBLE rather than scored.
+        TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
+        # The account the measured BUCKET SCRIPT runs under — the second
+        # measured party. See the script-user input.
+        TB_WALL_SCRIPT_USER: ${{ inputs.script-user }}
+        # The run key, scoped to THIS step. `wall begin` seals the signer
+        # roster with it before the measured script exists.
+        TB_WALL_RUN_KEY: ${{ inputs.run-key }}
+        BUCKET_NAME: ${{ inputs.name }}
+        TB_CAMPAIGN_ID: ${{ inputs.campaign-id }}
+        TB_STAGE1: ${{ inputs.stage1-digest }}
+        TB_STAGE2: ${{ inputs.stage2-digest }}
+        TB_REGISTRY: ${{ inputs.registry-digest }}
+        TB_VERIFIER_ID: ${{ inputs.verifier-id }}
+      run: |
+        set -euo pipefail
+        # The records directory is created by `wall begin` itself, INSIDE the
+        # envelope: creating it here would put action-owned work before
+        # AT_start and report an action shorter than the one that ran.
+        # THE SIGNER DELEGATE IS A STEP OUTPUT, NOT A JOB-GLOBAL VARIABLE.
+        #
+        # `wall begin` holds the run key and mints a delegate that may
+        # authorize the signers the MEASURED step creates: the script and
+        # invocation producers, and the action-owned children. That capability
+        # must reach the measured step and nothing else.
+        #
+        # It used to be appended to $GITHUB_ENV, which puts it in the
+        # environment of EVERY later step in the job — including the
+        # consumer-supplied setup command, which is somebody else's code
+        # running with the wrapper credential. A step output is the narrow
+        # channel: it enters a step's environment only where that step names
+        # it, and the bucket step below is the only one that does.
+        #
+        # `wall begin` writes the masking directive to stderr and exactly one
+        # base64 value to stdout, so this command substitution captures the
+        # value alone. A workflow command captured here would be swallowed
+        # rather than processed, and would make the exported value two lines
+        # that no decoder can read.
+        delegate="$(testbucket wall begin \
+          --dir "$TB_WALL_DIR" \
+          --bucket-id "$BUCKET_NAME" \
+          --campaign-id "$TB_CAMPAIGN_ID" \
+          --run-id "${GITHUB_RUN_ID:-}" \
+          --attempt-id "${GITHUB_RUN_ATTEMPT:-}" \
+          --repository "${GITHUB_REPOSITORY:-}" \
+          --workflow-run "${GITHUB_RUN_ID:-}" \
+          --job "${GITHUB_JOB:-}" \
+          --step "run-bucket" \
+          --step-attempt "${GITHUB_RUN_ATTEMPT:-}" \
+          --stage1 "$TB_STAGE1" \
+          --stage2 "$TB_STAGE2" \
+          --registry "$TB_REGISTRY" \
+          --verifier-id "$TB_VERIFIER_ID")"
+        case "$delegate" in
+          *[!A-Za-z0-9+/=]*|"")
+            if [ -n "$delegate" ]; then
+              echo "REFUSED: wall begin wrote something other than a single base64 value to stdout." >&2
+              exit 1
+            fi
+            ;;
+        esac
+        printf 'signer-delegate=%s\n' "$delegate" >> "$GITHUB_OUTPUT"
 
     # A consumer's own per-runner provisioning, run once before the bucket's test
     # command. Passed through the environment and executed as a bash block (never
     # spliced into the command line): the command is consumer-supplied data, and
     # splicing it into a run: line is how a workflow grows an injection. `-e` so a
     # failed provisioning step fails the bucket instead of leaking into the tests.
+    #
+    # Under measurement it runs through `wall run`, which admits it to the ACTION
+    # containment first: setup is real action-owned work, and work outside the
+    # containment is work the trace cannot see.
     - name: Set up the bucket
       if: inputs.setup-command != ''
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         TB_SETUP_COMMAND: ${{ inputs.setup-command }}
-      run: bash -eo pipefail -c "$TB_SETUP_COMMAND"
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
+        # The account the MEASURED WORK runs under. The wrapper stays as this
+        # step's user, which may write the delegated subtree; the measured
+        # command is executed as this account, which may not. Empty means no
+        # boundary was established, and the row is recorded in full and
+        # reported INELIGIBLE rather than scored.
+        TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
+      run: |
+        set -euo pipefail
+        if [ -n "$TB_WALL_DIR" ]; then
+          # NO --wrapper-chain: this is the CONSUMER'S command. `wall run`
+          # strips every wall-time secret and account selector from its child,
+          # so caller-supplied code never runs holding the signer delegate or
+          # anything else that could decide whose evidence a run admits.
+          testbucket wall run --dir "$TB_WALL_DIR" -- bash -eo pipefail -c "$TB_SETUP_COMMAND"
+        else
+          bash -eo pipefail -c "$TB_SETUP_COMMAND"
+        fi
 
     - name: Run the bucket
+      id: run
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
@@ -81,32 +526,195 @@ runs:
         BUCKET_NAME: ${{ inputs.name }}
         BUCKET_EST: ${{ inputs.est-seconds }}
         TB_EVENTS_DIR: ${{ inputs.events-dir }}
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
+        # The account the MEASURED WORK runs under. The wrapper stays as this
+        # step's user, which may write the delegated subtree; the measured
+        # command is executed as this account, which may not. Empty means no
+        # boundary was established, and the row is recorded in full and
+        # reported INELIGIBLE rather than scored.
+        TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
+        # The bucket script's own account. The wrapper drops to it before
+        # starting the script, so the measured script is not the credential
+        # owning what contains it; the invocation containments beneath it are
+        # created by the wrapper's controller rather than by the script.
+        TB_WALL_SCRIPT_USER: ${{ inputs.script-user }}
+        # THE SIGNER DELEGATE, NAMED BY THE ONE STEP THAT NEEDS IT.
+        #
+        # This is the only step that references the begin step's output, so it
+        # is the only step whose environment carries the capability. The
+        # consumer-supplied setup step above does not name it, and `wall run`
+        # strips it from that child's environment as well — two independent
+        # reasons caller-controlled code cannot hold it.
+        TB_WALL_SIGNER_DELEGATE_KEY: ${{ steps.begin.outputs.signer-delegate }}
+        TB_SCORED: ${{ inputs.scored }}
+        TB_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
-        # The generated script tees its events into this directory; create it
-        # first so `tee` has somewhere to write (the script itself does not mkdir,
-        # and each bucket runs on a fresh runner).
-        mkdir -p "$TB_EVENTS_DIR"
-        echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
-        printf '%s\n' "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
-        echo "--- invocations ---"
-        cat "$RUNNER_TEMP/testbucket-bucket.sh"
-        echo "--- output ---"
+        # Under measurement, EVERYTHING this step owns runs inside one
+        # `wall run`, which admits itself to the action containment before
+        # spawning its child — so the child, and everything the child starts,
+        # inherits that cgroup.
+        #
+        # Preparing here and wrapping only the script would not work: this
+        # Actions shell is already running, `wall run` moves only its own
+        # process, and a child cannot retroactively admit its parent. The
+        # preparation would sit inside A's clock interval while the peer and
+        # the trace never saw it.
+        #
+        # The measured body is single-quoted, so the generated script is never
+        # spliced into a command line; the inner shell reads it from the
+        # environment, exactly as the unmeasured path does.
+        # THE CREDENTIAL DROPS HAPPEN INSIDE THE WRAPPER, at both measured
+        # levels. This shell must not wrap anything: the wrapper chain needs
+        # the credential that can create and admit containments and write the
+        # evidence directory, and each measured process tree drops from it —
+        # the bucket script to TB_WALL_SCRIPT_USER, the test code inside each
+        # invocation to TB_WALL_WORKLOAD_USER.
+        #
+        # A guard here used to build a `sudo` prefix from two variables that no
+        # longer exist — one belonging to the removed supervisor, one never
+        # exported at all — so it was always empty and the drop never happened
+        # anywhere. Dead wiring that reads like a boundary is worse than none.
+        if [ -n "$TB_WALL_DIR" ]; then
+          set +e
+          # --wrapper-chain: this child IS the wrapper chain. The script-level
+          # wrapper it starts registers its own producers and its controller
+          # registers the invocation ones, so it needs the capabilities the
+          # setup command must not have.
+          testbucket wall run --dir "$TB_WALL_DIR" --wrapper-chain -- bash -euo pipefail -c '
+            # Delivery identity, checked INSIDE the envelope so a refusal is
+            # retained as a terminal record. The installer resolves `local`, a
+            # moving alias or an exact tag and nothing else; there is no
+            # release asset at an arbitrary commit SHA to download and
+            # checksum-verify, so a SHA is refused rather than promised.
+            # EXACT STABLE SemVer, by regex rather than by shell glob: in a
+            # shell pattern `*` is unrestricted, so `v[0-9]*.[0-9]*.[0-9]*`
+            # also accepted `v1x.2y.3junk` and `v1.2.3-rc.1`. The installer
+            # applies a strict expression later, which only turned a falsely
+            # accepted scored request into a failure further downstream.
+            if [ "$TB_SCORED" = "true" ]; then
+              # TWO delivery identities are admissible, and both are immutable.
+              #
+              # An exact published stable tag is one. The other is a
+              # PRE-PUBLICATION candidate artifact, addressed by workflow run
+              # id and artifact name and pinned by digest. That second form is
+              # what makes a scored candidate arm possible at all: the binary
+              # being proposed cannot come from a published release, because
+              # publication is gated on the very campaign this arm belongs to.
+              # It is not a released build and does not claim to be — it is an
+              # immutable upload whose bytes were named in advance.
+              #
+              # What stays refused is anything that is not an identity: a
+              # moving alias is descriptive metadata, a prerelease is a build
+              # the project has not stood behind, a bare commit SHA has no
+              # artifact to fetch and no digest to check, and `local` is bytes
+              # nobody attested.
+              if printf "%s" "$TB_VERSION" | grep -Eq "^v[0-9]+\.[0-9]+\.[0-9]+$"; then
+                :
+              elif printf "%s" "$TB_VERSION" | grep -Eq "^candidate:[0-9]+/[^@/]+@sha256:[0-9a-f]{64}$"; then
+                :
+              else
+                echo "scored=true needs an exact published stable release tag (vMAJOR.MINOR.PATCH) or a digest-pinned pre-publication candidate (candidate:<run-id>/<artifact>@sha256:<64-hex>), got '"'"'$TB_VERSION'"'"'." >&2
+                echo "A moving alias is descriptive metadata rather than a delivery identity; a prerelease is a build the project has not stood behind; a bare commit SHA has no artifact to fetch and no digest to verify; local is bytes nobody attested." >&2
+                exit 1
+              fi
+            fi
 
-        # The generated script already tees each stream to the events directory
-        # for the record job. The status taken is the SCRIPT's (PIPESTATUS[0]),
-        # never the renderer's.
-        set +e
-        if [ "$TB_RUNNER" = "go" ]; then
-          # Go's script emits `go test -json` on stdout; pipe it through
-          # `testbucket render` to reproduce the plain test log for humans.
-          bash "$RUNNER_TEMP/testbucket-bucket.sh" | testbucket render
-          status=${PIPESTATUS[0]}
-        else
-          # Vitest's script prints a default-reporter log itself (the JSON report
-          # goes to a side file), so run it directly.
-          bash "$RUNNER_TEMP/testbucket-bucket.sh"
+            # The generated script tees its events into this directory; create
+            # it first so `tee` has somewhere to write (the script itself does
+            # not mkdir, and each bucket runs on a fresh runner).
+            mkdir -p "$TB_EVENTS_DIR"
+            # DELEGATED THE SAME WAY THE EVIDENCE DIRECTORY IS: the measured
+            # script runs as its own account and must create files here, so the
+            # script group gets create access — setgid so new files carry the
+            # group, sticky so only an owner may remove or rename anything.
+            # Without that the dropped script cannot write a single event file.
+            # THE ACCOUNT'"'"'S ACTUAL PRIMARY GROUP, resolved rather than
+            # assumed. An account name is not a group name: `useradd` often
+            # creates a like-named group, but a valid account can have any
+            # primary group, and `chgrp "$TB_WALL_SCRIPT_USER"` then fails and
+            # the measured script cannot write one event file. The Go boundary
+            # resolves the real GID; this resolves the same thing.
+            if [ -n "${TB_WALL_SCRIPT_USER:-}" ]; then
+              script_gid="$(id -g "$TB_WALL_SCRIPT_USER")"
+              chgrp "$script_gid" "$TB_EVENTS_DIR"
+              chmod 3770 "$TB_EVENTS_DIR"
+            fi
+            echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
+            printf "%s\n" "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
+            echo "--- invocations ---"
+            cat "$RUNNER_TEMP/testbucket-bucket.sh"
+            echo "--- output ---"
+
+            # VB: the complete generated script under its own physical
+            # envelope, containment peer and independent trace. The run
+            # identity is inherited from the action state `wall begin` wrote,
+            # so the script and its invocations bind the same Stage-1 and
+            # Stage-2 receipts the action does. The wrapper exits with the
+            # script status and `wall run` passes it on, so a red bucket stays
+            # red.
+            testbucket wall exec --dir "$TB_WALL_DIR" --level script \
+              --desc "$BUCKET_NAME" -- bash "$RUNNER_TEMP/testbucket-bucket.sh"
+          '
           status=$?
+        else
+          # Unmeasured: exactly what this step always did.
+          mkdir -p "$TB_EVENTS_DIR"
+          echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
+          printf '%s\n' "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
+          echo "--- invocations ---"
+          cat "$RUNNER_TEMP/testbucket-bucket.sh"
+          echo "--- output ---"
+
+          # The generated script already tees each stream to the events
+          # directory for the record job. The status taken is the SCRIPT's
+          # (PIPESTATUS[0]), never the renderer's.
+          set +e
+          if [ "$TB_RUNNER" = "go" ]; then
+            # Go's script emits `go test -json` on stdout; pipe it through
+            # `testbucket render` to reproduce the plain test log for humans.
+            bash "$RUNNER_TEMP/testbucket-bucket.sh" | testbucket render
+            status=${PIPESTATUS[0]}
+          else
+            # Vitest's script prints a default-reporter log itself (the JSON
+            # report goes to a side file), so run it directly.
+            bash "$RUNNER_TEMP/testbucket-bucket.sh"
+            status=$?
+          fi
         fi
         set -e
         exit "$status"
+
+    # AT_end, after verified-empty containment. It runs even when the bucket
+    # failed: a failed bucket is still a complete measurement of a failed
+    # bucket, and an envelope left open would be a missing row rather than a
+    # recorded failure.
+    - name: Close the wall-time action envelope
+      if: always() && inputs.wall-time-dir != ''
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_WALL_CGROUP_ROOT: ${{ inputs.cgroup-root }}
+        TB_WALL_WORKLOAD_UID: ${{ inputs.workload-uid }}
+        # The account the MEASURED WORK runs under. The wrapper stays as this
+        # step's user, which may write the delegated subtree; the measured
+        # command is executed as this account, which may not. Empty means no
+        # boundary was established, and the row is recorded in full and
+        # reported INELIGIBLE rather than scored.
+        TB_WALL_WORKLOAD_USER: ${{ inputs.workload-user }}
+        # The run key again, scoped to THIS step. `wall end` seals the exact
+        # bytes of every stream and of the key log with it, after the measured
+        # script has finished and in a step that script was never in.
+        TB_WALL_RUN_KEY: ${{ inputs.run-key }}
+        TB_OUTCOME: ${{ steps.run.outcome }}
+      run: |
+        set -euo pipefail
+        terminal=passed
+        reason=""
+        if [ "$TB_OUTCOME" != "success" ]; then
+          terminal=failed
+          reason="the bucket step outcome was $TB_OUTCOME"
+        fi
+        testbucket wall end --dir "$TB_WALL_DIR" --terminal "$terminal" --reason "$reason"

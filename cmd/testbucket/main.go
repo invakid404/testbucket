@@ -33,6 +33,7 @@ import (
 	"github.com/invakid404/testbucket/internal/runner"
 	"github.com/invakid404/testbucket/internal/runner/gorunner"
 	"github.com/invakid404/testbucket/internal/runner/vitestrunner"
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
 // Build metadata, injected at release time via -ldflags -X (goreleaser fills
@@ -56,6 +57,11 @@ usage:
                               the plan it was fanned out from: every target
                               covered exactly as scheduled, shards and slices
                               accounted for
+  testbucket wall    <sub>    complete-action wall-time measurement: open and
+                              close the physical action envelope, run a command
+                              under a physical envelope with its own containment
+                              peer and independent trace, and verify a records
+                              directory against every frozen gate
   testbucket render           replay a "go test -json" stream from stdin as the
                               plain log it would have printed; a pure filter that
                               never changes an exit status
@@ -83,6 +89,8 @@ func main() {
 		err = runAudit(os.Args[2:])
 	case "render":
 		err = runRender(os.Args[2:])
+	case "wall":
+		err = runWall(os.Args[2:])
 	case "version", "--version", "-v":
 		printVersion()
 		return
@@ -141,6 +149,7 @@ type runnerConfig struct {
 	timeout      string
 	nodePrefixes []string
 	// Vitest run envelope.
+	wallDir                string
 	root                   string
 	vitestCommand          string
 	vitestDiscovery        string
@@ -193,6 +202,7 @@ func newRunner(cfg runnerConfig) (runner.Runner, liveLoader, error) {
 			DiscoveryTimeout: cfg.discoveryTimeout,
 			EventsDir:        cfg.eventsDir,
 			FileParallelism:  cfg.fileParallelism,
+			WallDir:          cfg.wallDir,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -249,6 +259,18 @@ func resolveCount(runnerKind string, count int, explicit bool) (int, error) {
 	return count, nil
 }
 
+// checkWallDirRunner refuses --wall-dir on the Go adapter rather than ignoring
+// it. Wall-time measurement is Vitest-only today: the Go adapter's events,
+// count shards and `-race -count=100` contract are deliberately untouched, and
+// a flag that silently does nothing is how a consumer ends up believing a
+// campaign was instrumented when it was not.
+func checkWallDirRunner(runnerKind, wallDir string) error {
+	if strings.TrimSpace(wallDir) == "" || runnerKind == "vitest" {
+		return nil
+	}
+	return fmt.Errorf("--wall-dir needs --runner vitest: complete-action wall-time measurement is Vitest-only today, and the Go adapter is deliberately left unchanged")
+}
+
 // splitPrefixes turns a comma-separated flag into a prefix list, empty for the
 // empty string (the default) rather than a single empty prefix.
 func splitPrefixes(s string) []string {
@@ -296,6 +318,16 @@ func runPlan(args []string) error {
 	countFlag := fs.Int("count", 100, "-count for the flake sweep; count-shards divide it (Go default 100; Vitest requires 1)")
 	timeout := fs.String("timeout", "20m", "-timeout passed to each go test invocation")
 	live := fs.String("live", "", "read the live package set from this JSON file instead of running go list")
+	wallBundle := fs.String("wall-bundle", "", "plan DETERMINISTICALLY from this frozen planning-input bundle (`testbucket wall bundle`) instead of discovering and reading the clock: every input comes from the bundle, so the plan is reproducible")
+	wallStage1 := fs.String("wall-stage1", "", "Stage-1 input manifest that authorises the bundle (--wall-bundle)")
+	wallStage2 := fs.String("wall-stage2", "", "write the Stage-2 derived-plan receipt here (--wall-bundle). It refuses to overwrite: the bound planner runs exactly once")
+	pallocScorer := fs.String("palloc-scorer", "", "frozen pre-plan scorer (--wall-bundle): KK then packs by Palloc while est_seconds keeps reporting the store's measured weights. Without it the partition uses the store weights, which is not campaign eligible")
+	wallRegistry := fs.String("wall-registry", "", "frozen Aeta component-registry template (--wall-bundle), instantiated per bucket into --wall-out-dir")
+	wallOutDir := fs.String("wall-out-dir", "", "write the per-bucket derived documents (Palloc, Pcheck, Aeta) here (--wall-bundle)")
+	wallClaimStore := fs.String("wall-claim-store", "", "DURABLE store for the one-shot planner claim (--wall-bundle). The contract allows one planner execution and refuses a replan, retry or second invocation; the claim is keyed by the Stage-1 and bundle digests, taken BEFORE planning, and created with O_EXCL so the filesystem decides the winner. It is a STORE, not an output directory: a claim kept beside the derived documents moved with the working directory, so a job rerun on a fresh runner saw no claim at all. Set this (or "+plannerClaimStoreEnv+") to a location every attempt of the job resolves; a SCORED derivation refuses to plan without one. Independent verifier replay does not claim")
+	wallAuthority := fs.String("wall-authority", "", "the EXACT protected environment the Stage-1 manifest must name, e.g. "+walltime.CampaignAuthority+". REQUIRED with --wall-bundle: the contract puts the protected authority's approval BEFORE either role plans, and a key can sign under any label — so a key check alone lets a manifest approved elsewhere drive the frozen planner")
+	var wallAuthorityKeys stringList
+	fs.Var(&wallAuthorityKeys, "wall-authority-key", "a PREDECLARED authority public key (hex); repeatable. REQUIRED with --wall-bundle: the contract puts an owner-authority signature on the planning inputs BEFORE the plan exists, and a post-run verifier can refuse a row but cannot un-run an action or restore an approval that never happened")
 	nodePrefixes := fs.String("node-prefixes", "", "comma-separated package-dir prefixes whose buckets need Node set up (empty = none; a consumer opts in)")
 	eventsDir := fs.String("events-dir", "", "if set, emitted invocations add -json and tee events into this directory")
 	fileParallelism := fs.Int("file-parallelism", 1, "intra-bucket file/package concurrency (#22): 1 keeps a bucket serial (the sum-of-weights model the balancer packs to); N>1 renders `-p=N` (Go) / `--maxWorkers=N` (Vitest), trading that estimate for more cores")
@@ -307,10 +339,28 @@ func runPlan(args []string) error {
 	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly` — resolves files by glob WITHOUT importing them, immune to the multi-project `vitest list` collection deadlock) or list (`vitest list --json` — imports the module graph; only its per-test names matter, which file-granularity bucketing does not use today)")
 	vitestDiscoveryCommand := fs.String("vitest-discovery-command", "", "override discovery with a command run VERBATIM (--runner vitest): it OWNS its subcommand and flags (testbucket appends nothing) and must print the [{file}] / [{name,file}] JSON to stdout. Lets a run-wrapper that already owns `run` be paired with a separate discovery command. Empty = derive from --vitest-command + --vitest-discovery")
 	discoveryTimeout := fs.Duration("discovery-timeout", defDiscoveryTimeout, "fail-fast deadline for vitest test discovery (--runner vitest); a stalled `vitest list` errors here instead of hanging the whole job. 0 disables. Default overridable via TB_DISCOVERY_TIMEOUT")
+	wallDir := fs.String("wall-dir", "", "records directory for complete-action wall-time measurement (--runner vitest): every rendered invocation runs under `testbucket wall exec`, which gives it a physical envelope, a containment peer and an independent trace. Empty (the default) renders exactly the bytes v0.2.2 rendered")
 	var excludes stringList
 	fs.Var(&excludes, "exclude-module", "module dir (glob) to leave out of the module set; repeatable, replaces the defaults")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// The frozen path takes over completely: a bundle carries K, the count, the
+	// token, the clock and the render configuration, so honouring a flag here
+	// as well would be a second, unbound source for the same input.
+	if *wallBundle != "" {
+		return planFromBundle(frozenPlanOptions{
+			bundlePath: *wallBundle, stage1Path: *wallStage1, stage2Path: *wallStage2,
+			shardPlan: *shardPlan, asJSON: *asJSON,
+			scorerPath: *pallocScorer, registryPath: *wallRegistry, outDir: *wallOutDir,
+			claimStore: *wallClaimStore,
+			// A frozen plan that binds a Stage-1 manifest is the scored path:
+			// that is the derivation whose one-shot rule the campaign rests
+			// on, so its claim must be durable.
+			scored:        *wallStage1 != "",
+			authorityKeys: wallAuthorityKeys, authority: *wallAuthority,
+		})
 	}
 
 	// The effective sweep count is adapter-aware (Go 100, Vitest 1); resolve it
@@ -322,6 +372,9 @@ func runPlan(args []string) error {
 	}
 	if *fileParallelism < 1 {
 		return fmt.Errorf("--file-parallelism must be >= 1, got %d", *fileParallelism)
+	}
+	if err := checkWallDirRunner(*runnerKind, *wallDir); err != nil {
+		return err
 	}
 
 	opt := core.PlanOptions{
@@ -353,6 +406,7 @@ func runPlan(args []string) error {
 		discoveryTimeout:       *discoveryTimeout,
 		eventsDir:              *eventsDir,
 		fileParallelism:        *fileParallelism,
+		wallDir:                *wallDir,
 	})
 	if err != nil {
 		return err
@@ -701,9 +755,21 @@ func runRender(args []string) error {
 	return nil
 }
 
+// writeJSONFile writes a derived artifact WITHOUT truncating an existing one.
+//
+// It used to be os.Create, which truncates. On the frozen planner path that
+// meant a second invocation could overwrite the shard plan before anything
+// discovered it was not allowed to run at all — the derived outputs were
+// replaced and only then was the exactly-once rule consulted. Refusing here
+// keeps the outputs of the one authorised derivation intact even if a later
+// guard is bypassed, and the planner claim now refuses the second invocation
+// before any of this is reached.
 func writeJSONFile(path string, v any) (err error) {
-	f, cerr := os.Create(path)
+	f, cerr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if cerr != nil {
+		if os.IsExist(cerr) {
+			return fmt.Errorf("%s already exists; a derived artifact is the output of one authorised derivation and is not overwritten", path)
+		}
 		return fmt.Errorf("create %s: %w", path, cerr)
 	}
 	// The close error is the one that matters here: a buffered short write

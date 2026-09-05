@@ -1,0 +1,191 @@
+name: testbucket pre-flight
+description: >-
+  Independently re-derive the frozen plan and verify its authority approval
+  BEFORE the measured action starts.
+
+  It is its own action, and it runs before run-bucket, because the contract
+  puts the independent replay and the owner-authority check ahead of AT_start.
+  Verification after the action can refuse the row; it cannot un-run it, and it
+  cannot restore an approval that never happened. A failure here fails the
+  bucket closed, so no envelope ever opens over an unauthorised plan.
+
+inputs:
+  bundle:
+    description: 'The frozen planning-input bundle the plan was derived from.'
+    required: true
+  stage1:
+    description: 'The authority-signed Stage-1 manifest that authorised it.'
+    required: true
+  stage2:
+    description: >-
+      The issued Stage-2 derived-plan receipt. This step re-plans from the
+      bundle and requires an exact match — every digest, the per-bucket
+      document bindings, and the pre-plan approval the receipt records.
+    required: true
+  authority-key:
+    description: >-
+      PREDECLARED authority public key (hex) that must have signed `stage1`.
+      Required: a signature checked against whatever signed it accepts any
+      self-generated key, which is the same as not checking.
+    required: true
+  authority:
+    description: >-
+      The EXACT protected environment that must have approved `stage1`, e.g.
+      `ewj2-campaign`.
+
+      Required, and separate from the key. A key can sign under any label, so
+      checking the key alone accepts a correctly keyed manifest approved under
+      some other environment — and this is the gate the contract puts BEFORE
+      the measured action. A refusal afterwards can invalidate the row; it
+      cannot un-run it.
+    required: true
+  registry:
+    description: >-
+      The frozen Aeta component-registry template. Needed because the receipt
+      binds per-bucket documents, and a replay that skipped them would leave
+      exactly those documents re-derived by nobody.
+    default: ""
+  scorer:
+    description: >-
+      The frozen scorer the plan allocated by, when Stage 1 binds one.
+    default: ""
+  stage1-digest:
+    description: >-
+      The Stage-1 digest the measured records will be stamped with. Replaying
+      the frozen documents proves the PLAN; it says nothing about the separate
+      caller strings run-bucket writes onto every record, and a mismatch there
+      used to be found only by verification after the bucket had already run.
+      Supplying it here makes the comparison happen before AT_start.
+    default: ""
+  stage2-digest:
+    description: 'The Stage-2 digest the measured records will be stamped with.'
+    default: ""
+  registry-digest:
+    description: >-
+      The Aeta component-registry digest the measured records will be stamped
+      with.
+    default: ""
+  verifier-id:
+    description: >-
+      The verifier identity the measured records will be stamped with. A record
+      that names no verifier is attributable to nobody, so a scored row needs
+      one and this refuses a blank before any work starts.
+    default: ""
+  replay-attestation:
+    description: >-
+      The SIGNED independent replay attestation this row will be verified
+      against.
+
+      `verifier-id` is a caller string with no document to derive it from, so
+      the pre-flight could previously only refuse a BLANK one. A caller that
+      resolved a different, perfectly non-blank identity passed here, opened the
+      action envelope and ran the tests; the genuine signed replay disagreed
+      with it only at post-action verification, which can invalidate the row but
+      cannot un-measure it.
+
+      Supplying it makes the pre-flight authenticate the attestation under the
+      replay signers Stage 1 declares and compare its verifier identity with
+      `verifier-id` BEFORE AT_start. Required whenever the record identities are
+      being bound at all.
+    default: ""
+  version:
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. The default is
+      the moving `v0` alias, which resolves to the highest published 0.x
+      release — this project is deliberately pre-1.0. A scored arm must pin an
+      exact `vX.Y.Z` instead: an alias is descriptive metadata, not a delivery
+      identity.
+    default: v0
+  release-pins-ref:
+    description: >-
+      Full 40-hex commit SHA of this repository carrying the precommitted
+      binary digest for a release published AFTER this action's own commit.
+
+      A release cannot contain its own digest: GoReleaser embeds the tag commit
+      and its timestamp in the binary, so the hash cannot exist before the tag
+      that produces it. The colocated pin file therefore covers releases
+      published earlier, and the newest one is pinned by the commit that comes
+      after it — proposed by the `pin-release` workflow and merged under review.
+      Only a full commit SHA is accepted: a branch or a tag would put the pin
+      back under the control of whoever can move that ref.
+    default: ""
+  candidate-binary-digest:
+    description: >-
+      The `sha256:<64-hex>` of the testbucket BINARY the campaign authorised,
+      as the signed Stage-1 manifest binds it. REQUIRED whenever `version` is a
+      `candidate:<run-id>/<artifact>@sha256:<64-hex>` pin: the archive digest
+      says which archive was downloaded, this says which binary is about to
+      execute, and Stage 1 binds the second. Do not type it in. Derive it with
+      `testbucket wall stage1-binary --file stage1.json` run from a PUBLISHED
+      release — that command validates the manifest, so the value comes from
+      the builder's attestation, the verifier's countersignature and the
+      campaign authority's own signature rather than from whoever wired the
+      job. Empty for a published release, whose bytes are checksum-verified
+      against the release manifest instead.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install testbucket
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+        TB_CANDIDATE_BINARY_DIGEST: ${{ inputs.candidate-binary-digest }}
+        TB_RELEASE_PINS_REF: ${{ inputs.release-pins-ref }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    - name: Re-derive the plan and check its approval
+      shell: bash
+      env:
+        TB_BUNDLE: ${{ inputs.bundle }}
+        TB_STAGE1: ${{ inputs.stage1 }}
+        TB_STAGE2: ${{ inputs.stage2 }}
+        TB_REGISTRY: ${{ inputs.registry }}
+        TB_SCORER: ${{ inputs.scorer }}
+        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_AUTHORITY: ${{ inputs.authority }}
+        TB_STAGE1_DIGEST: ${{ inputs.stage1-digest }}
+        TB_STAGE2_DIGEST: ${{ inputs.stage2-digest }}
+        TB_REGISTRY_DIGEST: ${{ inputs.registry-digest }}
+        TB_VERIFIER_ID: ${{ inputs.verifier-id }}
+        TB_REPLAY_ATTESTATION: ${{ inputs.replay-attestation }}
+      run: |
+        set -euo pipefail
+        if [ -z "$TB_AUTHORITY_KEY" ]; then
+          echo "pre-flight needs an authority-key: without a predeclared key the Stage-1 signature would be checked against whatever signed it, which accepts any self-generated key." >&2
+          exit 1
+        fi
+        if [ -z "$TB_AUTHORITY" ]; then
+          echo "pre-flight needs an authority: a key can sign under any label, so checking the key alone accepts a manifest approved by some other protected environment." >&2
+          exit 1
+        fi
+        args=(--bundle "$TB_BUNDLE" --stage2 "$TB_STAGE2" --stage1 "$TB_STAGE1"
+              --authority-key "$TB_AUTHORITY_KEY" --authority "$TB_AUTHORITY")
+        if [ -n "$TB_REGISTRY" ]; then args+=(--registry "$TB_REGISTRY"); fi
+        if [ -n "$TB_SCORER" ]; then args+=(--scorer "$TB_SCORER"); fi
+
+        # The four identities run-bucket will stamp onto every record. They are
+        # compared with what this replay derives, and an unequal or blank value
+        # fails the bucket here — before `wall begin`, before the envelope, and
+        # before any measured command exists.
+        if [ -n "$TB_STAGE1_DIGEST" ]; then args+=(--expect-stage1 "$TB_STAGE1_DIGEST"); fi
+        if [ -n "$TB_STAGE2_DIGEST" ]; then args+=(--expect-stage2 "$TB_STAGE2_DIGEST"); fi
+        if [ -n "$TB_REGISTRY_DIGEST" ]; then args+=(--expect-registry "$TB_REGISTRY_DIGEST"); fi
+        if [ -n "$TB_VERIFIER_ID" ]; then args+=(--expect-verifier-id "$TB_VERIFIER_ID"); fi
+
+        # The verifier identity is the one of the four with no document to
+        # derive it from, so a non-blank check is all a replay could do alone.
+        # Authenticating the SIGNED attestation here and comparing the identity
+        # it was made under is the contract's resolved-value equivalence, and
+        # it happens before the envelope rather than after the work.
+        if [ -n "$TB_REPLAY_ATTESTATION" ]; then args+=(--expect-attestation "$TB_REPLAY_ATTESTATION"); fi
+
+        # No `|| true`. This step exists to stop the bucket, and a pre-flight
+        # that reported a problem and continued would be a log line.
+        testbucket wall replay "${args[@]}"
+        echo "pre-flight: the plan re-derives from its frozen inputs and its authority approval verifies"

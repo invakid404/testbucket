@@ -14,7 +14,7 @@ name: Bucketed (dogfood)
 # This lane pins `testbucket-version: local`, so the actions BUILD testbucket
 # from this very commit's source rather than downloading a release — the dogfood
 # always exercises the code under review, and it stays green before any release
-# exists. External consumers instead pin `@v1` and get the released binary.
+# exists. External consumers instead pin `@v0` and get the released binary.
 #
 # The `baseline` job runs the same tests unbucketed, so the two makespans are
 # directly comparable on the same commit. This suite is small (the tool has few
@@ -41,10 +41,10 @@ jobs:
       contents: read
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.1"
       - name: go test ./... (unbucketed)
@@ -57,8 +57,16 @@ jobs:
   # single K knob is `k`; a real consumer suite runs it at 6+.
   bucketed:
     uses: ./.github/workflows/bucketed-reusable.yml
+    # THE CALLER GRANTS WHAT THE CALLED JOBS DECLARE.
+    #
+    # The reusable workflow's `test` job now declares `actions: read` for its
+    # A_GH collector, and a called workflow may only retain or reduce what its
+    # caller granted — so a caller granting less fails at startup. This is the
+    # in-repository half of that versioned migration; a test refuses the pair
+    # if they drift apart again.
     permissions:
       contents: read
+      actions: read
     with:
       runner: go
       k: "2"
@@ -77,8 +85,10 @@ jobs:
   # valid sweep).
   bucketed-vitest:
     uses: ./.github/workflows/bucketed-reusable.yml
+    # Same grant, same reason: see the `bucketed` job above.
     permissions:
       contents: read
+      actions: read
     with:
       runner: vitest
       k: "2"

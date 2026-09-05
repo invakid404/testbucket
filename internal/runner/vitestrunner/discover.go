@@ -112,6 +112,17 @@ func parseList(root string, data []byte) ([]runner.LivePackage, error) {
 // name added since the last record — the steady-state case is already demoted at
 // ingest, so refusing here is rare, and refusing beats emitting a slice that
 // would double-run a test.
+// ParseRunnableNames is the exported entry point to the bound runnable parser.
+//
+// It exists so a planning-input bundle can freeze the raw listing bytes AND
+// the names those bytes parse to, through the same parser the planner uses. A
+// bundle that carried only the bytes would leave every consumer to re-derive
+// the names, and a consumer that guessed — or defaulted to none — would report
+// a pre-plan feature that disagrees with the evidence it was taken from.
+func ParseRunnableNames(root, file string, data []byte) ([]string, error) {
+	return runnableNames(root, file, data)
+}
+
 func runnableNames(root, file string, data []byte) ([]string, error) {
 	var rows []listEntry
 	if err := json.Unmarshal(data, &rows); err != nil {
@@ -184,6 +195,12 @@ func parseProjects(root string, data []byte) (map[string]string, error) {
 // resolves files without importing them; `list` opts into the importing
 // full-collection path, and a verbatim DiscoveryCommand overrides both.
 func (r *Runner) discover(ctx context.Context) ([]runner.LivePackage, error) {
+	// A frozen bundle supplies the discovery BYTES; the parser below is the
+	// same one the live path uses, so a replay differs from the original run
+	// in where the bytes came from and in nothing else.
+	if r.frozen != nil {
+		return parseList(r.root, r.frozen.Discovery)
+	}
 	out, err := r.runDiscovery(ctx)
 	if err != nil {
 		return nil, err
@@ -195,12 +212,49 @@ func (r *Runner) discover(ctx context.Context) ([]runner.LivePackage, error) {
 // a deadline hit into an actionable discovery error.
 func (r *Runner) runDiscovery(ctx context.Context) ([]byte, error) {
 	vt, args := r.discoveryInvocation()
-	out, err := vt.run(ctx, r.root, args...)
+	// THE ARGV AND CWD THAT ACTUALLY RAN, retained here rather than
+	// reconstructed by the caller.
+	//
+	// The bundle used to rebuild its discovery argv from the same flags a
+	// second time and record that. The two agree today and are not one
+	// observed value: a change to how the invocation is assembled would make
+	// the bundle's provenance describe a command nobody issued, and nothing
+	// would notice.
+	var prov ExecProvenance
+	out, err := vt.runWith(ctx, r.root, &prov, args...)
+	r.observed = &DiscoveryProvenance{
+		Argv: prov.Argv, Cwd: prov.Cwd, Path: prov.Path, Env: prov.Env,
+	}
 	if err != nil {
 		return nil, r.discoveryError(err)
 	}
 	return out, nil
 }
+
+// DiscoveryProvenance is the exact invocation a discovery run issued: its
+// argv, the RESOLVED executable that ran, the directory it ran from and the
+// complete environment it ran with.
+//
+// Path and Env are what make it replayable rather than descriptive. The bundle
+// used to carry the intended argv beside a closure resolved afterwards from
+// whatever PATH the resolver saw, and an environment recorded as an allow-list
+// of values plus digests of everything else — from which nobody can reconstruct
+// the process that took the snapshot.
+type DiscoveryProvenance struct {
+	Argv []string
+	Cwd  string
+	Path string
+	Env  []string
+}
+
+// Discovered reports the argv and cwd of the discovery subprocess this runner
+// actually issued, or nil when discovery came from frozen bytes.
+func (r *Runner) Discovered() *DiscoveryProvenance { return r.observed }
+
+// Root is the canonical absolute root every subprocess was run from. The
+// bundle records THIS, not the caller's spelling of it: `--root .` names a
+// different directory from every other working directory in the world.
+func (r *Runner) Root() string { return r.root }
 
 // discoveryInvocation resolves the discovery subprocess: a verbatim
 // DiscoveryCommand (which owns its subcommand, so nothing is appended) when set,
@@ -210,7 +264,11 @@ func (r *Runner) runDiscovery(ctx context.Context) ([]byte, error) {
 // so the selection is unit-tested without spawning a process.
 func (r *Runner) discoveryInvocation() (nodetool, []string) {
 	if len(r.discoveryCmd) > 0 {
-		return nodetool{command: r.discoveryCmd, timeout: r.tool.timeout}, nil
+		// The same environment the base tool runs with. Dropping it here would
+		// have let a verbatim discovery command inherit the ambient
+		// environment while the bundle recorded the one everything else ran
+		// under.
+		return nodetool{command: r.discoveryCmd, timeout: r.tool.timeout, env: r.tool.env}, nil
 	}
 	if r.discoveryMode == discoveryList {
 		return r.tool, []string{"list", "--json"}

@@ -28,10 +28,30 @@
 #   TB_BINDIR    directory to install the binary into   (created if missing)
 # Optional env:
 #   GH_TOKEN     token for `gh release list`            (only the alias path needs it)
+#   TB_RELEASE_PINS_REF  full 40-hex commit SHA carrying the pin for a release
+#                published after this action's own commit (see below)
+#   TB_CANDIDATE_BINARY_DIGEST  sha256:<64-hex> of the binary Stage 1 authorised
+#                (MANDATORY on the candidate path; derive it with
+#                `testbucket wall stage1-binary --file stage1.json` from a
+#                PUBLISHED release, never by typing a digest in)
 set -euo pipefail
 
 : "${TB_VERSION:?TB_VERSION is required (local | vX | vX.Y | vX.Y.Z)}"
 : "${TB_BINDIR:?TB_BINDIR is required}"
+
+# A CANDIDATE BINARY DIGEST IS A CANDIDATE'S DIGEST.
+#
+# The value names the exact pre-publication binary Stage 1 authorised, and it
+# is checked only on the candidate path below. Supplied beside a `local` build
+# or a published release it would be silently ignored, and a caller who set it
+# would believe a delivery was being checked that nothing checks. Refused here
+# rather than dropped: the six composite actions take one `version` and one
+# digest, so the pair disagreeing is a wiring mistake worth failing on.
+if [ -n "${TB_CANDIDATE_BINARY_DIGEST:-}" ] && ! printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
+  echo "install-testbucket: TB_CANDIDATE_BINARY_DIGEST is set but TB_VERSION is '$TB_VERSION', which is not a candidate pin" >&2
+  echo "An attested candidate binary digest checks a pre-publication delivery; a released binary is verified against the release checksums instead." >&2
+  exit 1
+fi
 mkdir -p "$TB_BINDIR"
 bin="$TB_BINDIR/testbucket"
 
@@ -56,9 +76,24 @@ if [ "$TB_VERSION" = "local" ] || [ "$TB_VERSION" = "source" ]; then
   exit 0
 fi
 
-# --- released: download + checksum-verify --------------------------------------
-: "${TB_REPO:?TB_REPO is required to download a released binary}"
-
+# --- candidate: an immutable PRE-PUBLICATION artifact ---------------------------
+#
+# This is what breaks the release cycle. A scored candidate arm has to run the
+# exact binary being proposed, but that binary cannot be installed from a
+# published release: publication is itself gated on the campaign the scored arm
+# is part of. Building from source instead would deliver bytes nobody attested,
+# and there is no release asset at an arbitrary commit to checksum-verify.
+#
+# So a candidate is delivered as an artifact of the build workflow run that
+# produced it, addressed by IMMUTABLE run identity and pinned by digest:
+#
+#   --version candidate:<workflow-run-id>/<artifact-name>@sha256:<64-hex>
+#
+# The run id and artifact name say exactly which upload this is — they cannot be
+# moved the way a tag can — and the digest is what makes the download evidence
+# rather than a fetch. Both are required, and the archive is refused unless its
+# bytes hash to the digest that was demanded. This is deliberately NOT a
+# published release and never claims to be one.
 # Map the runner's OS/arch onto goreleaser's naming. Fall back to uname so the
 # script is exercisable outside Actions.
 os_raw="${RUNNER_OS:-$(uname -s)}"
@@ -73,6 +108,210 @@ case "$arch_raw" in
   ARM64|arm64|aarch64) arch=arm64 ;;
   *) echo "install-testbucket: unsupported arch '$arch_raw' (amd64/arm64 are released)" >&2; exit 1 ;;
 esac
+
+if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
+  spec="${TB_VERSION#candidate:}"
+  cand_digest="${spec##*@}"
+  cand_path="${spec%@*}"
+  cand_run="${cand_path%%/*}"
+  cand_artifact="${cand_path#*/}"
+  if [ "$cand_digest" = "$spec" ] || [ "$cand_path" = "$cand_run" ] ||
+     [ -z "$cand_run" ] || [ -z "$cand_artifact" ] || [ -z "$cand_digest" ]; then
+    echo "install-testbucket: a candidate needs candidate:<run-id>/<artifact>@sha256:<64-hex>; got '$TB_VERSION'" >&2
+    echo "An unpinned pre-publication binary is a download, not a delivery identity." >&2
+    exit 1
+  fi
+  if ! printf '%s' "$cand_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+    echo "install-testbucket: candidate digest '$cand_digest' is not sha256:<64-hex>" >&2
+    exit 1
+  fi
+  if ! printf '%s' "$cand_run" | grep -Eq '^[0-9]+$'; then
+    echo "install-testbucket: candidate run id '$cand_run' is not a workflow run id" >&2
+    exit 1
+  fi
+  # THE ARTIFACT NAMES THE PLATFORM IT IS FOR.
+  #
+  # "Exactly one archive" is not "the one archive for this runner": a candidate
+  # artifact that happened to hold a single foreign-platform build would have
+  # been accepted and installed. The artifact name must end in the runner's own
+  # os_arch, so the delivery is uniquely addressed per platform and a candidate
+  # built for another one cannot be fetched by accident.
+  if ! printf '%s' "$cand_artifact" | grep -q -- "-${os}_${arch}\$"; then
+    echo "install-testbucket: candidate artifact '$cand_artifact' does not name this runner's platform (expected a name ending -${os}_${arch})" >&2
+    echo "A candidate is published per platform so the delivery is uniquely addressed; one archive is not the same as the right archive." >&2
+    exit 1
+  fi
+  : "${TB_REPO:?TB_REPO is required to download a candidate artifact}"
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "install-testbucket: downloading a candidate artifact needs the gh CLI" >&2
+    exit 1
+  fi
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  echo "downloading candidate artifact $cand_artifact from run $cand_run"
+  gh run download "$cand_run" --repo "$TB_REPO" --name "$cand_artifact" --dir "$work"
+  # EXACTLY ONE ARCHIVE, AND NOTHING BESIDE IT IS TRUSTED.
+  #
+  # Choosing the first .tar.gz found anywhere under the download, digesting
+  # only that, and then searching the WHOLE download for something named
+  # testbucket meant the digest authenticated one file while an unrelated
+  # sibling executable was the thing that got installed. The digest has to
+  # govern the bytes that run, so: the artifact must contain exactly one
+  # archive, that archive is what the digest is checked against, and the
+  # binary is taken from a FRESH directory holding only that archive's
+  # contents.
+  archive_count=$(find "$work" -type f -name '*.tar.gz' | wc -l | tr -d ' ')
+  if [ "$archive_count" -ne 1 ]; then
+    echo "install-testbucket: candidate artifact $cand_artifact holds $archive_count .tar.gz members; a candidate artifact carries exactly one, for one platform" >&2
+    echo "Publish a per-platform candidate artifact so the delivery names one archive and cannot be ambiguous." >&2
+    exit 1
+  fi
+  archive=$(find "$work" -type f -name '*.tar.gz')
+  got="sha256:$(sha256sum "$archive" | cut -d' ' -f1)"
+  if [ "$got" != "$cand_digest" ]; then
+    echo "install-testbucket: candidate archive digests to $got, not the demanded $cand_digest" >&2
+    echo "A pre-publication artifact is trusted only because its bytes were named in advance." >&2
+    exit 1
+  fi
+  # WHAT IS INSIDE IS CONSTRAINED BEFORE IT IS UNPACKED.
+  #
+  # A tar can carry symlinks, hardlinks, devices and paths that climb out of
+  # the extraction directory. The fixed-member check below uses `[ -f ]`, which
+  # FOLLOWS a symlink, while the ambiguity check used `find -type f`, which does
+  # not — so a member named `testbucket` that was a symlink to something
+  # outside the verified tree was installed and executed. Listing the archive
+  # first and refusing anything that is not a regular file, and any path that
+  # is absolute or contains "..", closes that before a single byte is written.
+  # THE LISTING IS CAPTURED ONCE AND EVALUATED COMPLETELY.
+  #
+  # These two checks were `tar … | grep -q …`. `grep -q` stops reading at its
+  # first match and exits, which closes the pipe; `tar` is then killed by
+  # SIGPIPE and exits 141. Under `set -o pipefail` the PIPELINE's status is
+  # that 141 rather than grep's 0, so the `if` read FALSE in exactly the case
+  # the check exists for — an offending FIRST entry — and the archive went on
+  # to install. A short archive hid it, because tar finishes writing before
+  # grep exits; a listing larger than the pipe buffer does not.
+  #
+  # So there is no pipeline in the decision. Each listing is captured in one
+  # command substitution whose status is tar's own, every line is walked, and
+  # every offender is collected before anything is reported. Nothing about the
+  # outcome depends on which line matched or on when a reader closed its input.
+  entry_listing=$(tar -tzvf "$archive") || {
+    echo "install-testbucket: the pinned candidate archive could not be enumerated" >&2
+    exit 1
+  }
+  name_listing=$(tar -tzf "$archive") || {
+    echo "install-testbucket: the pinned candidate archive's member names could not be enumerated" >&2
+    exit 1
+  }
+  if [ -z "$name_listing" ]; then
+    echo "install-testbucket: the pinned candidate archive enumerates no members" >&2
+    exit 1
+  fi
+
+  irregular_count=0
+  irregular_first=""
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in
+      -*) ;;
+      *)
+        irregular_count=$((irregular_count + 1))
+        [ -n "$irregular_first" ] || irregular_first="$entry"
+        ;;
+    esac
+  done <<EOF
+$entry_listing
+EOF
+  if [ "$irregular_count" -ne 0 ]; then
+    echo "install-testbucket: the pinned candidate archive holds $irregular_count member(s) that are not regular files (symlink, hardlink, device or directory entry)" >&2
+    echo "first such entry: $irregular_first" >&2
+    echo "Only regular files are installable; a link is a name for bytes the digest did not cover." >&2
+    exit 1
+  fi
+
+  unsafe_count=0
+  unsafe_first=""
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    case "$member" in
+      /*|../*|*/../*|*/..)
+        unsafe_count=$((unsafe_count + 1))
+        [ -n "$unsafe_first" ] || unsafe_first="$member"
+        ;;
+      ..)
+        unsafe_count=$((unsafe_count + 1))
+        [ -n "$unsafe_first" ] || unsafe_first="$member"
+        ;;
+    esac
+  done <<EOF
+$name_listing
+EOF
+  if [ "$unsafe_count" -ne 0 ]; then
+    echo "install-testbucket: the pinned candidate archive holds $unsafe_count absolute or traversing path(s)" >&2
+    echo "first such path: $unsafe_first" >&2
+    exit 1
+  fi
+  # A FRESH directory, so nothing that arrived beside the archive can be
+  # mistaken for something the archive contained.
+  pinned="$work/pinned"
+  mkdir -p "$pinned"
+  tar -xzf "$archive" -C "$pinned"
+  # A FIXED member, not a search. `testbucket` at the archive root is the
+  # member the release archives carry, and asking for it by name means an
+  # archive that does not contain it is refused rather than fallen back from.
+  cand_bin="$pinned/testbucket"
+  # -h first: `[ -f ]` follows symlinks, so the link check has to come before
+  # the regular-file check rather than after it.
+  if [ -h "$cand_bin" ]; then
+    echo "install-testbucket: the pinned candidate archive's testbucket member is a symlink" >&2
+    exit 1
+  fi
+  if [ ! -f "$cand_bin" ]; then
+    echo "install-testbucket: the pinned candidate archive holds no testbucket member at its root" >&2
+    exit 1
+  fi
+  # And nothing else executable travelled inside it either: a second binary in
+  # the archive is the same ambiguity one level in.
+  # ANY execute bit, not just the owner's: a member executable by group or
+  # other is executable, and the stated rule is one binary.
+  extra=$(find "$pinned" \( -perm -u+x -o -perm -g+x -o -perm -o+x \) ! -type d ! -path "$cand_bin" | head -n1)
+  if [ -n "$extra" ]; then
+    echo "install-testbucket: the pinned candidate archive also holds executable $extra; a candidate archive carries one binary" >&2
+    exit 1
+  fi
+  # THE INSTALLED BYTES ARE RE-DIGESTED when the caller states what the
+  # builder and verifier attested. The archive digest says which archive; this
+  # says which binary, and Stage 1 binds the second.
+  # MANDATORY, not optional. An optional check that nothing supplies is not a
+  # check: the archive digest says which archive was downloaded, and this says
+  # which binary is about to run — which is the value Stage 1 binds and the
+  # builder and verifier attested. Without it the delivery is verified up to
+  # the archive and unverified at the thing that executes.
+  if [ -z "${TB_CANDIDATE_BINARY_DIGEST:-}" ]; then
+    echo "install-testbucket: a candidate needs TB_CANDIDATE_BINARY_DIGEST, the attested sha256 of the binary itself" >&2
+    echo "The archive digest names which archive; this names which binary, and Stage 1 binds the second." >&2
+    exit 1
+  fi
+  if ! printf '%s' "$TB_CANDIDATE_BINARY_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+    echo "install-testbucket: TB_CANDIDATE_BINARY_DIGEST '$TB_CANDIDATE_BINARY_DIGEST' is not sha256:<64-hex>" >&2
+    exit 1
+  fi
+  bin_got="sha256:$(sha256sum "$cand_bin" | cut -d' ' -f1)"
+  if [ "$bin_got" != "$TB_CANDIDATE_BINARY_DIGEST" ]; then
+    echo "install-testbucket: the installed candidate binary digests to $bin_got, not the attested $TB_CANDIDATE_BINARY_DIGEST" >&2
+    exit 1
+  fi
+  echo "candidate binary digest matches the attested $bin_got"
+  mv "$cand_bin" "$bin"
+  chmod +x "$bin"
+  printf '%s\n' "$TB_BINDIR" >>"${GITHUB_PATH:-/dev/null}"
+  "$bin" version || true
+  exit 0
+fi
+
+# --- released: download + checksum-verify --------------------------------------
+: "${TB_REPO:?TB_REPO is required to download a released binary}"
 
 # Resolve TB_VERSION to a concrete release tag.
 tag=""
@@ -126,6 +365,96 @@ curl -fsSL -o "$work/checksums.txt" "$base/checksums.txt"
   fi )
 
 tar -xzf "$work/$asset" -C "$work" testbucket
+
+# THE BYTES ARE CHECKED AGAINST A ROOT OUTSIDE THE RELEASE.
+#
+# The verification above compares the archive with `checksums.txt` — and both
+# are assets of the SAME release. `gh release upload --clobber` can replace
+# them together, and the Releases API reports every current testbucket release
+# as `immutable: false`, so an actor able to publish assets can swap the
+# archive and its checksum in one step and that check still passes. A tag name
+# is metadata, and this authenticated an archive against metadata that moves
+# with it.
+#
+# `released-binary-digests.tsv` is the root that does not move with the
+# release: it lives in this repository, under review and branch protection, and
+# it names the digest of the BINARY inside each published archive. The archive
+# digest says which archive was downloaded; this says which binary is about to
+# execute, which is what Stage 1 binds.
+#
+# A tag with no line here is REFUSED rather than installed on the strength of
+# the co-mutable pair. That is deliberate: publishing a release includes
+# committing its digests in a reviewed change, and a release nobody pinned is a
+# release nobody vouched for outside its own asset store.
+pins="$(dirname "${BASH_SOURCE[0]}")/released-binary-digests.tsv"
+if [ ! -f "$pins" ]; then
+  echo "install-testbucket: $pins is missing; a released binary is verified against a digest committed to the repository, and there is none to check against" >&2
+  exit 1
+fi
+pinned=$(awk -F'\t' -v t="$tag" -v p="${os}_${arch}" '$1 == t && $2 == p { print $3; exit }' "$pins")
+
+# A RELEASE CANNOT CONTAIN ITS OWN DIGEST, AND DOES NOT HAVE TO.
+#
+# GoReleaser embeds the tag commit and its timestamp in the binary, so the
+# digest of a release's own bytes cannot exist before the tag that produces
+# them — a pin committed beforehand would have to predict its own hash. The
+# colocated file above therefore pins releases published BEFORE the commit it
+# lives in, and the newest release is pinned by the commit that comes after it.
+#
+# TB_RELEASE_PINS_REF is that later commit, named as a FULL 40-hex commit SHA
+# and nothing else. A commit SHA is immutable and addresses one reviewed tree,
+# so the pin still comes from a root the release cannot move — a branch or a
+# tag would put the pin back under the control of whoever can move it, which is
+# the property this whole check exists for.
+if [ -n "${TB_RELEASE_PINS_REF:-}" ]; then
+  if ! printf '%s' "$TB_RELEASE_PINS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "install-testbucket: TB_RELEASE_PINS_REF is '$TB_RELEASE_PINS_REF', not a full 40-hex commit SHA" >&2
+    echo "A pin fetched through a branch or a tag is a pin whoever can move that ref controls." >&2
+    exit 1
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "install-testbucket: fetching pins from commit $TB_RELEASE_PINS_REF needs the gh CLI" >&2
+    exit 1
+  fi
+  later="$work/pins-at-ref.tsv"
+  if ! gh api "repos/${TB_REPO}/contents/.github/actions/released-binary-digests.tsv?ref=${TB_RELEASE_PINS_REF}"         -H "Accept: application/vnd.github.raw" > "$later" 2>/dev/null; then
+    echo "install-testbucket: could not read the pin file at commit $TB_RELEASE_PINS_REF in $TB_REPO" >&2
+    exit 1
+  fi
+  at_ref=$(awk -F'\t' -v t="$tag" -v p="${os}_${arch}" '$1 == t && $2 == p { print $3; exit }' "$later")
+  if [ -n "$at_ref" ]; then
+    if [ -n "$pinned" ] && [ "$pinned" != "$at_ref" ]; then
+      echo "install-testbucket: the colocated pin for $tag ${os}_${arch} is $pinned but commit $TB_RELEASE_PINS_REF says $at_ref" >&2
+      echo "Two reviewed roots disagreeing about one release's bytes is not a tie to break." >&2
+      exit 1
+    fi
+    pinned="$at_ref"
+    echo "pin for $tag ${os}_${arch} taken from commit $TB_RELEASE_PINS_REF"
+  fi
+fi
+
+if [ -z "$pinned" ]; then
+  echo "install-testbucket: no precommitted binary digest for $tag ${os}_${arch} in $pins" >&2
+  echo "The release archive and its checksums.txt are both mutable assets of the same release, so they cannot authenticate each other." >&2
+  echo "A release published AFTER this action's commit is pinned by a later commit: run the pin-release workflow, review and merge the four lines it proposes, then pass that commit as release-pins-ref (TB_RELEASE_PINS_REF)." >&2
+  exit 1
+fi
+if ! printf '%s' "$pinned" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+  echo "install-testbucket: the precommitted digest for $tag ${os}_${arch} is '$pinned', not sha256:<64 lower-case hex>" >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  got="sha256:$(sha256sum "$work/testbucket" | cut -d' ' -f1)"
+else
+  got="sha256:$(shasum -a 256 "$work/testbucket" | cut -d' ' -f1)"
+fi
+if [ "$got" != "$pinned" ]; then
+  echo "install-testbucket: the $tag ${os}_${arch} binary digests to $got, not the precommitted $pinned" >&2
+  echo "The release assets were replaced after that digest was reviewed, or this is not the release it claims to be." >&2
+  exit 1
+fi
+echo "released binary matches the precommitted digest $pinned"
+
 install -m 0755 "$work/testbucket" "$bin"
 printf '%s\n' "$TB_BINDIR" >>"${GITHUB_PATH:-/dev/null}"
 "$bin" version

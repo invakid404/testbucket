@@ -1,0 +1,11 @@
+[
+  {"name":"testbucket","path":"dist/testbucket_linux_amd64_v1/testbucket","goos":"linux","goarch":"amd64","type":"Binary"},
+  {"name":"testbucket","path":"dist/testbucket_linux_arm64_v8.0/testbucket","goos":"linux","goarch":"arm64","type":"Binary"},
+  {"name":"testbucket","path":"dist/testbucket_darwin_amd64_v1/testbucket","goos":"darwin","goarch":"amd64","type":"Binary"},
+  {"name":"testbucket","path":"dist/testbucket_darwin_arm64_v8.0/testbucket","goos":"darwin","goarch":"arm64","type":"Binary"},
+  {"name":"testbucket_0.3.0_linux_amd64.tar.gz","path":"dist/testbucket_0.3.0_linux_amd64.tar.gz","goos":"linux","goarch":"amd64","type":"Archive"},
+  {"name":"testbucket_0.3.0_linux_arm64.tar.gz","path":"dist/testbucket_0.3.0_linux_arm64.tar.gz","goos":"linux","goarch":"arm64","type":"Archive"},
+  {"name":"testbucket_0.3.0_darwin_amd64.tar.gz","path":"dist/testbucket_0.3.0_darwin_amd64.tar.gz","goos":"darwin","goarch":"amd64","type":"Archive"},
+  {"name":"testbucket_0.3.0_darwin_arm64.tar.gz","path":"dist/testbucket_0.3.0_darwin_arm64.tar.gz","goos":"darwin","goarch":"arm64","type":"Archive"},
+  {"name":"checksums.txt","path":"dist/checksums.txt","type":"Checksum"}
+]

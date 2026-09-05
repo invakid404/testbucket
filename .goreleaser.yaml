@@ -1,9 +1,16 @@
 # goreleaser config for the testbucket CLI.
 #
-# `goreleaser release` runs on a `v*` tag push (see .github/workflows/release.yml)
-# and builds the four cross-platform binaries, packages them as tar.gz archives
-# with a checksums file, and cuts a GitHub Release. Validate locally without
-# publishing: `goreleaser release --snapshot --clean`.
+# On a `v*` tag push (see .github/workflows/release.yml) goreleaser builds the
+# four cross-platform binaries and packages them as tar.gz archives with a
+# checksums file. It does NOT publish them: the workflow runs it with
+# `--skip=publish`, hashes the artifacts it produced, gates them on the frozen
+# campaign, and then uploads those exact bytes itself. Publishing from
+# goreleaser would mean a second build, and a gate that hashed the first build
+# would have authorised bytes nobody published.
+#
+# The `release:` and `changelog:` blocks below therefore describe the local
+# `goreleaser release --snapshot --clean` validation path, which is still the
+# way to check this config without publishing anything.
 version: 2
 
 project_name: testbucket

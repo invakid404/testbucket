@@ -1,0 +1,92 @@
+name: Pin a published release
+
+# PHASE TWO OF A RELEASE, and the reason it has to be a separate phase.
+#
+# `install-testbucket.sh` refuses a released binary whose digest is not
+# committed to this repository, because the archive and its `checksums.txt` are
+# both assets of the same mutable release and cannot authenticate each other.
+#
+# A release cannot contain its own digest. GoReleaser embeds the tag commit and
+# its commit timestamp in the binary, so the bytes do not exist until the tag
+# does, and a pin committed beforehand would have to predict its own hash. The
+# lifecycle is therefore two phases by construction:
+#
+#   1. `release.yml` builds, attests, verifies and publishes the tag.
+#   2. This workflow reads the published assets, computes the digest of the
+#      binary inside each platform archive, and OPENS A PULL REQUEST adding the
+#      four lines. A human reviews and merges it.
+#
+# It proposes; it does not commit. Writing the pin automatically would make the
+# root as automatic as the thing it is supposed to check — the value of the file
+# is that a person looked at it. Consumers then reference the merged commit as
+# `release-pins-ref` until it is old enough to be colocated with the action they
+# use.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The published release tag to pin, e.g. v0.3.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    # READ ONLY. This job computes and PRINTS the four lines; it does not
+    # commit them. The pin file's value is that a person reviewed it, so a
+    # token that could write it would make the root as automatic as the
+    # release it checks.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute the digest of every published platform binary
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "REFUSED: '$TAG' is not an exact published release tag" >&2
+            exit 1
+          fi
+          pins=.github/actions/released-binary-digests.tsv
+          if grep -q "^${TAG}	" "$pins"; then
+            echo "REFUSED: $TAG is already pinned in $pins; a pin is written once and never rewritten" >&2
+            exit 1
+          fi
+          version="${TAG#v}"
+          work="$(mktemp -d)"
+          : > "$work/new.tsv"
+          for platform in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            name="testbucket_${version}_${platform}.tar.gz"
+            url=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+                    --jq ".assets[] | select(.name==\"${name}\") | .url")
+            if [ -z "$url" ]; then
+              echo "REFUSED: $TAG publishes no $name; every platform is pinned or none is" >&2
+              exit 1
+            fi
+            gh api -H 'Accept: application/octet-stream' "$url" > "$work/a.tar.gz"
+            rm -rf "$work/x" && mkdir -p "$work/x"
+            tar -xzf "$work/a.tar.gz" -C "$work/x" testbucket
+            digest="sha256:$(sha256sum "$work/x/testbucket" | cut -d' ' -f1)"
+            printf '%s\t%s\t%s\n' "$TAG" "$platform" "$digest" >> "$work/new.tsv"
+          done
+          echo "proposed pins for $TAG (append these to $pins in a reviewed change):"
+          cat "$work/new.tsv"
+
+      - name: State what must be committed, and by whom
+        run: |
+          set -euo pipefail
+          echo "The four lines above are the proposal for ${{ inputs.tag }}." >&2
+          echo "Append them to .github/actions/released-binary-digests.tsv in a REVIEWED change." >&2
+          echo "This job deliberately holds a read-only token and commits nothing: the pin is a root outside the release, and a root written automatically is not one." >&2
+          echo "Consumers then pass the merged commit SHA as release-pins-ref until it is colocated with the action they use." >&2

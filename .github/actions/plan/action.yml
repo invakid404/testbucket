@@ -38,8 +38,41 @@ inputs:
     description: 'Path to write the full shard-plan JSON (upload it for the record job to audit).'
     default: /tmp/testbucket-shard-plan.json
   version:
-    description: 'testbucket binary to install: the moving v1 alias, an exact vX.Y.Z, or "local" to build from the checked-out source.'
-    default: v1
+    description: >-
+      testbucket binary to install: a moving `vX`/`vX.Y` alias, an exact
+      `vX.Y.Z`, or "local" to build from the checked-out source. The default is
+      the moving `v0` alias, which resolves to the highest published 0.x
+      release — this project is deliberately pre-1.0. A scored arm must pin an
+      exact `vX.Y.Z` instead: an alias is descriptive metadata, not a delivery
+      identity.
+    default: v0
+  release-pins-ref:
+    description: >-
+      Full 40-hex commit SHA of this repository carrying the precommitted
+      binary digest for a release published AFTER this action's own commit.
+
+      A release cannot contain its own digest: GoReleaser embeds the tag commit
+      and its timestamp in the binary, so the hash cannot exist before the tag
+      that produces it. The colocated pin file therefore covers releases
+      published earlier, and the newest one is pinned by the commit that comes
+      after it — proposed by the `pin-release` workflow and merged under review.
+      Only a full commit SHA is accepted: a branch or a tag would put the pin
+      back under the control of whoever can move that ref.
+    default: ""
+  candidate-binary-digest:
+    description: >-
+      The `sha256:<64-hex>` of the testbucket BINARY the campaign authorised,
+      as the signed Stage-1 manifest binds it. REQUIRED whenever `version` is a
+      `candidate:<run-id>/<artifact>@sha256:<64-hex>` pin: the archive digest
+      says which archive was downloaded, this says which binary is about to
+      execute, and Stage 1 binds the second. Do not type it in. Derive it with
+      `testbucket wall stage1-binary --file stage1.json` run from a PUBLISHED
+      release — that command validates the manifest, so the value comes from
+      the builder's attestation, the verifier's countersignature and the
+      campaign authority's own signature rather than from whoever wired the
+      job. Empty for a published release, whose bytes are checksum-verified
+      against the release manifest instead.
+    default: ""
   working-directory:
     description: 'Directory to plan in (where the tests live).'
     default: "."
@@ -68,6 +101,119 @@ inputs:
       resolved. Runs as a bash block; a failure fails the plan. Empty = no setup
       step ⇒ unchanged behavior.
     default: ""
+  wall-time-dir:
+    description: >-
+      Optional records directory for complete-action wall-time measurement
+      (runner: vitest). When set, every rendered invocation in the generated
+      script runs under `testbucket wall exec`, so it gets a physical envelope,
+      a containment peer and an independent trace. It MUST match the
+      wall-time-dir the run-bucket action is given: the script names the
+      directory, and a mismatch would write records nobody verifies. Empty = no
+      measurement ⇒ byte-identical script to before.
+    default: ""
+
+  bundle:
+    description: >-
+      Frozen planning-input bundle. When set, the matrix is derived by
+      `testbucket wall plan` from these EXACT bytes rather than by an ordinary
+      `testbucket plan` over the live tree — which is what the exactly-once
+      frozen handoff means. The ordinary path reads the working tree and the
+      restored store at the moment it runs; two arms of a pair would then be
+      comparing plans derived from different inputs. Empty = the ordinary
+      unmeasured path, byte-identical to before.
+    default: ""
+  stage1:
+    description: >-
+      Signed Stage-1 input manifest authorising that bundle. Required with
+      `bundle`: a frozen plan derived from inputs nobody authorised is frozen
+      and unaccountable.
+    default: ""
+  stage2-out:
+    description: >-
+      Where to write the Stage-2 derived-plan receipt. It is written O_EXCL.
+      That is an OUTPUT-collision check, not an execution guard: on its own it
+      only says this file does not already exist, and it is consulted after the
+      planner has run. `claim-dir` is what makes the one-shot rule mechanical.
+    default: ""
+  claim-store-attestation:
+    description: >-
+      The campaign authority's SIGNATURE over the claim store's identity, which
+      is what makes the store durable rather than merely configured.
+
+      Durability used to be inferred from "a path was configured", which an
+      arbitrary directory on a fresh runner satisfies exactly as well as a
+      shared store — the planner certifying the constraint the planner is
+      subject to. The signature is produced by the party that provisioned the
+      store, travels into the Stage-2 receipt with the claim, and is re-verified
+      wherever the receipt is read.
+
+      A SCORED derivation refuses to plan without it. Left empty the claim is
+      taken in the machine store and reported non-durable.
+    default: ""
+  campaign-authority-keys:
+    description: >-
+      Comma-separated PREDECLARED campaign-authority public keys the store
+      attestation is verified against. A signature checked against whatever
+      signed it is one anybody can mint.
+    default: ""
+  claim-store:
+    description: >-
+      DURABLE directory holding the one-shot planner claim. The contract allows
+      one planner execution and refuses a replan, retry or second invocation;
+      the claim is keyed by the Stage-1 and bundle digests and is taken BEFORE
+      the planner runs, so a second invocation is refused rather than performed
+      and rejected afterwards.
+
+      It must outlive one runner. A job rerun gets a fresh runner and a fresh
+      filesystem, so a store that moves with the workspace cannot see that an
+      earlier attempt already derived this plan — which is exactly the case the
+      rule exists for.
+
+      This is a STORE, not an output directory. The claim is always also taken
+      in a machine-local store, so leaving this empty weakens the cross-runner
+      guarantee without removing the same-machine one — but a SCORED derivation
+      refuses to plan without a durable store configured here or in
+      TB_WALL_PLANNER_CLAIM_STORE, because a guarantee that cannot survive a
+      rerun is not the one the contract asks for.
+
+      Independent verifier replay does not take this claim: re-deriving the
+      same plan on purpose is not a second authorised execution.
+    default: ""
+  scorer:
+    description: >-
+      Frozen scorer whose sealed lineage the plan allocates by. Without it the
+      partition uses the store's measured weights, which is a perfectly good
+      split and is not campaign eligible.
+    default: ""
+  registry:
+    description: 'Frozen Aeta component-registry template.'
+    default: ""
+  authority-key:
+    description: >-
+      PREDECLARED authority public key (hex) that must have signed `stage1`.
+      REQUIRED with `bundle`. The contract puts an owner-authority signature on
+      the planning inputs BEFORE the plan exists: a post-run verifier can
+      refuse a row, but it cannot un-run an action or restore an approval that
+      never happened. Pass a secret, never a literal.
+    default: ""
+  authority:
+    description: >-
+      The EXACT protected environment the Stage-1 manifest must name, e.g.
+      `ewj2-campaign`. A key says WHO signed; this says WHICH environment
+      approved, and the contract requires that approval BEFORE either role
+      plans.
+
+      REQUIRED with `bundle`. A key can sign under any label, so checking the
+      key alone lets a manifest approved by some other environment drive the
+      frozen planner — and by the time a downstream gate notices, the matrix
+      and the Stage-2 material already exist.
+    default: ""
+  derived-out:
+    description: >-
+      Directory for the per-bucket derived documents (Palloc, Pcheck, forecast,
+      invocation manifest). Every one is bound into the Stage-2 receipt by
+      digest as it is written.
+    default: ""
 
 outputs:
   matrix:
@@ -84,6 +230,8 @@ runs:
       shell: bash
       env:
         TB_VERSION: ${{ inputs.version }}
+        TB_CANDIDATE_BINARY_DIGEST: ${{ inputs.candidate-binary-digest }}
+        TB_RELEASE_PINS_REF: ${{ inputs.release-pins-ref }}
         TB_REPO: invakid404/testbucket
         TB_BINDIR: ${{ runner.temp }}/testbucket-bin
         GH_TOKEN: ${{ github.token }}
@@ -117,8 +265,52 @@ runs:
         TB_VITEST_COMMAND: ${{ inputs.vitest-command }}
         TB_NODE_PREFIXES: ${{ inputs.node-prefixes }}
         TB_EXCLUDE_MODULE: ${{ inputs.exclude-module }}
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_BUNDLE: ${{ inputs.bundle }}
+        TB_STAGE1: ${{ inputs.stage1 }}
+        TB_STAGE2_OUT: ${{ inputs.stage2-out }}
+        TB_SCORER: ${{ inputs.scorer }}
+        TB_REGISTRY: ${{ inputs.registry }}
+        TB_DERIVED_OUT: ${{ inputs.derived-out }}
+        TB_CLAIM_STORE: ${{ inputs.claim-store }}
+        TB_WALL_PLANNER_CLAIM_STORE_ATTESTATION: ${{ inputs.claim-store-attestation }}
+        TB_WALL_CAMPAIGN_AUTHORITY_KEYS: ${{ inputs.campaign-authority-keys }}
+        TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
+        TB_AUTHORITY: ${{ inputs.authority }}
       run: |
         set -euo pipefail
+
+        # THE FROZEN PATH. With a bundle, the matrix comes from `wall plan`
+        # over those exact bytes — the one authorised plan, with its Stage-2
+        # receipt and every per-bucket document derived and bound in the same
+        # step. The ordinary path below re-reads the live tree and the restored
+        # store at the moment it runs, so a scored pair planned that way would
+        # be comparing two derivations of different inputs.
+        if [ -n "$TB_BUNDLE" ]; then
+          if [ -z "$TB_STAGE1" ]; then
+            echo "a frozen bundle needs --stage1: a plan derived from inputs nobody authorised is frozen and unaccountable." >&2
+            exit 1
+          fi
+          if [ -z "$TB_AUTHORITY_KEY" ]; then
+            echo "a frozen bundle needs an authority-key: an owner-authority signature must be VERIFIED before the plan exists, and checking a signature against whatever signed it accepts any self-generated key." >&2
+            exit 1
+          fi
+          if [ -z "$TB_AUTHORITY" ]; then
+            echo "a frozen bundle needs an authority: a key can sign under any label, so checking the key alone lets a manifest approved by some other protected environment drive the frozen planner — and the contract puts that approval before either role plans." >&2
+            exit 1
+          fi
+          frozen=(--wall-bundle "$TB_BUNDLE" --wall-stage1 "$TB_STAGE1" --shard-plan "$TB_SHARD_PLAN")
+          frozen+=(--wall-authority-key "$TB_AUTHORITY_KEY" --wall-authority "$TB_AUTHORITY")
+          if [ -n "$TB_STAGE2_OUT" ]; then frozen+=(--wall-stage2 "$TB_STAGE2_OUT"); fi
+          if [ -n "$TB_SCORER" ]; then frozen+=(--palloc-scorer "$TB_SCORER"); fi
+          if [ -n "$TB_REGISTRY" ]; then frozen+=(--wall-registry "$TB_REGISTRY"); fi
+          if [ -n "$TB_DERIVED_OUT" ]; then frozen+=(--wall-out-dir "$TB_DERIVED_OUT"); fi
+          if [ -n "$TB_CLAIM_STORE" ]; then frozen+=(--wall-claim-store "$TB_CLAIM_STORE"); fi
+          matrix=$(testbucket plan "${frozen[@]}" --json)
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         if [ -f "$TB_STORE" ]; then
           echo "planning from the restored store at $TB_STORE"
         else
@@ -145,6 +337,13 @@ runs:
         while IFS= read -r mod; do
           [ -n "$mod" ] && extra+=(--exclude-module "$mod")
         done <<< "$TB_EXCLUDE_MODULE"
+
+        # Wall-time measurement is opt-in and Vitest-only. Passing the flag only
+        # when it is set keeps the generated script byte-identical for everyone
+        # who has not asked for it.
+        if [ -n "$TB_WALL_DIR" ]; then
+          extra+=(--wall-dir "$TB_WALL_DIR")
+        fi
 
         # --json puts the fromJSON matrix on stdout and the loaded-vs-missing
         # summary on stderr, so the summary lands in this log while the matrix

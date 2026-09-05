@@ -1,0 +1,193 @@
+package walltime
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"sync"
+)
+
+// selfOnce caches the binary identity: the digest of the executable actually
+// running. It is delivery-bound evidence — a peer built from different bytes
+// than the one Stage 1 bound is not the peer the campaign authorised.
+var selfOnce struct {
+	sync.Once
+	digest Digest
+	path   string
+}
+
+// SelfDigest is the SHA-256 of the running executable, or the empty digest if
+// it cannot be read. An unknown binary identity is not fatal here; it is a
+// missing delivery fact the verifier refuses to score.
+func SelfDigest() Digest {
+	selfOnce.Do(func() {
+		p, err := os.Executable()
+		if err != nil {
+			return
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return
+		}
+		selfOnce.path, selfOnce.digest = p, DigestBytes(b)
+	})
+	return selfOnce.digest
+}
+
+// ProducerID names one producer's execution context: its role and its process
+// identity. Two producers that share it are the SAME execution context and
+// therefore not independent observers, which the verifier checks.
+//
+// The binary identity is deliberately NOT encoded here. It lives in its own
+// Record field as a full digest, because the verifier compares it for exact
+// equality and a digest embedded in a display string invites a substring
+// match — which a prefix collision satisfies.
+func ProducerID(p Producer) string {
+	pid := os.Getpid()
+	return fmt.Sprintf("%s#%d.%s", p, pid, processStartID(pid))
+}
+
+// NewSigningKey mints a per-producer ed25519 key. Each producer signs with its
+// own key, so a peer record and a trace record of the same transition carry
+// different signers — the contract's "distinct record hashes/signers".
+func NewSigningKey() (ed25519.PrivateKey, error) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("walltime: signing key: %w", err)
+	}
+	return priv, nil
+}
+
+// EncodeKey renders a private key for handing to a child observer process.
+func EncodeKey(k ed25519.PrivateKey) string { return base64.StdEncoding.EncodeToString(k) }
+
+// DecodeKey parses a key produced by EncodeKey.
+func DecodeKey(s string) (ed25519.PrivateKey, error) {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("walltime: decode key: %w", err)
+	}
+	if len(b) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("walltime: key is %d bytes, want %d", len(b), ed25519.PrivateKeySize)
+	}
+	return ed25519.PrivateKey(b), nil
+}
+
+// SignDigest produces the detached signature value a Signature carries. It is
+// one function so every document in this package is signed the same way and a
+// second implementation cannot drift.
+func SignDigest(k ed25519.PrivateKey, d Digest) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(k, []byte(d)))
+}
+
+// SignApproval signs a document digest TOGETHER WITH the authority label that
+// will be recorded beside it.
+//
+// The label used to be outside everything signed: `DigestOf` excludes the
+// whole Signature struct, and `SignDigest` covers the digest alone. A valid
+// signature from an unprotected context could therefore be relabelled
+// `ewj2-campaign` after the fact, and every later check that compared the
+// protected authority name was reading a field its own signature did not
+// cover. Signing over `authority NUL digest` binds the two: the same bytes
+// under a different label do not verify.
+func SignApproval(authority string, k ed25519.PrivateKey, d Digest) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(k, approvalMessage(authority, d)))
+}
+
+// approvalMessage is the exact byte string an approval signature covers. The
+// NUL separator means an authority ending in the digest's first characters
+// cannot be confused with a shorter authority and a longer digest.
+func approvalMessage(authority string, d Digest) []byte {
+	return []byte(authority + "\x00" + string(d))
+}
+
+// PublicKeyOf renders a signer id (the hex public key) from a private key.
+func PublicKeyOf(k ed25519.PrivateKey) string {
+	return hex.EncodeToString(k.Public().(ed25519.PublicKey))
+}
+
+// ParseSignerKey is THE parser for a signer identity, and the only one.
+//
+// In this protocol a signer id is the hex rendering of a 32-byte Ed25519
+// public key — that is what PublicKeyOf produces and what every signature
+// check decodes. Anywhere a signer identity was merely checked for
+// non-emptiness, a sentence passed as an identity: a signed document naming
+// "the campaign authority" as its signer is signed, complete, and names
+// nobody. Callers that verify a signature and callers that only validate a
+// record now ask the same question of the same bytes.
+func ParseSignerKey(id string) (ed25519.PublicKey, error) {
+	// CANONICAL, NOT NORMALISED.
+	//
+	// The grammar is exactly what PublicKeyOf emits: 64 characters, each of
+	// them 0-9 or a-f. Nothing here trims, lowercases or otherwise repairs the
+	// input, because an identity that had to be repaired to be recognised is
+	// not the identity that was written down.
+	//
+	// This used to decode `strings.TrimSpace(id)`, and `hex.DecodeString`
+	// accepts upper case — so " KEY", "KEY\t\n" and the upper-case spelling of
+	// a key all parsed, at the parser AND at every caller that trusts it,
+	// including the nested Stage-1 approval. Four spellings of one key are
+	// four different strings: they compare unequal to the predeclared key
+	// sets, they digest differently, and a document is bound by the bytes it
+	// carries rather than by what those bytes could be turned into. Accepting
+	// them meant a receipt could name an approver that no key-set membership
+	// test would ever match.
+	const want = ed25519.PublicKeySize * 2
+	if len(id) != want {
+		return nil, fmt.Errorf("signer id %q is %d characters, not the %d of a canonical %d-byte ed25519 public key", id, len(id), want, ed25519.PublicKeySize)
+	}
+	for i := 0; i < len(id); i++ {
+		if c := id[i]; !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return nil, fmt.Errorf("signer id %q is not canonical: byte %d is %q, and a signer id is exactly %d lower-case hex characters with no padding", id, i, string(c), want)
+		}
+	}
+	pub, err := hex.DecodeString(id)
+	if err != nil {
+		return nil, fmt.Errorf("signer id %q is not the hex rendering of a %d-byte ed25519 public key: %w", id, ed25519.PublicKeySize, err)
+	}
+	return ed25519.PublicKey(pub), nil
+}
+
+// VerifySignature checks a record's detached signature against its hash.
+func VerifySignature(r Record) error {
+	if r.Signature == "" || r.SignerID == "" {
+		return fmt.Errorf("record %d is unsigned", r.Seq)
+	}
+	pub, err := ParseSignerKey(r.SignerID)
+	if err != nil {
+		return fmt.Errorf("record %d has a malformed signer id", r.Seq)
+	}
+	sig, err := base64.StdEncoding.DecodeString(r.Signature)
+	if err != nil {
+		return fmt.Errorf("record %d has a malformed signature", r.Seq)
+	}
+	if !ed25519.Verify(pub, []byte(r.Hash), sig) {
+		return fmt.Errorf("record %d signature does not verify", r.Seq)
+	}
+	return nil
+}
+
+// streamName is the per-producer, per-level, PER-SEQUENCE stream file. One
+// writer per file is load-bearing: the hash chain is per stream, and two
+// processes appending to one file would interleave into a chain neither of
+// them can close.
+//
+// THE SEQUENCE IS ALWAYS IN THE NAME, at every level.
+//
+// It used to be added only for invocations, so the action envelope (sequence
+// 0) and every action-owned child (sequence 1 and up) resolved to the same
+// path. The writer resumes a file-wide chain while the verifier groups records
+// by producer, level AND sequence — so the child's records began with the
+// envelope's chain state and were then read as a stream of their own, which is
+// a terminal WT-002 on every action that runs a setup or bucket command. That
+// is every measured action.
+//
+// A rule with a level in it is a rule that gets this wrong again the next time
+// a level acquires sequences. One logical identity, one file: the name carries
+// everything the verifier groups by.
+func streamName(p Producer, l Level, seq int) string {
+	return fmt.Sprintf("%s.%s.%03d.jsonl", p, l, seq)
+}
