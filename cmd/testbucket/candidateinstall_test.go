@@ -351,8 +351,13 @@ func TestTheCandidateDeliveryIsVerifiedEndToEnd(t *testing.T) {
 			ran, _ := exec.Command(bin).Output()
 			t.Fatalf("a symlink member was installed and ran %q\n%s", strings.TrimSpace(string(ran)), out)
 		}
-		if !strings.Contains(out, "not a regular file") {
+		// The enumeration now reports every offender and names the first, so
+		// the message is plural; the property under test is unchanged.
+		if !strings.Contains(out, "not regular files") {
 			t.Errorf("the refusal does not name the member type: %s", out)
+		}
+		if !strings.Contains(out, "first such entry:") {
+			t.Errorf("the refusal does not name which entry: %s", out)
 		}
 	})
 

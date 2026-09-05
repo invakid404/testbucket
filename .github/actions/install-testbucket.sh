@@ -182,13 +182,74 @@ if printf '%s' "$TB_VERSION" | grep -q '^candidate:'; then
   # outside the verified tree was installed and executed. Listing the archive
   # first and refusing anything that is not a regular file, and any path that
   # is absolute or contains "..", closes that before a single byte is written.
-  if tar -tzvf "$archive" | grep -qvE '^-'; then
-    echo "install-testbucket: the pinned candidate archive holds a member that is not a regular file (symlink, hardlink, device or directory entry)" >&2
+  # THE LISTING IS CAPTURED ONCE AND EVALUATED COMPLETELY.
+  #
+  # These two checks were `tar … | grep -q …`. `grep -q` stops reading at its
+  # first match and exits, which closes the pipe; `tar` is then killed by
+  # SIGPIPE and exits 141. Under `set -o pipefail` the PIPELINE's status is
+  # that 141 rather than grep's 0, so the `if` read FALSE in exactly the case
+  # the check exists for — an offending FIRST entry — and the archive went on
+  # to install. A short archive hid it, because tar finishes writing before
+  # grep exits; a listing larger than the pipe buffer does not.
+  #
+  # So there is no pipeline in the decision. Each listing is captured in one
+  # command substitution whose status is tar's own, every line is walked, and
+  # every offender is collected before anything is reported. Nothing about the
+  # outcome depends on which line matched or on when a reader closed its input.
+  entry_listing=$(tar -tzvf "$archive") || {
+    echo "install-testbucket: the pinned candidate archive could not be enumerated" >&2
+    exit 1
+  }
+  name_listing=$(tar -tzf "$archive") || {
+    echo "install-testbucket: the pinned candidate archive's member names could not be enumerated" >&2
+    exit 1
+  }
+  if [ -z "$name_listing" ]; then
+    echo "install-testbucket: the pinned candidate archive enumerates no members" >&2
+    exit 1
+  fi
+
+  irregular_count=0
+  irregular_first=""
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in
+      -*) ;;
+      *)
+        irregular_count=$((irregular_count + 1))
+        [ -n "$irregular_first" ] || irregular_first="$entry"
+        ;;
+    esac
+  done <<EOF
+$entry_listing
+EOF
+  if [ "$irregular_count" -ne 0 ]; then
+    echo "install-testbucket: the pinned candidate archive holds $irregular_count member(s) that are not regular files (symlink, hardlink, device or directory entry)" >&2
+    echo "first such entry: $irregular_first" >&2
     echo "Only regular files are installable; a link is a name for bytes the digest did not cover." >&2
     exit 1
   fi
-  if tar -tzf "$archive" | grep -qE '^/|(^|/)\.\.(/|$)'; then
-    echo "install-testbucket: the pinned candidate archive holds an absolute or traversing path" >&2
+
+  unsafe_count=0
+  unsafe_first=""
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    case "$member" in
+      /*|../*|*/../*|*/..)
+        unsafe_count=$((unsafe_count + 1))
+        [ -n "$unsafe_first" ] || unsafe_first="$member"
+        ;;
+      ..)
+        unsafe_count=$((unsafe_count + 1))
+        [ -n "$unsafe_first" ] || unsafe_first="$member"
+        ;;
+    esac
+  done <<EOF
+$name_listing
+EOF
+  if [ "$unsafe_count" -ne 0 ]; then
+    echo "install-testbucket: the pinned candidate archive holds $unsafe_count absolute or traversing path(s)" >&2
+    echo "first such path: $unsafe_first" >&2
     exit 1
   fi
   # A FRESH directory, so nothing that arrived beside the archive can be
