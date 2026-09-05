@@ -20,7 +20,11 @@ import (
 // assertion.
 func TestAScoredArmRequiresAFleetAttestationOfItsRunner(t *testing.T) {
 	image := "ubuntu-24.04@sha256:" + strings.Repeat("cd", 32)
-	run := RunIdentity{Repository: "example/mandel", WorkflowRun: "run-1", AttemptID: "1"}
+	run := RunIdentity{
+		Repository: "example/mandel", WorkflowRun: "run-1", AttemptID: "1",
+		Job: "test", BucketID: "bucket-0",
+		RunnerName: "fleet-runner-7", RunnerOS: "Linux", RunnerArch: "X64",
+	}
 	good := testRunnerAttestation(image, run.Repository, run.WorkflowRun, run.AttemptID)
 	if err := good.Verify(image, run, testRunnerKeys()); err != nil {
 		t.Fatalf("a genuine fleet attestation for this run was refused: %v", err)
@@ -64,7 +68,7 @@ func TestAScoredArmRequiresAFleetAttestationOfItsRunner(t *testing.T) {
 				a.WorkflowRun = "run-2"
 				_ = a.Sign("ewj2-fleet", testFleetAuthority)
 			},
-			want: "not this run's",
+			want: "for workflow run",
 		},
 		{
 			name: "a statement about another attempt",
@@ -72,7 +76,49 @@ func TestAScoredArmRequiresAFleetAttestationOfItsRunner(t *testing.T) {
 				a.RunAttempt = "2"
 				_ = a.Sign("ewj2-fleet", testFleetAuthority)
 			},
-			want: "not this run's",
+			want: "for run attempt",
+		},
+		{
+			// THE REPLAY THE FINDING NAMES. One valid statement, reused by a
+			// different matrix job in the same repository/run/attempt.
+			name: "replayed into a different matrix job",
+			edit: func(a *RunnerAttestation) {
+				a.Job = "other-job"
+				_ = a.Sign("ewj2-fleet", testFleetAuthority)
+			},
+			want: "for job",
+		},
+		{
+			name: "replayed into a different bucket of the same job",
+			edit: func(a *RunnerAttestation) {
+				a.Bucket = "bucket-9"
+				_ = a.Sign("ewj2-fleet", testFleetAuthority)
+			},
+			want: "for bucket",
+		},
+		{
+			name: "a statement about a host this row did not run on",
+			edit: func(a *RunnerAttestation) {
+				a.Runner = "runner-a"
+				_ = a.Sign("ewj2-fleet", testFleetAuthority)
+			},
+			want: "for runner name",
+		},
+		{
+			name: "a statement about another platform",
+			edit: func(a *RunnerAttestation) {
+				a.OS = "Windows"
+				_ = a.Sign("ewj2-fleet", testFleetAuthority)
+			},
+			want: "for runner os",
+		},
+		{
+			name: "a statement about another architecture",
+			edit: func(a *RunnerAttestation) {
+				a.Arch = "ARM64"
+				_ = a.Sign("ewj2-fleet", testFleetAuthority)
+			},
+			want: "for runner arch",
 		},
 		{
 			name: "an unsigned statement",

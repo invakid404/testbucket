@@ -33,6 +33,8 @@ func runWallAttestRunner(args []string) error {
 	repository := fs.String("repository", os.Getenv("GITHUB_REPOSITORY"), "the repository the run belongs to")
 	workflowRun := fs.String("workflow-run", os.Getenv("GITHUB_RUN_ID"), "the workflow run this statement is scoped to")
 	attempt := fs.String("run-attempt", os.Getenv("GITHUB_RUN_ATTEMPT"), "the run attempt this statement is scoped to")
+	job := fs.String("job", os.Getenv("GITHUB_JOB"), "the matrix job this statement is scoped to. A statement scoped only to a run is good for every job in it")
+	bucket := fs.String("bucket", "", "the bucket this statement is scoped to (required): a fleet attests one row on one host")
 	at := fs.String("attested-at", "", "the instant the fleet made this statement, RFC3339 (required)")
 	fleet := fs.String("fleet", "", "the fleet identity signing this statement (required)")
 	out := fs.String("out", "", "write the signed attestation here (required)")
@@ -42,7 +44,8 @@ func runWallAttestRunner(args []string) error {
 	for name, v := range map[string]string{
 		"--image": *image, "--runner": *runner, "--os": *osName, "--arch": *arch,
 		"--repository": *repository, "--workflow-run": *workflowRun,
-		"--run-attempt": *attempt, "--attested-at": *at, "--fleet": *fleet, "--out": *out,
+		"--run-attempt": *attempt, "--job": *job, "--bucket": *bucket,
+		"--attested-at": *at, "--fleet": *fleet, "--out": *out,
 	} {
 		if strings.TrimSpace(v) == "" {
 			return fmt.Errorf("wall attest-runner needs %s: a statement missing any part of the host, the image or the run it is about attests nothing", name)
@@ -60,7 +63,7 @@ func runWallAttestRunner(args []string) error {
 	a := walltime.RunnerAttestation{
 		Image: *image, Runner: *runner, OS: *osName, Arch: *arch,
 		Repository: *repository, WorkflowRun: *workflowRun, RunAttempt: *attempt,
-		AttestedAt: *at,
+		Job: *job, Bucket: *bucket, AttestedAt: *at,
 	}
 	if err := a.Sign(*fleet, key); err != nil {
 		return fmt.Errorf("sign the runner attestation: %w", err)
@@ -74,8 +77,8 @@ func runWallAttestRunner(args []string) error {
 	if err := walltime.WriteJSONFile(*out, a); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "testbucket wall: %s attests %s booted from %s for %s run %s attempt %s\n",
-		*fleet, *runner, *image, *repository, *workflowRun, *attempt)
+	fmt.Fprintf(os.Stderr, "testbucket wall: %s attests %s booted from %s for %s run %s attempt %s job %s bucket %s\n",
+		*fleet, *runner, *image, *repository, *workflowRun, *attempt, *job, *bucket)
 	fmt.Fprintln(os.Stdout, walltime.PublicKeyOf(key))
 	return nil
 }

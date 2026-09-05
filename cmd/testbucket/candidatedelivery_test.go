@@ -243,9 +243,15 @@ func TestTheReusableWorkflowDeliversTheAttestedCandidateBinaryDigest(t *testing.
 	if calls == 0 {
 		t.Fatal("no job in the reusable workflow installs testbucket; this test is looking at the wrong contract")
 	}
+	// Checked over the call's own `with:` BLOCK rather than the next line: the
+	// keys of a mapping have no required order, and an assertion about
+	// adjacency breaks the moment another input is threaded through.
 	for i, part := range strings.Split(body, versionLine)[1:] {
-		next, _, _ := strings.Cut(part, "\n")
-		if !strings.HasPrefix(versionLine+next+"\n", versionLine+digestLine) {
+		block := part
+		if end := strings.Index(block, "\n      - name:"); end > 0 {
+			block = block[:end]
+		}
+		if !strings.Contains(block, digestLine) {
 			t.Errorf("action call %d installs `testbucket-version` without threading candidate-binary-digest; a candidate pin through that call cannot satisfy the installer", i+1)
 		}
 	}

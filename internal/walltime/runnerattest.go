@@ -42,12 +42,16 @@ type RunnerAttestation struct {
 	// run actually reports.
 	OS   string `json:"os"`
 	Arch string `json:"arch"`
-	// Repository, WorkflowRun and RunAttempt scope the statement to ONE run.
-	// A fleet attestation good for every run is a fleet attestation that
-	// cannot be revoked by the run ending.
+	// Repository, WorkflowRun, RunAttempt, Job and Bucket scope the statement
+	// to ONE ROW. A statement scoped only to a run is good for every matrix
+	// job in it: one host attestation naming `runner-a` could be replayed
+	// across jobs and buckets that never touched `runner-a`, and every
+	// signature check would still pass. A fleet attests one row on one host.
 	Repository  string `json:"repository"`
 	WorkflowRun string `json:"workflow_run"`
 	RunAttempt  string `json:"run_attempt"`
+	Job         string `json:"job"`
+	Bucket      string `json:"bucket"`
 	// AttestedAt is when the fleet made the statement.
 	AttestedAt string     `json:"attested_at"`
 	Signature  *Signature `json:"signature,omitempty"`
@@ -85,16 +89,31 @@ func (a RunnerAttestation) Verify(image string, run RunIdentity, keys []string) 
 	}
 	// AND IT IS ABOUT THIS RUN. The manifest is signed before any run exists,
 	// so this half is checked where the records are: the verifier holds both.
+	// THE ROW, AND THE HOST THE ROW SAW.
+	//
+	// Repository/run/attempt scope a statement to a run, and a run is a matrix
+	// of jobs: one statement naming `runner-a` was good for every job and
+	// bucket in it, none of which need have executed on `runner-a`. Job and
+	// bucket narrow it to one row; the three runner fields are the row's OWN
+	// observation of the machine it is running on, read from the runner's
+	// environment by the wrapper rather than taken from the statement being
+	// checked. The fleet says what it booted; the row says what it is on; this
+	// requires them to be the same host.
 	for _, f := range []struct{ what, got, want string }{
 		{"repository", a.Repository, run.Repository},
 		{"workflow run", a.WorkflowRun, run.WorkflowRun},
 		{"run attempt", a.RunAttempt, run.AttemptID},
+		{"job", a.Job, run.Job},
+		{"bucket", a.Bucket, run.BucketID},
+		{"runner name", a.Runner, run.RunnerName},
+		{"runner os", a.OS, run.RunnerOS},
+		{"runner arch", a.Arch, run.RunnerArch},
 	} {
 		if strings.TrimSpace(f.want) == "" {
-			return fmt.Errorf("runner attestation cannot be scoped to this run: the records record no %s", f.what)
+			return fmt.Errorf("runner attestation cannot be bound to this row: the records record no %s, so nothing independent says which host ran it", f.what)
 		}
 		if f.got != f.want {
-			return fmt.Errorf("the runner attestation is for %s %s, not this run's %s", f.what, f.got, f.want)
+			return fmt.Errorf("the runner attestation is for %s %q, but this row records %q", f.what, f.got, f.want)
 		}
 	}
 	return nil
@@ -114,6 +133,8 @@ func (a RunnerAttestation) VerifyDocument(image string, keys []string) error {
 		"the repository":       a.Repository,
 		"the workflow run":     a.WorkflowRun,
 		"the run attempt":      a.RunAttempt,
+		"the job":              a.Job,
+		"the bucket":           a.Bucket,
 		"the attestation time": a.AttestedAt,
 	}); err != nil {
 		return fmt.Errorf("runner attestation %w", err)

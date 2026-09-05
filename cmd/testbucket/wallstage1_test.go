@@ -749,6 +749,7 @@ func fleetAttestation(t *testing.T, image string) string {
 	a := walltime.RunnerAttestation{
 		Image: image, Runner: "fleet-runner-1", OS: "Linux", Arch: "X64",
 		Repository: "mandel-ai/mandel", WorkflowRun: "run-1", RunAttempt: "1",
+		Job: "test", Bucket: "bucket-0",
 		AttestedAt: "2026-09-01T00:00:00Z",
 	}
 	if err := a.Sign("ewj2-fleet", fleetKey); err != nil {

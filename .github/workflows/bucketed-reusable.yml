@@ -132,6 +132,25 @@ on:
           value is used on its own.
         type: string
         default: ""
+      release-pins-ref:
+        description: >-
+          Full 40-hex commit SHA of the testbucket repository carrying the
+          precommitted binary digest for a release published AFTER the action
+          source this workflow resolves to.
+
+          A release cannot contain its own digest — GoReleaser embeds the tag
+          commit and its timestamp in the binary — so the pin for the newest
+          release lives in the commit that comes after it, proposed by the
+          `pin-release` workflow and merged under review. Without this input
+          the reusable route could reach every composite action's
+          `release-pins-ref` through none of them, and a caller could not
+          install such a release at all: GitHub rejects an undeclared
+          reusable-workflow input, so README guidance alone was unusable.
+
+          Only a full commit SHA is accepted, by the installer: a branch or a
+          tag would put the pin back under the control of whoever can move it.
+        type: string
+        default: ""
       candidate-resolver-version:
         description: >-
           The PUBLISHED, IMMUTABLE testbucket release that READS the Stage-1
@@ -644,6 +663,7 @@ jobs:
           events-dir: /tmp/testbucket-events
           shard-plan: ${{ runner.temp }}/shard-plan.json
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
           candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
@@ -893,6 +913,7 @@ jobs:
         uses: $/.github/actions/preflight
         with:
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
           candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           bundle: ${{ runner.temp }}/testbucket-frozen-inputs/bundle.json
           stage1: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
@@ -927,6 +948,7 @@ jobs:
         uses: $/.github/actions/install
         with:
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
           candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
 
       - name: Run bucket ${{ matrix.bucket }}
@@ -947,6 +969,7 @@ jobs:
           est-seconds: ${{ matrix.est_seconds }}
           events-dir: /tmp/testbucket-events
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
           candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           working-directory: ${{ inputs.working-directory }}
           setup-command: ${{ inputs.setup-command }}
@@ -1025,6 +1048,7 @@ jobs:
           wall-time-dir: ${{ inputs.wall-time-dir }}
           require: ${{ inputs.verify-require }}
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
           candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           authority: ${{ inputs.authority }}
           authority-key: ${{ inputs.authority-key }}
@@ -1148,6 +1172,7 @@ jobs:
           events-dir: /tmp/testbucket-events
           shard-plan: ${{ runner.temp }}/plan/shard-plan.json
           version: ${{ inputs.testbucket-version }}
+          release-pins-ref: ${{ inputs.release-pins-ref }}
           candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}

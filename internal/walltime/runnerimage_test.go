@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 // A DIGEST-PINNED IMAGE IS A COMPLETE DIGEST, NOT A SUBSTRING.
@@ -47,6 +48,21 @@ func TestOnlyACompleteDigestPinsARunnerImage(t *testing.T) {
 		{"ubuntu-latest@md5:" + sha256Hex, "an algorithm this protocol does not accept"},
 		{"prefix @sha256:" + sha256Hex + " suffix", "a digest mentioned inside some other text"},
 		{"", "nothing at all"},
+		// WHITESPACE IN THE NAME, at a valid digest length. This is the case
+		// the table was missing: everything about the digest is correct, so
+		// only a rule about the NAME can refuse it — and the workflow
+		// pre-gate refuses every whitespace-bearing value.
+		{"runner image@sha256:" + sha256Hex, "a space inside the image name"},
+		{"runner\timage@sha256:" + sha256Hex, "a tab inside the image name"},
+		{"runner\nimage@sha256:" + sha256Hex, "a newline inside the image name"},
+		{"runner\rimage@sha256:" + sha256Hex, "a carriage return inside the image name"},
+		{" ubuntu-24.04@sha256:" + sha256Hex, "a leading space"},
+		{"ubuntu-24.04@sha256:" + sha256Hex + " ", "a trailing space"},
+		{"\tubuntu-24.04@sha256:" + sha256Hex, "a leading tab"},
+		{"ubuntu-24.04@sha256:" + sha256Hex + "\n", "a trailing newline"},
+		{"ubuntu-24.04@sha256:" + sha256Hex + "\r\n", "a trailing CRLF"},
+		{"ubuntu-24.04@sha512:" + sha512Hex + " ", "a trailing space on a sha512 pin"},
+		{"runner image@sha512:" + sha512Hex, "a space in the name of a sha512 pin"},
 	} {
 		if isImmutableImage(bad.v) {
 			t.Errorf("%q was accepted as an immutable image (%s)", bad.v, bad.why)
@@ -212,11 +228,32 @@ func TestTheWorkflowPreGateAgreesWithTheManifestCheck(t *testing.T) {
 		"@sha256:" + sha256Hex,
 		"ubuntu-latest@md5:" + sha256Hex,
 		"",
+		// The parity table must contain values whose DIGEST is valid and whose
+		// NAME is not, or it cannot prove the two implementations agree about
+		// anything except digests. These are exactly the shapes the workflow
+		// pre-gate refuses before it applies its pattern.
+		"runner image@sha256:" + sha256Hex,
+		"runner\timage@sha256:" + sha256Hex,
+		" ubuntu-24.04@sha256:" + sha256Hex,
+		"ubuntu-24.04@sha256:" + sha256Hex + " ",
+		"\tubuntu-24.04@sha256:" + sha256Hex,
+		"ubuntu-24.04@sha512:" + sha512Hex + " ",
+		"runner image@sha512:" + sha512Hex,
+		"runner\nimage@sha256:" + sha256Hex,
+		"ubuntu-24.04@sha256:" + sha256Hex + "\n",
+		"ubuntu-24.04@sha256:" + sha256Hex + "\r\n",
 	} {
 		want := isImmutableImage(v)
-		cmd := exec.Command("grep", "-Eq", pattern)
-		cmd.Stdin = strings.NewReader(v)
-		got := cmd.Run() == nil
+		// THE GATE AS A WHOLE, not one half of it. The workflow refuses every
+		// whitespace-bearing value in a `case` BEFORE it applies the pattern,
+		// which is what lets it use a line-oriented `grep` safely — so the
+		// shell answer being modelled here is both steps.
+		got := !strings.ContainsFunc(v, unicode.IsSpace)
+		if got {
+			cmd := exec.Command("grep", "-Eq", pattern)
+			cmd.Stdin = strings.NewReader(v)
+			got = cmd.Run() == nil
+		}
 		if got != want {
 			t.Errorf("%q: the workflow pre-gate says %v and the manifest check says %v; the gate stands in for the check and must not accept more", v, got, want)
 		}

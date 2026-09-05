@@ -390,9 +390,16 @@ func testRunnerKeys() []string { return []string{PublicKeyOf(testFleetAuthority)
 // testRunnerAttestation is the fleet's signed statement about the host a run
 // executes on, scoped to that run.
 func testRunnerAttestation(image, repository, workflowRun, attempt string) *RunnerAttestation {
+	return testRunnerAttestationFor(image, repository, workflowRun, attempt, "test", "bucket-0", "fleet-runner-7")
+}
+
+// testRunnerAttestationFor is the same statement scoped to one ROW on one
+// host: a statement scoped only to a run is good for every matrix job in it.
+func testRunnerAttestationFor(image, repository, workflowRun, attempt, job, bucket, runner string) *RunnerAttestation {
 	a := &RunnerAttestation{
-		Image: image, Runner: "fleet-runner-7", OS: "Linux", Arch: "X64",
+		Image: image, Runner: runner, OS: "Linux", Arch: "X64",
 		Repository: repository, WorkflowRun: workflowRun, RunAttempt: attempt,
+		Job: job, Bucket: bucket,
 		AttestedAt: "2026-09-01T00:00:00Z",
 	}
 	if err := a.Sign("ewj2-fleet", testFleetAuthority); err != nil {
@@ -642,7 +649,8 @@ func testManifest(b PlanningInputBundle, registry Digest) Stage1Manifest {
 	// booted from that image, verified against keys this manifest predeclares.
 	// An immutable spelling is not an observation.
 	m.RunnerAuthorityKeys = testRunnerKeys()
-	m.RunnerAttestation = testRunnerAttestation(m.Consumer.RunnerImage, "example/mandel", "run-1", "1")
+	m.RunnerAttestation = testRunnerAttestationFor(m.Consumer.RunnerImage,
+		"example/mandel", "run-1", "1", "test", "bucket-1", "fleet-runner-7")
 	profile := testSourceProfile()
 	m.Consumer.Facade = profile.Facade
 	m.Consumer.Config = profile.Config

@@ -166,7 +166,13 @@ func (s *synthRun) run() RunIdentity {
 		// attestation must name this same identity, or it is an independent
 		// re-derivation of the right plan by somebody nobody bound to this row.
 		VerifierID: "synthetic-verifier",
-		Stage2:     s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+		// THE HOST THIS ROW OBSERVED. Production reads these from the runner's
+		// own environment on the machine that executes the row; a fixture that
+		// left them blank would make "no observed host" the shape of a good
+		// row, and the fleet statement could then be replayed across jobs that
+		// never ran on the host it names.
+		RunnerName: "fleet-runner-7", RunnerOS: "Linux", RunnerArch: "X64",
+		Stage2: s.stage2, Stage1: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
 		ComponentRegistry: registry,
 	}
 }

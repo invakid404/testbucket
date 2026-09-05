@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // The two-stage delivery protocol. Stage 1 binds INPUTS before anything plans;
@@ -949,6 +950,18 @@ func requireSet(fields map[string]string) error {
 // non-empty repository part, then `@`, then a supported algorithm, then
 // exactly the number of lower-case hex characters that algorithm produces.
 func isImmutableImage(v string) bool {
+	// ONE CANONICAL LANGUAGE: no whitespace anywhere in the value.
+	//
+	// This checked the digest strictly and said nothing about the name, so
+	// `runner image@sha256:<64 lower hex>` was accepted here while the
+	// workflow pre-gate — which refuses every whitespace-bearing value before
+	// it applies its anchored pattern — rejected the same resolved string. Two
+	// checks of one rule that disagree are one check: whichever is laxer
+	// decides, and the manifest is the laxer one. A parity test whose table
+	// held no whitespace-bearing value of valid digest length could not see it.
+	if strings.ContainsFunc(v, unicode.IsSpace) {
+		return false
+	}
 	for algo, hexLen := range map[string]int{"sha256": 64, "sha512": 128} {
 		marker := "@" + algo + ":"
 		name, digest, ok := strings.Cut(v, marker)

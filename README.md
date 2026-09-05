@@ -783,6 +783,12 @@ Only a full commit SHA is accepted. A branch or a tag would put the pin back
 under the control of whoever can move that ref, which is the property the pin
 exists for.
 
+`release-pins-ref` is a declared input of the reusable workflow as well as of
+every composite action, and the workflow forwards it to each job that installs
+testbucket — so the reusable route reaches the same check. It is optional and
+empty by default: a release already pinned in the action source you resolve
+needs nothing.
+
 **A scored arm needs its runner attested.** Stage 1 binds a runner image and
 the pair equality check compares it, but `--runner-image` is text until someone
 says the host was booted from it. A scored arm must carry a fleet attestation

@@ -140,6 +140,20 @@ type RunIdentity struct {
 	ComponentRegistry Digest `json:"component_registry_digest,omitempty"`
 	// VerifierID is the delivery-bound verifier identity the run expects.
 	VerifierID string `json:"verifier_id,omitempty"`
+	// RunnerName, RunnerOS and RunnerArch are the EXECUTING HOST as the job
+	// itself observes it — $RUNNER_NAME, $RUNNER_OS, $RUNNER_ARCH, read by the
+	// wrapper on the machine that runs the row.
+	//
+	// They exist because a fleet's signed statement says what the fleet
+	// BOOTED, and that is a different claim from which host executed this
+	// matrix row. Without an independently observed identity, one valid
+	// statement naming `runner-a` could be replayed across every job and
+	// bucket of a run — none of which need have executed on `runner-a` — and
+	// every signature check would still pass. The verifier compares the two,
+	// so the fleet's word and the row's own observation have to agree.
+	RunnerName string `json:"runner_name,omitempty"`
+	RunnerOS   string `json:"runner_os,omitempty"`
+	RunnerArch string `json:"runner_arch,omitempty"`
 }
 
 // ContainmentIdentity is the stable containment the physical wrapper, its peer

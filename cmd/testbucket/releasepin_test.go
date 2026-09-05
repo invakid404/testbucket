@@ -261,3 +261,73 @@ func TestALaterCommitMaySupplyAReleasePin(t *testing.T) {
 		}
 	}
 }
+
+// THE COMPLETE WORKFLOW-CALL ROUTE, not only the leaf actions.
+//
+// The six composite actions exposed `release-pins-ref` and exported
+// TB_RELEASE_PINS_REF, and the reusable workflow declared neither. GitHub
+// rejects an undeclared reusable-workflow input, so the supported route could
+// reach every leaf's input through none of them: a caller on the reusable
+// workflow could not install a release whose pin lives at the later immutable
+// root at all, whatever the README said. A test that checked only the leaves
+// could not see it, because every leaf was correct.
+func TestTheReusableWorkflowCarriesTheReleasePinsRef(t *testing.T) {
+	path := filepath.Join("..", "..", ".github", "workflows", "bucketed-reusable.yml")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+
+	// 1. THE TYPED INPUT. Without a declaration the value cannot be passed.
+	decl := strings.Index(body, "\n      release-pins-ref:\n")
+	if decl < 0 {
+		t.Fatal("the reusable workflow declares no release-pins-ref input; GitHub rejects an undeclared reusable-workflow input, so the supported route cannot pass one")
+	}
+	schemaEnd := strings.Index(body, "\njobs:\n")
+	if schemaEnd < 0 || decl > schemaEnd {
+		t.Error("release-pins-ref is not declared in the workflow_call schema")
+	}
+	block := body[decl:]
+	if end := strings.Index(block, "\n      candidate-resolver-version:"); end > 0 {
+		block = block[:end]
+	}
+	if !strings.Contains(block, "type: string") || !strings.Contains(block, `default: ""`) {
+		t.Errorf("release-pins-ref is not an optional typed string:\n%s", block)
+	}
+
+	// 2. EVERY INSTALLING CALL FORWARDS IT. The calls are found by the version
+	// they pass, so a new job cannot be added without answering this.
+	const versionLine = "          version: ${{ inputs.testbucket-version }}\n"
+	const forward = "          release-pins-ref: ${{ inputs.release-pins-ref }}\n"
+	calls := strings.Count(body, versionLine)
+	if calls == 0 {
+		t.Fatal("no job in the reusable workflow installs testbucket; this test is looking at the wrong contract")
+	}
+	// Over the call's own `with:` block, not the adjacent line: mapping keys
+	// have no required order.
+	for i, part := range strings.Split(body, versionLine)[1:] {
+		block := part
+		if end := strings.Index(block, "\n      - name:"); end > 0 {
+			block = block[:end]
+		}
+		if !strings.Contains(block, forward) {
+			t.Errorf("action call %d installs testbucket-version without forwarding release-pins-ref; a release pinned at the later root could not be installed through this call", i+1)
+		}
+	}
+	if got := strings.Count(body, forward); got != calls {
+		t.Errorf("%d of %d installing calls forward release-pins-ref", got, calls)
+	}
+
+	// 3. AND THE VALUE REACHES THE INSTALLER. The leaf contract is what turns
+	// a forwarded input into the variable the shell reads.
+	for _, a := range publicActions {
+		leaf, err := os.ReadFile(filepath.Join("..", "..", ".github", "actions", a, "action.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(leaf), "TB_RELEASE_PINS_REF: ${{ inputs.release-pins-ref }}") {
+			t.Errorf("the %s action does not export the forwarded pins ref", a)
+		}
+	}
+}

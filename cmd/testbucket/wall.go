@@ -188,6 +188,16 @@ func (f *runIdentityFlags) identity() walltime.RunIdentity {
 		Step: f.step, StepAttempt: f.stepAttempt,
 		Stage1: walltime.Digest(f.stage1), Stage2: walltime.Digest(f.stage2),
 		ComponentRegistry: walltime.Digest(f.registry), VerifierID: f.verifier,
+		// THE EXECUTING HOST, OBSERVED HERE. These are read from the runner's
+		// own environment on the machine that runs the row, not passed in by
+		// the caller and not taken from any attestation: a fleet's signed
+		// statement says what the fleet BOOTED, and which host executed this
+		// matrix row is a different claim. The verifier compares the two, so
+		// one statement naming a host can no longer be replayed across jobs
+		// and buckets that never ran on it.
+		RunnerName: strings.TrimSpace(os.Getenv("RUNNER_NAME")),
+		RunnerOS:   strings.TrimSpace(os.Getenv("RUNNER_OS")),
+		RunnerArch: strings.TrimSpace(os.Getenv("RUNNER_ARCH")),
 	}
 }
 
