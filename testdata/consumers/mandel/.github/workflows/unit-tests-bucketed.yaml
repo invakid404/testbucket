@@ -1,0 +1,476 @@
+name: Unit Tests (bucketed)
+
+# The SOLE unit gate. It replaces the former monolithic `unit-tests.yaml` (~29-min
+# serial `test:unit` job, now deleted): the same offline `test:unit` scope is
+# fanned out into K time-balanced buckets via testbucket
+# (https://github.com/invakid404/testbucket), so wall-clock is the slowest bucket
+# instead of the whole suite.
+#
+# Coverage partition (no test dropped, none double-run):
+#   {buckets} ∪ {misc: Case Phase-2 manifest} = the full test:unit file set.
+#   - buckets: every discovered test:unit file EXCEPT `shared/f/lib/cases/**`
+#     (the façade's discovery excludes that prefix — see TB_DISCOVERY_EXCLUDE_PREFIXES).
+#   - misc: runs `shared/f/lib/cases/**` (the ~45 Case Phase-2 manifest files,
+#     incl. the serial case-replset project) monolithically into ONE cumulative
+#     JSON, then asserts it with assert_phase2_vitest_report.ts. Folding Phase-2
+#     into misc keeps the buckets pure and needs no per-bucket JSON aggregation.
+#
+# The misc job also carries the non-test:unit gates the old job ran (Maxcom
+# fixture feature test, Cloudflare-Worker verify). The typecheck gates run in a
+# sibling `static-checks` job. The `check:unit-test-workflows` composition guard
+# that used to enforce the old monolithic shape has been deleted; the coverage
+# partition above is now a reviewed, one-time accounting in the PR.
+#
+# testbucket composite actions are composed directly (not bucketed-reusable.yml,
+# which can only inject setup-node + npm ci) so each job gets mandel's pnpm +
+# MONGOMS binary. Every testbucket ref is pinned to @v0.2.2 (Renovate-trackable).
+# Scope is test:unit only; the façade seals the offline env (forbidden real-Mongo
+# URLs). Discovery uses the façade's glob path (no `vitest list` collection hang).
+#
+# v0.2.0 added #21 name-slicing (split a whale file's tests across buckets); v0.2.1
+# added the file-scope fix that makes it worthwhile here. It is now ENABLED (record
+# runs --whale-k = K, so a file whose weight exceeds total/K is flagged split=run
+# and sliced). v0.2.1's Runnables lists a whale's per-test names via a FILE-SCOPED
+# `vitest list <./file> --json --project <p>` — importing one spec (~5–30s), not the
+# whole ~1,400-file project (~200s+ that v0.2.0 paid and we suppressed). The façade
+# (scripts/tb-vitest.ts) serves that file-scoped list; discovery stays glob-only.
+# NOTE: a file is only sliced once a canary `record` has flagged it AND seeded its
+# per-test timings, so slicing engages the SECOND canary push after this merges —
+# never on a PR (the plan reads a cached store with no split flags).
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: read
+
+on:
+  pull_request:
+    branches:
+      - main
+      - canary
+
+  push:
+    branches:
+      - canary
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TESTBUCKET_VERSION: v0.2.2
+  TESTBUCKET_K: '8'
+  TESTBUCKET_COUNT: '1' # the Vitest adapter requires count == 1
+  TESTBUCKET_CACHE_SCOPE: unit
+  TESTBUCKET_EVENTS_DIR: /tmp/testbucket-events
+  TESTBUCKET_VITEST_COMMAND: pnpm exec tsx scripts/tb-vitest.ts
+  # Coverage partition: these prefixes are excluded from bucket discovery and run
+  # in the misc job instead. Keep in sync with the misc Phase-2 step's scope.
+  TB_DISCOVERY_EXCLUDE_PREFIXES: shared/f/lib/cases/
+
+jobs:
+  # Static typecheck gates (carried over from the old job). Sibling, so they run
+  # once, in parallel, and do not block the timing measurement per bucket.
+  static-checks:
+    name: Typecheck gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          node-version: '24'
+          cache: ''
+
+      - name: Configure PNPM store
+        shell: bash
+        run: |
+          {
+            echo "NODE_VERSION=$(node -v)"
+            echo "STORE_PATH=$(pnpm store path | tr -d '\n')"
+            echo "PNPM_CACHE_KEY=${{ runner.os }}-node-$(node -v)-pnpm-$(pnpm -v)-${{ hashFiles('pnpm-lock.yaml') }}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v6
+        name: Cache PNPM store
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ env.PNPM_CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Typecheck production build configuration
+        run: pnpm check:build-types
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+
+      - name: Typecheck Case Phase 2 test project
+        run: pnpm check:cases-phase2-types
+
+      - name: Typecheck CI proof scripts and tests
+        run: pnpm check:ci-proof-types
+
+      - name: Typecheck the playbook-map worker boundary
+        run: pnpm check:playbook-map-types
+
+  # 1/4 — PLAN. Discover the bucketable test:unit files (façade glob, EXCLUDING
+  # the Phase-2 prefix) and partition them K=8 ways. Coverage gate for the buckets.
+  plan:
+    name: Plan buckets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          node-version: '24'
+          cache: ''
+
+      - name: Configure PNPM store
+        shell: bash
+        run: |
+          {
+            echo "NODE_VERSION=$(node -v)"
+            echo "STORE_PATH=$(pnpm store path | tr -d '\n')"
+            echo "PNPM_CACHE_KEY=${{ runner.os }}-node-$(node -v)-pnpm-$(pnpm -v)-${{ hashFiles('pnpm-lock.yaml') }}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v6
+        name: Cache PNPM store
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ env.PNPM_CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # The façade glob discovery reads vitest.config.ts but imports no test code;
+      # it needs no MONGOMS binary. The buckets do (mongo unit tests), so provision
+      # it here too for parity with the test jobs.
+      - uses: ./.github/actions/setup-case-test-mongo
+
+      - name: Restore the timing store
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-${{ env.TESTBUCKET_CACHE_SCOPE }}-v1-${{ github.sha }}
+          restore-keys: |
+            testbucket-timings-${{ env.TESTBUCKET_CACHE_SCOPE }}-v1-
+
+      - name: Plan the buckets
+        id: plan
+        uses: invakid404/testbucket/.github/actions/plan@v0.2.2
+        with:
+          runner: vitest
+          k: ${{ env.TESTBUCKET_K }}
+          count: ${{ env.TESTBUCKET_COUNT }}
+          store-path: ${{ runner.temp }}/testbucket-store/test-timings.json
+          events-dir: ${{ env.TESTBUCKET_EVENTS_DIR }}
+          shard-plan: ${{ runner.temp }}/shard-plan.json
+          version: ${{ env.TESTBUCKET_VERSION }}
+          working-directory: .
+          vitest-command: ${{ env.TESTBUCKET_VITEST_COMMAND }}
+
+      - name: Upload the shard plan
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: testbucket-shard-plan-${{ env.TESTBUCKET_CACHE_SCOPE }}
+          path: ${{ runner.temp }}/shard-plan.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # 2/4 — TEST. One job per bucket, each running only its own slice serially
+  # (`--no-file-parallelism`) under the sealed offline env.
+  test:
+    name: Bucket ${{ matrix.bucket }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          node-version: '24'
+          cache: ''
+
+      - name: Configure PNPM store
+        shell: bash
+        run: |
+          {
+            echo "NODE_VERSION=$(node -v)"
+            echo "STORE_PATH=$(pnpm store path | tr -d '\n')"
+            echo "PNPM_CACHE_KEY=${{ runner.os }}-node-$(node -v)-pnpm-$(pnpm -v)-${{ hashFiles('pnpm-lock.yaml') }}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v6
+        name: Cache PNPM store
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ env.PNPM_CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - uses: ./.github/actions/setup-case-test-mongo
+
+      - name: Run bucket ${{ matrix.bucket }}
+        uses: invakid404/testbucket/.github/actions/run-bucket@v0.2.2
+        with:
+          runner: vitest
+          script: ${{ matrix.script }}
+          name: ${{ matrix.name }}
+          est-seconds: ${{ matrix.est_seconds }}
+          events-dir: ${{ env.TESTBUCKET_EVENTS_DIR }}
+          version: ${{ env.TESTBUCKET_VERSION }}
+          working-directory: .
+
+      - name: Upload timing events
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: testbucket-events-${{ env.TESTBUCKET_CACHE_SCOPE }}-bucket-${{ matrix.bucket }}
+          path: ${{ env.TESTBUCKET_EVENTS_DIR }}/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # 3/4 — MISC. The non-bucketed lane: the Case Phase-2 manifest (`shared/f/lib/cases/**`,
+  # incl. the serial case-replset project) run monolithically into one cumulative
+  # report + its acceptance assertion, plus the non-test:unit gates the old job
+  # carried (Maxcom fixture feature test, Cloudflare-Worker verify). Runs in
+  # parallel to the buckets.
+  misc:
+    name: Misc (Case Phase-2 + feature/worker gates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # dorny/paths-filter needs history on push
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          node-version: '24'
+          cache: ''
+
+      - name: Configure PNPM store
+        shell: bash
+        run: |
+          {
+            echo "NODE_VERSION=$(node -v)"
+            echo "STORE_PATH=$(pnpm store path | tr -d '\n')"
+            echo "PNPM_CACHE_KEY=${{ runner.os }}-node-$(node -v)-pnpm-$(pnpm -v)-${{ hashFiles('pnpm-lock.yaml') }}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v6
+        name: Cache PNPM store
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ env.PNPM_CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - uses: ./.github/actions/setup-case-test-mongo
+
+      # Case Phase-2 acceptance report — run the manifest scope monolithically
+      # (one cumulative JSON) and assert. `shared/f/lib/cases/` matches exactly the
+      # 45 manifest files (both the case-replset project and the case unit tests);
+      # this is the SAME set excluded from bucket discovery above.
+      - name: Run Case Phase 2 manifest and emit acceptance report
+        run: pnpm test:unit shared/f/lib/cases/ --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/case-phase2-vitest.json"
+        env:
+          MONGOMS_RUNTIME_DOWNLOAD: 'false'
+
+      - name: Validate Case Phase 2 acceptance report
+        run: pnpm tsx shared/f/lib/cases/test_support/assert_phase2_vitest_report.ts "$RUNNER_TEMP/case-phase2-vitest.json"
+
+      - name: Detect changed paths
+        id: changes
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            worker:
+              - 'packages/region-router/**'
+
+      - name: Run Maxcom ERP fixture feature test
+        run: pnpm vitest run --config integration-tests/vitest.config.ts integration-tests/feature/maxcom-erp-slice1/maxcom-erp-slice1-e2e.test.ts
+
+      - name: Verify Cloudflare Worker (typecheck + tests)
+        if: steps.changes.outputs.worker == 'true'
+        run: |
+          pnpm --filter @mandel/region-router typecheck
+          pnpm --filter @mandel/region-router test
+
+  # 4/4 — RECORD. canary push only. Audit the run against the plan, then fold the
+  # measured per-file timings back into the store so the next split is better.
+  record:
+    name: Record timings
+    needs: [plan, test]
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/canary' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          node-version: '24'
+          cache: ''
+
+      - name: Configure PNPM store
+        shell: bash
+        run: |
+          {
+            echo "NODE_VERSION=$(node -v)"
+            echo "STORE_PATH=$(pnpm store path | tr -d '\n')"
+            echo "PNPM_CACHE_KEY=${{ runner.os }}-node-$(node -v)-pnpm-$(pnpm -v)-${{ hashFiles('pnpm-lock.yaml') }}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v6
+        name: Cache PNPM store
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ env.PNPM_CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # ingest re-runs discovery (the façade) to prune stale store entries, so the
+      # MONGOMS binary must be provisioned; the exclusion env keeps it consistent
+      # with the plan's bucketed scope.
+      - uses: ./.github/actions/setup-case-test-mongo
+
+      - name: Download timing events
+        uses: actions/download-artifact@v7
+        with:
+          pattern: testbucket-events-${{ env.TESTBUCKET_CACHE_SCOPE }}-bucket-*
+          merge-multiple: true
+          path: ${{ env.TESTBUCKET_EVENTS_DIR }}
+
+      - name: Download the shard plan
+        uses: actions/download-artifact@v7
+        with:
+          name: testbucket-shard-plan-${{ env.TESTBUCKET_CACHE_SCOPE }}
+          path: ${{ runner.temp }}/plan
+
+      - name: Restore the previous timing store
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-${{ env.TESTBUCKET_CACHE_SCOPE }}-v1-${{ github.sha }}
+          restore-keys: |
+            testbucket-timings-${{ env.TESTBUCKET_CACHE_SCOPE }}-v1-
+
+      - name: Audit and record the run
+        uses: invakid404/testbucket/.github/actions/record@v0.2.2
+        with:
+          runner: vitest
+          # --whale-k is derived from this: a file is flagged split=run when its
+          # weight exceeds total/K. Matching the plan's K=8 enables name-slicing
+          # (see the header note); v0.2.1 file-scopes the resulting Runnables list.
+          k: ${{ env.TESTBUCKET_K }}
+          count: ${{ env.TESTBUCKET_COUNT }}
+          store-path: ${{ runner.temp }}/testbucket-store/test-timings.json
+          events-dir: ${{ env.TESTBUCKET_EVENTS_DIR }}
+          shard-plan: ${{ runner.temp }}/plan/shard-plan.json
+          version: ${{ env.TESTBUCKET_VERSION }}
+          working-directory: .
+          vitest-command: ${{ env.TESTBUCKET_VITEST_COMMAND }}
+
+      - name: Save the timing store
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/testbucket-store
+          key: testbucket-timings-${{ env.TESTBUCKET_CACHE_SCOPE }}-v1-${{ github.sha }}
+
+      - name: Upload the timing store
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: testbucket-timing-store-${{ env.TESTBUCKET_CACHE_SCOPE }}
+          path: ${{ runner.temp }}/testbucket-store/test-timings.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  # AGGREGATE GATE. Re-produces the status-check context the Canary ruleset
+  # (#4497856) requires by name — `Run unit tests` was the deleted monolithic
+  # job's display name, and the check context of a GitHub Actions job IS its
+  # `name:`. Fails CLOSED unless every unit lane succeeded, so the ruleset stays
+  # green only when the whole bucketed lane is green — with no ruleset admin
+  # change. It deliberately does NOT depend on `record` (canary-push-only; on a
+  # PR it is skipped, which would otherwise strand every PR). For the matrix
+  # `test` job, needs.test.result is `success` only if ALL 8 bucket jobs pass.
+  run-unit-tests:
+    name: Run unit tests
+    if: always()
+    needs: [static-checks, plan, test, misc]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert every unit lane succeeded
+        env:
+          STATIC_CHECKS: ${{ needs.static-checks.result }}
+          PLAN: ${{ needs.plan.result }}
+          TEST: ${{ needs.test.result }}
+          MISC: ${{ needs.misc.result }}
+        run: |
+          echo "static-checks=$STATIC_CHECKS plan=$PLAN test=$TEST misc=$MISC"
+          fail=0
+          for result in "$STATIC_CHECKS" "$PLAN" "$TEST" "$MISC"; do
+            [ "$result" = "success" ] || fail=1
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::A unit lane was not success (static-checks=$STATIC_CHECKS plan=$PLAN test=$TEST misc=$MISC) — failing the aggregate gate closed." >&2
+            exit 1
+          fi
+          echo "All unit lanes succeeded."

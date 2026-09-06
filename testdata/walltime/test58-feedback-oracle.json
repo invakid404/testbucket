@@ -1,0 +1,222 @@
+{
+ "schema": "testbucket.wall-feedback-oracle/v2",
+ "purpose": "Published reference values for scope.md test 58. This file is EVIDENCE, not an authority: acceptance-contract.md 0.10 gives it the EVIDENCE role and acceptance-contract.md 6.5 specifies the planner. Every value here was produced by that planner: Stage 1 and Stage 2 are both acceptance-contract.md 6.5's, and this file describes neither. No LPT or other heuristic is used anywhere.",
+ "planner_provenance": {
+  "generated_by": "acceptance-contract.md 6.5",
+  "stage1_source": "internal/core/partition.go"
+ },
+ "units": "reporter_sum_ns and A are integer nanoseconds; the corpus table shows billions for readability. scale is a dimensionless float64; the other three coefficients are int64 nanoseconds.",
+ "ground_truth_model_billions": {
+  "fixed": 5,
+  "scale": 1,
+  "whole_invocation_overhead": 8,
+  "per_slice_overhead": 3
+ },
+ "corpus": {
+  "row_shapes_billions": [
+   {
+    "design_row": [
+     1,
+     10,
+     1,
+     0
+    ],
+    "A": 23,
+    "count": 8,
+    "runs": [
+     "r1",
+     "r2",
+     "r3"
+    ]
+   },
+   {
+    "design_row": [
+     1,
+     20,
+     1,
+     0
+    ],
+    "A": 33,
+    "count": 8,
+    "runs": [
+     "r1",
+     "r2",
+     "r3"
+    ]
+   },
+   {
+    "design_row": [
+     1,
+     15,
+     0,
+     1
+    ],
+    "A": 23,
+    "count": 7,
+    "runs": [
+     "r1",
+     "r2",
+     "r3"
+    ]
+   }
+  ],
+  "rows_23": 23,
+  "rank_at_23": 3,
+  "why_23_is_insufficient": "Every one of the 23 rows satisfies I + slice_count == 1, so column 1 equals column 3 plus column 4 and the design spans only 3 dimensions. The corpus fails BOTH admission gates at 23: rank < 4 and rows < MIN_ROWS = 24.",
+  "row_24": {
+   "design_row": [
+    1,
+    30,
+    1,
+    2
+   ],
+   "A": 49,
+   "run": "r3",
+   "note": "a MIXED bucket - one whole unit and two slices - so I + slice_count == 3 and the row leaves the 3-dimensional span."
+  },
+  "rank_at_24": 4,
+  "row_25": {
+   "design_row": [
+    1,
+    10,
+    1,
+    1
+   ],
+   "A": 42,
+   "run": "r3",
+   "note": "a second mixed shape carrying new information: the row-24 model predicts 5+10+8+3 = 26 for it, the observation is 42."
+  }
+ },
+ "fit_at_24": {
+  "exact_rational_billions": [
+   "5",
+   "1",
+   "8",
+   "3"
+  ],
+  "coefficients_ns": {
+   "fixed_ns": 5000000000,
+   "scale": 1.0,
+   "whole_invocation_overhead_ns": 8000000000,
+   "per_slice_overhead_ns": 3000000000
+  },
+  "signs": "all four non-negative",
+  "recovers_ground_truth": true
+ },
+ "fit_at_25": {
+  "exact_rational_billions": [
+   "5",
+   "37/53",
+   "680/53",
+   "399/53"
+  ],
+  "coefficients_ns": {
+   "fixed_ns": 5000000000,
+   "scale": 0.6981132075471698,
+   "whole_invocation_overhead_ns": 12830188679,
+   "per_slice_overhead_ns": 7528301887
+  },
+  "signs": "all four non-negative",
+  "changed_from_24": {
+   "fixed_ns": false,
+   "scale": true,
+   "whole_invocation_overhead_ns": true,
+   "per_slice_overhead_ns": true
+  }
+ },
+ "partition_transition": {
+  "universe": {
+   "K": 3,
+   "units": {
+    "w1": "whole, 5e9",
+    "w2": "whole, 5e9",
+    "s1": "slice, 5e9",
+    "s2": "slice, 5e9"
+   }
+  },
+  "note_two_seeds": "The Stage-1 seed weight of a slice unit is scale*base + per_slice_overhead_ns, so the seed itself is MODEL-SPECIFIC. The two models therefore have DIFFERENT KK seeds; an earlier revision published one shared seed, which was wrong (R10-D1).",
+  "at_row_24": {
+   "stage1_kk_seed": [
+    [
+     "w1",
+     "w2"
+    ],
+    [
+     "s1"
+    ],
+    [
+     "s2"
+    ]
+   ],
+   "stage1_seed_weights_ns": {
+    "s1": 8000000000,
+    "s2": 8000000000,
+    "w1": 5000000000,
+    "w2": 5000000000
+   },
+   "final_plan": [
+    [
+     "w2"
+    ],
+    [
+     "w1"
+    ],
+    [
+     "s1",
+     "s2"
+    ]
+   ],
+   "bucket_a_eta_ns": [
+    18000000000,
+    18000000000,
+    21000000000
+   ],
+   "makespan_ns": 21000000000
+  },
+  "at_row_25": {
+   "stage1_kk_seed": [
+    [
+     "s1"
+    ],
+    [
+     "s2"
+    ],
+    [
+     "w1",
+     "w2"
+    ]
+   ],
+   "stage1_seed_weights_ns": {
+    "s1": 11018867925,
+    "s2": 11018867925,
+    "w1": 3490566038,
+    "w2": 3490566038
+   },
+   "final_plan": [
+    [
+     "s1"
+    ],
+    [
+     "s2"
+    ],
+    [
+     "w1",
+     "w2"
+    ]
+   ],
+   "bucket_a_eta_ns": [
+    16018867925,
+    16018867925,
+    24811320754
+   ],
+   "makespan_ns": 24811320754
+  },
+  "differs_as_multiset": true,
+  "cross_evaluation": {
+   "plan_at_24_under_row25_model_makespan_ns": 27037735849,
+   "plan_at_25_under_row25_model_makespan_ns": 24811320754,
+   "row25_model_strictly_prefers_plan_at_25": true
+  },
+  "mechanism": "At row 24 per-slice overhead (3e9) is small next to whole-invocation overhead (8e9), so the seed separates the heavier slice units and refinement pairs the wholes. Row 25 raises per_slice to 7.53e9 and whole to 12.83e9; the slice units now dominate the seed, KK separates them, and refinement leaves them separated."
+ }
+}

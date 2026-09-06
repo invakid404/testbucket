@@ -1,0 +1,1652 @@
+{
+ "format": "testbucket-practical-walltime-component-map/v1",
+ "status": "SALVAGE_READY",
+ "target": {
+  "label": "R54",
+  "commit": "8d27e9bccc537032615578748c80bed9300ec7bd",
+  "jj_change": "tvlupxsw",
+  "working_copy_parent": "8d27e9bccc537032615578748c80bed9300ec7bd",
+  "r54_audit_working_copy_clean": true,
+  "r54_audit_working_copy_clean_note": "HISTORICAL: true only of the R54 read-only audit. Not a statement about the current working copy."
+ },
+ "baseline": {
+  "requested_names": [
+   "v0.2.2",
+   "master"
+  ],
+  "resolved_commit": "693a19981fb6e0061d3fab62e59d75dc1c01ff3f",
+  "resolution_note": "v0.2.2 and master@origin resolve to this commit. The local master bookmark is stale at c2ae47, so it was not used as the baseline."
+ },
+ "historical_evidence": [
+  {
+   "path": "/tmp/claude-501/-Users-inva-Coding-testbucket-equal-wall-time/9c1a590b-31fc-4751-832b-457ddbb28893/scratchpad/acceptance-contract.md",
+   "sha256": "2f23ef5cca314a805b5d49f674040445e8823f2f5cdf342591c2e00a2805c412",
+   "role": "recovered frozen contract; historical evidence only"
+  },
+  {
+   "path": "/tmp/testbucket-ewj2-campaign/source-handoff.md",
+   "sha256": "cfc27b4997ed4b9d7456989cfcbb9cb559ff01507d8e2411157f411bb3806fe3",
+   "role": "campaign source-gap handoff; historical evidence only"
+  }
+ ],
+ "diff": {
+  "files_changed": 184,
+  "insertions": 53295,
+  "deletions": 972,
+  "classification_rule": "Every path appears exactly once in components[].files; a group classification applies to each path in that group."
+ },
+ "classifications": {
+  "KEEP": "Retain substantially as-is because it directly supports practical complete run-bucket timing, safe allocation, exact execution, compatibility, or regression protection.",
+  "SIMPLIFY": "Retain a smaller product-facing kernel or regression; delete the campaign/proof mechanics embedded in the current component.",
+  "REMOVE": "Revert/delete the R54 addition or R54 rewrite because it exists only for protected research/campaign claims or is unrelated to practical wall-time balancing.",
+  "UNCERTAIN": "Do not rely on it until independently validated; it is not needed to begin salvage."
+ },
+ "critical_findings": [
+  {
+   "id": "FIND-LOOP-OPEN",
+   "severity": "critical",
+   "summary": "The production record loop never ingests wall-time records.",
+   "evidence": [
+    ".github/actions/record/action.yml:91",
+    ".github/actions/record/action.yml:124",
+    ".github/actions/record/action.yml:145",
+    ".github/workflows/bucketed-reusable.yml:1087",
+    ".github/workflows/bucketed-reusable.yml:1144",
+    ".github/workflows/bucketed-reusable.yml:1165",
+    "cmd/testbucket/main.go:469",
+    "cmd/testbucket/main.go:565",
+    "internal/core/ingest.go:204"
+   ],
+   "impact": "The next plan still learns reporter package seconds, not complete Vitest/run-bucket elapsed time."
+  },
+  {
+   "id": "FIND-DEFAULT-OFF",
+   "severity": "critical",
+   "summary": "Wall measurement and Palloc allocation are opt-in and absent from the ordinary plan path and dogfood Vitest lane.",
+   "evidence": [
+    "cmd/testbucket/main.go:342",
+    "cmd/testbucket/main.go:349",
+    "cmd/testbucket/main.go:380",
+    "cmd/testbucket/main.go:433",
+    ".github/workflows/bucketed-reusable.yml:199",
+    ".github/workflows/bucketed.yml:86"
+   ],
+   "impact": "R54 preserves v0.2.2 behavior by default and therefore does not deliver the stated product change."
+  },
+  {
+   "id": "FIND-WRONG-TRAINING-TARGET",
+   "severity": "critical",
+   "summary": "Palloc is trained on per-invocation physical V, not complete action A, and no production code creates its required label-evidence documents.",
+   "evidence": [
+    "internal/walltime/palloc.go:12",
+    "internal/walltime/palloc.go:127",
+    "internal/walltime/labelevidence.go:30",
+    "internal/walltime/labelevidence.go:80",
+    "internal/walltime/labelevidence.go:96",
+    "internal/walltime/labelevidence.go:156",
+    "cmd/testbucket/wall.go:557"
+   ],
+   "impact": "The learning surface is externally fabricated/sealed rather than closed by normal runs, and its target is not the complete run-bucket duration."
+  },
+  {
+   "id": "FIND-NONDISCRIMINATING-FEATURES",
+   "severity": "high",
+   "summary": "The frozen feature vector excludes historical timing and unit identity as a numeric/category signal; ordinary one-file units commonly collapse to identical predictions.",
+   "evidence": [
+    "internal/planbind/features.go:13",
+    "internal/planbind/features.go:21",
+    "internal/planbind/features.go:62",
+    "internal/walltime/palloc.go:38"
+   ],
+   "impact": "Even a valid fitted scorer cannot learn that two same-shaped files have different runtimes."
+  },
+  {
+   "id": "FIND-ESTIMATE-DIVERGENCE",
+   "severity": "high",
+   "summary": "AllocationScore can alter packing, but est_seconds remains the reporter-EWMA sum and Aeta is a separate document not consumed by partitioning.",
+   "evidence": [
+    "internal/core/plan.go:107",
+    "internal/core/plan.go:189",
+    "internal/core/plan.go:205",
+    "internal/core/plan.go:237",
+    "internal/core/plan.go:338",
+    "internal/planbind/features.go:197",
+    "internal/walltime/aeta.go:243",
+    ".github/actions/run-bucket/action.yml:515",
+    "README.md:609"
+   ],
+   "impact": "The displayed prediction and the weight used to balance can disagree, and neither is learned from complete action elapsed time."
+  },
+  {
+   "id": "FIND-A-SPAN-CLAIM",
+   "severity": "high",
+   "summary": "The monotonic span is useful but is not literally the complete GitHub composite-action wall time.",
+   "evidence": [
+    ".github/actions/run-bucket/action.yml:374",
+    ".github/actions/run-bucket/action.yml:395",
+    ".github/actions/run-bucket/action.yml:479",
+    ".github/actions/run-bucket/action.yml:515",
+    ".github/actions/run-bucket/action.yml:690",
+    "internal/walltime/action.go:151",
+    "internal/walltime/action.go:176",
+    "internal/walltime/action.go:897"
+   ],
+   "impact": "Action expression evaluation, shell startup, and post-end record/seal work sit outside the interval; installation is deliberately outside the action. Contract §2 names the observed run-bucket execution span, and names it honestly."
+  },
+  {
+   "id": "FIND-GROUPED-LABEL",
+   "severity": "high",
+   "summary": "Vitest whole-file units are merged into one invocation, while TrainingLabel requires one UnitID.",
+   "evidence": [
+    "internal/runner/vitestrunner/render.go:37",
+    "internal/runner/vitestrunner/render.go:59",
+    "internal/runner/vitestrunner/render.go:87",
+    "internal/runner/vitestrunner/render.go:93",
+    "internal/walltime/palloc.go:131",
+    "internal/walltime/labelevidence.go:174"
+   ],
+   "impact": "There is no defensible per-unit attribution for the observed invocation duration. Preserve membership, then either learn at bucket/invocation level or emit one learnable invocation per scheduling unit."
+  },
+  {
+   "id": "FIND-SELF-ACTION-SYNTAX",
+   "severity": "medium",
+   "summary": "The reusable workflow depends on $/.github/actions/... and suppresses the linter, but the historical handoff says the external path was not exercised.",
+   "evidence": [
+    ".github/actionlint.yaml:1",
+    ".github/workflows/bucketed-reusable.yml:1166",
+    "/tmp/testbucket-ewj2-campaign/source-handoff.md:41"
+   ],
+   "impact": "Consumer portability is uncertain. Salvage can proceed using a known supported action reference form, so this is not an external blocker."
+  }
+ ],
+ "components": [
+  {
+   "id": "self-action-resolution-lint",
+   "kind": "configuration",
+   "classification": "UNCERTAIN",
+   "files": [
+    ".github/actionlint.yaml"
+   ],
+   "evidence": [
+    ".github/actionlint.yaml:1",
+    ".github/workflows/bucketed-reusable.yml:1166"
+   ],
+   "dependency_impact": "Only suppresses validation of the $/ self-action form. Remove with that syntax or retain only after GitHub consumer validation."
+  },
+  {
+   "id": "product-documentation",
+   "kind": "documentation",
+   "classification": "SIMPLIFY",
+   "files": [
+    "README.md"
+   ],
+   "evidence": [
+    "README.md:320",
+    "README.md:337",
+    "README.md:609",
+    "README.md:615"
+   ],
+   "dependency_impact": "Keep user-facing practical measurement/allocation semantics; delete campaign authority, observer, cgroup, signer, release-proof, and frozen-study instructions."
+  },
+  {
+   "id": "safe-installer-kernel",
+   "kind": "action-and-tests",
+   "classification": "SIMPLIFY",
+   "files": [
+    ".github/actions/install/action.yml",
+    ".github/actions/install-testbucket.sh",
+    "cmd/testbucket/archiveenumeration_test.go",
+    "cmd/testbucket/candidateinstall_test.go"
+   ],
+   "evidence": [
+    ".github/actions/install/action.yml:12",
+    ".github/actions/install-testbucket.sh:379",
+    "cmd/testbucket/archiveenumeration_test.go:158",
+    "cmd/testbucket/archiveenumeration_test.go:222",
+    "cmd/testbucket/candidateinstall_test.go:115",
+    "cmd/testbucket/candidateinstall_test.go:281"
+   ],
+   "dependency_impact": "Keep ordinary local/release installation, checksum checking, exhaustive archive-member validation, and the archive regression. Remove candidate authority, later-commit release pins, and candidate end-to-end proof inputs/tests."
+  },
+  {
+   "id": "candidate-and-release-proof-chain",
+   "kind": "release-protocol",
+   "classification": "REMOVE",
+   "claim_only": [
+    "protected-authority",
+    "permanent-storage",
+    "research-proof"
+   ],
+   "files": [
+    ".github/actions/candidate-digest/action.yml",
+    ".github/actions/candidate-resolver.sh",
+    ".github/actions/released-binary-digests.tsv",
+    ".github/workflows/pin-release.yml",
+    ".github/workflows/release.yml",
+    ".goreleaser.yaml",
+    "cmd/testbucket/aliasfreeze_test.go",
+    "cmd/testbucket/candidatedelivery_test.go",
+    "cmd/testbucket/candidateresolver_test.go",
+    "cmd/testbucket/releasepin_test.go",
+    "cmd/testbucket/stage1binary.go",
+    "internal/walltime/attest.go",
+    "internal/walltime/release.go",
+    "internal/walltime/release_test.go",
+    "internal/walltime/releasetrust_test.go",
+    "testdata/goreleaser/README.md",
+    "testdata/goreleaser/artifacts.json"
+   ],
+   "evidence": [
+    ".github/actions/candidate-digest/action.yml:9",
+    ".github/actions/install-testbucket.sh:379",
+    ".github/workflows/pin-release.yml:61",
+    "internal/walltime/attest.go:28",
+    "internal/walltime/release.go:33",
+    "/tmp/testbucket-ewj2-campaign/source-handoff.md:65"
+   ],
+   "dependency_impact": "Delete the unpublished-candidate and publication-gating cycle; restore the simple v0.2.2 release path while retaining normal third-party SHA pins in CI."
+  },
+  {
+   "id": "plan-action",
+   "kind": "action",
+   "classification": "SIMPLIFY",
+   "files": [
+    ".github/actions/plan/action.yml"
+   ],
+   "evidence": [
+    ".github/actions/plan/action.yml:8",
+    ".github/actions/plan/action.yml:104",
+    ".github/actions/plan/action.yml:115",
+    ".github/actions/plan/action.yml:138",
+    ".github/actions/plan/action.yml:153"
+   ],
+   "dependency_impact": "Keep normal discovery/store/plan outputs and a small wall-predictor input. Remove bundle, Stage-1/2, claim store, registry, scorer-signature, and authority inputs."
+  },
+  {
+   "id": "preflight-proof-action",
+   "kind": "action-and-tests",
+   "classification": "REMOVE",
+   "claim_only": [
+    "protected-authority",
+    "multi-signer",
+    "research-proof"
+   ],
+   "files": [
+    ".github/actions/preflight/action.yml",
+    "cmd/testbucket/preflight_test.go",
+    "cmd/testbucket/preflightverifier_test.go",
+    "cmd/testbucket/replay_attest_test.go"
+   ],
+   "evidence": [
+    ".github/actions/preflight/action.yml:3",
+    ".github/actions/preflight/action.yml:25",
+    "cmd/testbucket/preflightverifier_test.go:104",
+    "cmd/testbucket/replay_attest_test.go:20"
+   ],
+   "dependency_impact": "Removes independent replay/authority gating before measurement; no practical timing learner depends on it."
+  },
+  {
+   "id": "record-action",
+   "kind": "action",
+   "classification": "SIMPLIFY",
+   "files": [
+    ".github/actions/record/action.yml"
+   ],
+   "evidence": [
+    ".github/actions/record/action.yml:91",
+    ".github/actions/record/action.yml:120",
+    ".github/actions/record/action.yml:145"
+   ],
+   "dependency_impact": "Keep audit-before-ingest and reporter ingestion for compatibility, then add successful complete-span ingestion. Remove candidate/release-proof inputs. This is the missing product feedback edge."
+  },
+  {
+   "id": "run-bucket-action",
+   "kind": "action",
+   "classification": "SIMPLIFY",
+   "files": [
+    ".github/actions/run-bucket/action.yml"
+   ],
+   "evidence": [
+    ".github/actions/run-bucket/action.yml:395",
+    ".github/actions/run-bucket/action.yml:479",
+    ".github/actions/run-bucket/action.yml:515",
+    ".github/actions/run-bucket/action.yml:645",
+    ".github/actions/run-bucket/action.yml:690"
+   ],
+   "dependency_impact": "Keep one monotonic start, setup plus complete generated script, explicit status, process-group signal/reap, end, and always-uploadable observation. Remove cgroup delegation, account separation, keys, signers, stages, observers, scored eligibility, and candidate delivery."
+  },
+  {
+   "id": "wall-verification-action",
+   "kind": "action",
+   "classification": "SIMPLIFY",
+   "files": [
+    ".github/actions/verify-wall/action.yml"
+   ],
+   "evidence": [
+    ".github/actions/verify-wall/action.yml:9",
+    ".github/actions/verify-wall/action.yml:57",
+    ".github/actions/verify-wall/action.yml:94",
+    ".github/actions/verify-wall/action.yml:109",
+    ".github/actions/verify-wall/action.yml:152"
+   ],
+   "dependency_impact": "Reduce to schema, terminal-state, plan/bucket identity, exact membership, positive monotonic duration, and event coverage checks. Remove authority/replay/registry/Pcheck/training/signer surfaces."
+  },
+  {
+   "id": "reusable-plan-test-record-workflow",
+   "kind": "workflow",
+   "classification": "SIMPLIFY",
+   "files": [
+    ".github/workflows/bucketed-reusable.yml"
+   ],
+   "evidence": [
+    ".github/workflows/bucketed-reusable.yml:85",
+    ".github/workflows/bucketed-reusable.yml:199",
+    ".github/workflows/bucketed-reusable.yml:1087",
+    ".github/workflows/bucketed-reusable.yml:1107",
+    ".github/workflows/bucketed-reusable.yml:1144",
+    ".github/workflows/bucketed-reusable.yml:1165"
+   ],
+   "dependency_impact": "Keep plan -> matrix -> test -> default-branch record and SHA-pinned third-party actions. Download wall observations in record and update the predictor. Delete campaign/stage/authority/cgroup/candidate inputs and A_GH-only actions permission."
+  },
+  {
+   "id": "dogfood-workflow",
+   "kind": "workflow",
+   "classification": "SIMPLIFY",
+   "files": [
+    ".github/workflows/bucketed.yml"
+   ],
+   "evidence": [
+    ".github/workflows/bucketed.yml:54",
+    ".github/workflows/bucketed.yml:67",
+    ".github/workflows/bucketed.yml:86"
+   ],
+   "dependency_impact": "Keep Go and Vitest consumer lanes; drop A_GH actions:read and make the Vitest lane exercise measurement/learning. Go stays unwrapped."
+  },
+  {
+   "id": "ci-sha-pins",
+   "kind": "workflow",
+   "classification": "KEEP",
+   "files": [
+    ".github/workflows/ci.yml"
+   ],
+   "evidence": [
+    ".github/workflows/ci.yml:27",
+    ".github/workflows/ci.yml:67",
+    ".github/workflows/ci.yml:95"
+   ],
+   "dependency_impact": "Preserves ordinary build/test/Vitest integration/release dry-run while pinning external actions by immutable SHA."
+  },
+  {
+   "id": "wall-cli-and-acquisition",
+   "kind": "command-and-tests",
+   "classification": "SIMPLIFY",
+   "files": [
+    "cmd/testbucket/acquisitionprovenance_test.go",
+    "cmd/testbucket/actionsexpr_test.go",
+    "cmd/testbucket/main.go",
+    "cmd/testbucket/main_test.go",
+    "cmd/testbucket/planningsnapshot_test.go",
+    "cmd/testbucket/wall.go",
+    "cmd/testbucket/wallplan.go",
+    "cmd/testbucket/workflowpermissions_test.go"
+   ],
+   "evidence": [
+    "cmd/testbucket/main.go:307",
+    "cmd/testbucket/main.go:342",
+    "cmd/testbucket/main.go:380",
+    "cmd/testbucket/main.go:469",
+    "cmd/testbucket/acquisitionprovenance_test.go:108",
+    "cmd/testbucket/acquisitionprovenance_test.go:131",
+    "cmd/testbucket/acquisitionprovenance_test.go:148"
+   ],
+   "dependency_impact": "Keep compact measure/verify/ingest commands, canonical cwd/resolved executable/actual argv capture, workflow-condition/permission checks that survive the simplified workflow, and Vitest-only opt-in safeguards. Remove the research command surface."
+  },
+  {
+   "id": "cli-consumer-safety-regressions",
+   "kind": "tests",
+   "classification": "KEEP",
+   "files": [
+    "cmd/testbucket/actionpins_test.go",
+    "cmd/testbucket/auditplan_test.go"
+   ],
+   "evidence": [
+    "cmd/testbucket/actionpins_test.go:28",
+    "cmd/testbucket/actionpins_test.go:74",
+    "cmd/testbucket/auditplan_test.go:19",
+    "cmd/testbucket/auditplan_test.go:63",
+    "cmd/testbucket/auditplan_test.go:146"
+   ],
+   "dependency_impact": "Pins external action immutability and one-read exact-plan audit behavior independently of the research protocol."
+  },
+  {
+   "id": "cli-proof-and-cgroup-surface",
+   "kind": "command-and-tests",
+   "classification": "REMOVE",
+   "claim_only": [
+    "protected-authority",
+    "multi-signer",
+    "permanent-storage",
+    "triple-observer",
+    "cgroup",
+    "research-proof"
+   ],
+   "files": [
+    "cmd/testbucket/cgrouplifecycle_test.go",
+    "cmd/testbucket/checkdelegation.go",
+    "cmd/testbucket/closure_test.go",
+    "cmd/testbucket/countersign_test.go",
+    "cmd/testbucket/delegateexport_test.go",
+    "cmd/testbucket/derivedproducer_test.go",
+    "cmd/testbucket/eligibleguard_test.go",
+    "cmd/testbucket/main_test_dispatch_test.go",
+    "cmd/testbucket/nestedexec_test.go",
+    "cmd/testbucket/planauthority_test.go",
+    "cmd/testbucket/plannerclaimrollback_test.go",
+    "cmd/testbucket/runkey_test.go",
+    "cmd/testbucket/signercontract_test.go",
+    "cmd/testbucket/verdictidentity_test.go",
+    "cmd/testbucket/verifierkeyguard_test.go",
+    "cmd/testbucket/wallattestrunner.go",
+    "cmd/testbucket/wallhold.go",
+    "cmd/testbucket/wallstage1.go",
+    "cmd/testbucket/wallstage1_test.go"
+   ],
+   "evidence": [
+    "cmd/testbucket/checkdelegation.go:13",
+    "cmd/testbucket/countersign_test.go:22",
+    "cmd/testbucket/planauthority_test.go:22",
+    "cmd/testbucket/plannerclaimrollback_test.go:26",
+    "cmd/testbucket/wallstage1_test.go:282",
+    "cmd/testbucket/wallstage1_test.go:503",
+    "cmd/testbucket/wallstage1_test.go:672"
+   ],
+   "dependency_impact": "Deletes CLI wiring and tests whose only consumer is eligibility/proof infrastructure. Exact path and acquisition regressions are retained in the preceding groups."
+  },
+  {
+   "id": "core-neutral-seams",
+   "kind": "package-and-tests",
+   "classification": "KEEP",
+   "files": [
+    "internal/core/audit_bucket.go",
+    "internal/core/consumer_contract_test.go",
+    "internal/core/plan.go",
+    "internal/core/store.go"
+   ],
+   "evidence": [
+    "internal/core/audit_bucket.go:24",
+    "internal/core/audit_bucket.go:39",
+    "internal/core/audit_bucket.go:53",
+    "internal/core/plan.go:86",
+    "internal/core/plan.go:107",
+    "internal/core/plan.go:189",
+    "internal/core/store.go:142",
+    "internal/core/consumer_contract_test.go:24",
+    "internal/core/consumer_contract_test.go:61",
+    "internal/core/consumer_contract_test.go:91",
+    "internal/core/consumer_contract_test.go:152"
+   ],
+   "dependency_impact": "Provides runner-neutral score injection, explicit unit/run identity, safe one-read bucket audit, byte parsing, Go neutrality, and matrix compatibility. Add a new wall estimate field rather than silently repurposing est_seconds."
+  },
+  {
+   "id": "plan-binding-and-allocation",
+   "kind": "package-and-tests",
+   "classification": "SIMPLIFY",
+   "files": [
+    "internal/planbind/features.go",
+    "internal/planbind/features_test.go",
+    "internal/planbind/planbind.go",
+    "internal/planbind/planbind_test.go"
+   ],
+   "evidence": [
+    "internal/planbind/features.go:13",
+    "internal/planbind/features.go:62",
+    "internal/planbind/features.go:103",
+    "internal/planbind/features.go:165",
+    "internal/planbind/features.go:197",
+    "internal/planbind/planbind.go:481"
+   ],
+   "dependency_impact": "Keep deterministic unit/membership projection and the allocator adapter. Replace the sealed static-feature scorer with a versioned, ordinary-history wall model; remove Stage receipts, replay, claims, and implementation-identity proof."
+  },
+  {
+   "id": "plan-implementation-identity-proof",
+   "kind": "tests",
+   "classification": "REMOVE",
+   "claim_only": [
+    "protected-authority",
+    "research-proof"
+   ],
+   "files": [
+    "internal/planbind/planidentity_test.go"
+   ],
+   "evidence": [
+    "internal/planbind/planidentity_test.go:19",
+    "internal/planbind/planidentity_test.go:94",
+    "internal/planbind/planidentity_test.go:193"
+   ],
+   "dependency_impact": "No product behavior depends on cryptographically naming each planner implementation function."
+  },
+  {
+   "id": "runner-neutral-invocation-identity",
+   "kind": "package",
+   "classification": "KEEP",
+   "files": [
+    "internal/runner/gorunner/render.go",
+    "internal/runner/types.go"
+   ],
+   "evidence": [
+    "internal/runner/gorunner/render.go:120",
+    "internal/runner/types.go:126",
+    "internal/runner/types.go:135",
+    "internal/runner/types.go:142",
+    "internal/runner/types.go:148"
+   ],
+   "dependency_impact": "Adds data-only Units/Selector/Atoms identity without changing Go command bytes; required to attribute and audit wall observations safely."
+  },
+  {
+   "id": "vitest-adapter-measurement-hook",
+   "kind": "package-and-tests",
+   "classification": "SIMPLIFY",
+   "files": [
+    "internal/runner/vitestrunner/discover.go",
+    "internal/runner/vitestrunner/exec.go",
+    "internal/runner/vitestrunner/render.go",
+    "internal/runner/vitestrunner/vitestrunner.go",
+    "internal/runner/vitestrunner/vitestrunner_test.go"
+   ],
+   "evidence": [
+    "internal/runner/vitestrunner/render.go:29",
+    "internal/runner/vitestrunner/exec.go:39",
+    "internal/runner/vitestrunner/exec.go:104",
+    "internal/runner/vitestrunner/render.go:37",
+    "internal/runner/vitestrunner/render.go:87",
+    "internal/runner/vitestrunner/render.go:139",
+    "internal/runner/vitestrunner/render.go:214",
+    "internal/runner/vitestrunner/vitestrunner.go:148",
+    "internal/runner/vitestrunner/vitestrunner.go:165"
+   ],
+   "dependency_impact": "Keep exact path tokens, actual argv, unit/selector/atom membership, reporter output, and a small direct wrapper hook. Drop Stage-frozen inputs and walltime proof coupling. Decide explicitly whether grouped whole-file invocations remain the training unit."
+  },
+  {
+   "id": "vitest-executable-provenance-regression",
+   "kind": "tests",
+   "classification": "KEEP",
+   "files": [
+    "internal/runner/vitestrunner/toolpath_test.go"
+   ],
+   "evidence": [
+    "internal/runner/vitestrunner/exec.go:39",
+    "internal/runner/vitestrunner/exec.go:60",
+    "internal/runner/vitestrunner/exec.go:104",
+    "internal/runner/vitestrunner/toolpath_test.go:18"
+   ],
+   "dependency_impact": "Preserves the regression that the retained resolved executable is the one actually run while exec.go is simplified."
+  },
+  {
+   "id": "frozen-vitest-study-version",
+   "kind": "tests-and-fixture",
+   "classification": "REMOVE",
+   "claim_only": [
+    "research-proof"
+   ],
+   "files": [
+    "internal/runner/vitestrunner/frozen_version_test.go",
+    "testdata/vitest-sample/package-lock.json",
+    "testdata/vitest-sample/package.json"
+   ],
+   "evidence": [
+    "internal/runner/vitestrunner/frozen_version_test.go:43",
+    "internal/runner/vitestrunner/frozen_version_test.go:59",
+    "testdata/vitest-sample/package.json:6"
+   ],
+   "dependency_impact": "Restore the fixture version selected by normal maintenance. The 4.1.10 freeze exists for the historical Mandel campaign, not practical timing."
+  },
+  {
+   "id": "portable-measurement-primitives",
+   "kind": "package-and-tests",
+   "classification": "KEEP",
+   "files": [
+    "internal/walltime/audit.go",
+    "internal/walltime/canon.go",
+    "internal/walltime/canon_test.go",
+    "internal/walltime/clock.go",
+    "internal/walltime/clock_fallback.go",
+    "internal/walltime/clock_linux.go",
+    "internal/walltime/clock_other.go",
+    "internal/walltime/nanos.go",
+    "internal/walltime/procsignal_linux.go",
+    "internal/walltime/procsignal_other.go",
+    "internal/walltime/spec.go"
+   ],
+   "evidence": [
+    "internal/walltime/clock.go:14",
+    "internal/walltime/clock.go:30",
+    "internal/walltime/clock.go:72",
+    "internal/walltime/clock_linux.go:15",
+    "internal/walltime/nanos.go:16",
+    "internal/walltime/procsignal_linux.go:15",
+    "internal/walltime/spec.go:18",
+    "internal/walltime/audit.go:13"
+   ],
+   "dependency_impact": "This is the portable kernel for exact nanosecond durations, direct argv specs, safe process identity signaling, canonical observation digests, and audit results. Extract process-start identity before deleting cgroup membership files, and remove cross-process observer assumptions from comments/API."
+  },
+  {
+   "id": "practical-lifecycle-and-model-kernel",
+   "kind": "package",
+   "classification": "SIMPLIFY",
+   "files": [
+    "internal/walltime/action.go",
+    "internal/walltime/aeta.go",
+    "internal/walltime/contain.go",
+    "internal/walltime/contain_other.go",
+    "internal/walltime/contain_pgroup.go",
+    "internal/walltime/doc.go",
+    "internal/walltime/exec.go",
+    "internal/walltime/gates.go",
+    "internal/walltime/palloc.go",
+    "internal/walltime/record.go",
+    "internal/walltime/spawn_other.go",
+    "internal/walltime/verify.go"
+   ],
+   "evidence": [
+    "internal/walltime/action.go:151",
+    "internal/walltime/action.go:463",
+    "internal/walltime/action.go:796",
+    "internal/walltime/contain_pgroup.go:11",
+    "internal/walltime/contain_pgroup.go:92",
+    "internal/walltime/exec.go:352",
+    "internal/walltime/palloc.go:12",
+    "internal/walltime/aeta.go:243",
+    "internal/walltime/gates.go:164",
+    "internal/walltime/verify.go:181"
+   ],
+   "dependency_impact": "Extract a small begin/run/end observation writer, terminal-state verifier, and online wall predictor. Eliminate cryptographic ledgers, observer coordination, campaign gates, sealed ridge lineage, and Aeta registry proof."
+  },
+  {
+   "id": "practical-lifecycle-regressions",
+   "kind": "tests",
+   "classification": "SIMPLIFY",
+   "files": [
+    "internal/walltime/actione2e_test.go",
+    "internal/walltime/actionspan_test.go",
+    "internal/walltime/aeta_test.go",
+    "internal/walltime/beginrollback_test.go",
+    "internal/walltime/exec_test.go",
+    "internal/walltime/gates_test.go",
+    "internal/walltime/palloc_test.go",
+    "internal/walltime/synth_test.go",
+    "internal/walltime/verify_test.go"
+   ],
+   "evidence": [
+    "internal/walltime/actione2e_test.go:25",
+    "internal/walltime/actionspan_test.go:55",
+    "internal/walltime/beginrollback_test.go:25",
+    "internal/walltime/exec_test.go:159",
+    "internal/walltime/exec_test.go:353",
+    "internal/walltime/exec_test.go:507",
+    "internal/walltime/gates_test.go:39",
+    "internal/walltime/gates_test.go:72",
+    "internal/walltime/gates_test.go:323",
+    "internal/walltime/palloc_test.go:189"
+   ],
+   "dependency_impact": "Port the practical assertions—complete span, failure propagation, output pass-through, whole-call bracketing, rollback, deterministic score/floor, bucket-total error, and malformed/incomplete record rejection—to the small API; delete proof-specific assertions."
+  },
+  {
+   "id": "cancellation-regressions",
+   "kind": "tests",
+   "classification": "KEEP",
+   "files": [
+    "internal/walltime/cancel_test.go"
+   ],
+   "evidence": [
+    "internal/walltime/cancel_test.go:50",
+    "internal/walltime/cancel_test.go:164",
+    "internal/walltime/cancel_test.go:217",
+    "internal/walltime/cancel_test.go:254"
+   ],
+   "dependency_impact": "Preserve TERM-to-KILL escalation, hard deadline, and owned-process-group signal and drain/reap behavior; adapt the detached-descendant case to the chosen portable process-group contract."
+  },
+  {
+   "id": "cgroup-and-credential-proof",
+   "kind": "package-and-tests",
+   "classification": "REMOVE",
+   "claim_only": [
+    "cgroup",
+    "triple-observer",
+    "research-proof"
+   ],
+   "files": [
+    "internal/walltime/actionhold.go",
+    "internal/walltime/cgroupdelegation.go",
+    "internal/walltime/cgroupdelegation_test.go",
+    "internal/walltime/contain_linux.go",
+    "internal/walltime/containmentidentity_test.go",
+    "internal/walltime/controller.go",
+    "internal/walltime/controller_test.go",
+    "internal/walltime/credentialboundary_test.go",
+    "internal/walltime/hierarchy.go",
+    "internal/walltime/hierarchy_test.go",
+    "internal/walltime/idsampler.go",
+    "internal/walltime/membership_linux.go",
+    "internal/walltime/membership_other.go",
+    "internal/walltime/peercred_linux.go",
+    "internal/walltime/peercred_other.go",
+    "internal/walltime/proctree.go",
+    "internal/walltime/proctree_test.go",
+    "internal/walltime/procuid_linux.go",
+    "internal/walltime/procuid_other.go",
+    "internal/walltime/selfcgroup_linux.go",
+    "internal/walltime/selfcgroup_other.go",
+    "internal/walltime/spawn_linux.go"
+   ],
+   "evidence": [
+    "internal/walltime/contain_linux.go:1",
+    "internal/walltime/cgroupdelegation.go:1",
+    "internal/walltime/controller.go:40",
+    "internal/walltime/proctree.go:8",
+    "internal/walltime/credentialboundary_test.go:24"
+   ],
+   "dependency_impact": "Deletes Linux-only containment delegation, held-child admission, privilege/account separation, nested controller sockets, membership snapshots, and process-tree proof. Practical execution falls back to owned child plus process group, signal forwarding, wait, and reap."
+  },
+  {
+   "id": "multi-signer-and-triple-observer-proof",
+   "kind": "package-and-tests",
+   "classification": "REMOVE",
+   "claim_only": [
+    "multi-signer",
+    "triple-observer",
+    "protected-authority",
+    "research-proof"
+   ],
+   "files": [
+    "internal/walltime/delegation.go",
+    "internal/walltime/delegation_test.go",
+    "internal/walltime/detach_unix.go",
+    "internal/walltime/evidencedir_test.go",
+    "internal/walltime/filechannel_test.go",
+    "internal/walltime/handoff_test.go",
+    "internal/walltime/identity.go",
+    "internal/walltime/identitygates_test.go",
+    "internal/walltime/observe.go",
+    "internal/walltime/observerabandon_test.go",
+    "internal/walltime/observerexit_test.go",
+    "internal/walltime/observerfail_test.go",
+    "internal/walltime/producercontract_test.go",
+    "internal/walltime/rawevidence.go",
+    "internal/walltime/rawevidence_test.go",
+    "internal/walltime/roles_test.go",
+    "internal/walltime/roster.go",
+    "internal/walltime/secretenv_test.go",
+    "internal/walltime/selfattest_test.go",
+    "internal/walltime/signerauthority_test.go",
+    "internal/walltime/signercanonical_test.go",
+    "internal/walltime/streambinding_test.go"
+   ],
+   "evidence": [
+    "internal/walltime/identity.go:53",
+    "internal/walltime/delegation.go:47",
+    "internal/walltime/observe.go:66",
+    "internal/walltime/roster.go:39",
+    "internal/walltime/rawevidence.go:1",
+    "internal/walltime/producercontract_test.go:17"
+   ],
+   "dependency_impact": "Deletes per-producer Ed25519 keys, delegations, rosters, seals, detached peer/trace processes, three-ledger reconciliation, and file-channel isolation. A local observation needs atomic write/rename and plan identity, not a public-key hierarchy."
+  },
+  {
+   "id": "stage-replay-and-permanent-storage-proof",
+   "kind": "package-tests-and-fixture",
+   "classification": "REMOVE",
+   "claim_only": [
+    "protected-authority",
+    "permanent-storage",
+    "research-proof"
+   ],
+   "files": [
+    "internal/walltime/dirdigest.go",
+    "internal/walltime/lockclosure.go",
+    "internal/walltime/lockclosure_test.go",
+    "internal/walltime/mandel_lock_test.go",
+    "internal/walltime/planidentity.go",
+    "internal/walltime/replaybinding_test.go",
+    "internal/walltime/runnerattest.go",
+    "internal/walltime/runnerattest_test.go",
+    "internal/walltime/runnerimage_test.go",
+    "internal/walltime/stage.go",
+    "internal/walltime/stage2identity_test.go",
+    "internal/walltime/stage2match_test.go",
+    "testdata/mandel-lock/README.md",
+    "testdata/mandel-lock/pnpm-lock.yaml"
+   ],
+   "evidence": [
+    "internal/walltime/stage.go:153",
+    "internal/walltime/stage.go:482",
+    "internal/walltime/stage.go:1625",
+    "internal/walltime/stage.go:2031",
+    "internal/walltime/stage.go:2257",
+    "internal/walltime/runnerattest.go:33",
+    "/tmp/testbucket-ewj2-campaign/source-handoff.md:80",
+    "/tmp/testbucket-ewj2-campaign/source-handoff.md:89"
+   ],
+   "dependency_impact": "Deletes frozen Stage-1/2 manifests, replay receipts, one-shot durable planner claims, source/package closure, runner-fleet attestations, and Mandel lock proof. Retain only ordinary plan digest/membership fields in the practical record."
+  },
+  {
+   "id": "campaign-and-training-proof",
+   "kind": "package-and-tests",
+   "classification": "REMOVE",
+   "claim_only": [
+    "protected-authority",
+    "permanent-storage",
+    "research-proof"
+   ],
+   "files": [
+    "internal/walltime/ablation.go",
+    "internal/walltime/ablation_test.go",
+    "internal/walltime/ablationderived.go",
+    "internal/walltime/agh.go",
+    "internal/walltime/campaign.go",
+    "internal/walltime/campaign_test.go",
+    "internal/walltime/labelevidence.go",
+    "internal/walltime/labelevidence_test.go",
+    "internal/walltime/schedule.go",
+    "internal/walltime/topologygrammar_test.go"
+   ],
+   "evidence": [
+    "internal/walltime/ablation.go:45",
+    "internal/walltime/campaign.go:19",
+    "internal/walltime/campaign.go:37",
+    "internal/walltime/labelevidence.go:30",
+    "internal/walltime/schedule.go:13",
+    "/tmp/testbucket-ewj2-campaign/source-handoff.md:41",
+    "/tmp/testbucket-ewj2-campaign/source-handoff.md:59"
+   ],
+   "dependency_impact": "Deletes the 12-ablation/five-pair/80-row study harness, API step observer, signed training evidence, randomized schedule, and topology-stratum proof. Replace with ordinary default-branch historical observations and normal model-quality tests."
+  }
+ ],
+ "schemas": [
+  {
+   "id": "plan-and-matrix",
+   "source": "internal/core/plan.go:14",
+   "types": [
+    "PlanUnit",
+    "PlanBucket",
+    "PlanSummary",
+    "PlanDocument",
+    "PlanOptions"
+   ],
+   "classification": "KEEP",
+   "change": "# STATUS: SUPERSEDED BY PD-1 — est_seconds is NOT replaced; est_basis declares its meaning and new fields are additive. Original text: PlanUnit.Run and AllocationScore are useful additions. Preserve numeric one-decimal est_seconds; add a separate wall_est_seconds/prediction metadata field for the new model.",
+   "dependencies": [
+    "internal/runner/types.go:103",
+    "internal/core/consumer_contract_test.go:150"
+   ],
+   "superseded_by": "PD-1",
+   "superseded_status": "SUPERSEDED by owner decision PD-1 (docs/walltime/acceptance-contract.md §0.7): additive compatibility is frozen. est_seconds is NOT replaced by wall_est_seconds; est_basis declares its meaning, new fields are additive, and a canonical v0.2.2-field projection stays byte-identical for an unopted consumer."
+  },
+  {
+   "id": "runner-invocation",
+   "source": "internal/runner/types.go:126",
+   "types": [
+    "Invocation"
+   ],
+   "fields_added": [
+    "units",
+    "selector",
+    "atoms"
+   ],
+   "classification": "KEEP",
+   "change": "Contract §13 makes scheduled membership and selector identity exact, for audit and attribution; Go rendering remains byte-neutral."
+  },
+  {
+   "id": "vitest-acquisition",
+   "sources": [
+    "internal/runner/vitestrunner/exec.go:60",
+    "internal/runner/vitestrunner/discover.go:243",
+    "internal/runner/vitestrunner/vitestrunner.go:95",
+    "internal/runner/vitestrunner/vitestrunner.go:115",
+    "internal/runner/vitestrunner/vitestrunner.go:171"
+   ],
+   "types": [
+    "ExecProvenance",
+    "DiscoveryProvenance",
+    "ResolvedProgram",
+    "Options",
+    "FrozenInputs"
+   ],
+   "classification": "SIMPLIFY",
+   "change": "Keep actual argv/path/cwd and WallDir hook; remove Stage-frozen replay and complete ambient environment capture."
+  },
+  {
+   "id": "planbind",
+   "sources": [
+    "internal/planbind/features.go:32",
+    "internal/planbind/features.go:106",
+    "internal/planbind/planbind.go:44",
+    "internal/planbind/planbind.go:256",
+    "internal/planbind/planbind.go:273",
+    "internal/planbind/planbind.go:481"
+   ],
+   "types": [
+    "FeatureBuilder",
+    "Allocator",
+    "AcquireOptions",
+    "Result",
+    "PlanOptions",
+    "SemanticPlan",
+    "SemanticBucket",
+    "SemanticUnit"
+   ],
+   "classification": "SIMPLIFY",
+   "change": "Keep allocator bridge and stable semantic membership projection; delete frozen-stage acquisition/result protocol."
+  },
+  {
+   "id": "measurement-core",
+   "sources": [
+    "internal/walltime/clock.go:33",
+    "internal/walltime/nanos.go:16",
+    "internal/walltime/spec.go:18",
+    "internal/walltime/audit.go:13"
+   ],
+   "types": [
+    "Instant",
+    "Clock",
+    "SystemClock",
+    "Nanos",
+    "InvocationSpec",
+    "InvocationIdentity",
+    "InvocationManifest",
+    "AuditEvidence",
+    "AuditFunc",
+    "Digest"
+   ],
+   "classification": "KEEP",
+   "change": "Reduce identities to schema/version, monotonic start/end/duration, terminal state, bucket/plan/invocation membership, argv/cwd/selector, and optional diagnostic timestamps."
+  },
+  {
+   "id": "lifecycle-ledger",
+   "sources": [
+    "internal/walltime/action.go:20",
+    "internal/walltime/action.go:475",
+    "internal/walltime/exec.go:82",
+    "internal/walltime/record.go:21",
+    "internal/walltime/record.go:338",
+    "internal/walltime/verify.go:31",
+    "internal/walltime/verify.go:102"
+   ],
+   "types": [
+    "ActionState",
+    "RunInActionOptions",
+    "ExecOptions",
+    "Level",
+    "Role",
+    "Producer",
+    "RunIdentity",
+    "ContainmentIdentity",
+    "ProcIdentity",
+    "Record",
+    "SpecIdentity",
+    "Writer",
+    "Finding",
+    "Phase",
+    "Interval",
+    "Envelope",
+    "Verdict",
+    "VerifyOptions"
+   ],
+   "classification": "SIMPLIFY",
+   "change": "Replace the multi-stream signed ledger with one atomic per-bucket observation plus optional per-invocation observations; keep terminal/failure and process completion semantics."
+  },
+  {
+   "id": "containment-schema",
+   "source": "internal/walltime/contain.go:98",
+   "types": [
+    "WorkloadCredential",
+    "MembershipFacts",
+    "RawEvent",
+    "Containment"
+   ],
+   "classification": "REMOVE",
+   "change": "These encode cgroup membership and credential authority. The practical runner needs an internal process-group controller, not an evidence schema."
+  },
+  {
+   "id": "predictor-and-eta",
+   "sources": [
+    "internal/walltime/palloc.go:62",
+    "internal/walltime/palloc.go:131",
+    "internal/walltime/palloc.go:376",
+    "internal/walltime/palloc.go:645",
+    "internal/walltime/aeta.go:24",
+    "internal/walltime/aeta.go:84",
+    "internal/walltime/gates.go:89",
+    "internal/walltime/gates.go:164"
+   ],
+   "types": [
+    "Feature",
+    "FeatureVector",
+    "TrainingLabel",
+    "TrainingLineageID",
+    "TrainingReceiptSet",
+    "Scorer",
+    "PcheckInvocation",
+    "PcheckDocument",
+    "ComponentClass",
+    "Component",
+    "AetaRegistry",
+    "AetaInputs",
+    "InstantiatedComponent",
+    "AetaInstance",
+    "GateResult",
+    "PredictorSample",
+    "AetaSample"
+   ],
+   "classification": "SIMPLIFY",
+   "change": "Replace sealed lineage/registry/Pcheck schemas with a versioned online model and observation rows. Keep deterministic scoring, nonnegative floors, bucket-total ETA, MAE/error regression helpers, and separate allocation/display values."
+  },
+  {
+   "id": "campaign-gates",
+   "source": "internal/walltime/gates.go:104",
+   "types": [
+    "Reconciliation",
+    "CampaignRun",
+    "CampaignPair"
+   ],
+   "classification": "REMOVE",
+   "change": "Only implements frozen study reconciliation and B/C population decisions."
+  },
+  {
+   "id": "authority-stage-and-replay",
+   "sources": [
+    "internal/walltime/stage.go:47",
+    "internal/walltime/stage.go:153",
+    "internal/walltime/stage.go:470",
+    "internal/walltime/stage.go:482",
+    "internal/walltime/stage.go:1625",
+    "internal/walltime/stage.go:2031",
+    "internal/walltime/stage.go:2257"
+   ],
+   "types": [
+    "AlgorithmIdentity",
+    "ToolIdentity",
+    "RawSnapshot",
+    "RunnableSnapshot",
+    "ClockPolicy",
+    "ParserIdentity",
+    "PlanningInputBundle",
+    "Signature",
+    "Stage1Manifest",
+    "ActionIdentity",
+    "SourceProfileReceipt",
+    "StoreFacts",
+    "StoreReceipt",
+    "InstrumentationIdentity",
+    "InputAccess",
+    "Stage2Receipt",
+    "Stage1Approval",
+    "ReplayAttestation",
+    "PlannerClaimReceipt",
+    "BuildAttestation",
+    "RunnerAttestation",
+    "LockedPackage"
+   ],
+   "classification": "REMOVE",
+   "change": "Protected authority, signed frozen inputs, implementation identity, fleet/build attestations, replay, and one-shot durable claims are historical research-proof schemas."
+  },
+  {
+   "id": "signer-and-observer",
+   "sources": [
+    "internal/walltime/delegation.go:47",
+    "internal/walltime/roster.go:39",
+    "internal/walltime/observe.go:66"
+   ],
+   "types": [
+    "SignerDelegation",
+    "DelegationScope",
+    "RosterEntry",
+    "Roster",
+    "StreamDigest",
+    "Seal",
+    "KeyLogEntry",
+    "ObserverConfig",
+    "InvocationController"
+   ],
+   "classification": "REMOVE",
+   "change": "Only supports multi-signer and triple-observer eligibility claims."
+  },
+  {
+   "id": "training-evidence",
+   "source": "internal/walltime/labelevidence.go:30",
+   "types": [
+    "PhysicalVReceipt",
+    "SelectedWorkDocument",
+    "TopologyValidationReceipt",
+    "LabelEvidence"
+   ],
+   "classification": "REMOVE",
+   "change": "No production constructor closes this schema; it exists to prove sealed offline training attribution. Replace with ordinary atomic wall observations keyed to exact plan membership."
+  },
+  {
+   "id": "campaign-ablation-schedule",
+   "sources": [
+    "internal/walltime/ablation.go:45",
+    "internal/walltime/ablationderived.go:18",
+    "internal/walltime/agh.go:22",
+    "internal/walltime/campaign.go:19",
+    "internal/walltime/schedule.go:13"
+   ],
+   "types": [
+    "CampaignAblationRef",
+    "AblationDerived",
+    "StepAttempt",
+    "StepAttemptDocument",
+    "CampaignArm",
+    "CampaignPairRef",
+    "CampaignIndex",
+    "CampaignRelease",
+    "CampaignLoader",
+    "FileCampaignLoader",
+    "ScheduledPair",
+    "CampaignSchedule"
+   ],
+   "classification": "REMOVE",
+   "change": "Only supports the frozen 12-ablation/five-pair/80-row research decision."
+  },
+  {
+   "id": "release-manifest",
+   "source": "internal/walltime/release.go:33",
+   "types": [
+    "ReleaseManifest",
+    "ReleaseAsset",
+    "ReleaseAssetMember",
+    "GoreleaserArtifact"
+   ],
+   "classification": "REMOVE",
+   "change": "Only supports candidate/release proof and publication gating; ordinary release checks remain outside wall-time."
+  }
+ ],
+ "action_interfaces": [
+  {
+   "action": "candidate-digest",
+   "source": ".github/actions/candidate-digest/action.yml:16",
+   "classification": "REMOVE",
+   "inputs": [
+    "resolver-version",
+    "stage1-file",
+    "authority",
+    "authority-key",
+    "expect"
+   ],
+   "outputs": [
+    "digest"
+   ]
+  },
+  {
+   "action": "install",
+   "source": ".github/actions/install/action.yml:12",
+   "classification": "SIMPLIFY",
+   "keep_inputs": [
+    "version"
+   ],
+   "remove_inputs": [
+    "release-pins-ref",
+    "candidate-binary-digest"
+   ]
+  },
+  {
+   "action": "plan",
+   "source": ".github/actions/plan/action.yml:8",
+   "classification": "SIMPLIFY",
+   "keep_inputs": [
+    "runner",
+    "k",
+    "count",
+    "file-parallelism",
+    "store-path",
+    "events-dir",
+    "shard-plan",
+    "version",
+    "working-directory",
+    "vitest-command",
+    "node-prefixes",
+    "exclude-module",
+    "setup-command",
+    "wall-time-dir"
+   ],
+   "remove_inputs": [
+    "release-pins-ref",
+    "candidate-binary-digest",
+    "bundle",
+    "stage1",
+    "stage2-out",
+    "claim-store-attestation",
+    "campaign-authority-keys",
+    "claim-store",
+    "scorer",
+    "registry",
+    "authority-key",
+    "authority",
+    "derived-out"
+   ],
+   "keep_outputs": [
+    "matrix",
+    "shard-plan"
+   ],
+   "added_inputs": [
+    "est-basis",
+    "runner-class",
+    "runs-on-label",
+    "scored",
+    "cache-declaration-file",
+    "candidate-sha",
+    "workload-commit"
+   ],
+   "added_inputs_note": "S-4/R20-F1 (acceptance-contract.md 21 is authoritative for every input below; this note records provenance only): each sentence here names that section rather than repeating it. The execution-class leaf replaced a runner instance name because the instance name has no stability contract (acceptance-contract.md 15.3). A label producer was added because no GitHub context yields the caller's resolved value (acceptance-contract.md 15.3). The scored flag is explicit because a basis cannot imply it (acceptance-contract.md 5.1). The declaration, candidate and workload inputs reach the plan action so admission can refuse before matrix emission (acceptance-contract.md 19.3a), and the setup input is the producer for its comparability leaf (acceptance-contract.md 15.3).",
+   "cache_note": "R12-D2/R17-F3: plan receives ONLY the plan-time DECLARATION leaves of acceptance-contract.md 10.5.0 via cache-declaration-file and validates them under AD-9 before matrix emission. It never sees matched_key, disposition, or an executed Mongo digest - those do not exist yet."
+  },
+  {
+   "action": "preflight",
+   "source": ".github/actions/preflight/action.yml:12",
+   "classification": "REMOVE",
+   "inputs": [
+    "bundle",
+    "stage1",
+    "stage2",
+    "authority-key",
+    "authority",
+    "registry",
+    "scorer",
+    "stage1-digest",
+    "stage2-digest",
+    "registry-digest",
+    "verifier-id",
+    "replay-attestation",
+    "version",
+    "release-pins-ref",
+    "candidate-binary-digest"
+   ]
+  },
+  {
+   "action": "record",
+   "source": ".github/actions/record/action.yml:8",
+   "classification": "SIMPLIFY",
+   "keep_inputs": [
+    "runner",
+    "k",
+    "count",
+    "store-path",
+    "events-dir",
+    "shard-plan",
+    "version",
+    "working-directory",
+    "vitest-command",
+    "exclude-module"
+   ],
+   "remove_inputs": [
+    "release-pins-ref",
+    "candidate-binary-digest"
+   ],
+   "add_inputs": [
+    "wall-observations-dir",
+    "campaign-config-json",
+    "campaign-config-digest-expected"
+   ],
+   "add_inputs_note": "D-3/R9-D2/R19-F1/R11-F3: the frozen pre-pilot configuration reaches ingest as canonical content plus the caller's expected digest, not as a caller-side path. The four transport steps, the digest comparison, and the campaign-identity binding are acceptance-contract.md 19.9c-1's; what ingest does with a row that carries a campaign identity, and what it does when that identity is missing or does not match the supplied configuration, are acceptance-contract.md 15.1b and acceptance-contract.md 19.9c's. An earlier note here restated those and named a single `campaign-config` input that no longer exists."
+  },
+  {
+   "action": "run-bucket",
+   "source": ".github/actions/run-bucket/action.yml:8",
+   "classification": "SIMPLIFY",
+   "keep_inputs": [
+    "runner",
+    "script",
+    "name",
+    "est-seconds",
+    "events-dir",
+    "version",
+    "working-directory",
+    "setup-command",
+    "wall-time-dir"
+   ],
+   "remove_inputs": [
+    "release-pins-ref",
+    "candidate-binary-digest",
+    "cgroup-root",
+    "workload-user",
+    "script-user",
+    "workload-uid",
+    "scored",
+    "run-key",
+    "stage1-digest",
+    "stage2-digest",
+    "registry-digest",
+    "verifier-id"
+   ],
+   "add_inputs": [
+    "runs-on-label",
+    "cache-declaration-file",
+    "cache-declaration-digest",
+    "dependency-cache-producer",
+    "dependency-cache-matched-key",
+    "dependency-cache-hit",
+    "campaign-id",
+    "candidate-sha",
+    "workload-commit",
+    "shard-plan"
+   ],
+   "add_inputs_note": "S-4/R18-F1: runs-on-label is passed as one caller expression to both actions so that the key and the observation cannot disagree about it - QC12 is the comparison. The cache declaration reaches the plan action as a file whose leaves and transport are acceptance-contract.md 10.5.0 and 10.5.2's; this note names neither the leaves nor the mechanism.",
+   "cache_note": "R12-D2/R13-D2/R18-F1: this action consumes the declaration and produces the outcomes. Which leaves are which, how the declaration is verified on arrival, where the restore result comes from, and what the QC split checks are all acceptance-contract.md 10.5's, and are neither enumerated, counted, nor paraphrased here."
+  },
+  {
+   "action": "verify-wall",
+   "source": ".github/actions/verify-wall/action.yml:9",
+   "classification": "SIMPLIFY",
+   "keep_inputs": [
+    "wall-time-dir",
+    "version",
+    "shard-plan-file",
+    "events-dir",
+    "runner"
+   ],
+   "remove_inputs": [
+    "require",
+    "release-pins-ref",
+    "candidate-binary-digest",
+    "stage1-file",
+    "stage2-file",
+    "replay-file",
+    "registry-file",
+    "aeta-file",
+    "pcheck-file",
+    "invocations-file",
+    "step-attempt-file",
+    "authority",
+    "authority-key",
+    "verdict-file",
+    "record-signer",
+    "verifier-key",
+    "scorer-file",
+    "training-set-file",
+    "records-artifact"
+   ]
+  }
+ ],
+ "workflow_interface": {
+  "workflow": ".github/workflows/bucketed-reusable.yml",
+  "source": ".github/workflows/bucketed-reusable.yml:57",
+  "classification": "SIMPLIFY",
+  "keep_inputs": [
+   "runner",
+   "k",
+   "count",
+   "file-parallelism",
+   "test-command",
+   "cache-scope",
+   "testbucket-version",
+   "go-version",
+   "node-version",
+   "working-directory",
+   "node-prefixes",
+   "exclude-module",
+   "setup-command",
+   "wall-time-dir",
+   "runs-on"
+  ],
+  "remove_inputs": [
+   "candidate-binary-digest",
+   "release-pins-ref",
+   "candidate-resolver-version",
+   "cgroup-root",
+   "workload-user",
+   "script-user",
+   "workload-uid",
+   "campaign-authority-keys",
+   "planner-claim-store",
+   "stage1-digest",
+   "stage2-digest",
+   "registry-digest",
+   "verifier-id",
+   "verify-require",
+   "authority",
+   "authority-key",
+   "run-key-secret",
+   "record-signer",
+   "verifier-key-secret",
+   "frozen-inputs-artifact",
+   "frozen-scorer-file",
+   "frozen-training-set-file",
+   "frozen-documents-artifact"
+  ],
+  "remove_secrets": [
+   "planner-claim-store-attestation",
+   "run-key",
+   "verifier-key"
+  ],
+  "keep_plan_job_outputs": [
+   "matrix"
+  ],
+  "add_plan_job_outputs": [
+   "cache-declaration-json",
+   "cache-declaration-digest"
+  ],
+  "add_workflow_outputs": [
+   "cache-declaration-json",
+   "cache-declaration-digest"
+  ],
+  "transport_note": "R13-D2/R18-F1: this note records only why a pathname was insufficient. Separate Actions jobs share no filesystem, so the earlier design -- passing one cache-declaration-file PATHNAME to plan and to every matrix job -- carried no bytes and could not satisfy the byte identity it claimed. The transport that replaced it is normative in acceptance-contract.md 10.5.2 and is not described here, in outline or in detail.",
+  "remove_plan_job_outputs": [
+   "candidate-binary-digest"
+  ],
+  "permission_effect": "Remove actions:read when A_GH and candidate artifact resolution are gone; retain contents:read.",
+  "added_inputs": [
+   "est-basis",
+   "scored",
+   "runner-class",
+   "runs-on-label",
+   "cache-declaration-json",
+   "cache-declaration-digest-expected",
+   "dependency-cache-producer",
+   "dependency-cache-matched-key",
+   "dependency-cache-hit",
+   "candidate-sha",
+   "workload-commit",
+   "campaign-id",
+   "wall-observations-dir",
+   "campaign-config-json",
+   "campaign-config-digest-expected"
+  ],
+  "added_inputs_note": "R8-D6 (acceptance-contract.md 21 is authoritative): the reusable workflow exposes EVERY input a scored plan needs. An earlier revision offered `scored` while omitting cache-declaration-file, candidate-sha and workload-commit, so a caller could request a scored run and then fail AD-9/AD-10 with no way to satisfy them. Where the label is defined and which jobs and action inputs reference it are acceptance-contract.md 21's.",
+  "disposition_note": "R10-D5: every input name has exactly ONE disposition per interface. `campaign-id` is classified as ADDED here: R54 has no such input on this workflow, and the scored path introduces it. An input never appears in more than one of keep/remove/add.",
+  "cache_note": "R12-D2: the workflow transports the DECLARATION only; outcomes are produced per bucket job."
+ },
+ "recommended_practical_observation_schema": {
+  "kind": "testbucket.wall-observation/v1",
+  "fields_authority": "R18-F1: the observation artifact's wire paths are the field registry's, filtered to artifact: observation. `scope.md` §2A is the machine authority for that set; this document held a second copy and no longer does.",
+  "rules": [
+   "R21-F1: acceptance-contract.md 13 states how an observation is written and uploaded.",
+   "R21-F1: acceptance-contract.md 7.1 states the ingest qualification checks.",
+   "R21-F1: acceptance-contract.md 15.1b states which retained rows a fit selects.",
+   "S-4/R21-F1: which leaf carries the comparability token, and which name survives only as a diagnostic, are acceptance-contract.md 15.3's.",
+   "S-1/R20-F1: the objective and its display conversion are acceptance-contract.md 0.9's, evaluated in the domain of acceptance-contract.md 1.1. Queue and unrelated whole-job time are outside the measured interval of acceptance-contract.md 3. [The additive per-invocation form is SUPERSEDED by PD-3.]",
+   "# STATUS: SUPERSEDED BY PD-1 - Expose wall_est_seconds separately from legacy est_seconds until a deliberate versioned contract change.  [SUPERSEDED by PD-1: additive only; est_seconds is not replaced.]",
+   "S-6/R21-F1: acceptance-contract.md 15.1a separates the three provenance identities and acceptance-contract.md 7.1 states the check that rejects a row collapsing them."
+  ],
+  "canonical_profile_authority": "R18-F1: the canonical profile block is defined in acceptance-contract.md 13.0 and its wire paths are registered in `scope.md` §2A. This document held a second copy and no longer does.",
+  "history_ring_row_authority": "R18-F1: the ring row is defined in acceptance-contract.md 15.1a and its wire paths are registered in `scope.md` §2A. This document held a second copy and no longer does.",
+  "model_parameters_authority": "R18-F1: the four frozen model parameters are named in acceptance-contract.md 0.9. This document held a second copy and no longer does.",
+  "canonical_schema_table": "docs/walltime/scope.md 2A - the field registry: wire_paths, roles and memberships as three dimensions. S-3/R24-F1: the earlier schema-generation claim is withdrawn, and which projections are generated and how each is compared are acceptance-contract.md 22 test 63's named table. This document states neither.",
+  "regressors_authority": "R18-F1: the design columns and their order are the field registry's REGRESSOR rows in `scope.md` §2A, read by acceptance-contract.md 0.9. This document held a second copy and no longer does.",
+  "response": "elapsed_ns (observation top-level) = A, integer nanoseconds",
+  "diagnostics_not_model_inputs_authority": "R18-F1: the DIAGNOSTIC role is assigned in `scope.md` §2A. This document held a second copy and no longer does.",
+  "comparability_key_name": "comparability_key_digest",
+  "comparability_key_leaves_authority": "R18-F1: the ordered membership is the field registry's memberships.comparability_key in `scope.md` §2A, projected by acceptance-contract.md 15.3. This document held a second copy and no longer does.",
+  "comparability_key_source": "R20-F1: the key's leaves are sourced from the plan job's context and environment. Which leaves those are, and which of them the plan action carries, are acceptance-contract.md 15.3's. S-4: a runner instance name was removed from the key.",
+  "units": "S-1/D-1/R11-D8/R19-F1: the unit system, the one non-integer coefficient, the rounding step and the single display division are acceptance-contract.md 0.9's, and the inventory of seconds-valued surfaces with the emission predicate for each is acceptance-contract.md 5.1's. This map states none of them. What it records is why the question recurred: an earlier revision wrote a rule about every seconds display, which was false because the reporter-basis PlanUnit and PlanSummary values are legacy v0.2.2 seconds frozen by PD-1 and were never part of the new unit system, and because ImbalancePct is a percentage rather than a duration.",
+  "fields_note": "S-3/R18-F1: the observation artifact's wire paths are the field registry's, filtered to artifact: observation. `scope.md` §2A is the machine authority and acceptance-contract.md 13 is the normative schema; this document names neither the paths nor their number. TestFieldRegistryCoversEverySerializedPath is the test. An earlier revision held a second copy of the list here and cited a scope section that is now a redirect.",
+  "history_ring_row_note": "S-6/R8-D3/R18-F1/R20-F1: this note records only why the ring row took the shape it did. An earlier append-dependent recency rule let two ingest orders retain different populations, and a row-intrinsic key removed that (acceptance-contract.md 15.1b). Two further fields were serialized so the key is reconstructible from a decoded row (acceptance-contract.md 15.1a). The recency key itself, the eviction bound, the exclusion rule and the trainable write are acceptance-contract.md 15.1a and acceptance-contract.md 15.1b's to state.",
+  "regressors_note": "S-1/R19-F1: the design columns, their order and their units are acceptance-contract.md 0.9's, read from the field registry's REGRESSOR rows. This map states neither.",
+  "fitting_population": "S-2/R8-D2/R9-D2/R19-F1: what the fitter reads, when the trainable flag is written, and what happens to a row whose campaign identity is missing or mismatched are acceptance-contract.md 15.1b and acceptance-contract.md 19.9c's; this map states none of them. An earlier note here restated all three and was ambiguous between two of its own clauses, which is the drift a second copy produces.",
+  "calibration_outcomes_authority": "R20-F1: the bounded-calibration outcome vocabulary is named in acceptance-contract.md 6.7. This document held a second copy and no longer does.",
+  "calibration_outcomes_note": "S-7/R8-D1/R12-D4/R18-F1: this note records only why the outcome vocabulary needed repair. An earlier revision used a bare INFEASIBLE for a search that had merely run out of budget, which conflated 'not found yet' with 'cannot exist', and it called the layout function total when it is not. The corrected vocabulary, what each outcome names, and the partial-layout / total-proposer split are acceptance-contract.md 6.7's. The published boundary fixture is acceptance-contract.md 17.3's.",
+  "fixture_acceptance_tests": [
+   "TestPinnedConsumerStoredFixtureIntegrity",
+   "TestPinnedConsumerCheckoutMatchesManifest",
+   "TestPinnedConsumerSuffixAtomsMatchProductionAlgorithm"
+  ],
+  "implementation_delta_registry": "docs/walltime/scope.md 21.0 - the machine-readable delta registry block, one of the two machine authorities acceptance-contract.md 0.10 names. Counts are DERIVED from it. R8-D8/R17-F2: the delta projection contract is acceptance-contract.md 0.5's table and this map does not restate it. An earlier note here said TestScopeArtifactConsistency compares only the ID set, its order, acceptance_tests and gap_section resolution, which is one of the three incompatible accounts R4 found; 0.5 is now the only account. What remains hand-authored is the gap bodies' file:line detail and rationale, and no renderer exists for those. S-10: no document quotes a gap count, a line count, or a SHA-256 of a document in this set.",
+  "scored_run_required_action_inputs": {
+   "plan": [
+    "runner-class",
+    "runs-on-label",
+    "scored",
+    "cache-declaration-file",
+    "candidate-sha",
+    "workload-commit"
+   ],
+   "run-bucket": [
+    "runs-on-label",
+    "cache-declaration-file",
+    "cache-declaration-digest",
+    "dependency-cache-producer",
+    "campaign-id",
+    "candidate-sha",
+    "workload-commit",
+    "shard-plan"
+   ],
+   "record": [
+    "wall-observations-dir",
+    "campaign-config-json",
+    "campaign-config-digest-expected"
+   ],
+   "reusable_workflow": [
+    "est-basis",
+    "scored",
+    "runner-class",
+    "runs-on-label",
+    "cache-declaration-json",
+    "cache-declaration-digest-expected",
+    "dependency-cache-producer",
+    "dependency-cache-matched-key",
+    "dependency-cache-hit",
+    "candidate-sha",
+    "workload-commit",
+    "campaign-id",
+    "wall-observations-dir",
+    "campaign-config-json",
+    "campaign-config-digest-expected"
+   ],
+   "note": "AD-8, AD-9, AD-10. R8-D6/R19-F1: this list is the acceptance-contract.md 21 union, in the contract's order, compared in both directions. An earlier revision offered a scored run while omitting three of the inputs it needs, so a caller could ask for one and then fail admission with no way to satisfy it; R16-F2 later found one more input missing from the projection. The declaration's membership is acceptance-contract.md 10.5.0's and its transport is acceptance-contract.md 10.5.2's; neither is described here."
+  },
+  "cache_state_invariants": "R11-D3/R12-D2/R15-F2/R18-F1: this note records only why the cache block is shaped as it is. An earlier phrase called every leaf a declaration, which the registry contradicted, and an earlier design passed a pathname where bytes were required. The leaves, their DECLARATION/OUTCOME classes, their legal values, the transport, the QC split and the cross-arm comparison are acceptance-contract.md 10.5 and 17.19's, and the compared membership is the field registry's memberships.bc_inv in `scope.md` §2A. None of them is enumerated, counted, or paraphrased here.",
+  "fixture_acceptance_tests_note": "R11-D11/R12-D8: three distinct symbols - stored-byte integrity, checkout equality, and the production suffix-atom regression. The single-symbol form that once held both the offline and checkout contracts is obsolete and is not named anywhere in this map.",
+  "objective": "R13-A: the four-term A_eta_ns objective and its est_seconds display conversion are stated ONCE, normatively, in acceptance-contract.md 0.9, and evaluated in the checked-integer domain of acceptance-contract.md 1.1. This map does not restate them. An earlier revision carried the same equation in four documents and one of the copies (salvage-audit.md) dropped the round_half_up -- which is exactly the drift a second copy produces.",
+  "residual_definitions": "R12-D7/R13-A/R16-F1: residual_mae_ns, residual_p90_ns and the pinned sigma_max procedure are defined once, in acceptance-contract.md 6.8 step 5 and 6.6; their arithmetic domain, overflow behaviour and terminal outcomes are acceptance-contract.md 1.1 and 1.3. An earlier note here named scope.md 7.4/7.4a, which the R15 move turned into derivations. This map names those homes and restates neither the definitions nor the published row-25 witness.",
+  "arithmetic_domain": "R13-D5/R19-F1: the arithmetic domain, the accumulation and narrowing rules, the forbidden forms, the terminal outcomes and the solver-cap outcomes are acceptance-contract.md 1.1 and acceptance-contract.md 1.3's. An earlier note here restated all of them; it is removed rather than reworded.",
+  "model_parameters_units_authority": "R19-F1: the four frozen model parameters and their units are named in acceptance-contract.md 0.9. This document held a second copy and no longer does."
+ },
+ "verification": {
+  "json_valid": true,
+  "changed_path_inventory": {
+   "expected": 184,
+   "listed": 184,
+   "unique": 184,
+   "missing": 0,
+   "extra": 0,
+   "method": "sorted comparison with jj diff --summary at the exact baseline and target"
+  },
+  "classifications": {
+   "KEEP": 22,
+   "SIMPLIFY": 49,
+   "REMOVE": 112,
+   "UNCERTAIN": 1
+  },
+  "go_test": {
+   "command": "go test ./...",
+   "status": "pass",
+   "tests_passed": 1419,
+   "packages": 7,
+   "status_note": "HISTORICAL: recorded during the R54 read-only audit. NOT a current result. scope.md test 25 requires `go test -race -count=1 ./...` on Linux in the OrbStack VM before the first deletion and again after step 6; no execution result is claimed by the specification (D-13)."
+  },
+  "repository_working_copy": "clean",
+  "repository_working_copy_note": "HISTORICAL: describes the R54 audit's working copy, not the current one. The current inventory is enumerated from `jj status` at read time (S-10)."
+ },
+ "dependency_order": [
+  "R22-F1: the implementation order is acceptance-contract.md 0.5a's; this document states none of it.",
+  "# STATUS: SUPERSEDED BY PD-1 AND PD-3 - Add a versioned wall history/model and pass its per-unit score through AllocationScore; add wall_est_seconds to plan/matrix."
+ ],
+ "superseded_recommendations": {
+  "PD-1": {
+   "status": "superseded",
+   "decision": "Additive compatibility frozen by owner decision PD-1.",
+   "effect": "Any recommendation in this file or salvage-audit.md to replace est_seconds with wall_est_seconds is not adopted.",
+   "authority": "docs/walltime/acceptance-contract.md §0.7",
+   "acceptance_test": "TestReporterBasisPreservesLegacyProjectionAndDeclaresBasis"
+  },
+  "PD-3": {
+   "status": "superseded",
+   "decision": "Nonlinear four-parameter partition objective frozen by owner decision PD-3.",
+   "effect": "Any recommendation here or in salvage-audit.md for an additive per-invocation model is NOT adopted. The model this package uses is acceptance-contract.md 0.9's, and this record does not restate it.",
+   "authority": "docs/walltime/acceptance-contract.md §0.9",
+   "acceptance_test": "TestWallModelAndPlannerUsePD3Objective",
+   "also_applies_to": [
+    "dependency_order entries recommending an additive per-invocation model",
+    "recommended_practical_observation_schema rules mentioning per-invocation overhead"
+   ]
+  },
+  "stale_names": {
+   "status": "superseded",
+   "authority": "docs/walltime/scope.md §2A — the field registry",
+   "replaced": {
+    "comparability_key_digest": "comparability_key_digest",
+    "per_invocation_ns": "whole_invocation_overhead_ns + per_slice_overhead_ns",
+    "wall_est_seconds": "est_basis + a_eta_display (additive; est_seconds not replaced)",
+    "plan_id": "plan_digest",
+    "runner_image_digest": "runner_image_label",
+    "runner_image_id": "runner_image_label",
+    "whole_file_count (as model dependency)": "i_any_whole_file (indicator); the count is DIAGNOSTIC",
+    "reporter_sum": "reporter_sum_ns (integer nanoseconds, S-1)",
+    "runner_name": "runner_class (comparability leaf) + actual_runner_name (diagnostic) (S-4)",
+    "I_any_whole_file": "i_any_whole_file",
+    "INFEASIBLE": "NOT_FOUND_WITHIN_BUDGET (bounded search) or STRUCTURALLY_INFEASIBLE (proof) (S-7)",
+    "head_sha (as candidate/workload identity)": "head_sha (orchestration) + candidate_sha + workload_commit (S-6)",
+    "bc_* aliases": "wire paths in scope.md §2A memberships.bc_inv (S-3)",
+    "canonical schema table": "field registry: wire_paths + roles + memberships (S-3)"
+   }
+  },
+  "S-1-units": {
+   "status": "SUPERSEDED BY S-1",
+   "superseded_text": "A_eta computed with fixed_ns/1e9 + scale * sum(base seconds) + whole_invocation_overhead_ns/1e9 + per_slice_overhead_ns/1e9 * slice_count",
+   "reason": "mixed units: three coefficients divided by 1e9 while scale * sum(base seconds) stayed in nanoseconds; a literal implementation is wrong by 1e9",
+   "replacement": "integer nanoseconds throughout, scale dimensionless, one division of the complete A_eta_ns at the display boundary",
+   "acceptance_test": "TestWallModelIsIntegerNanosecondsEndToEnd"
+  },
+  "S-4-runner-name": {
+   "status": "SUPERSEDED BY S-4",
+   "superseded_text": "comparability key leaf runner_name, sourced from ${{ runner.name }} in the plan job",
+   "reason": "a hosted runner instance name has no stability contract across runs, so the key described a plan-job instance and MIN_RUNS=3 under one key was unreachable",
+   "replacement": "runner_class, an explicit stable required plan-action input; the instance name survives as the diagnostic actual_runner_name",
+   "acceptance_test": "TestExecutionProfileIsPlanTimeAvailableAndLabelBound"
+  },
+  "S-6-head-sha-overload": {
+   "status": "SUPERSEDED BY S-6",
+   "superseded_text": "exclude rows whose head_sha equals the B candidate, the C candidate, or the orchestration commit",
+   "reason": "overloaded one field with three identities and contradicted warming, since comparability pins testbucket_sha256 and the warm corpus is necessarily produced by the candidate binary",
+   "replacement": "three separate identity fields plus exclusion by campaign run id and campaign window, per acceptance-contract.md 15.1b",
+   "acceptance_test": "TestWallHistoryRecencyEvictionAndThreeIdentities"
+  },
+  "R9-calibration-outcome": {
+   "status": "SUPERSEDED BY S-7/R8-D1",
+   "superseded_text": "calibration reports INFEASIBLE after a bounded layout search",
+   "reason": "a bounded search cannot prove the universe cannot produce rank 4",
+   "replacement": "NOT_FOUND_WITHIN_BUDGET for the bounded case; STRUCTURALLY_INFEASIBLE only for a whole-universe proof naming the actually-zero column",
+   "acceptance_test": "TestCalibrationModeTerminatesSufficientOrNotFoundWithinBudget"
+  }
+ },
+ "working_copy_inventory": {
+  "note": "CURRENT STATE: the working copy is NOT clean. It carries uncommitted additions in the four path groups listed below, visible to `jj status` and `jj file list -r @`. No commit has been made. R13-D6: NO COUNT IS WRITTEN HERE. An earlier note said 20 and enumerated only three of the four groups -- it dropped testdata/walltime/ while the adjacent inventory_source key both forbade a count and named the oracle as part of the inventory. The count is derived by TestScopeArtifactConsistency from `jj status` at read time; the path groups below are the complete grouping. The historical R54 audit-clean fact is recorded separately under target.r54_audit_working_copy_clean and is not the current state.",
+  "inventory_source": "R11-D11: enumerated from jj status / jj file list -r @ at read time by TestScopeArtifactConsistency. NO count is written here. testdata/walltime/test58-feedback-oracle.json is part of the inventory.",
+  "path_groups": [
+   "docs/walltime/",
+   "testdata/consumers/",
+   "testdata/walltime/",
+   "review inputs: scope-adversary.md, scope-adjudication.md"
+  ]
+ },
+ "revision": "PWT-13"
+}

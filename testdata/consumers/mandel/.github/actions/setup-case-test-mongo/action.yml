@@ -1,0 +1,36 @@
+name: Set up strict Case test MongoDB
+description: Provision and prove the cached MongoDB binary used by offline Case tests
+
+runs:
+  using: composite
+  steps:
+    - name: Configure strict Case test paths
+      shell: bash
+      run: |
+        if [[ "$RUNNER_TEMP" != /* || "$RUNNER_TEMP" == "/" ]]; then
+          echo "RUNNER_TEMP must be an absolute non-root path" >&2
+          exit 1
+        fi
+        echo "MONGOMS_DOWNLOAD_DIR=$RUNNER_TEMP/case-mongodb-binaries" >> "$GITHUB_ENV"
+        echo "EXCEPTIONS_REPLSET_TMP_ROOT=$RUNNER_TEMP/case-replset" >> "$GITHUB_ENV"
+
+    - name: Cache Case MongoDB binary
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/case-mongodb-binaries
+        key: ${{ runner.os }}-${{ runner.arch }}-case-mongod-${{ hashFiles('pnpm-lock.yaml', '.github/scripts/prepare-case-mongod.ts', '.github/actions/setup-case-test-mongo/action.yml') }}
+
+    - name: Bootstrap strict Case MongoDB binary
+      shell: bash
+      run: pnpm tsx .github/scripts/prepare-case-mongod.ts
+      env:
+        MONGOMS_RUNTIME_DOWNLOAD: 'true'
+        MONGOMS_MD5_CHECK: 'true'
+
+    - name: Seal Case proof environment
+      shell: bash
+      run: echo "MONGOMS_RUNTIME_DOWNLOAD=false" >> "$GITHUB_ENV"
+
+    - name: Preflight strict Case replica set
+      shell: bash
+      run: env -u MONGO_URL -u MONGO_URI -u MONGODB_URL pnpm tsx shared/f/lib/cases/test_support/replset_preflight.ts
