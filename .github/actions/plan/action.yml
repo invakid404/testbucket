@@ -215,6 +215,56 @@ inputs:
       digest as it is written.
     default: ""
 
+  # --- contract §21 added inputs -------------------------------------------
+  est-basis:
+    description: >-
+      Which weight the partition is built from: `reporter` (default) or `wall`.
+      Mode selection is contract §16.1; §0.8's phase 1 decides what plan would
+      be produced and phase 2 vetoes a cold plan for a scored run.
+    default: reporter
+  scored:
+    description: >-
+      Whether this plan belongs to a scored campaign run. Nothing else can
+      derive it — basis does not imply it, since a scored B arm runs `reporter`
+      and an unscored warm-up may too — so it is an explicit boolean and it
+      gates PD-2's phase-2 veto plus AD-8…AD-10.
+    default: "false"
+  runner-class:
+    description: >-
+      The stable execution-class string of comparability-key leaf 1 (§15.3). It
+      replaces the former runner_name leaf, whose per-instance value had no
+      cross-run stability contract and made MIN_RUNS = 3 under one key
+      unreachable. Required non-empty for a scored plan (AD-8).
+    default: ""
+  runs-on-label:
+    description: >-
+      The caller's resolved `runs-on` label, the producer for key leaf 2. No
+      GitHub context yields it inside a composite action, so the caller passes
+      it explicitly; the same value goes to run-bucket, which echoes it as
+      observed_runs_on_label for QC12. Required non-empty for a scored plan
+      (AD-8).
+    default: ""
+  cache-declaration-file:
+    description: >-
+      Job-local file holding the canonical cache declaration of §10.5.0, which
+      the plan job materialized from `cache-declaration-json` and verified
+      against `cache-declaration-digest-expected` (§10.5.2 steps 0b–0c). plan
+      validates only the declaration leaves and refuses before emitting a
+      matrix; it never sees a matched key, a disposition or an executed digest,
+      because those do not exist yet. Required for a scored plan (AD-9).
+    default: ""
+  candidate-sha:
+    description: >-
+      The testbucket commit the executing binary was built from. Neither the
+      runner context nor the binary carries it, so the caller that built it
+      passes it. Required for a scored plan (AD-10).
+    default: ""
+  workload-commit:
+    description: >-
+      The consumer checkout this run executes against. The orchestrator checked
+      it out at a full SHA, so it is the only party that knows it. Required for
+      a scored plan (AD-10).
+    default: ""
 outputs:
   matrix:
     description: 'The fromJSON matrix to feed the test job''s strategy.'
@@ -223,6 +273,20 @@ outputs:
     description: 'Path of the written shard-plan JSON.'
     value: ${{ inputs.shard-plan }}
 
+  cache-declaration-json:
+    description: >-
+      The canonical cache-declaration bytes the plan job verified, as a
+      single-line string. Job outputs are the transport because they cross the
+      job boundary with no extra permission and no artifact hop; a pathname
+      would transport nothing, since separate jobs share no filesystem
+      (§10.5.2 step 2).
+    value: ${{ steps.plan.outputs.cache-declaration-json }}
+  cache-declaration-digest:
+    description: >-
+      SHA-256 over those same bytes. Every matrix job materializes the JSON to
+      a job-local file and run-bucket re-verifies this digest before use, which
+      is what makes cross-job byte identity a checked property.
+    value: ${{ steps.plan.outputs.cache-declaration-digest }}
 runs:
   using: composite
   steps:
@@ -277,6 +341,13 @@ runs:
         TB_WALL_CAMPAIGN_AUTHORITY_KEYS: ${{ inputs.campaign-authority-keys }}
         TB_AUTHORITY_KEY: ${{ inputs.authority-key }}
         TB_AUTHORITY: ${{ inputs.authority }}
+        TB_EST_BASIS: ${{ inputs.est-basis }}
+        TB_SCORED: ${{ inputs.scored }}
+        TB_RUNNER_CLASS: ${{ inputs.runner-class }}
+        TB_RUNS_ON_LABEL: ${{ inputs.runs-on-label }}
+        TB_CACHE_DECLARATION_FILE: ${{ inputs.cache-declaration-file }}
+        TB_CANDIDATE_SHA: ${{ inputs.candidate-sha }}
+        TB_WORKLOAD_COMMIT: ${{ inputs.workload-commit }}
       run: |
         set -euo pipefail
 
@@ -344,6 +415,68 @@ runs:
         if [ -n "$TB_WALL_DIR" ]; then
           extra+=(--wall-dir "$TB_WALL_DIR")
         fi
+
+        # --- contract §19.3a scored admission, before any matrix exists -------
+        #
+        # AD-8, AD-9 and AD-10 are enforced HERE because §7 rule 17 names plan
+        # as the component that must refuse before emitting a matrix. An
+        # unscored run may omit every one of these and keeps its current
+        # defaults.
+        if [ "$TB_SCORED" = "true" ]; then
+          for pair in \
+            "runner-class:$TB_RUNNER_CLASS" \
+            "runs-on-label:$TB_RUNS_ON_LABEL" \
+            "cache-declaration-file:$TB_CACHE_DECLARATION_FILE" \
+            "candidate-sha:$TB_CANDIDATE_SHA" \
+            "workload-commit:$TB_WORKLOAD_COMMIT"; do
+            name=${pair%%:*}
+            value=${pair#*:}
+            if [ -z "$value" ]; then
+              echo "scored plan refused: $name is empty (contract §19.3a)" >&2
+              exit 1
+            fi
+          done
+          if [ ! -f "$TB_CACHE_DECLARATION_FILE" ]; then
+            echo "scored plan refused: cache-declaration-file $TB_CACHE_DECLARATION_FILE does not exist" >&2
+            exit 1
+          fi
+        fi
+
+        # --- §10.5.2 step 2: publish the declaration as JOB OUTPUTS ----------
+        #
+        # Job outputs are the transport because they cross the job boundary
+        # with no extra permission and no artifact hop. A pathname would carry
+        # nothing: separate jobs share no filesystem, so only content plus a
+        # verified digest establishes byte identity.
+        if [ -n "$TB_CACHE_DECLARATION_FILE" ] && [ -f "$TB_CACHE_DECLARATION_FILE" ]; then
+          # tr -d '\n' keeps the canonical single-line form the digest is taken
+          # over; a trailing newline would change the bytes run-bucket verifies.
+          decl=$(tr -d '\n' < "$TB_CACHE_DECLARATION_FILE")
+          printf 'cache-declaration-json=%s\n' "$decl" >> "$GITHUB_OUTPUT"
+          printf 'cache-declaration-digest=%s\n' \
+            "$(printf '%s' "$decl" | sha256sum | cut -d" " -f1)" >> "$GITHUB_OUTPUT"
+          extra+=(--cache-declaration-file "$TB_CACHE_DECLARATION_FILE")
+        fi
+
+        # est-basis selects the partition WEIGHT only; unit topology is
+        # store-derived in both bases (§16.1).
+        if [ -n "$TB_EST_BASIS" ]; then
+          extra+=(--est-basis "$TB_EST_BASIS")
+        fi
+        if [ "$TB_SCORED" = "true" ]; then
+          extra+=(--scored)
+        fi
+        for flag_pair in \
+          "--runner-class:$TB_RUNNER_CLASS" \
+          "--runs-on-label:$TB_RUNS_ON_LABEL" \
+          "--candidate-sha:$TB_CANDIDATE_SHA" \
+          "--workload-commit:$TB_WORKLOAD_COMMIT"; do
+          flag=${flag_pair%%:*}
+          value=${flag_pair#*:}
+          if [ -n "$value" ]; then
+            extra+=("$flag" "$value")
+          fi
+        done
 
         # --json puts the fromJSON matrix on stdout and the loaded-vs-missing
         # summary on stderr, so the summary lands in this log while the matrix

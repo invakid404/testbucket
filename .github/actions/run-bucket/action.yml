@@ -352,6 +352,66 @@ inputs:
     description: 'Delivery-bound verifier identity recorded on every record.'
     default: ""
 
+  # --- contract §21 added inputs -------------------------------------------
+  runs-on-label:
+    description: >-
+      The same label the caller passed to `plan`. Recorded into the observation
+      as observed_runs_on_label and compared against the key's
+      runner_image_label by QC12; a divergence is a reported misconfiguration,
+      not silent tolerance. Required non-empty for a scored run.
+    default: ""
+  cache-declaration-file:
+    description: >-
+      Job-local file this matrix job materialized from the plan job's
+      `cache-declaration-json` output — the immutable plan-time declaration of
+      §10.5.0. run-bucket verifies its digest, copies the declaration leaves
+      verbatim into the observation, and then fills every leaf §10.5.0 classes
+      as an outcome. Required for a scored run (AD-9).
+    default: ""
+  cache-declaration-digest:
+    description: >-
+      The SHA-256 the plan job published. run-bucket recomputes it over the
+      materialized bytes and fails the job on any difference, before the bucket
+      script starts. Required for a scored run (AD-9).
+    default: ""
+  dependency-cache-producer:
+    description: >-
+      Exactly `none`, `action` or `caller` — the wire representation of
+      §10.5.3's "the workflow declares which". `none` is required when the
+      declared mode is `disabled` and illegal otherwise; `action` and `caller`
+      are legal only under `exact-key`. Required for a scored run.
+    default: ""
+  dependency-cache-matched-key:
+    description: >-
+      The caller's restore step's matched key, possibly empty. Required
+      (possibly empty) iff the producer is `caller`, and must be ABSENT under
+      `action` and `none` — supplying it under another producer fails the job
+      rather than being silently resolved.
+    default: ""
+  dependency-cache-hit:
+    description: >-
+      The caller's restore result, `true` or `false`. A tri-state is not
+      permitted and empty is not false: an empty matched key WITH a false hit
+      is a caller-owned miss, while an empty matched key WITHOUT a hit is
+      absent producer data, and before this input existed the two were
+      indistinguishable. Required non-empty iff the producer is `caller`.
+    default: ""
+  candidate-sha:
+    description: >-
+      Written into the observation as candidate_sha, one of the three separate
+      provenance identities QC15 requires. Required for a scored run.
+    default: ""
+  workload-commit:
+    description: >-
+      Written into the observation as workload_commit, likewise. Required for a
+      scored run.
+    default: ""
+  shard-plan:
+    description: >-
+      The plan job's shard-plan output, carrying the canonical `profile` block
+      that is copied verbatim into the observation so QC13 has a real byte
+      path. Required for a scored run.
+    default: ""
 runs:
   using: composite
   steps:

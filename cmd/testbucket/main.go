@@ -342,8 +342,30 @@ func runPlan(args []string) error {
 	wallDir := fs.String("wall-dir", "", "records directory for complete-action wall-time measurement (--runner vitest): every rendered invocation runs under `testbucket wall exec`, which gives it a physical envelope, a containment peer and an independent trace. Empty (the default) renders exactly the bytes v0.2.2 rendered")
 	var excludes stringList
 	fs.Var(&excludes, "exclude-module", "module dir (glob) to leave out of the module set; repeatable, replaces the defaults")
+
+	// --- contract §21 added plan inputs --------------------------------------
+	estBasis := fs.String("est-basis", string(core.BasisReporter), "which weight the partition is built from: reporter (default) or wall. Mode selection is contract §16.1; an explicit `wall` request with no fitted `ok` model is a hard error with no matrix (§0.8 outcome c), never a silent fallback")
+	scored := fs.Bool("scored", false, "this plan belongs to a scored campaign run. Nothing else can derive it — basis does not imply it, since a scored B arm runs `reporter` — so it is explicit, and it gates §0.8's phase-2 veto plus AD-8…AD-10")
+	runnerClass := fs.String("runner-class", "", "the stable execution-class leaf of the comparability key (§15.3). Required non-empty for a scored plan (AD-8); it replaces the former runner_name leaf, whose per-instance value had no cross-run stability contract")
+	runsOnLabel := fs.String("runs-on-label", "", "the caller's resolved runs-on label, the producer for the runner_image_label key leaf. No context yields it inside a composite action, so the caller passes it; run-bucket echoes it and QC12 compares them (AD-8)")
+	candidateSHA := fs.String("candidate-sha", "", "the testbucket commit the executing binary was built from, recorded as the observation's candidate_sha (AD-10, QC15)")
+	workloadCommit := fs.String("workload-commit", "", "the consumer checkout this run executes against, recorded as the observation's workload_commit (AD-10, QC15)")
+	cacheDeclarationFile := fs.String("cache-declaration-file", "", "job-local file holding the canonical cache declaration of §10.5.0, already verified against its expected digest by the plan job. plan validates only the declaration leaves and refuses before emitting a matrix; the outcome leaves do not exist yet (AD-9)")
+
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// §0.8's two ordered phases, and §19.3a's admission, run BEFORE any matrix
+	// is emitted — §7 rule 17 names plan as the component that must refuse.
+	basis := core.EstBasis(*estBasis)
+	if !basis.Valid() {
+		return fmt.Errorf("--est-basis %q: contract §5.1 permits exactly reporter or wall", *estBasis)
+	}
+	if *scored {
+		if err := scoredPlanAdmission(*runnerClass, *runsOnLabel, *candidateSHA, *workloadCommit, *cacheDeclarationFile); err != nil {
+			return err
+		}
 	}
 
 	// The frozen path takes over completely: a bundle carries K, the count, the
@@ -492,8 +514,46 @@ func runIngest(args []string) error {
 	fs.Var(&in, "in", "go test -json file to ingest, or - for stdin; repeatable (extra positional args also count)")
 	var excludes stringList
 	fs.Var(&excludes, "exclude-module", "module dir (glob) to leave out of the module set; repeatable, replaces the defaults")
+
+	// --- contract §14.2 added ingest inputs ----------------------------------
+	wallObservations := fs.String("wall-observations", "", "directory of wall observations to ingest (§14.2): each document is parsed, the §7.1 qualification checks are applied, qualifying rows are appended to the store's bounded ring under §15.1b, and the model is refit under §6.8 IF AND ONLY IF the append changed the selected trainable population. R54 uploaded a wall artifact that nothing downloaded; this is the reader that closes the loop")
+	campaignConfig := fs.String("campaign-config", "", "job-local path to the frozen campaign config (§19.9a), already materialized and verified against its expected digest by the record job (§19.9c-1). Supplying it makes every matching row `trainable: false` AT APPEND, so no fit at any later time can consume a campaign or pilot row")
+
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// §19.9c-1: the config is verified BEFORE ingest touches the store, so an
+	// unverified config can never reach append.
+	var verifiedConfig *walltime.VerifiedCampaignConfig
+	if *campaignConfig != "" {
+		content, err := os.ReadFile(*campaignConfig)
+		if err != nil {
+			return fmt.Errorf("read campaign config: %w", err)
+		}
+		expected := strings.TrimSpace(os.Getenv("TB_CAMPAIGN_CONFIG_DIGEST_EXPECTED"))
+		cfg, err := walltime.VerifyCampaignConfig(content, expected)
+		if err != nil {
+			return err
+		}
+		verifiedConfig = &cfg
+	}
+	if *wallObservations != "" {
+		sources, err := walltime.ReadWallObservations(*wallObservations)
+		if err != nil {
+			return err
+		}
+		// The per-observation accept/reject table §14.2 requires, with the
+		// exact reason for each rejection.
+		for _, src := range sources {
+			trainable, accept, reason := walltime.TrainableAtAppend(src.Obs, verifiedConfig)
+			verdict := "REJECT"
+			if accept {
+				verdict = "accept"
+			}
+			fmt.Fprintf(os.Stderr, "%-8s %-12s trainable=%-5v %s\n",
+				verdict, src.Obs.BucketName, trainable, reason)
+		}
 	}
 
 	// Resolve the adapter-aware sweep count (Go 100, Vitest 1) up front. For
@@ -784,6 +844,26 @@ func writeJSONFile(path string, v any) (err error) {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// scoredPlanAdmission enforces contract §19.3a's AD-8…AD-10 at the component
+// §7 rule 17 names: a scored plan refuses to emit a matrix unless every one of
+// these is present. An unscored run may omit them all and keeps every current
+// default.
+func scoredPlanAdmission(runnerClass, runsOnLabel, candidateSHA, workloadCommit, cacheDeclarationFile string) error {
+	for _, f := range []struct{ flag, value, rule string }{
+		{"--runner-class", runnerClass, "AD-8"},
+		{"--runs-on-label", runsOnLabel, "AD-8"},
+		{"--cache-declaration-file", cacheDeclarationFile, "AD-9"},
+		{"--candidate-sha", candidateSHA, "AD-10"},
+		{"--workload-commit", workloadCommit, "AD-10"},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			return fmt.Errorf("scored plan refused: %s is empty (%s, contract §19.3a); no matrix is emitted",
+				f.flag, f.rule)
+		}
 	}
 	return nil
 }

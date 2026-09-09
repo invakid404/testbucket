@@ -74,6 +74,27 @@ inputs:
       set. Empty = every module under the working directory is in scope.
     default: ""
 
+  # --- contract §21 added inputs -------------------------------------------
+  wall-observations-dir:
+    description: >-
+      Directory of downloaded wall observations for `ingest --wall-observations`
+      to read. R54 uploaded a wall artifact that nothing downloaded; this input
+      and the same-run download beside it close that end of the loop
+      (§14.1, §14.2).
+    default: ""
+  campaign-config-json:
+    description: >-
+      The frozen §19.9a campaign config as CONTENT, not a pathname: a record
+      runner's path is not a shared filesystem. Required iff the ingested set
+      contains a scored or pilot row.
+    default: ""
+  campaign-config-digest-expected:
+    description: >-
+      Expected SHA-256 of that content. §19.9c-1 materializes and verifies the
+      bytes job-locally and fails BEFORE invoking `ingest`, then passes the
+      local path to `ingest --campaign-config` so `trainable` is set at append.
+      A perturbation of either the bytes or this digest fails independently.
+    default: ""
 runs:
   using: composite
   steps:
