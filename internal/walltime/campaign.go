@@ -27,7 +27,8 @@ type CampaignArm struct {
 	VerdictPaths []string `json:"verdicts"`
 }
 
-// CampaignPairRef is one randomized baseline/candidate pair.
+// CampaignPairRef is one precommitted baseline/candidate pair. The
+// within-pair order is the fixed counterbalanced sequence of §0.2, not a draw.
 type CampaignPairRef struct {
 	Baseline  CampaignArm `json:"baseline"`
 	Candidate CampaignArm `json:"candidate"`

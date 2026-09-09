@@ -21,7 +21,7 @@ type ScheduledPair struct {
 	CandidateRun string `json:"candidate_run"`
 	// Date is the UTC calendar date (YYYY-MM-DD) the pair is scheduled for.
 	// The contract requires at least three distinct dates, and choosing them
-	// afterwards from whatever ran is not a randomised schedule.
+	// afterwards from whatever ran is not a precommitted schedule.
 	Date string `json:"date"`
 }
 
@@ -112,7 +112,7 @@ func (s CampaignSchedule) Validate() error {
 //
 // Order is compared positionally, not as a set. A campaign that ran the same
 // five pairs in a different sequence ran a different experiment: the whole
-// point of freezing a randomised order before the first candidate run is that
+// point of freezing a counterbalanced order before the first candidate run is that
 // the sequence cannot be chosen once the results are visible.
 func bindOrder(index CampaignIndex, schedule CampaignSchedule) []string {
 	var problems []string

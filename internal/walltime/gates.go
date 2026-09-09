@@ -50,7 +50,14 @@ const (
 	// one, and EvaluateCampaign enforces the count rather than trusting the
 	// caller to supply it.
 	ScoredActionRows = 80
-	// CampaignPairs is the number of randomized baseline/candidate pairs.
+	// CampaignPairs is the number of precommitted baseline/candidate pairs.
+	//
+	// The sequence is a FIXED COUNTERBALANCED one declared before run 1
+	// (§0.2, §19.5): pairs 1, 3, 5 run B->C and pairs 2, 4 run C->B.
+	// Counterbalancing is a control, not a draw — the campaign is not
+	// randomized, and §22 test 18 fails on any shipped string that calls it
+	// randomized or claims a seed, draw or shuffle in a campaign-order
+	// context.
 	CampaignPairs = 5
 	// BucketsPerRun is K for the scored profile. Every eligible run
 	// contributes exactly this many action observations; a run with fewer is
@@ -420,7 +427,8 @@ func (r CampaignRun) DA() float64 {
 	return float64(r.Amax()) / float64(m)
 }
 
-// CampaignPair is one randomized baseline/candidate pair.
+// CampaignPair is one precommitted baseline/candidate pair. The within-pair
+// order is the fixed counterbalanced sequence of §0.2, not a draw.
 type CampaignPair struct {
 	Baseline  CampaignRun `json:"baseline"`
 	Candidate CampaignRun `json:"candidate"`
