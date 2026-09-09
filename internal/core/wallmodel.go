@@ -398,3 +398,13 @@ func AllocateWall(m WallModel, units []AllocUnit, k int) (WallPartition, error) 
 	}
 	return WallRefine(m, seed)
 }
+
+// KarmarkarKarp exposes the generalized Karmarkar–Karp of partition.go, so the
+// calibration proposer of contract §17.3a can pack residual units with "the
+// same deterministic KK the reporter basis uses" rather than a second
+// implementation that would drift from it.
+//
+// It is deliberately the existing function and not a re-derivation: §6.5 fixes
+// Stage 1 as the EXISTING karmarkarKarp and explicitly not LPT, and a separate
+// copy here would be exactly the divergence that rule exists to prevent.
+func KarmarkarKarp(items []Item, k int) [][]Item { return karmarkarKarp(items, k) }

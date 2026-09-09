@@ -305,7 +305,7 @@ func sigmaMaxGolubReinsch(x [][]float64) (float64, error) {
 	cap := svdIterationCapPerColumn * minInt(m, DesignColumns)
 	iters := 0
 	for p := n - 1; p > 0; {
-		// Deflate any negligible superdiagonal.
+		// Deflate any negligible SUPERDIAGONAL: the block splits there.
 		converged := false
 		for i := p - 1; i >= 0; i-- {
 			if math.Abs(e[i]) <= Float64Eps*(math.Abs(d[i])+math.Abs(d[i+1])) {
@@ -318,6 +318,48 @@ func sigmaMaxGolubReinsch(x [][]float64) (float64, error) {
 			}
 		}
 		if converged {
+			continue
+		}
+
+		// Deflate a negligible DIAGONAL entry. This is the case the
+		// implicit-shift sweep cannot resolve on its own: with d[k] = 0 the
+		// Wilkinson shift degenerates and the bulge chase leaves e[k]
+		// unchanged, so the iteration spins until the cap fires and reports
+		// E_RANK_NON_CONVERGENT on a design that is merely rank-deficient.
+		//
+		// It is reachable in this product: the calibration proposer of §17.3a
+		// evaluates K-bucket designs, and a K = 2 layout gives a 2x4 matrix
+		// whose trailing diagonal entries are structurally zero.
+		//
+		// A zero diagonal entry means the block splits at k with a zero
+		// singular value, so the adjacent superdiagonal is negligible in the
+		// same sense and is cleared.
+		scale := 0.0
+		for i := 0; i <= p; i++ {
+			if v := math.Abs(d[i]); v > scale {
+				scale = v
+			}
+			if i < p {
+				if v := math.Abs(e[i]); v > scale {
+					scale = v
+				}
+			}
+		}
+		split := false
+		for k := 0; k <= p; k++ {
+			if math.Abs(d[k]) > Float64Eps*scale {
+				continue
+			}
+			switch {
+			case k < p:
+				e[k] = 0
+			case k > 0:
+				e[k-1] = 0
+			}
+			split = true
+			break
+		}
+		if split {
 			continue
 		}
 		if iters >= cap {
