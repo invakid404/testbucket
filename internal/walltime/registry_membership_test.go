@@ -1,6 +1,8 @@
 package walltime
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -68,4 +70,28 @@ func bcInvMembershipFromRegistry(t *testing.T) (membership []string, tupleLeaves
 		}
 	}
 	return membership, tupleLeaves
+}
+
+// allGoSource concatenates every non-test Go file, for the symbol-resolution
+// half of test 28.
+func allGoSource(t *testing.T) string {
+	t.Helper()
+	var b strings.Builder
+	for _, dir := range []string{"internal", "cmd", "testdata"} {
+		err := filepath.Walk(filepath.Join("..", "..", dir), func(p string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || !strings.HasSuffix(p, ".go") {
+				return nil
+			}
+			c, rerr := os.ReadFile(p)
+			if rerr != nil {
+				return nil
+			}
+			b.Write(c)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return b.String()
 }

@@ -11,3 +11,13 @@ func fmtSscan(s string, out *float64) (int, error) {
 	*out = v
 	return 1, nil
 }
+
+// fmtSscanInt parses a decimal integer.
+func fmtSscanInt(s string, out *int) (int, error) {
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	*out = v
+	return 1, nil
+}
