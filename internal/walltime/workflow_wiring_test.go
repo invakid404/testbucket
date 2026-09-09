@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -234,4 +235,119 @@ func TestActionInternalVerificationSteps(t *testing.T) {
 			t.Fatal("record accepts campaign-id without the config inputs; §15.1b would reject every scored row")
 		}
 	})
+}
+
+// TestEveryActionShipsExactlyTheMapsInputSet compares each SIMPLIFY action's
+// COMPLETE shipped input set against the governed component map, in both
+// directions.
+//
+// The test above it checks only the ADDED-input projection — that every input
+// §21 adds is declared. That is a one-directional check over a subset, so an
+// action could declare every added input and still ship a dozen the map's
+// `remove_inputs` list requires absent, which is exactly what happened: the
+// install, plan and record actions kept 17 research-era inputs through two
+// visits of "the SIMPLIFY surface is clean" while every §21 test stayed green.
+//
+// The map is the authority and it enumerates the sets exactly, so this reads
+// them from the map rather than restating them here. A restatement would be
+// one more thing that can agree with itself while the shipped YAML says
+// something else.
+func TestEveryActionShipsExactlyTheMapsInputSet(t *testing.T) {
+	var cm struct {
+		ActionInterfaces []struct {
+			Action         string   `json:"action"`
+			Classification string   `json:"classification"`
+			KeepInputs     []string `json:"keep_inputs"`
+			RemoveInputs   []string `json:"remove_inputs"`
+			AddInputs      []string `json:"add_inputs"`
+			AddedInputs    []string `json:"added_inputs"`
+		} `json:"action_interfaces"`
+	}
+	if err := json.Unmarshal([]byte(readRepoFile(t, "docs/walltime/component-map.json")), &cm); err != nil {
+		t.Fatalf("parse the component map: %v", err)
+	}
+	if len(cm.ActionInterfaces) == 0 {
+		t.Fatal("the component map declares no action interfaces; this test is reading the wrong document")
+	}
+
+	checked := 0
+	for _, iface := range cm.ActionInterfaces {
+		path := filepath.Join(".github", "actions", iface.Action, "action.yml")
+		if _, err := os.Stat(filepath.Join("..", "..", path)); err != nil {
+			// A REMOVE-classified action is absent by design; the REMOVE sweep
+			// is what asserts that, not this test.
+			if iface.Classification == "REMOVE" {
+				continue
+			}
+			t.Errorf("%s is classified %s but is not shipped", path, iface.Classification)
+			continue
+		}
+		checked++
+
+		declared := actionInputNames(t, path)
+		want := map[string]bool{}
+		for _, in := range iface.KeepInputs {
+			want[in] = true
+		}
+		for _, in := range iface.AddInputs {
+			want[in] = true
+		}
+		for _, in := range iface.AddedInputs {
+			want[in] = true
+		}
+		remove := map[string]bool{}
+		for _, in := range iface.RemoveInputs {
+			remove[in] = true
+		}
+
+		for in := range want {
+			if !declared[in] {
+				t.Errorf("%s does not declare input %q, which the map keeps", path, in)
+			}
+		}
+		for in := range declared {
+			switch {
+			case remove[in]:
+				// Named explicitly, because "the map says to remove this" is a
+				// sharper finding than "this is unexpected".
+				t.Errorf("%s still declares input %q, which the map's remove_inputs requires absent", path, in)
+			case !want[in]:
+				t.Errorf("%s declares input %q, which the map's keep/add lists do not include", path, in)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no shipped action was compared; the paths this test reads have moved")
+	}
+}
+
+// actionInputNames reads one composite action's top-level input names.
+//
+// It scans for two-space keys under `inputs:` rather than parsing YAML,
+// because this package has no YAML dependency and the shape being read is
+// fixed: `inputs:` at column 0, one key per input at column 2, and the next
+// column-0 key ends the block. A malformed file fails the assertions above
+// rather than being silently read as empty — hence the fatal on an empty set.
+func actionInputNames(t *testing.T, rel string) map[string]bool {
+	t.Helper()
+	src := readRepoFile(t, rel)
+	out := map[string]bool{}
+	key := regexp.MustCompile(`^  ([a-z0-9][a-z0-9-]*):`)
+	inBlock := false
+	for _, line := range strings.Split(src, "\n") {
+		if !inBlock {
+			inBlock = line == "inputs:"
+			continue
+		}
+		if line != "" && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "#") {
+			break // a new column-0 key: the inputs block is over
+		}
+		if m := key.FindStringSubmatch(line); m != nil {
+			out[m[1]] = true
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("%s declares no inputs at all; the block this test reads has moved", rel)
+	}
+	return out
 }
