@@ -333,7 +333,11 @@ func lawsonHanson(x [][]float64, y []float64) (coef []float64, converged bool) {
 		return w
 	}
 
-	for iter := 0; iter < nnlsOuterCap; iter++ {
+	outerCap := nnlsOuterCap
+	if nnlsOuterCapOverride > 0 {
+		outerCap = nnlsOuterCapOverride
+	}
+	for iter := 0; iter < outerCap; iter++ {
 		w := dual()
 		// Maximum dual over the ACTIVE set; ties to the lowest column index.
 		best, bestW := -1, 0.0
@@ -489,3 +493,8 @@ func solvePassive(x [][]float64, y []float64, passive []bool) []float64 {
 	}
 	return out
 }
+
+// nnlsOuterCapOverride is zero in production. A test sets it to force §6.8's
+// budget-exhaustion path, which resolves to a STATUS rather than a failure —
+// the one cap in this product that does.
+var nnlsOuterCapOverride int

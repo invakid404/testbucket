@@ -302,7 +302,15 @@ func sigmaMaxGolubReinsch(x [][]float64) (float64, error) {
 	}
 
 	// --- implicit-shift QR on the bidiagonal ---
+	// The cap is §6.6's 75 x min(rows, 4). svdIterationCapOverride lets a test
+	// drive the EXHAUSTION path without fabricating a pathological bidiagonal
+	// matrix: the property under test is that the cap resolves to
+	// E_RANK_NON_CONVERGENT with no rank inferred, not the numerology of which
+	// matrices happen to converge slowly.
 	cap := svdIterationCapPerColumn * minInt(m, DesignColumns)
+	if svdIterationCapOverride > 0 {
+		cap = svdIterationCapOverride
+	}
 	iters := 0
 	for p := n - 1; p > 0; {
 		// Deflate any negligible SUPERDIAGONAL: the block splits there.
@@ -448,3 +456,7 @@ func minInt(a, b int) int {
 	}
 	return b
 }
+
+// svdIterationCapOverride is zero in production. A test sets it to force the
+// §6.6 cap and restores it immediately; it is never read from configuration.
+var svdIterationCapOverride int
