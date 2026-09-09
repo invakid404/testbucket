@@ -383,3 +383,41 @@ func assignFilterAtoms(live []runner.LivePackage) {
 		}
 	}
 }
+
+// AssignFilterAtoms is the exported entry point to the production
+// suffix-atom algorithm, for the pinned-consumer regression of contract
+// §20.6a (ID-19).
+//
+// It is the SAME code path discovery uses — not a re-implementation for the
+// test. That matters: §20.6a's finding is that asserting only the two
+// illustrative root-containment examples leaves a regression in project-root
+// suffix enumeration free to pass while invalidating the workload safety
+// claim, so the regression must exercise the production function over the full
+// pinned universe.
+func AssignFilterAtoms(live []runner.LivePackage) { assignFilterAtoms(live) }
+
+// CollidesUnderProductionRelation is the PRODUCTION collision relation of
+// contract §20.6a: containment asked in both directions at the workspace root
+// AND at every shared possible project-root suffix, under the conservative
+// Unicode fold.
+//
+// It folds its arguments, which is the part that is easy to get wrong: the
+// unexported collidesUnderSomeProjectRoot takes ALREADY-FOLDED ids, so calling
+// it with raw paths silently under-reports collisions — 31 instead of 42 over
+// the pinned universe. Going through filterSelects is what makes this the
+// production relation rather than an approximation of it.
+func CollidesUnderProductionRelation(a, b string) bool {
+	return filterSelects(a, b) || filterSelects(b, a)
+}
+
+// CollidesUnderRootContainment is the ILLUSTRATIVE subset of §20.6a's table:
+// plain substring containment at the workspace root only, which is what
+// Vitest's testFile.includes(filter) does when every project is rooted there.
+//
+// §20.6a is explicit that this is an example set and NOT the protected
+// property — over the pinned universe it finds only the two keto/attribution
+// pairs, while the production relation finds 42.
+func CollidesUnderRootContainment(a, b string) bool {
+	fa, fb := filterFold(a), filterFold(b)
+	return strings.Contains(fb, fa) || strings.Contains(fa, fb)
+}
