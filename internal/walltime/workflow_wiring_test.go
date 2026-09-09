@@ -1,6 +1,8 @@
 package walltime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -230,11 +232,78 @@ func TestActionInternalVerificationSteps(t *testing.T) {
 		}
 	})
 
-	t.Run("record refuses a campaign id with no verified config", func(t *testing.T) {
-		if !strings.Contains(record, "Refuse a campaign id with no verified config") {
-			t.Fatal("record accepts campaign-id without the config inputs; §15.1b would reject every scored row")
+	t.Run("a campaign id with no verified config is refused before append", func(t *testing.T) {
+		// This used to assert that the record action contains a step NAMED
+		// "Refuse a campaign id with no verified config". That step's
+		// condition read `inputs.campaign-id`, which the action does not
+		// declare and the record job does not pass, so the condition was
+		// always false — the test passed on a string while the guard it
+		// claimed to cover could never fire.
+		//
+		// The property is real, and §15.1b enforces it where it can: against
+		// the rows ingest actually parses. So it is asserted there, on
+		// behaviour.
+		obs := buildObservation(t, false, "campaign-1", "workload-1", "head-1", 0)
+		trainable, accept, reason := TrainableAtAppend(obs, nil)
+		if accept || trainable {
+			t.Errorf("a row carrying campaign_id %q was accepted with no verified config (trainable=%v accept=%v)",
+				obs.CampaignID, trainable, accept)
+		}
+		if !strings.Contains(reason, "campaign_id") {
+			t.Errorf("the refusal does not name the campaign id: %q", reason)
+		}
+
+		// And the same row IS accepted once a config verifies it, so the
+		// refusal above is the campaign identity being checked rather than
+		// everything being refused.
+		cfg, err := VerifyCampaignConfig(campaignConfigBytes(t, "campaign-1"), campaignConfigDigest(t, "campaign-1"))
+		if err != nil {
+			t.Fatalf("VerifyCampaignConfig: %v", err)
+		}
+		if _, accept, reason := TrainableAtAppend(obs, &cfg); !accept {
+			t.Errorf("a row matching its verified config was refused: %s", reason)
 		}
 	})
+
+	t.Run("no action condition reads an input the action does not declare", func(t *testing.T) {
+		// The class of defect the step above was: a guard whose condition can
+		// never be true, because the input it reads is not part of the
+		// action's interface. It is invisible to every green test that checks
+		// for the guard's presence rather than its reachability.
+		cond := regexp.MustCompile(`(?m)^\s+if:\s*(.+)$`)
+		ref := regexp.MustCompile(`inputs\.([a-z0-9][a-z0-9-]*)`)
+		for _, action := range []string{"install", "plan", "record", "run-bucket", "verify-wall"} {
+			rel := filepath.Join(".github", "actions", action, "action.yml")
+			declared := actionInputNames(t, rel)
+			for _, m := range cond.FindAllStringSubmatch(readRepoFile(t, rel), -1) {
+				for _, r := range ref.FindAllStringSubmatch(m[1], -1) {
+					if !declared[r[1]] {
+						t.Errorf("%s has a condition reading undeclared input %q, so it can never fire: %s",
+							rel, r[1], strings.TrimSpace(m[1]))
+					}
+				}
+			}
+		}
+	})
+}
+
+// campaignConfigBytes is a minimal §19.9a document naming one campaign.
+func campaignConfigBytes(t *testing.T, id string) []byte {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"manifest": map[string]any{"campaign_id": id}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// campaignConfigDigest is the caller-side expected digest of those bytes, which
+// §19.9c-1 verifies before ingest runs. It is the bare hex form the transport
+// carries, not the `sha256:`-prefixed record form.
+func campaignConfigDigest(t *testing.T, id string) string {
+	t.Helper()
+	sum := sha256.Sum256(campaignConfigBytes(t, id))
+	return hex.EncodeToString(sum[:])
 }
 
 // TestEveryActionShipsExactlyTheMapsInputSet compares each SIMPLIFY action's

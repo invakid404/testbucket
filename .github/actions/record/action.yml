@@ -105,15 +105,18 @@ runs:
         echo "file=$dest" >> "$GITHUB_OUTPUT"
         echo "digest=$actual" >> "$GITHUB_OUTPUT"
 
-    # A workflow that exposes campaign-id without the config inputs is a
-    # miswiring: §15.1b would then reject every scored row it ingests, so the
-    # record job refuses rather than ingesting rows it knows will be refused.
-    - name: Refuse a campaign id with no verified config
-      if: inputs.campaign-id != '' && inputs.campaign-config-json == ''
-      shell: bash
-      run: |
-        echo "campaign-id was supplied without campaign-config-json: §15.1b would reject every scored row this ingests" >&2
-        exit 1
+    # THE PRE-INGEST CAMPAIGN-ID REFUSAL IS REMOVED.
+    #
+    # It read `inputs.campaign-id`, which this action does not declare and the
+    # record job does not pass — the component map gives record
+    # wall-observations-dir and the two campaign-config inputs, and no campaign
+    # identity. The condition was therefore always false: a guard that cannot
+    # fire, with a test asserting coverage that did not exist.
+    #
+    # The property itself is real and is enforced where it CAN be: §15.1b's
+    # TrainableAtAppend refuses, before append, any observation carrying a
+    # campaign_id with no verified config. That runs against the rows ingest
+    # actually parses rather than against an input nobody supplies.
 
     - name: Install testbucket
       shell: bash
