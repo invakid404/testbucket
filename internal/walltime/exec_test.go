@@ -29,8 +29,8 @@ func TestExecPropagatesChildFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyDir: %v", err)
 	}
-	if !hasFinding(v, "WT-002") {
-		t.Errorf("a failed child left no WT-002 finding; findings = %+v", v.Findings)
+	if !hasFinding(v, "WT-014") {
+		t.Errorf("a failed child left no WT-014 finding; findings = %+v", v.Findings)
 	}
 	if v.Eligible {
 		t.Errorf("a failed run must not be scorable")

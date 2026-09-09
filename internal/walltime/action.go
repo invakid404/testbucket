@@ -56,18 +56,6 @@ type ActionState struct {
 	// StartedAt is the AT_start reading, repeated here only so a human reading
 	// the file can find the record; the RECORD is the evidence.
 	StartedAt Instant `json:"started_at"`
-
-	// SignerDelegate is the delegate PRIVATE key this step minted, returned to
-	// the caller in memory and never serialized.
-	//
-	// It has to reach the measured step — that is where the script and
-	// invocation producers, and the action-owned children, mint the keys it
-	// authorizes — and it must reach nothing else. Writing it into the
-	// evidence directory put it where the measured script could read it and
-	// where every observer is told to look; the caller places it in the
-	// measured step's ENVIRONMENT instead, where the observer scrub removes it
-	// and `sudo` strips it from the measured child.
-	SignerDelegate string `json:"-"`
 }
 
 // BeginAction opens the action envelope and leaves the handoff `wall end`

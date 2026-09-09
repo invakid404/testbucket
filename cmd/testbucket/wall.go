@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/invakid404/testbucket/internal/core"
+	"github.com/invakid404/testbucket/internal/planbind"
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
@@ -26,74 +28,31 @@ const replayKeyEnv = walltime.ReplayKeyEnv
 const wallUsage = `testbucket wall — complete-action wall-time measurement
 
 usage:
-  testbucket wall begin   [flags]  open the physical action envelope (AT_start),
-                                   its containment, and the independent CPA peer
-                                   and VTA collector; leaves state for ` + "`wall end`" + `
-  testbucket wall end     [flags]  close that envelope after verified-empty
-                                   containment (AT_end)
+  testbucket wall begin   [flags]  open the physical action envelope (AT_start)
+                                   and leave state for ` + "`wall end`" + `
+  testbucket wall end     [flags]  close that envelope after the process group
+                                   is drained (AT_end)
   testbucket wall exec    [flags] -- cmd...
                                    run one command under a physical envelope
-                                   (VB or V) with its own peer and collector
+                                   (VB or V)
   testbucket wall run     [flags] -- cmd...
-                                   run an action-owned command inside the action
-                                   containment, with no envelope of its own (a
-                                   per-bucket setup command)
-  testbucket wall observe [flags]  INTERNAL: the peer/collector process itself
-  testbucket wall hold    -- cmd...  INTERNAL: the action-owned child's barrier;
-                                   it waits for the wrapper's containment proof
-                                   and then execs the command in place
-  testbucket wall verify  [flags]  verify a records directory and report
-                                   eligibility, reconciliation and every gate
-  testbucket wall bundle  [flags]  freeze a planning-input bundle: the canonical
-                                   instant, the raw discovery and runnable bytes,
-                                   the store bytes, and the acquisition closure
-  testbucket wall replay  [flags]  independently replay a bundle through the
-                                   planner and refuse to agree unless every
-                                   digest matches the issued Stage-2 receipt
-  testbucket wall stage1  [flags]  assemble and sign the Stage-1 input manifest
-                                   that authorises a bundle (the signing key
-                                   comes from TB_WALL_AUTHORITY_KEY, never a
-                                   flag)
-  testbucket wall stage1-binary [flags]  print the binary digest a signed
-                                   Stage-1 manifest AUTHORISES, for the
-                                   installer's mandatory candidate check
-  testbucket wall check-delegation [flags]  verify that a cgroup-v2 subtree is
-                                   really delegated — that this credential can
-                                   create containments under it AND migrate
-                                   into them
-  testbucket wall digest  [flags]  print the canonical digest of a manifest,
-                                   receipt, bundle, registry or scorer — the
-                                   identity every record has to bind to
-  testbucket wall train   [flags]  fit the frozen scorer from a sealed training
-                                   receipt set of historical wrapper-qualified
-                                   physical V labels
-  testbucket wall verify-attestation [flags]  refuse an asset whose
-                                    attestation does not authenticate against
-                                    BOTH predeclared keys
-  testbucket wall countersign [flags]  the VERIFIER'S independent signature
-                                    over a builder attestation, after
-                                    re-deriving the artifact's digest
-  testbucket wall attest-runner [flags]  the FLEET'S signed statement that a
-                                    host was booted from a named image, scoped
-                                    to one run; a scored arm requires it
-  testbucket wall attest   [flags]  produce the builder's SIGNED build
-                                   attestation for one exact artifact: its
-                                   subject digest, source, builder, issuer,
-                                   verifier identity and retained result
-  testbucket wall release-manifest [flags]
-                                   derive the canonical publish set from
-                                   goreleaser's own artifact manifest: every
-                                   asset a release uploads, hashed, plus the
-                                   digest of every file inside each archive
-  testbucket wall campaign [flags] apply the frozen five-pair decision rule to a
-                                   campaign of AUTHENTICATED rows: each arm's
-                                   signed Stage-1 manifest and one eligible
-                                   verifier verdict per bucket
+                                   run an action-owned command inside the
+                                   action's lifecycle, with no envelope of its
+                                   own (a per-bucket setup command)
+  testbucket wall verify  [flags]  verify a records directory: schema, terminal
+                                   state, positive monotonic duration,
+                                   plan/bucket identity, exact invocation
+                                   membership and event coverage
 
 Every endpoint is a fresh CLOCK_MONOTONIC read taken by the producer that
-records it. A host with no delegated cgroup-v2 subtree (TB_WALL_CGROUP_ROOT)
-still records everything, and ` + "`wall verify`" + ` reports the run INELIGIBLE rather
-than scoring a lifecycle it cannot prove.
+records it.
+
+` + "`wall verify`" + ` separates two answers and never merges them. COMPLETE says the
+records describe a well-formed measurement, whatever it turned out to be — so a
+run that failed cleanly is complete and not scorable. ELIGIBLE says the row may
+be SCORED, which additionally needs the plan it was rendered from and an audit
+of what it ran. An absent prerequisite is reported, never skipped: "nobody
+checked" and "it passed" are different answers.
 `
 
 // runIdentityFlags collects the campaign/delivery keys every record carries.
@@ -181,10 +140,6 @@ func runWallBegin(args []string) error {
 	// parser rejects and which no base64 decoder can read. The runner reads
 	// workflow commands from the step's log, which stderr is part of, so the
 	// mask still takes effect — and stdout stays exactly one decodable value.
-	if st.SignerDelegate != "" {
-		fmt.Fprintf(os.Stderr, "::add-mask::%s\n", st.SignerDelegate)
-		fmt.Println(st.SignerDelegate)
-	}
 	return nil
 }
 
@@ -473,11 +428,19 @@ func runWallExec(args []string) error {
 
 // runWall dispatches the wall subcommands that survive the removal plan.
 //
-// The removed verbs went with their machinery: observe, hold, verify, bundle,
-// replay, stage1, stage1-binary, check-delegation, digest, train, campaign,
+// The removed verbs went with their machinery: observe, hold, bundle, replay,
+// stage1, stage1-binary, check-delegation, digest, train, campaign,
 // release-manifest, verify-attestation and countersign all served the
 // protected-authority, observer or campaign-proof models. What remains is the
-// measurement lifecycle the rendered script actually calls.
+// measurement lifecycle the rendered script actually calls, plus the
+// verification the retained wall-time action runs against what it wrote —
+// measure, verify, ingest.
+//
+// `verify` was briefly removed with them, which broke the shipped workflow: the
+// retained verify-wall action invokes it on every wall-time-enabled bucket, so
+// a run could measure and upload its records and then deterministically fail
+// the step that checks them. Removing a command an action calls is not a
+// simplification, it is a break.
 func runWall(args []string) error {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, wallUsage)
@@ -492,10 +455,102 @@ func runWall(args []string) error {
 		return runWallExec(args[1:])
 	case "run":
 		return runWallRun(args[1:])
+	case "verify":
+		return runWallVerify(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, wallUsage)
 		return nil
 	default:
 		return fmt.Errorf("unknown wall subcommand %q", args[0])
+	}
+}
+
+// runWallVerify is the compact verifier the retained wall-time action calls.
+//
+// Its flag set is exactly what the simplified verify-wall action passes, and
+// that is deliberate: the action and the binary have to agree on an executable
+// command path, and the way they stay agreed is that neither carries anything
+// the other does not. The Stage-1/Stage-2, replay, registry, Pcheck, scorer,
+// training-set, authority and signer flags went with the machinery behind
+// them — a flag whose evidence no longer exists is a flag that can only be
+// ignored.
+//
+// ONE PLAN ARTIFACT answers three of the six questions. The authorised plan
+// carries the buckets and the invocations they render, so the plan/bucket
+// identity, the exact invocation membership and the expected coverage are all
+// derived from the same document rather than from three inputs a caller could
+// let disagree.
+//
+// There is no --require. The scored campaign arm that asked for `eligible`
+// is gone, so the caller-facing question is whether these records are a
+// well-formed measurement — and a bucket that did not run its plan fails that,
+// because a failed coverage audit is TERMINAL rather than merely unscorable.
+// Eligibility is still computed and reported; it is no longer a flag.
+func runWallVerify(args []string) error {
+	fs := flag.NewFlagSet("wall verify", flag.ExitOnError)
+	dir := fs.String("dir", "", "records directory (required)")
+	asJSON := fs.Bool("json", false, "write the verdict as JSON instead of a report")
+	shardPlan := fs.String("shard-plan", "", "the authorised plan artifact. It supplies the planned invocation identities the measured argv, selector, unit membership and atom closure are compared against, and — with --events — the expected coverage")
+	eventsDir := fs.String("events", "", "this bucket's runner events directory, for the exact-run coverage audit. Without --events and --shard-plan nothing checks that the measured script ran the work the plan gave it")
+	runnerKind := fs.String("runner", "go", "which adapter's event parser reads --events: go or vitest")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*dir) == "" {
+		return fmt.Errorf("--dir is required")
+	}
+
+	v, err := walltime.VerifyDir(walltime.VerifyOptions{
+		Dir:         *dir,
+		Invocations: plannedInvocations(*shardPlan),
+		Audit:       coverageAudit(*shardPlan, *eventsDir, *runnerKind),
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(v); err != nil {
+			return err
+		}
+	} else if err := v.Write(os.Stdout); err != nil {
+		return err
+	}
+	// Fail closed. An absent prerequisite leaves the row unscorable and is
+	// reported as such; records that are not a complete measurement, or a
+	// bucket that did not run its plan, fail here.
+	if !v.Complete {
+		return fmt.Errorf("wall verify: the records are not a complete measurement (%d finding(s))", len(v.Findings))
+	}
+	return nil
+}
+
+// plannedInvocations renders the planned invocation identities for whichever
+// bucket the records turn out to name.
+//
+// It lives here rather than in internal/walltime for the same reason the
+// coverage audit does: rendering invocations belongs to the planner/adapter
+// layer, and the measurement package deliberately imports neither. Returning
+// nil when no plan was supplied is not a way to skip the comparison — the
+// verifier turns a nil lookup into a finding.
+func plannedInvocations(shardPlan string) walltime.InvocationsFunc {
+	if shardPlan == "" {
+		return nil
+	}
+	return func(bucketID string) (*walltime.InvocationManifest, error) {
+		doc, err := core.ParseShardPlan(shardPlan)
+		if err != nil {
+			return nil, err
+		}
+		index, err := core.BucketIndexIn(doc, bucketID)
+		if err != nil {
+			return nil, err
+		}
+		// The Stage-2 receipt this used to be bound to is gone, so the
+		// manifest carries no receipt digest. What makes it a control is that
+		// it is rendered from the authorised plan rather than read back from
+		// the records it is compared against.
+		return planbind.InvocationManifestFor(doc, index, "")
 	}
 }

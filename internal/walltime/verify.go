@@ -95,6 +95,10 @@ type Envelope struct {
 	Desc        string              `json:"desc,omitempty"`
 }
 
+// InvocationsFunc resolves the invocation manifest for one bucket. A caller
+// that supplies none gets a finding, never a pass.
+type InvocationsFunc func(bucketID string) (*InvocationManifest, error)
+
 // VerifyOptions selects what to verify and against which frozen documents.
 type VerifyOptions struct {
 	Dir string
@@ -114,10 +118,18 @@ type VerifyOptions struct {
 	// identity sanity, and it is what makes the unmeasurable binary-install
 	// prefix visible instead of merely absent.
 	StepAttemptPath string
-	// InvocationsPath is the per-bucket invocation manifest: what the
+	// Invocations resolves the per-bucket invocation manifest: what the
 	// authorised plan rendered. Without it a measured Spec is an assertion
 	// travelling beside the plan rather than a claim checked against it.
-	InvocationsPath string
+	//
+	// It is INJECTED, and by bucket id, for the same two reasons the audit is.
+	// Building the manifest means reading a plan document and rendering its
+	// invocations, which belongs to the planner/adapter layer that this
+	// package deliberately does not import — the measurement code must not be
+	// able to reach the code it measures. And the bucket the manifest is for
+	// is a fact the RECORDS carry, so it cannot be known before they are
+	// read.
+	Invocations InvocationsFunc
 	// ReplayPath is the independent Stage-2 replay attestation. Without it the
 	// records are bound to a receipt nobody re-derived, so the run cannot be
 	// scored: comparing the planner's account of its own output to itself
@@ -568,6 +580,32 @@ func (v *Verdict) Write(out io.Writer) error {
 // The two properties the retained cancellation regressions turn on are kept
 // exactly: an absent measurement is not a zero-length one, and a run that was
 // cancelled or left an escaped descendant is RETAINED but never scored.
+// VerifyDir is the practical verifier: the six checks the simplified
+// verification action retains, and nothing else.
+//
+// The removed checks went with their machinery — Stage-1/Stage-2 binding,
+// replay attestation, the Aeta registry, the Pcheck projection, the scorer's
+// training lineage, the signer roster and the closing seal all belonged to the
+// protected-authority model. What is left is what a measurement can be checked
+// against using only the records themselves and the plan that produced them:
+//
+//  1. SCHEMA — every record is of the epoch this binary understands;
+//  2. TERMINAL STATE — nothing reached a state other than `passed`;
+//  3. POSITIVE MONOTONIC DURATION — every interval closed, and closed after
+//     it opened;
+//  4. PLAN/BUCKET IDENTITY — the records name one run, and every artifact
+//     compared against them is for the bucket that was measured;
+//  5. EXACT MEMBERSHIP — each measured invocation ran the argv, selector, unit
+//     and atom closure the authorised plan rendered;
+//  6. EVENT COVERAGE — the bucket ran the work the plan gave it.
+//
+// COMPLETE and ELIGIBLE stay separate, and both are affirmative. Complete is
+// about the evidence: the records describe a well-formed measurement, whatever
+// it turned out to be — so a run that failed cleanly is complete and not
+// eligible, while a truncated stream is neither. Eligible additionally
+// requires every prerequisite a scorable row has, and an absent prerequisite
+// is a finding rather than a skip: "nobody checked" and "it passed" must never
+// reach the same verdict.
 func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	recs := opt.Records
 	if recs == nil {
@@ -588,33 +626,244 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 		return v, nil
 	}
 
-	// Eligibility is affirmative and fails closed: it requires a closing
-	// boundary that reached `passed`, so a cancelled run, a crash, an escaped
-	// descendant or a truncated stream all leave it false without needing a
-	// rule of their own.
-	sawEnd := false
-	for _, r := range recs {
-		if r.Terminal != "" && r.Terminal != TerminalPassed {
-			v.add("WT-002", SeverityIneligible,
-				fmt.Sprintf("a record reached terminal state %q: %s", r.Terminal, r.Reason))
-		}
-		if r.Kind == "boundary" && r.Boundary == "end" {
-			sawEnd = true
-			if r.Level == LevelAction || r.Level == LevelScript || r.Level == LevelInvocation {
-				v.Run = r.Run
-			}
-		}
-	}
-	if !sawEnd {
-		v.add("WT-003", SeverityTerminal, "no closing boundary record: the interval was never closed")
-	}
-	// Complete and Eligible are the two-level split the report renders, and
-	// both are affirmative. COMPLETE is about the evidence: the records
-	// describe a well-formed measurement, whatever it turned out to be — so a
-	// run that failed cleanly is complete and not eligible, while a truncated
-	// stream is neither. Leaving Complete unset made the report say
-	// `complete: false` over a perfectly well-formed measurement.
+	verifySchema(v, recs)
+	v.Envelopes = collectEnvelopes(v, recs)
+	verifyRunIdentity(v, recs)
+	verifyIntervals(v, v.Envelopes)
+	verifyInvocationMembership(v, opt, v.Envelopes)
+	verifyAudit(v, opt)
+	summariseDurations(v, v.Envelopes)
+
 	v.Complete = !v.has(SeverityTerminal)
 	v.Eligible = v.Complete && !v.has(SeverityIneligible)
 	return v, nil
+}
+
+// verifySchema is check 1. A schema change is a new epoch, not a migration:
+// this binary cannot know what a later schema means, and guessing would make a
+// verdict about records it did not understand.
+func verifySchema(v *Verdict, recs []Record) {
+	for _, r := range recs {
+		if r.Schema != "" && r.Schema != SchemaVersion {
+			v.add("WT-001", SeverityTerminal,
+				fmt.Sprintf("%s/%s record %d has schema %q, want %q; a schema change is a new epoch, not a migration",
+					r.Producer, r.Level, r.Seq, r.Schema, SchemaVersion))
+		}
+	}
+}
+
+// collectEnvelopes groups the records into one envelope per measured thing.
+//
+// A DUPLICATE OPENING is reported here rather than folded into a longer
+// interval: two starts in one stream is a retry or a second lifecycle written
+// over the first, and taking the widest pair would report the union of two
+// runs as the duration of one.
+func collectEnvelopes(v *Verdict, recs []Record) []Envelope {
+	streams := groupStreams(recs)
+	var out []Envelope
+	for _, key := range sortedKeys(streams) {
+		stream := streams[key]
+		if isActionChildStream(stream) {
+			continue
+		}
+		starts := 0
+		for _, r := range stream {
+			if r.Kind == "boundary" && r.Boundary == "start" {
+				starts++
+			}
+		}
+		if starts == 0 {
+			continue
+		}
+		if starts > 1 {
+			v.add("WT-020", SeverityTerminal,
+				fmt.Sprintf("%s[%d] has %d start records; a second lifecycle in one stream is a duplicate or a retry, not a longer interval",
+					key.Level, key.Ordinal, starts))
+		}
+		e := Envelope{Level: key.Level, Seq: key.Ordinal, Physical: boundaryInterval(stream)}
+		for _, r := range stream {
+			if r.Kind != "boundary" {
+				continue
+			}
+			if r.Spec != nil {
+				e.Spec = r.Spec
+			}
+			if r.Boundary == "end" {
+				e.Terminal, e.Reason = r.Terminal, r.Reason
+				e.Containment = r.Containment
+			}
+		}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if levelRank(out[i].Level) != levelRank(out[j].Level) {
+			return levelRank(out[i].Level) < levelRank(out[j].Level)
+		}
+		return out[i].Seq < out[j].Seq
+	})
+	return out
+}
+
+// verifyIntervals is checks 2 and 3.
+func verifyIntervals(v *Verdict, envs []Envelope) {
+	if len(envs) == 0 {
+		v.add("WT-004", SeverityTerminal, "no envelope has an opening boundary: nothing here measures anything")
+		return
+	}
+	closed := 0
+	for _, e := range envs {
+		label := fmt.Sprintf("%s[%d]", e.Level, e.Seq)
+		// An interval with ONE endpoint is missing, not shorter. A run whose
+		// closing record never arrived is the shape a killed runner leaves,
+		// and inferring an end would turn it into a measurement.
+		if !e.Physical.OK {
+			v.add("WT-004", SeverityTerminal,
+				fmt.Sprintf("%s: the ledger has no closed start/end pair; an interval with one endpoint is missing, not shorter", label))
+		} else {
+			closed++
+			// POSITIVE and MONOTONIC. A reading that does not advance means
+			// the two endpoints were not two reads of a running clock, so the
+			// number derived from them is not a duration.
+			if d := e.Physical.Duration(); d <= 0 {
+				v.add("WT-012", SeverityTerminal,
+					fmt.Sprintf("%s: the interval is %d ns (start %d, end %d); an endpoint pair that does not advance is not a duration",
+						label, d, e.Physical.StartNs, e.Physical.EndNs))
+			}
+			if b := e.Physical.start.Instant.BootID; b != "" && b != e.Physical.end.Instant.BootID {
+				v.add("WT-011", SeverityTerminal,
+					fmt.Sprintf("%s: the endpoints carry boot identities %s and %s; two readings on different timelines are never compared",
+						label, b, e.Physical.end.Instant.BootID))
+			}
+		}
+		if e.Terminal != "" && e.Terminal != TerminalPassed {
+			v.add("WT-014", SeverityIneligible,
+				fmt.Sprintf("%s terminated %s: %s (retained, never scored)", label, e.Terminal, e.Reason))
+		}
+	}
+	if closed == 0 {
+		v.add("WT-003", SeverityTerminal, "no closing boundary record: the interval was never closed")
+	}
+}
+
+// verifyRunIdentity is check 4's first half: the records agree about which run
+// produced them.
+//
+// A row every record of which agrees about having NO identity is a row that
+// cannot be attributed to the run that produced it, which is why an empty
+// field is a finding rather than a match.
+func verifyRunIdentity(v *Verdict, recs []Record) {
+	seen := map[RunIdentity]bool{}
+	for _, r := range recs {
+		if r.Kind != "boundary" {
+			continue
+		}
+		seen[r.Run] = true
+		if r.Run.BucketID != "" || r.Run.Stage2 != "" {
+			v.Run = r.Run
+		}
+		if r.Boundary == "end" && r.Level == LevelAction {
+			v.Terminal = r.Terminal
+			v.StartedAt = firstNonEmptyStr(v.StartedAt, r.Instant.Realtime)
+		}
+	}
+	if len(seen) > 1 {
+		var got []string
+		for id := range seen {
+			got = append(got, fmt.Sprintf("%+v", id))
+		}
+		sort.Strings(got)
+		v.add("WT-026", SeverityIneligible,
+			fmt.Sprintf("the records name %d different run identities: %s; one measurement belongs to one run",
+				len(seen), strings.Join(got, " / ")))
+	}
+	if v.Run.BucketID == "" {
+		v.add("WT-026", SeverityIneligible,
+			"the records name no bucket; a row that cannot say which bucket it measured cannot be counted into one")
+	}
+}
+
+// verifyInvocationMembership is checks 4's second half and 5.
+//
+// Without the manifest a measured Spec is an assertion travelling beside the
+// plan rather than a claim checked against it: the verifier could confirm that
+// a record names SOME argv and selector, but not that they are the ones the
+// authorised plan rendered. Two legal name slices of one file have the same
+// description and different units, so the comparison is over identities.
+func verifyInvocationMembership(v *Verdict, opt VerifyOptions, envs []Envelope) {
+	var measured []Envelope
+	for _, e := range envs {
+		if e.Level == LevelInvocation {
+			measured = append(measured, e)
+		}
+	}
+	if opt.Invocations == nil {
+		if len(measured) > 0 {
+			v.add("WT-021", SeverityIneligible,
+				"no invocation manifest was supplied, so the measured argv, selector, unit membership and atom closure are not checked against the authorised plan")
+		}
+		return
+	}
+	m, err := opt.Invocations(v.Run.BucketID)
+	if err != nil {
+		v.add("WT-021", SeverityIneligible, fmt.Sprintf("invocation manifest: %v", err))
+		return
+	}
+	if m == nil {
+		v.add("WT-021", SeverityIneligible, "the invocation manifest lookup produced nothing")
+		return
+	}
+	if m.Kind != InvocationManifestKind {
+		v.add("WT-021", SeverityIneligible,
+			fmt.Sprintf("invocation manifest kind %q, want %q", m.Kind, InvocationManifestKind))
+		return
+	}
+	// PLAN/BUCKET IDENTITY: a manifest that names no bucket would verify
+	// identically against any bucket of the same plan.
+	switch {
+	case m.BucketName == "":
+		v.add("WT-025", SeverityIneligible,
+			"the invocation manifest names no bucket, so it would verify identically against any bucket of this plan")
+	case v.Run.BucketID != "" && m.BucketName != v.Run.BucketID:
+		v.add("WT-025", SeverityIneligible,
+			fmt.Sprintf("the invocation manifest is for bucket %q but bucket %q was measured", m.BucketName, v.Run.BucketID))
+	}
+	if len(m.Invocations) != len(measured) {
+		v.add("WT-021", SeverityIneligible,
+			fmt.Sprintf("the plan rendered %d invocation(s) but %d were measured", len(m.Invocations), len(measured)))
+	}
+	for _, e := range measured {
+		planned, ok := m.Find(e.Seq)
+		if !ok {
+			v.add("WT-021", SeverityIneligible,
+				fmt.Sprintf("invocation[%d] was measured but the authorised plan rendered no such invocation", e.Seq))
+			continue
+		}
+		if e.Spec == nil {
+			v.add("WT-021", SeverityIneligible,
+				fmt.Sprintf("invocation[%d] carries no spec, so what it ran cannot be compared to what was planned", e.Seq))
+			continue
+		}
+		for _, p := range planned.Compare(*e.Spec) {
+			v.add("WT-021", SeverityIneligible, fmt.Sprintf("invocation[%d] %s", e.Seq, p))
+		}
+	}
+}
+
+// summariseDurations fills the reported spans from the envelopes the verifier
+// derived, so the report's numbers come from the records rather than from
+// anything a producer asserted alongside them.
+func summariseDurations(v *Verdict, envs []Envelope) {
+	for _, e := range envs {
+		if !e.Physical.OK {
+			continue
+		}
+		switch e.Level {
+		case LevelAction:
+			v.ActionNs = e.Physical.Duration()
+		case LevelScript:
+			v.ScriptNs = e.Physical.Duration()
+		case LevelInvocation:
+			v.InvocationNs = append(v.InvocationNs, e.Physical.Duration())
+		}
+	}
 }

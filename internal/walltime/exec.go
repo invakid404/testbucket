@@ -676,21 +676,6 @@ const (
 	ReplayKeyEnv = "TB_WALL_REPLAY_KEY"
 	// BuilderKeyEnv signs a build attestation.
 	BuilderKeyEnv = "TB_WALL_BUILDER_KEY"
-	// SignerDelegateKeyEnv carries the SIGNER DELEGATION the action opened.
-	//
-	// The run key authorizes key-log registrations, and it is deliberately
-	// scoped to `wall begin` and `wall end` so the measured step cannot forge
-	// the signer set. That left the script and invocation producers — whose
-	// keys are minted during the measured step — with no authorization path at
-	// all, so every one of them was registered unauthorized and the verifier
-	// made every row ineligible for want of a capability nobody could hold.
-	//
-	// `wall begin` mints a delegate key, signs a delegation naming it with the
-	// run key, and leaves the delegate where the WRAPPER CHAIN can read it and
-	// the measured workload cannot. This is that channel. The delegation is
-	// bound to one run and may authorize only the lower levels, so holding it
-	// cannot register an action-level signer or vouch for another run.
-	SignerDelegateKeyEnv = "TB_WALL_SIGNER_DELEGATE_KEY"
 
 	// RunnerKeyEnv is the FLEET'S key: it signs the statement that a host was
 	// booted from a named image. The fleet provisions runners; the job does
