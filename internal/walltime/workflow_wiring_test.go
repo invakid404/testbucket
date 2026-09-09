@@ -138,3 +138,100 @@ func recordStepBlock(t *testing.T, wf string) string {
 	}
 	return wf[i:end]
 }
+
+// TestActionInternalVerificationSteps gates Step E: the run-bucket and record
+// actions must not merely DECLARE the §21 inputs, they must verify them.
+//
+// An input that arrives and is never checked is decoration: §10.5.2 step 4 and
+// §19.9c-1 both turn on a recomputation happening inside the action, before the
+// work it guards.
+func TestActionInternalVerificationSteps(t *testing.T) {
+	bucket := readRepoFile(t, filepath.Join(".github", "actions", "run-bucket", "action.yml"))
+	record := readRepoFile(t, filepath.Join(".github", "actions", "record", "action.yml"))
+
+	t.Run("run-bucket recomputes the declaration digest", func(t *testing.T) {
+		if !strings.Contains(bucket, "Verify the cache declaration") {
+			t.Fatal("run-bucket has no declaration-verification step")
+		}
+		if !strings.Contains(bucket, "sha256sum") {
+			t.Error("run-bucket does not recompute a digest; byte identity would be an assertion, not a check")
+		}
+		// The verification must precede the bucket script.
+		vi := strings.Index(bucket, "Verify the cache declaration")
+		ri := strings.Index(bucket, "Run the bucket")
+		if vi < 0 || ri < 0 || vi > ri {
+			t.Error("the declaration is verified after the bucket runs; a mismatch must fail BEFORE any script starts")
+		}
+	})
+
+	t.Run("run-bucket validates the producer state machine", func(t *testing.T) {
+		if !strings.Contains(bucket, "Validate the dependency-cache producer") {
+			t.Fatal("run-bucket has no producer-validation step")
+		}
+		// The rules that make an empty hit distinguishable from an absent one.
+		for _, rule := range []string{
+			"empty is not false",
+			"two producers is rejected",
+			"hit true with an empty matched key",
+			"hit false with a non-empty matched key",
+		} {
+			if !strings.Contains(bucket, rule) {
+				t.Errorf("the producer validation does not enforce %q", rule)
+			}
+		}
+		// Every legal mode has exactly one legal producer state.
+		if !strings.Contains(bucket, "mode disabled requires dependency-cache-producer none") {
+			t.Error("disabled mode does not pin its producer to none")
+		}
+		if !strings.Contains(bucket, "exact-key requires a producer") {
+			t.Error("exact-key mode does not reject producer none")
+		}
+	})
+
+	t.Run("run-bucket runs QC14a over the EXECUTED binary", func(t *testing.T) {
+		if !strings.Contains(bucket, "QC14a") {
+			t.Fatal("run-bucket has no QC14a step")
+		}
+		if !strings.Contains(bucket, "MONGOMS_SYSTEM_BINARY") {
+			t.Error("QC14a does not hash the file MONGOMS_SYSTEM_BINARY names, so a decoy could be hashed instead")
+		}
+		// It must run before upload, i.e. before the envelope closes.
+		qi := strings.Index(bucket, "QC14a")
+		ci := strings.Index(bucket, "Close the wall-time action envelope")
+		if qi < 0 || ci < 0 || qi > ci {
+			t.Error("QC14a must run on the bucket runner before artifact upload")
+		}
+	})
+
+	t.Run("record verifies the campaign config before invoking ingest", func(t *testing.T) {
+		if !strings.Contains(record, "Materialize and verify the campaign config") {
+			t.Fatal("record has no config-verification step")
+		}
+		vi := strings.Index(record, "Materialize and verify the campaign config")
+		ii := strings.Index(record, "testbucket ingest")
+		if vi < 0 || ii < 0 || vi > ii {
+			t.Error("the config is verified after ingest runs; §19.9c-1 requires it before")
+		}
+		if !strings.Contains(record, "printf '%s'") {
+			t.Error("the config is written with something other than printf; an expanding shell would change the bytes the digest covers")
+		}
+	})
+
+	t.Run("record passes the LOCAL verified path to ingest", func(t *testing.T) {
+		if !strings.Contains(record, "--campaign-config \"$TB_CAMPAIGN_CONFIG\"") {
+			t.Error("ingest does not receive the verified local path")
+		}
+		if !strings.Contains(record, "steps.campaign-config.outputs.file") {
+			t.Error("the config path does not come from the verify step's own output")
+		}
+		if !strings.Contains(record, "--wall-observations \"$TB_WALL_OBSERVATIONS\"") {
+			t.Error("ingest does not receive the observations directory")
+		}
+	})
+
+	t.Run("record refuses a campaign id with no verified config", func(t *testing.T) {
+		if !strings.Contains(record, "Refuse a campaign id with no verified config") {
+			t.Fatal("record accepts campaign-id without the config inputs; §15.1b would reject every scored row")
+		}
+	})
+}

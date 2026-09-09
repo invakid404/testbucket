@@ -98,6 +98,50 @@ inputs:
 runs:
   using: composite
   steps:
+    # --- §19.9c-1: materialize and VERIFY the campaign config ---------------
+    #
+    # The config crosses the boundary as CONTENT plus an expected digest,
+    # because a record-runner path is not a shared filesystem. The bytes are
+    # written job-locally and the digest recomputed over what was actually
+    # written, and the job fails BEFORE invoking `ingest` on any mismatch — so
+    # no row is appended, no selected identity or model byte changes, and the
+    # fitter is never called. The two perturbations fail independently: bytes
+    # changed with the digest held, and digest changed with the bytes held.
+    - name: Materialize and verify the campaign config
+      id: campaign-config
+      if: inputs.campaign-config-json != ''
+      shell: bash
+      env:
+        TB_CFG_JSON: ${{ inputs.campaign-config-json }}
+        TB_CFG_EXPECTED: ${{ inputs.campaign-config-digest-expected }}
+      run: |
+        set -euo pipefail
+        if [ -z "$TB_CFG_EXPECTED" ]; then
+          echo "campaign-config-json supplied without campaign-config-digest-expected" >&2
+          exit 1
+        fi
+        dest="${{ runner.temp }}/campaign-config.json"
+        # printf, not echo: the config is canonical JSON and a shell that
+        # expanded escapes would change the very bytes the digest covers.
+        printf '%s' "$TB_CFG_JSON" > "$dest"
+        actual=$(sha256sum "$dest" | cut -d' ' -f1)
+        if [ "$actual" != "$TB_CFG_EXPECTED" ]; then
+          echo "campaign config digest mismatch: materialized $actual, expected $TB_CFG_EXPECTED" >&2
+          exit 1
+        fi
+        echo "file=$dest" >> "$GITHUB_OUTPUT"
+        echo "digest=$actual" >> "$GITHUB_OUTPUT"
+
+    # A workflow that exposes campaign-id without the config inputs is a
+    # miswiring: §15.1b would then reject every scored row it ingests, so the
+    # record job refuses rather than ingesting rows it knows will be refused.
+    - name: Refuse a campaign id with no verified config
+      if: inputs.campaign-id != '' && inputs.campaign-config-json == ''
+      shell: bash
+      run: |
+        echo "campaign-id was supplied without campaign-config-json: §15.1b would reject every scored row this ingests" >&2
+        exit 1
+
     - name: Install testbucket
       shell: bash
       env:
@@ -113,6 +157,9 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        TB_WALL_OBSERVATIONS: ${{ inputs.wall-observations-dir }}
+        TB_CAMPAIGN_CONFIG: ${{ steps.campaign-config.outputs.file }}
+        TB_CAMPAIGN_CONFIG_DIGEST_EXPECTED: ${{ steps.campaign-config.outputs.digest }}
         TB_RUNNER: ${{ inputs.runner }}
         TB_K: ${{ inputs.k }}
         TB_COUNT: ${{ inputs.count }}
@@ -164,6 +211,17 @@ runs:
         # back into a whole-unit measurement, so the store keeps measuring units
         # however the matrix happened to slice them. --whale-k is the plan's k.
         echo "ingesting into $TB_STORE"
+        # §14.2's two added flags. --wall-observations is the directory the
+        # same-run artifact download left; --campaign-config is the LOCAL path
+        # the verify step above produced, never the caller's content, so an
+        # unverified config cannot reach append.
+        if [ -n "${TB_WALL_OBSERVATIONS:-}" ]; then
+          extra+=(--wall-observations "$TB_WALL_OBSERVATIONS")
+        fi
+        if [ -n "${TB_CAMPAIGN_CONFIG:-}" ]; then
+          extra+=(--campaign-config "$TB_CAMPAIGN_CONFIG")
+        fi
+
         testbucket ingest \
           --runner "$TB_RUNNER" \
           --store "$TB_STORE" \

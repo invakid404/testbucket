@@ -436,6 +436,136 @@ runs:
         echo "scored=true needs a wall-time-dir: a scored row is a MEASURED row, and with no records directory this bucket produces no evidence to verify." >&2
         exit 1
 
+    # --- §10.5.2 step 4: VERIFY the materialized declaration -----------------
+    #
+    # The bytes were published by the plan job and written to a job-local file
+    # by this matrix job. Recomputing the digest here is what makes cross-job
+    # byte identity a CHECKED property rather than an assertion about a shared
+    # pathname — two jobs on two runners share no filesystem. A declaration
+    # that arrived altered fails HERE, before any bucket script starts, so it
+    # can never reach QC14 as a silent difference.
+    - name: Verify the cache declaration
+      if: inputs.cache-declaration-file != ''
+      shell: bash
+      env:
+        TB_DECL_FILE: ${{ inputs.cache-declaration-file }}
+        TB_DECL_DIGEST: ${{ inputs.cache-declaration-digest }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$TB_DECL_FILE" ]; then
+          echo "cache-declaration-file $TB_DECL_FILE does not exist on this runner" >&2
+          exit 1
+        fi
+        if [ -z "$TB_DECL_DIGEST" ]; then
+          echo "cache-declaration-file supplied without cache-declaration-digest" >&2
+          exit 1
+        fi
+        actual=$(sha256sum "$TB_DECL_FILE" | cut -d' ' -f1)
+        if [ "$actual" != "$TB_DECL_DIGEST" ]; then
+          echo "cache declaration digest mismatch: materialized $actual, plan published $TB_DECL_DIGEST" >&2
+          exit 1
+        fi
+
+    # --- §10.5.3: the producer state machine, before the script starts -------
+    #
+    # Every legal mode has exactly one legal producer state, and the companion
+    # inputs are required IFF the producer is `caller`. Supplying two producers
+    # is rejected rather than silently resolved in favour of one, and an empty
+    # `dependency-cache-hit` is NOT false — an empty matched key WITH a false
+    # hit is a caller-owned miss, while an empty matched key WITHOUT a hit is
+    # absent producer data, and the two must stay distinguishable.
+    - name: Validate the dependency-cache producer
+      if: inputs.scored == 'true'
+      shell: bash
+      env:
+        TB_PRODUCER: ${{ inputs.dependency-cache-producer }}
+        TB_MATCHED: ${{ inputs.dependency-cache-matched-key }}
+        TB_HIT: ${{ inputs.dependency-cache-hit }}
+        TB_DECL_FILE: ${{ inputs.cache-declaration-file }}
+      run: |
+        set -euo pipefail
+        case "$TB_PRODUCER" in
+          none|action|caller) ;;
+          "") echo "dependency-cache-producer is required for a scored run" >&2; exit 1 ;;
+          *)  echo "dependency-cache-producer is \"$TB_PRODUCER\"; it must be none, action or caller" >&2; exit 1 ;;
+        esac
+
+        # The declared mode decides which producer is legal.
+        mode=$(grep -o '"dependency_cache_mode":"[^"]*"' "$TB_DECL_FILE" | head -1 | cut -d'"' -f4)
+        case "$mode" in
+          disabled)
+            if [ "$TB_PRODUCER" != "none" ]; then
+              echo "declared mode disabled requires dependency-cache-producer none, got $TB_PRODUCER" >&2
+              exit 1
+            fi ;;
+          exact-key)
+            if [ "$TB_PRODUCER" = "none" ]; then
+              echo "declared mode exact-key requires a producer; none is illegal there" >&2
+              exit 1
+            fi ;;
+          *)
+            echo "declared dependency_cache_mode is \"$mode\"; only disabled and exact-key are legal" >&2
+            exit 1 ;;
+        esac
+
+        if [ "$TB_PRODUCER" = "caller" ]; then
+          # Both companions required; the HIT must be a literal true or false,
+          # because empty is not false.
+          if [ -z "${TB_HIT}" ]; then
+            echo "producer caller requires dependency-cache-hit; empty is not false" >&2
+            exit 1
+          fi
+          if [ "$TB_HIT" != "true" ] && [ "$TB_HIT" != "false" ]; then
+            echo "dependency-cache-hit is \"$TB_HIT\"; it is true or false and nothing else" >&2
+            exit 1
+          fi
+          if [ "$TB_HIT" = "true" ] && [ -z "$TB_MATCHED" ]; then
+            echo "incoherent producer result: hit true with an empty matched key" >&2
+            exit 1
+          fi
+          if [ "$TB_HIT" = "false" ] && [ -n "$TB_MATCHED" ]; then
+            echo "incoherent producer result: hit false with a non-empty matched key" >&2
+            exit 1
+          fi
+        else
+          # Under `action` and `none` BOTH companions must be absent —
+          # supplying them is two producers, which is rejected.
+          if [ -n "$TB_MATCHED" ] || [ -n "$TB_HIT" ]; then
+            echo "producer $TB_PRODUCER with a companion input present: supplying two producers is rejected" >&2
+            exit 1
+          fi
+        fi
+
+    # --- QC14a: the hashed binary is the EXECUTED binary --------------------
+    #
+    # On the bucket runner, before artifact upload. The digest is taken over
+    # the file MONGOMS_SYSTEM_BINARY names, so a decoy resident elsewhere
+    # cannot be hashed in its place — even one whose digest happens to equal
+    # the declared expectation.
+    - name: QC14a — bind the executed MongoDB binary
+      if: inputs.scored == 'true'
+      shell: bash
+      env:
+        TB_DECL_FILE: ${{ inputs.cache-declaration-file }}
+      run: |
+        set -euo pipefail
+        if [ -z "${MONGOMS_SYSTEM_BINARY:-}" ]; then
+          echo "QC14a: MONGOMS_SYSTEM_BINARY is unset or empty; no scored observation is produced" >&2
+          exit 1
+        fi
+        if [ ! -f "$MONGOMS_SYSTEM_BINARY" ]; then
+          echo "QC14a: MONGOMS_SYSTEM_BINARY names $MONGOMS_SYSTEM_BINARY, which is not a file" >&2
+          exit 1
+        fi
+        executed=$(sha256sum "$MONGOMS_SYSTEM_BINARY" | cut -d' ' -f1)
+        expected=$(grep -o '"expected_mongo_binary_sha256":"[^"]*"' "$TB_DECL_FILE" | head -1 | cut -d'"' -f4)
+        expected=${expected#sha256:}
+        if [ -n "$expected" ] && [ "$executed" != "$expected" ]; then
+          echo "QC14a: executed binary $MONGOMS_SYSTEM_BINARY digests to $executed, declaration expects $expected" >&2
+          exit 1
+        fi
+        echo "QC14a: executed binary $MONGOMS_SYSTEM_BINARY verified on this runner"
+
     # The Go runner needs the binary for `testbucket render`; a Vitest bucket's
     # script prints its own default-reporter log, so it needs no binary.
     #
