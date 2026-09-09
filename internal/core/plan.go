@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"text/tabwriter"
 	"time"
 
@@ -40,6 +41,20 @@ type PlanBucket struct {
 	Units       []PlanUnit          `json:"units"`
 	Invocations []runner.Invocation `json:"invocations"`
 	Script      string              `json:"script"`
+
+	// AEtaNs is the exact integer-nanosecond objective value of contract
+	// §0.9, serialized as a decimal string. It is ADDITIVE (PD-1) and present
+	// iff the plan was built under `est_basis: wall`; §5.1 puts it on plan
+	// buckets and observations, and MATRIX ENTRIES CARRY NONE.
+	//
+	// Under wall basis est_seconds is exactly round1(a_eta_ns / 1e9), and a
+	// validator recomputes one from the other.
+	AEtaNs *Nanos `json:"a_eta_ns,omitempty"`
+
+	// WallEstSeconds is §5.1's additive SHADOW, emitted iff the basis is
+	// reporter AND a fitted model with status ok exists. It never reaches
+	// AllocationScore.
+	WallEstSeconds *float64 `json:"wall_est_seconds,omitempty"`
 }
 
 // PlanSummary is the loaded-vs-missing report. It exists so that a store that
@@ -81,6 +96,62 @@ type PlanDocument struct {
 	Summary   PlanSummary  `json:"summary"`
 	Buckets   []PlanBucket `json:"buckets"`
 	Notes     []string     `json:"notes,omitempty"`
+
+	// EstBasis declares what the displayed estimate MEANS (§16.1). The plan
+	// document and every matrix entry carry it. It is additive: PD-1's
+	// canonical v0.2.2-field projection excludes it, so an unopted consumer
+	// still reads byte-identical legacy bytes.
+	EstBasis EstBasis `json:"est_basis"`
+
+	// ExpandedUnitSetDigest is additive too, and is byte-identical across the
+	// two bases for one store and one live set — unit topology is
+	// store-derived in both, so only the partition differs.
+	ExpandedUnitSetDigest string `json:"expanded_unit_set_digest,omitempty"`
+
+	// RuntimeProfileDeclared and its digest ride in the plan document, which
+	// is already transported to every bucket job. §21 fixes the plan job's
+	// output set at matrix, cache-declaration-json and cache-declaration-digest,
+	// and §15.3a does not enlarge it.
+	RuntimeProfileDeclared       map[string]string `json:"runtime_profile_declared,omitempty"`
+	RuntimeProfileDeclaredDigest string            `json:"runtime_profile_declared_digest,omitempty"`
+}
+
+// Nanos is a nanosecond count serialized as a JSON STRING.
+//
+// The reason is the canonical digest: RFC 8785 renders numbers through
+// ECMAScript double formatting, so an integer above 2^53 — which a nanosecond
+// count routinely is — would round, and two readers could canonicalise the same
+// plan to different bytes. Carrying it as a string keeps the value exact.
+type Nanos int64
+
+func (n Nanos) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.Quote(strconv.FormatInt(int64(n), 10))), nil
+}
+
+func (n *Nanos) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return fmt.Errorf("nanoseconds %q: %w", s, err)
+		}
+		*n = Nanos(v)
+		return nil
+	}
+	var v int64
+	if err := json.Unmarshal(b, &v); err != nil {
+		return fmt.Errorf("nanoseconds %s: %w", b, err)
+	}
+	*n = Nanos(v)
+	return nil
+}
+
+// LegacyProjectionFields is PD-1's canonical v0.2.2 field set for a matrix
+// entry, in v0.2.2 order. The projection restricted to these names must be
+// BYTE-IDENTICAL for a consumer that has not opted in; everything else this
+// product adds is additive and asserted separately.
+func LegacyProjectionFields() []string {
+	return []string{"bucket", "name", "est_seconds", "needs_node", "units", "invocations", "script"}
 }
 
 // PlanOptions is the framework-NEUTRAL plan configuration. Everything about how
@@ -336,6 +407,12 @@ func renderPlanBucket(b runner.Bucket, r runner.Rendered) PlanBucket {
 // MatrixJSON renders the GitHub-Actions matrix, ready for
 // `matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}`.
 func (d *PlanDocument) MatrixJSON() ([]byte, error) {
+	// The v0.2.2 field set comes first, in v0.2.2 order, so PD-1's canonical
+	// legacy projection is a prefix of this struct rather than a reordering of
+	// it. The additive fields follow and are omitted when they do not apply.
+	//
+	// There is deliberately NO a_eta_ns here: §5.1 puts the exact integer on
+	// plan buckets and observations, and matrix entries carry none.
 	type entry struct {
 		Bucket      int                 `json:"bucket"`
 		Name        string              `json:"name"`
@@ -344,18 +421,23 @@ func (d *PlanDocument) MatrixJSON() ([]byte, error) {
 		Units       []string            `json:"units"`
 		Invocations []runner.Invocation `json:"invocations"`
 		Script      string              `json:"script"`
+
+		EstBasis       EstBasis `json:"est_basis"`
+		WallEstSeconds *float64 `json:"wall_est_seconds,omitempty"`
 	}
 	out := struct {
 		Include []entry `json:"include"`
 	}{}
 	for _, b := range d.Buckets {
 		e := entry{
-			Bucket:      b.Index,
-			Name:        b.Name,
-			Seconds:     round1(b.Seconds),
-			NeedsNode:   b.NeedsNode,
-			Invocations: b.Invocations,
-			Script:      b.Script,
+			Bucket:         b.Index,
+			Name:           b.Name,
+			Seconds:        round1(b.Seconds),
+			NeedsNode:      b.NeedsNode,
+			Invocations:    b.Invocations,
+			Script:         b.Script,
+			EstBasis:       d.EstBasis,
+			WallEstSeconds: b.WallEstSeconds,
 		}
 		for _, u := range b.Units {
 			e.Units = append(e.Units, u.ID)
