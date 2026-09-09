@@ -16,7 +16,12 @@ inputs:
     description: 'Human label for the bucket (matrix.name).'
     default: bucket
   est-seconds:
-    description: 'The bucket''s time estimate in seconds (matrix.est_seconds).'
+    description: >-
+      The bucket's estimate in seconds, from `matrix.est_seconds`. Its MEANING
+      is given by `est_basis` (§16.4): under `reporter` it is the bucket's
+      reporter-work sum, and under `wall` it is `round1(A_eta_ns/1e9)` of the
+      model's objective. It is never the job's wall time — the job is not
+      measured.
     default: ""
   events-dir:
     description: >-

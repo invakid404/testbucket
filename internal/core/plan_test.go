@@ -123,7 +123,9 @@ func TestBuildPlanLoadedVsMissingSummary(t *testing.T) {
 		"live test packages",
 		"loaded (recorded timing)",
 		"missing (mean estimate)",
-		"measured wall-time",
+		// §16.4 repair: this line said "measured wall-time", which the job never
+		// is. The basis is now named.
+		"recorded reporter work",
 		"total scheduled work",
 		"store rows with no live package",
 		"coverage drift vs store",

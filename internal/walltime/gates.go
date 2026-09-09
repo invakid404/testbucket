@@ -353,7 +353,8 @@ func EvaluateAeta(samples []AetaSample, expected int) []GateResult {
 	}
 }
 
-// CampaignRun is one workflow run's per-bucket complete action times for one
+// CampaignRun is one workflow run's per-bucket instrumented run-bucket
+// intervals for one
 // arm. Bucket rows are not independent primary samples; the run-level Amax and
 // TA are.
 //
@@ -398,7 +399,8 @@ type CampaignRun struct {
 	VerdictDigests []Digest `json:"verdict_digests"`
 }
 
-// Amax is the makespan of the run: the longest complete action.
+// Amax is the makespan of the run: the longest instrumented run-bucket
+// interval.
 func (r CampaignRun) Amax() int64 {
 	var m int64
 	for _, a := range r.ActionNs {
@@ -573,7 +575,8 @@ func campaignScoped(gates []GateResult) []GateResult {
 }
 
 // campaignPopulation is the gate the frozen thresholds are defined over:
-// exactly five pairs, ten eligible runs, eighty complete action observations
+// exactly five pairs, ten eligible runs, eighty instrumented run-bucket
+// interval observations
 // per arm, every run contributing exactly K rows, at least three distinct UTC
 // dates, a window of at most fourteen days, and every run retained with its
 // terminal state.
@@ -610,7 +613,7 @@ func campaignPopulation(pairs []CampaignPair) GateResult {
 			}
 			for j, ns := range r.ActionNs {
 				if ns <= 0 {
-					problems = append(problems, fmt.Sprintf("pair %d %s bucket %d has no positive complete action", i, arm, j))
+					problems = append(problems, fmt.Sprintf("pair %d %s bucket %d has no positive instrumented run-bucket interval", i, arm, j))
 				}
 			}
 			if len(r.VerdictDigests) != len(r.ActionNs) {

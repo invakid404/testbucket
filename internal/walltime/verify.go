@@ -1562,7 +1562,7 @@ func verifyStepAttempt(v *Verdict, opt VerifyOptions, envs []Envelope) {
 		return
 	}
 	if action == nil || !action.Physical.OK {
-		v.add("WT-022", SeverityIneligible, "a step attempt was supplied but no complete action envelope was recorded")
+		v.add("WT-022", SeverityIneligible, "a step attempt was supplied but no instrumented run-bucket interval was recorded")
 		return
 	}
 	for _, p := range doc.Attempt.CheckIdentity(v.Run, action.Physical.start, action.Physical.end) {

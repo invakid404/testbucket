@@ -74,7 +74,8 @@ differencing), deterministic down to the tie-break, so the same store and the
 same K always produce the same buckets. Its objective is the SUM of a bucket's
 unit times, so by default every emitted invocation runs its units serially
 (`-p=1` for Go, `--no-file-parallelism` for Vitest) — which is what makes that sum
-the job's actual wall time rather than a proxy for it. (LPT is kept one function
+the bucket's reporter-work estimate rather than a proxy for it. It is not the
+job's wall time: the job is never measured, and §310 below says so. (LPT is kept one function
 away as the reference the KK partition is measured against in the tests.)
 
 `--file-parallelism N` (N>1) opts out, rendering `-p=N` / `--maxWorkers=N` so a
@@ -440,8 +441,8 @@ behaviour of a system that refuses to assert a boundary it does not have.
   membership and atom closure are compared to it rather than merely recorded —
   two legal name slices of one file share a description and differ only there.
   The second is A_GH: GitHub reports whole seconds, so it is never a gate, but
-  it says which step a ledger measured and accounts for the wrapper install
-  that necessarily precedes AT_start.
+  it says which step a ledger measured. It accounts for no wrapper install:
+  that install happens OUTSIDE the measured interval, before AT_start.
 - The frozen profile is **enforced, not assumed**. Stage-1 validation requires
   the source profile, the consumer identity and the bundle source to be exactly
   `mandel-ai/mandel@d9ae1d43…`. Internal agreement among caller-supplied fields

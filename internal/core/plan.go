@@ -114,6 +114,13 @@ type PlanDocument struct {
 	// and §15.3a does not enlarge it.
 	RuntimeProfileDeclared       map[string]string `json:"runtime_profile_declared,omitempty"`
 	RuntimeProfileDeclaredDigest string            `json:"runtime_profile_declared_digest,omitempty"`
+
+	// fileParallelism is the intra-bucket concurrency the plan was built
+	// under. It is unexported and unserialized: it exists only so the human
+	// report can suppress §16.4's execution-model line above 1, where the
+	// sentence would be false. A serialized field would be a new wire path
+	// with no registry entry.
+	fileParallelism int
 }
 
 // Nanos is a nanosecond count serialized as a JSON STRING.
@@ -194,6 +201,13 @@ type PlanOptions struct {
 	// Runnables method is used; it is an injection seam for tests that drive
 	// the planner against a synthetic tree with no toolchain.
 	Runnables runnableNamer
+	// FileParallelism is the intra-bucket concurrency the buckets were
+	// rendered under. Core does not use it to pack — the sum-of-weights model
+	// is unchanged — but §16.4 requires the human report to SUPPRESS its
+	// execution-model line above 1, where "a bucket's estimate is its serial
+	// reporter-work sum" stops being true: a bucket then finishes nearer its
+	// heaviest unit than its sum.
+	FileParallelism int
 }
 
 // Validate rejects settings that would emit an invalid or meaningless matrix. A
@@ -298,12 +312,13 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 	}
 
 	doc := &PlanDocument{
-		K:         opt.K,
-		Flags:     token,
-		Algorithm: "karmarkar-karp",
-		StorePath: storeName(opt.StorePath),
-		UpdatedAt: st.UpdatedAt,
-		Notes:     ex.Notes,
+		K:               opt.K,
+		Flags:           token,
+		Algorithm:       "karmarkar-karp",
+		StorePath:       storeName(opt.StorePath),
+		UpdatedAt:       st.UpdatedAt,
+		Notes:           ex.Notes,
+		fileParallelism: opt.FileParallelism,
 	}
 	if opt.AllocationScore != nil {
 		// Say so out loud: a reader comparing bucket estimates against the
@@ -479,7 +494,7 @@ func (d *PlanDocument) WriteSummary(out io.Writer, shortenPrefix string) error {
 	fmt.Fprintf(w, "\nloaded vs missing\n")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(tw, "  live test packages\t%d\t\n", s.LivePackages)
-	fmt.Fprintf(tw, "  loaded (recorded timing)\t%d\tmeasured wall-time %s\n", s.Loaded, humanSeconds(s.MeasuredSeconds))
+	fmt.Fprintf(tw, "  loaded (recorded timing)\t%d\trecorded reporter work %s\n", s.Loaded, humanSeconds(s.MeasuredSeconds))
 	fmt.Fprintf(tw, "  missing (mean estimate)\t%d\testimated %s @ mean %.1fs\n", s.Missing, humanSeconds(s.EstimatedSeconds), s.MeanSeconds)
 	fmt.Fprintf(tw, "  scheduled units\t%d\ttotal scheduled work %s\n", s.ScheduledUnits, humanSeconds(s.TotalSeconds))
 	if len(s.StaleRows) > 0 {
@@ -527,6 +542,12 @@ func (d *PlanDocument) WriteSummary(out io.Writer, shortenPrefix string) error {
 	_, _ = fmt.Fprintf(w, "or fuzz target) of every name-sliced package, and every count-shard of\n")
 	_, _ = fmt.Fprintf(w, "every sharded package is assigned to exactly one bucket; each sharded\n")
 	_, _ = fmt.Fprintf(w, "package's shards add back up to the requested -count.\n")
-	_, _ = fmt.Fprintf(w, "execution model: -p=1, so a bucket's estimate is its serial wall time.\n")
+	// §16.4: the old wording called this "serial wall time", which is true only
+	// of the serial REPORTER-WORK sum. The basis is named, and the line is not
+	// emitted at all when file_parallelism > 1, because a bucket then finishes
+	// nearer its heaviest unit than its sum and the sentence would be false.
+	if d.fileParallelism <= 1 {
+		_, _ = fmt.Fprintf(w, "execution model: -p=1, so a bucket's estimate is its serial reporter-work sum.\n")
+	}
 	return ew.err
 }
