@@ -479,6 +479,103 @@ on:
 # grants less than a called job declares, so the two halves cannot drift apart
 # again.
 
+      # --- contract §21 scored caller union ---------------------------------
+      #
+      # The reusable workflow exposes EVERY scored input (R8-D6). An earlier
+      # revision gave the plan action six scored inputs while the workflow
+      # exposed only three, so a caller could set `scored: true` through the
+      # workflow and then fail AD-9/AD-10 with no way to supply what they need.
+      est-basis:
+        description: >-
+          Which weight the partition is built from: `reporter` (default) or
+          `wall` (§16.1).
+        type: string
+        default: reporter
+      scored:
+        description: >-
+          Whether this run belongs to a scored campaign. Explicit because
+          nothing else derives it — a scored B arm runs `reporter` too.
+        type: string
+        default: "false"
+      runner-class:
+        description: 'Stable execution-class leaf of the comparability key (§15.3, AD-8).'
+        type: string
+        default: ""
+      runs-on-label:
+        description: >-
+          The caller's resolved `runs-on` label. No context yields it inside a
+          composite action, so the caller passes it to both `plan` and
+          `run-bucket`; QC12 compares the two (AD-8).
+        type: string
+        default: ""
+      cache-declaration-json:
+        description: >-
+          The canonical cache declaration of §10.5.0 as CONTENT. A pathname
+          cannot cross the workflow-call boundary: it is only a string inside
+          the called workflow, and the two share no filesystem (§10.5.2 hop 0).
+        type: string
+        default: ""
+      cache-declaration-digest-expected:
+        description: >-
+          Expected SHA-256 of that content, consumed once at §10.5.2 step 0c
+          and nowhere else. It is a distinct name from the plan job's
+          `cache-declaration-digest` OUTPUT, which is produced over the bytes
+          the plan job verified; matrix jobs consume the output only.
+        type: string
+        default: ""
+      dependency-cache-producer:
+        description: '`none`, `action` or `caller` — §10.5.3''s wire representation.'
+        type: string
+        default: ""
+      dependency-cache-matched-key:
+        description: >-
+          The caller's restore matched key, possibly empty. Required (possibly
+          empty) iff the producer is `caller`.
+        type: string
+        default: ""
+      dependency-cache-hit:
+        description: >-
+          The caller's restore result, `true` or `false`. Empty is NOT false:
+          an empty matched key with a false hit is a caller-owned miss, while
+          an empty matched key with no hit is absent producer data.
+        type: string
+        default: ""
+      candidate-sha:
+        description: 'The testbucket commit the executing binary was built from (AD-10, QC15).'
+        type: string
+        default: ""
+      workload-commit:
+        description: 'The consumer checkout this run executes against (AD-10, QC15).'
+        type: string
+        default: ""
+      wall-observations-dir:
+        description: 'Directory the record job hands to `ingest --wall-observations` (§14.2).'
+        type: string
+        default: ""
+      campaign-config-json:
+        description: >-
+          The frozen §19.9a campaign config as content. Required iff the
+          ingested set contains a scored or pilot row.
+        type: string
+        default: ""
+      campaign-config-digest-expected:
+        description: >-
+          Expected SHA-256 of that content. §19.9c-1 verifies job-locally and
+          fails BEFORE invoking `ingest`; the two perturbations fail
+          independently.
+        type: string
+        default: ""
+    outputs:
+      cache-declaration-json:
+        description: >-
+          The canonical declaration bytes the plan job verified, re-exposed so
+          a caller composing this workflow can see exactly what every bucket
+          verified against.
+        value: ${{ jobs.plan.outputs.cache-declaration-json }}
+      cache-declaration-digest:
+        description: 'SHA-256 over those same bytes (§10.5.2 step 2).'
+        value: ${{ jobs.plan.outputs.cache-declaration-digest }}
+
 jobs:
   # 1/3 — PLAN. Cheap, and the gate for everything downstream.
   plan:
@@ -493,6 +590,11 @@ jobs:
       # every downstream job that installs the candidate. One derivation is the
       # point: a value each job resolved for itself could differ between them.
       candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}
+      # §10.5.2 step 2: the declaration crosses the job boundary as CONTENT
+      # plus a digest, because two jobs on two runners share no filesystem and
+      # a pathname would transport nothing.
+      cache-declaration-json: ${{ steps.plan.outputs.cache-declaration-json }}
+      cache-declaration-digest: ${{ steps.plan.outputs.cache-declaration-digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -651,10 +753,47 @@ jobs:
           authority-key: ${{ inputs.authority-key }}
           expect: ${{ inputs.candidate-binary-digest }}
 
+      # §10.5.2 hop 0, steps 0b-0c. The caller's bytes are written to a
+      # JOB-LOCAL file and the digest is recomputed over what was actually
+      # written; a mismatch fails the job BEFORE `plan` is invoked, so no
+      # matrix is emitted. A perturbation of either the bytes or the expected
+      # digest fails here, independently.
+      - name: Materialize and verify the cache declaration
+        id: cache-declaration
+        if: inputs.cache-declaration-json != ''
+        shell: bash
+        env:
+          TB_DECL_JSON: ${{ inputs.cache-declaration-json }}
+          TB_DECL_EXPECTED: ${{ inputs.cache-declaration-digest-expected }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TB_DECL_EXPECTED" ]; then
+            echo "cache-declaration-json supplied without cache-declaration-digest-expected" >&2
+            exit 1
+          fi
+          dest="${{ runner.temp }}/cache-declaration.json"
+          # printf, not echo: the declaration is canonical single-line JSON and
+          # a shell that expanded escapes would change the very bytes the
+          # digest is taken over.
+          printf '%s' "$TB_DECL_JSON" > "$dest"
+          actual=$(sha256sum "$dest" | cut -d' ' -f1)
+          if [ "$actual" != "$TB_DECL_EXPECTED" ]; then
+            echo "cache declaration digest mismatch: materialized $actual, expected $TB_DECL_EXPECTED" >&2
+            exit 1
+          fi
+          echo "file=$dest" >> "$GITHUB_OUTPUT"
+
       - name: Plan the buckets
         id: plan
         uses: $/.github/actions/plan
         with:
+          est-basis: ${{ inputs.est-basis }}
+          scored: ${{ inputs.scored }}
+          runner-class: ${{ inputs.runner-class }}
+          runs-on-label: ${{ inputs.runs-on-label }}
+          cache-declaration-file: ${{ steps.cache-declaration.outputs.file }}
+          candidate-sha: ${{ inputs.candidate-sha }}
+          workload-commit: ${{ inputs.workload-commit }}
           runner: ${{ inputs.runner }}
           k: ${{ inputs.k }}
           count: ${{ inputs.count }}
@@ -872,6 +1011,22 @@ jobs:
       # derived, and the plan itself. The plan is what the coverage audit
       # compares this bucket's events against: a wall-time envelope records how
       # long something took and can never record what it skipped.
+      # §10.5.2 step 3. Each matrix job writes the plan job's published bytes
+      # to its OWN job-local file; run-bucket then re-verifies the digest and
+      # fails the job before any bucket script starts if a byte moved. The path
+      # is job-local by construction and is never claimed to be shared.
+      - name: Materialize the cache declaration
+        id: bucket-cache-declaration
+        if: needs.plan.outputs.cache-declaration-json != ''
+        shell: bash
+        env:
+          TB_DECL_JSON: ${{ needs.plan.outputs.cache-declaration-json }}
+        run: |
+          set -euo pipefail
+          dest="${{ runner.temp }}/cache-declaration.json"
+          printf '%s' "$TB_DECL_JSON" > "$dest"
+          echo "file=$dest" >> "$GITHUB_OUTPUT"
+
       - name: Download the derived plan documents
         if: inputs.frozen-inputs-artifact != ''
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -958,6 +1113,18 @@ jobs:
           runner: ${{ inputs.runner }}
           script: ${{ matrix.script }}
           name: ${{ matrix.name }}
+          # §10.5.2 step 3: the bytes come from the PLAN JOB'S OUTPUTS, never
+          # from the caller inputs — exactly one value governs every bucket job
+          # of a run, and a bucket wired to the caller would reintroduce the
+          # unbound second source the transport repair removed.
+          runs-on-label: ${{ inputs.runs-on-label }}
+          cache-declaration-file: ${{ steps.bucket-cache-declaration.outputs.file }}
+          cache-declaration-digest: ${{ needs.plan.outputs.cache-declaration-digest }}
+          dependency-cache-producer: ${{ inputs.dependency-cache-producer }}
+          dependency-cache-matched-key: ${{ inputs.dependency-cache-matched-key }}
+          dependency-cache-hit: ${{ inputs.dependency-cache-hit }}
+          candidate-sha: ${{ inputs.candidate-sha }}
+          workload-commit: ${{ inputs.workload-commit }}
           # Bound by the ACTION to `wall begin` and `wall end` only. It must
           # never reach the setup command or the measured script: those are the
           # work being attested, and a signer set the measured work can produce
@@ -1165,6 +1332,9 @@ jobs:
       - name: Audit and record the run
         uses: $/.github/actions/record
         with:
+          wall-observations-dir: ${{ inputs.wall-observations-dir }}
+          campaign-config-json: ${{ inputs.campaign-config-json }}
+          campaign-config-digest-expected: ${{ inputs.campaign-config-digest-expected }}
           runner: ${{ inputs.runner }}
           k: ${{ inputs.k }}
           count: ${{ inputs.count }}
