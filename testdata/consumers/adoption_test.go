@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
 // PinnedMandelCommit is the frozen workload identity of contract §19.3. The
@@ -232,8 +236,16 @@ func TestConsumerAdoptionIdentitiesAreSeparateAndRecorded(t *testing.T) {
 // is rejected, including the case where both arms agree with each other and
 // both disagree with the pinned revision.
 //
-// The checkout-bound half is gate AG-2 and cannot run offline; what is tested
-// here is that the comparison rejects rather than tolerates.
+// The checkout-bound half is gate AG-2 and cannot run offline. What runs here
+// is the comparison — and its "recomputed" side is DERIVED, every value of it,
+// from the pinned fixture and from the digests SOURCE.md records. It used to be
+// eight literals, four of them placeholders (`sha256:tree`, `sha256:units`,
+// `pnpm tb-vitest`, `integration-tests/`), compared against themselves. Two of
+// those were not merely synthetic but WRONG: the fixture's own workflow says
+// the façade is `pnpm exec tsx scripts/tb-vitest.ts` and the discovery
+// exclusion is `shared/f/lib/cases/`. A manifest carrying the fixture's real
+// values would have been rejected and one carrying the placeholders accepted,
+// which is this test's own purpose pointing the wrong way.
 func TestWorkloadBindingRecomputesFromPinnedCheckout(t *testing.T) {
 	// The recomputable values §19.2a names.
 	type binding struct {
@@ -258,19 +270,66 @@ func TestWorkloadBindingRecomputesFromPinnedCheckout(t *testing.T) {
 			"discovered_unit_set_digest": b.DiscoveredUnitSetDigest,
 		}
 	}
-	// Recomputed from the pinned fixture, for the two values we can derive
-	// offline.
-	d := StoredFixtureDigests()
+
 	recomputed := binding{
-		FacadeSHA256:             d["mandel/scripts/tb-vitest.ts"],
-		VitestConfigSHA256:       d["mandel/vitest.config.ts"],
-		LockfileSHA256:           "c9381f491ac8a5a3954b70f761834c7a69dbef890bde673d269a732952be611c",
-		PackageJSONSHA256:        d["mandel/package.json"],
-		WorkloadTreeDigest:       "sha256:tree",
-		FacadeArgv:               "pnpm tb-vitest",
-		DiscoveryExcludePrefixes: "integration-tests/",
-		DiscoveredUnitSetDigest:  "sha256:units",
+		// Hashed from the vendored bytes rather than read from the digest
+		// table: the table is checked against these same files elsewhere, and
+		// a value taken from it would make this test agree with a
+		// transcription.
+		FacadeSHA256:       fileDigest(t, "mandel", "scripts", "tb-vitest.ts"),
+		VitestConfigSHA256: fileDigest(t, "mandel", "vitest.config.ts"),
+		PackageJSONSHA256:  fileDigest(t, "mandel", "package.json"),
+		// The full pnpm-lock.yaml is NOT vendored — SOURCE.md is explicit that
+		// its digest is a CHECKOUT assertion rather than an offline result. So
+		// it is read from the record that makes the assertion, and a drift in
+		// that record fails here.
+		LockfileSHA256: sourceRecordedDigest(t, "mandel/pnpm-lock.yaml"),
+		// The workload tree digest is likewise a checkout value. What is
+		// derivable offline is the digest over the pinned fixture's OWN file
+		// set, which is what this repository knows of that tree: change any
+		// vendored byte and this moves.
+		WorkloadTreeDigest: pinnedFixtureTreeDigest(t),
+		// Read from the fixture's own workflow, which SOURCE.md names as where
+		// these constants are read from rather than asserted.
+		FacadeArgv:               fixtureEnvValue(t, "TESTBUCKET_VITEST_COMMAND"),
+		DiscoveryExcludePrefixes: fixtureEnvValue(t, "TB_DISCOVERY_EXCLUDE_PREFIXES"),
+		// Derived from tracked-test-paths.txt through §20.6a's membership
+		// partition — the same input the fixture's other regressions use.
+		DiscoveredUnitSetDigest: discoveredUnitSetDigest(t),
 	}
+
+	// The derivations must produce the fixture's real values, not merely
+	// something. Stated explicitly, so a broken derivation cannot quietly make
+	// every comparison below trivial.
+	t.Run("every recomputed value is the fixture's own", func(t *testing.T) {
+		stored := StoredFixtureDigests()
+		for path, got := range map[string]string{
+			"mandel/scripts/tb-vitest.ts": recomputed.FacadeSHA256,
+			"mandel/vitest.config.ts":     recomputed.VitestConfigSHA256,
+			"mandel/package.json":         recomputed.PackageJSONSHA256,
+		} {
+			if stored[path] != got {
+				t.Errorf("%s hashes to %s, but the pinned digest is %s", path, got, stored[path])
+			}
+		}
+		if want := "c9381f491ac8a5a3954b70f761834c7a69dbef890bde673d269a732952be611c"; recomputed.LockfileSHA256 != want {
+			t.Errorf("the lockfile digest read from SOURCE.md is %q, want the recorded %q", recomputed.LockfileSHA256, want)
+		}
+		if want := "pnpm exec tsx scripts/tb-vitest.ts"; recomputed.FacadeArgv != want {
+			t.Errorf("facade argv read from the fixture = %q, want %q", recomputed.FacadeArgv, want)
+		}
+		if want := "shared/f/lib/cases/"; recomputed.DiscoveryExcludePrefixes != want {
+			t.Errorf("discovery exclude prefixes read from the fixture = %q, want %q", recomputed.DiscoveryExcludePrefixes, want)
+		}
+		for name, v := range map[string]string{
+			"workload_tree_digest":       recomputed.WorkloadTreeDigest,
+			"discovered_unit_set_digest": recomputed.DiscoveredUnitSetDigest,
+		} {
+			if !strings.HasPrefix(v, "sha256:") || len(v) != len("sha256:")+64 {
+				t.Errorf("%s = %q, which is not a derived sha256 digest", name, v)
+			}
+		}
+	})
 
 	validate := func(declared, recomputed binding) error {
 		dl, rl := fields(declared), fields(recomputed)
@@ -318,6 +377,32 @@ func TestWorkloadBindingRecomputesFromPinnedCheckout(t *testing.T) {
 		}
 	})
 
+	t.Run("the placeholders this test used to recompute are now rejected", func(t *testing.T) {
+		// The exact four values the earlier revision compared against itself.
+		// Each must now be refused, because each disagrees with the fixture.
+		for name, placeholder := range map[string]string{
+			"workload_tree_digest":       "sha256:tree",
+			"discovered_unit_set_digest": "sha256:units",
+			"facade_argv":                "pnpm tb-vitest",
+			"discovery_exclude_prefixes": "integration-tests/",
+		} {
+			manifest := recomputed
+			switch name {
+			case "workload_tree_digest":
+				manifest.WorkloadTreeDigest = placeholder
+			case "discovered_unit_set_digest":
+				manifest.DiscoveredUnitSetDigest = placeholder
+			case "facade_argv":
+				manifest.FacadeArgv = placeholder
+			case "discovery_exclude_prefixes":
+				manifest.DiscoveryExcludePrefixes = placeholder
+			}
+			if err := validate(manifest, recomputed); err == nil {
+				t.Errorf("the placeholder %s = %q was accepted against the pinned fixture", name, placeholder)
+			}
+		}
+	})
+
 	t.Run("both arms agreeing with each other and both wrong is still rejected", func(t *testing.T) {
 		// The case §22 test 29 calls out: cross-arm equality does not
 		// establish agreement with the pinned revision.
@@ -330,15 +415,131 @@ func TestWorkloadBindingRecomputesFromPinnedCheckout(t *testing.T) {
 			t.Fatal("two arms agreeing with each other and disagreeing with the pinned revision were accepted")
 		}
 	})
+}
 
-	t.Run("the pinned facade and config digests are the fixture's own", func(t *testing.T) {
-		b, err := os.ReadFile(filepath.Join("mandel", "scripts", "tb-vitest.ts"))
-		if err != nil {
-			t.Fatal(err)
+// fileDigest hashes one vendored fixture file.
+func fileDigest(t *testing.T, parts ...string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(parts...))
+	if err != nil {
+		t.Fatalf("read fixture %v: %v", parts, err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// sourceRecordedDigest reads a digest SOURCE.md records for a path it does not
+// vendor. Those rows are checkout assertions, so the record IS the value
+// offline, and a drift in the record fails the comparison rather than passing
+// silently.
+func sourceRecordedDigest(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile("SOURCE.md")
+	if err != nil {
+		t.Fatalf("read SOURCE.md: %v", err)
+	}
+	re := regexp.MustCompile("(?m)^\\| `" + regexp.QuoteMeta(path) + "` \\| `([0-9a-f]{64})`")
+	m := re.FindStringSubmatch(string(b))
+	if m == nil {
+		t.Fatalf("SOURCE.md records no full-file digest for %s", path)
+	}
+	return m[1]
+}
+
+// fixtureEnvValue reads one workflow-level env constant out of the pinned
+// consumer's own workflow.
+func fixtureEnvValue(t *testing.T, name string) string {
+	t.Helper()
+	p := filepath.Join("mandel", ".github", "workflows", "unit-tests-bucketed.yaml")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read the pinned mandel workflow: %v", err)
+	}
+	re := regexp.MustCompile("(?m)^  " + regexp.QuoteMeta(name) + ": *(.*?) *(?:#.*)?$")
+	m := re.FindStringSubmatch(string(b))
+	if m == nil {
+		t.Fatalf("the pinned workflow declares no %s", name)
+	}
+	return strings.Trim(strings.TrimSpace(m[1]), "'\"")
+}
+
+// pinnedFixtureTreeDigest is the canonical digest over the pinned fixture's own
+// file set: every stored path with its full digest, in sorted order.
+//
+// The real workload_tree_digest is a checkout value AG-2 recomputes from the
+// tree at workload_commit, and nothing offline can produce it. This produces
+// the same KIND of value over the bytes this repository actually pins, so a
+// vendored file that changes moves it — which is what makes it a derivation
+// rather than a placeholder.
+func pinnedFixtureTreeDigest(t *testing.T) string {
+	t.Helper()
+	stored := StoredFixtureDigests()
+	paths := make([]string, 0, len(stored))
+	for p := range stored {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	rows := make([][2]string, 0, len(paths))
+	for _, p := range paths {
+		rows = append(rows, [2]string{p, stored[p]})
+	}
+	d, err := walltime.DigestJSON(rows)
+	if err != nil {
+		t.Fatalf("digest the pinned fixture tree: %v", err)
+	}
+	return string(d)
+}
+
+// discoveredUnitSetDigest is the canonical digest over the discovered path
+// set: the selected bucket universe at the pinned revision, derived from
+// tracked-test-paths.txt through §20.6a's membership partition.
+func discoveredUnitSetDigest(t *testing.T) string {
+	t.Helper()
+	selected := selectedFixturePaths(t)
+	if len(selected) != 1396 {
+		t.Fatalf("the discovered unit set has %d paths, want the pinned 1396", len(selected))
+	}
+	// The partition below is the one DeriveMembership COUNTS with. Keeping one
+	// predicate in two shapes is exactly how a count regression and this
+	// digest come to disagree, so the two are required to agree here.
+	tracked, err := os.ReadFile(filepath.Join("mandel", "tracked-test-paths.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := DeriveMembership(string(tracked)).BucketUniverse; len(selected) != want {
+		t.Fatalf("the selected path list has %d entries but the membership partition counts %d", len(selected), want)
+	}
+	d, err := walltime.DigestJSON(selected)
+	if err != nil {
+		t.Fatalf("digest the discovered unit set: %v", err)
+	}
+	return string(d)
+}
+
+// selectedFixturePaths is §20.6a's membership partition, returning the selected
+// paths themselves rather than only their count. Its caller requires it to
+// agree with DeriveMembership, which counts under the same rules.
+func selectedFixturePaths(t *testing.T) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("mandel", "tracked-test-paths.txt"))
+	if err != nil {
+		t.Fatalf("read the pinned path list: %v", err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasSuffix(line, ".test.ts") {
+			continue
 		}
-		sum := sha256.Sum256(b)
-		if got := hex.EncodeToString(sum[:]); got != recomputed.FacadeSHA256 {
-			t.Fatalf("facade digest = %s, want %s", got, recomputed.FacadeSHA256)
+		switch {
+		case strings.HasPrefix(line, "shared/f/lib/cases/"):
+		case strings.HasPrefix(line, HarnessUnitInclude):
+			out = append(out, line)
+		case strings.HasPrefix(line, "integration-tests/"):
+		case strings.HasPrefix(line, "packages/region-router/"):
+		default:
+			out = append(out, line)
 		}
-	})
+	}
+	return out
 }
