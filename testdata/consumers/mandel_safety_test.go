@@ -1,10 +1,19 @@
 package consumers
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/invakid404/testbucket/internal/core"
+	"github.com/invakid404/testbucket/internal/runner"
+	"github.com/invakid404/testbucket/internal/runner/gorunner"
 )
 
 // Project classification of contract §20.4. Membership is PROJECT-BASED, and
@@ -313,11 +322,226 @@ func TestBamlRestInputSetStillDrivesTheActions(t *testing.T) {
 }
 
 // TestGoConsumerSurfaceUnchangedAcrossRepin is §22 test 32.
+//
+// The contract's G1 table names seven rows of Go surface that must not change,
+// and owes the check on EVERY repin. The check it describes renders the
+// baml-rest-shaped bucket at the currently pinned revision and at the proposed
+// one and compares the two.
+//
+// A two-binary comparison is not available here: the pinned revision is a
+// published release, and fetching it is a live network call this suite must not
+// make. What is available — and what the contract is actually protecting — is
+// each row's OBSERVABLE value at this revision, pinned byte-for-byte. A repin
+// that changes any of them fails here, at the commit that changes it, which is
+// earlier than a comparison against a downloaded binary would fire.
+//
+// The earlier form of this test scanned the plan action for `default:` and
+// `cmd/testbucket/main.go` for the string "wall-dir". It rendered nothing,
+// compared no bytes, and could not have noticed a changed script, a changed
+// token, a changed event parse, or a refusal that stopped refusing.
 func TestGoConsumerSurfaceUnchangedAcrossRepin(t *testing.T) {
-	// The §20.3 claim is current-pin isolation plus default execution
-	// neutrality: the Go adapter's rendered bytes, canonical token, events and
-	// audit semantics are unchanged, and no newly required action input
-	// reaches a Go consumer.
+	cfg := pinnedBamlRestPlanConfig(t)
+
+	// The Go adapter, configured exactly as the pinned caller configures it.
+	r, err := gorunner.New(gorunner.Options{
+		Race: true, Count: cfg.count, Timeout: "20m",
+		NodePrefixes: cfg.nodePrefixes, EventsDir: "/tmp/testbucket-events",
+	})
+	if err != nil {
+		t.Fatalf("gorunner.New: %v", err)
+	}
+	doc, err := core.BuildPlan(t.Context(), r, nil, "cold", core.PlanOptions{
+		K: 2, Count: cfg.count, Live: bamlRestShapedLive(), Token: r.CanonicalToken(),
+		Now: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	if len(doc.Buckets) != 2 {
+		t.Fatalf("the plan has %d bucket(s), want 2", len(doc.Buckets))
+	}
+
+	// --- G1 row: rendered script bytes for a given bucket ------------------
+	t.Run("rendered script bytes", func(t *testing.T) {
+		want := map[int]string{
+			0: "set -euo pipefail\n" +
+				"( cd . && go test -race -p=1 -count=100 -timeout 20m -json dynclient server | tee -a /tmp/testbucket-events/bucket-0-00.ndjson )",
+			1: "set -euo pipefail\n" +
+				"( cd adapters/openai && GOWORK=off go test -race -p=1 -count=100 -timeout 20m -json . | tee -a /tmp/testbucket-events/bucket-1-00.ndjson )\n" +
+				"( cd . && go test -race -p=1 -count=100 -timeout 20m -json internal/wire | tee -a /tmp/testbucket-events/bucket-1-01.ndjson )",
+		}
+		for _, b := range doc.Buckets {
+			if b.Script != want[b.Index] {
+				t.Errorf("bucket %d script bytes changed:\n got: %q\nwant: %q", b.Index, b.Script, want[b.Index])
+			}
+		}
+	})
+
+	// --- G1 row: canonical token `-race -count=100` ------------------------
+	t.Run("canonical token", func(t *testing.T) {
+		// The token is the store's comparability key: a changed token
+		// cold-starts every consumer's store, silently discarding every
+		// measurement it had.
+		if got, want := r.CanonicalToken(), "-race -count=100"; got != want {
+			t.Errorf("canonical token = %q, want %q", got, want)
+		}
+		if doc.Flags != "-race -count=100" {
+			t.Errorf("the plan records flags %q, want the canonical token", doc.Flags)
+		}
+	})
+
+	// --- G1 row: -p=1, -timeout 20m, count shards summing to the sweep -----
+	t.Run("invocation envelope", func(t *testing.T) {
+		for _, b := range doc.Buckets {
+			for i, inv := range b.Invocations {
+				where := fmt.Sprintf("bucket %d inv %d", b.Index, i)
+				if idx := indexOfArg(inv.Args, "-p=1"); idx < 0 {
+					t.Errorf("%s does not render -p=1: %q", where, inv.Args)
+				}
+				if idx := indexOfArg(inv.Args, "-timeout"); idx < 0 || idx+1 >= len(inv.Args) || inv.Args[idx+1] != "20m" {
+					t.Errorf("%s does not render -timeout 20m: %q", where, inv.Args)
+				}
+				if idx := indexOfArg(inv.Args, "-count=100"); idx < 0 {
+					t.Errorf("%s does not render the full sweep -count=100: %q", where, inv.Args)
+				}
+			}
+		}
+
+		// COUNT SHARDS SUM TO THE SWEEP. A shard group whose counts do not add
+		// up runs fewer iterations than the sweep asked for while every
+		// invocation looks well formed, so the grammar gate is asked directly.
+		live := map[string]runner.LivePackage{}
+		for _, p := range bamlRestShapedLive() {
+			live[p.ID] = p
+		}
+		shard := func(n, of, count int) runner.Unit {
+			return runner.Unit{
+				ID: fmt.Sprintf("server#%d/%d", n, of), Kind: runner.KindCountShard,
+				Packages: []runner.LivePackage{live["server"]}, Module: ".", Mode: "work",
+				Count: count, Shard: n, Shards: of,
+			}
+		}
+		total := 0
+		for n := 1; n <= 4; n++ {
+			u := shard(n, 4, cfg.count/4)
+			total += u.Count
+			if defects := r.ValidateUnit(u, live, cfg.count); len(defects) > 0 {
+				t.Errorf("a well-formed count-shard was refused: %v", defects)
+			}
+		}
+		if total != cfg.count {
+			t.Errorf("four shards of the %d sweep sum to %d", cfg.count, total)
+		}
+		// And a shard that runs nothing is refused rather than rendered.
+		if defects := r.ValidateUnit(shard(1, 4, 0), live, cfg.count); len(defects) == 0 {
+			t.Error("a count-shard running -count=0 was accepted; it executes nothing and still passes")
+		}
+	})
+
+	// --- G1 row: `go test -json` event parsing and AuditCoverage -----------
+	t.Run("event parsing and audit coverage", func(t *testing.T) {
+		// The events every rendered invocation would tee, fed through the
+		// production parser and the production audit.
+		var readers []io.Reader
+		for _, b := range doc.Buckets {
+			for _, inv := range b.Invocations {
+				readers = append(readers, strings.NewReader(goTestJSONFor(inv.Units)))
+			}
+		}
+		sum, err := r.ParseTimings(readers...)
+		if err != nil {
+			t.Fatalf("ParseTimings: %v", err)
+		}
+		for _, p := range bamlRestShapedLive() {
+			if secs, ok := sum.PackageSeconds[p.ID]; !ok {
+				t.Errorf("the parsed summary has no entry for %s", p.ID)
+			} else if secs <= 0 {
+				t.Errorf("%s parsed to %v seconds", p.ID, secs)
+			}
+		}
+
+		blob, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "shard-plan.json")
+		if err := os.WriteFile(path, blob, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		planned, err := core.LoadPlannedCoverage(path)
+		if err != nil {
+			t.Fatalf("LoadPlannedCoverage: %v", err)
+		}
+		if err := core.AuditCoverage(io.Discard, planned, sum); err != nil {
+			t.Errorf("the audit refuses a run that executed exactly its plan: %v", err)
+		}
+
+		// And it is a control, not a formality: a bucket that skipped a unit
+		// fails the audit.
+		short, err := r.ParseTimings(strings.NewReader(goTestJSONFor([]string{"server"})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := core.AuditCoverage(io.Discard, planned, short); err == nil {
+			t.Error("the audit passed a run that executed one unit of the plan")
+		}
+	})
+
+	// --- G1 row: needs_node derivation -------------------------------------
+	t.Run("needs_node derivation", func(t *testing.T) {
+		// The pinned caller opts in with `node-prefixes: adapters`, so a
+		// bucket carrying an adapters/ target needs Node and one that does not
+		// must not claim it — a bucket that wrongly claimed it would provision
+		// a toolchain inside the measured interval.
+		for _, b := range doc.Buckets {
+			wantNode := false
+			for _, u := range b.Units {
+				for _, pkg := range u.Packages {
+					if strings.HasPrefix(pkg, "adapters") {
+						wantNode = true
+					}
+				}
+			}
+			if b.NeedsNode != wantNode {
+				t.Errorf("bucket %d needs_node = %v, want %v (units %v)", b.Index, b.NeedsNode, wantNode, b.Units)
+			}
+		}
+	})
+
+	// --- G1 row: refusal of --wall-dir under --runner go -------------------
+	t.Run("the Go --wall-dir refusal", func(t *testing.T) {
+		// Behavioural, not a source scan: the binary is built and run, so a
+		// refusal that stopped refusing fails here.
+		bin := buildTestbucket(t)
+		out, err := exec.Command(bin, "plan", "--runner", "go", "--wall-dir", t.TempDir()).CombinedOutput()
+		if err == nil {
+			t.Fatalf("`plan --runner go --wall-dir` succeeded; wall-time is Vitest-only:\n%s", out)
+		}
+		if !strings.Contains(string(out), "--wall-dir needs --runner vitest") {
+			t.Errorf("the refusal does not name the reason:\n%s", out)
+		}
+		// And the same flag with the Vitest adapter is NOT refused for this
+		// reason — otherwise the check above would pass against a binary that
+		// refuses everything.
+		out, err = exec.Command(bin, "plan", "--runner", "vitest", "--wall-dir", t.TempDir(),
+			"--live", filepath.Join(t.TempDir(), "no-such-live.json")).CombinedOutput()
+		if err != nil && strings.Contains(string(out), "--wall-dir needs --runner vitest") {
+			t.Errorf("the Vitest adapter was refused the wall-time flag:\n%s", out)
+		}
+	})
+
+	// --- G1 row: no wall-time surface in any Go script ---------------------
+	t.Run("no wall-time surface reaches a Go script", func(t *testing.T) {
+		for _, b := range doc.Buckets {
+			for _, banned := range []string{"testbucket wall", "spec-", "--level invocation"} {
+				if strings.Contains(b.Script, banned) {
+					t.Errorf("bucket %d's Go script contains %q:\n%s", b.Index, banned, b.Script)
+				}
+			}
+		}
+	})
+
+	// --- and no newly required action input reaches a Go consumer ----------
 	t.Run("no added action input is required of a Go consumer", func(t *testing.T) {
 		plan, err := os.ReadFile(filepath.Join("..", "..", ".github", "actions", "plan", "action.yml"))
 		if err != nil {
@@ -341,19 +565,110 @@ func TestGoConsumerSurfaceUnchangedAcrossRepin(t *testing.T) {
 				t.Errorf("added input %q has no default; a Go consumer would be forced to supply it", in)
 			}
 		}
+		// And the inputs the pinned caller actually passes are all still
+		// declared: a repin that renamed one would break that consumer.
+		for _, in := range cfg.passedInputs {
+			if !strings.Contains(src, "\n  "+in+":") {
+				t.Errorf("the pinned baml-rest caller passes %q, which the plan action no longer declares", in)
+			}
+		}
 	})
+}
 
-	t.Run("the Go refusal is pinned to stay", func(t *testing.T) {
-		// §22 item 11: --wall-dir with --runner go errors. It already passed
-		// at R54 and is pinned so it cannot regress.
-		main, err := os.ReadFile(filepath.Join("..", "..", "cmd", "testbucket", "main.go"))
-		if err != nil {
-			t.Fatal(err)
+// bamlRestPlanConfig is the pinned Go consumer's plan configuration, read from
+// its own vendored workflow rather than transcribed here.
+type bamlRestPlanConfig struct {
+	count        int
+	nodePrefixes []string
+	passedInputs []string
+}
+
+// pinnedBamlRestPlanConfig reads the configuration out of the pinned caller.
+// SOURCE.md pins that file's digest, so the values below are the ones the
+// frozen consumer actually uses; a transcribed constant could agree with
+// itself while the fixture said something else.
+func pinnedBamlRestPlanConfig(t *testing.T) bamlRestPlanConfig {
+	t.Helper()
+	p := filepath.Join("baml-rest", ".github", "workflows", "unit-tests-bucketed.yml")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read the pinned baml-rest caller: %v", err)
+	}
+	src := string(b)
+
+	cfg := bamlRestPlanConfig{}
+	// The `with:` block of the pinned plan-action step.
+	idx := strings.Index(src, "/.github/actions/plan@")
+	if idx < 0 {
+		t.Fatal("the pinned caller no longer uses the plan action")
+	}
+	block := src[idx:min2(idx+700, len(src))]
+	if !strings.Contains(block, "count: \"100\"") {
+		t.Fatalf("the pinned caller's sweep is no longer 100:\n%s", block)
+	}
+	cfg.count = 100
+	if !strings.Contains(block, "node-prefixes: adapters") {
+		t.Fatalf("the pinned caller's node prefixes changed:\n%s", block)
+	}
+	cfg.nodePrefixes = []string{"adapters"}
+	for _, in := range []string{"version", "k", "count", "store-path", "events-dir", "shard-plan", "node-prefixes", "exclude-module"} {
+		if strings.Contains(block, "\n          "+in+":") {
+			cfg.passedInputs = append(cfg.passedInputs, in)
 		}
-		if !strings.Contains(string(main), "wall-dir") {
-			t.Fatal("the --wall-dir flag is gone; the Go refusal cannot be expressed")
+	}
+	if len(cfg.passedInputs) != 8 {
+		t.Errorf("read %d of the pinned caller's 8 plan inputs: %v", len(cfg.passedInputs), cfg.passedInputs)
+	}
+	return cfg
+}
+
+// bamlRestShapedLive is a live set with that repo's shape: a workspace module
+// with several packages, plus one out-of-workspace adapter module that cannot
+// be mixed into a shared build list and therefore rides as its own atom.
+func bamlRestShapedLive() []runner.LivePackage {
+	return []runner.LivePackage{
+		{ID: "adapters/openai", Dir: "adapters/openai", Module: "adapters/openai", Mode: "off", Atom: "adapters/openai", HasTests: true},
+		{ID: "internal/wire", Dir: "internal/wire", Module: ".", Mode: "work", HasTests: true},
+		{ID: "dynclient", Dir: "dynclient", Module: ".", Mode: "work", HasTests: true},
+		{ID: "server", Dir: "server", Module: ".", Mode: "work", HasTests: true},
+	}
+}
+
+// goTestJSONFor synthesises the `go test -json` stream an invocation covering
+// these units would produce: one passing test per package, exactly as the real
+// toolchain reports it.
+func goTestJSONFor(units []string) string {
+	var b strings.Builder
+	for _, u := range units {
+		pkg := strings.TrimPrefix(u, "mod:")
+		fmt.Fprintf(&b, `{"Action":"run","Package":%q,"Test":"TestOne"}`+"\n", pkg)
+		fmt.Fprintf(&b, `{"Action":"pass","Package":%q,"Test":"TestOne","Elapsed":0.5}`+"\n", pkg)
+		fmt.Fprintf(&b, `{"Action":"pass","Package":%q,"Elapsed":0.5}`+"\n", pkg)
+	}
+	return b.String()
+}
+
+// indexOfArg reports where an exact argument appears, or -1.
+func indexOfArg(args []string, want string) int {
+	for i, a := range args {
+		if a == want {
+			return i
 		}
-	})
+	}
+	return -1
+}
+
+// buildTestbucket builds the CLI once per test so a refusal can be exercised
+// as behaviour rather than asserted about source text.
+func buildTestbucket(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "testbucket")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/invakid404/testbucket/cmd/testbucket")
+	cmd.Dir = filepath.Join("..", "..")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	return bin
 }
 
 func min2(a, b int) int {
