@@ -1,12 +1,15 @@
 package vitestrunner
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/invakid404/testbucket/internal/core"
 	"github.com/invakid404/testbucket/internal/runner"
 )
 
@@ -146,22 +149,75 @@ func TestPinnedConsumerSuffixAtomsMatchProductionAlgorithm(t *testing.T) {
 
 	// --- assertion 4: no atom is split across an invocation or bucket ------
 	t.Run("no atom is split across an invocation or bucket boundary", func(t *testing.T) {
-		// The atom key IS the core's co-scheduling instruction: a non-empty
-		// value means every target sharing it rides in one invocation. The
-		// property to assert is therefore that the key is a function of the
-		// group, which is what makes it unsplittable downstream.
+		// This drives the PRODUCTION planner at K=8 over the pinned universe
+		// and then reads back where every selected path actually landed.
+		//
+		// The earlier form of this assertion only checked that the atom key is
+		// a function of its group and that a second assignment reproduces it.
+		// Both are true of a key nothing downstream honours: it could pass
+		// while the planner packed two members of one atom into different
+		// buckets, or the renderer emitted them as two invocations, and the
+		// suffix collision the atom exists to prevent would happen anyway.
+		// What has to hold is a property of the PLAN, so the plan is what is
+		// inspected.
+		placement := planPinnedUniverseAtK8(t, u.Selected)
+
+		if got := len(placement.buckets); got != 8 {
+			t.Fatalf("the plan has %d bucket(s), want 8", got)
+		}
+		for i := 0; i < 8; i++ {
+			if _, ok := placement.buckets[i]; !ok {
+				t.Errorf("the plan has no bucket %d; every index 0..7 must be rendered", i)
+			}
+		}
+		if got := len(placement.bucketOf); got != len(u.Selected) {
+			t.Errorf("the plan placed %d of the %d selected paths", got, len(u.Selected))
+		}
+
 		for at, members := range groups {
 			if len(members) < 2 {
 				continue
 			}
+			// ONE BUCKET. Two members of one atom in different buckets run in
+			// different jobs, which is the coarsest possible split.
+			wantBucket, ok := placement.bucketOf[members[0]]
+			if !ok {
+				t.Errorf("atom %q member %s was not placed in any bucket", at, members[0])
+				continue
+			}
+			// ONE INVOCATION. Same bucket is not enough: two invocations of
+			// one bucket are two `vitest run` processes, and a suffix filter
+			// in either would select the other's file too.
+			wantInv, ok := placement.invocationOf[members[0]]
+			if !ok {
+				t.Errorf("atom %q member %s reached no invocation", at, members[0])
+				continue
+			}
+			for _, m := range members[1:] {
+				if b, ok := placement.bucketOf[m]; !ok {
+					t.Errorf("atom %q member %s was not placed in any bucket", at, m)
+				} else if b != wantBucket {
+					t.Errorf("atom %q is split across buckets: %s in bucket %d, %s in bucket %d",
+						at, members[0], wantBucket, m, b)
+				}
+				if iv, ok := placement.invocationOf[m]; !ok {
+					t.Errorf("atom %q member %s reached no invocation", at, m)
+				} else if iv != wantInv {
+					t.Errorf("atom %q is split across invocations: %s in %s, %s in %s",
+						at, members[0], wantInv, m, iv)
+				}
+			}
+		}
+
+		// The atom key is still a function of the group, and still
+		// deterministic — the plan property above rests on both.
+		for at, members := range groups {
 			for _, m := range members {
 				if atomOf[m] != at {
 					t.Fatalf("member %s of atom %q carries atom %q", m, at, atomOf[m])
 				}
 			}
 		}
-		// Re-running the production algorithm reproduces the same grouping, so
-		// a plan cannot land two different partitions of one atom.
 		again := make([]runner.LivePackage, 0, len(u.Selected))
 		for _, id := range u.Selected {
 			again = append(again, runner.LivePackage{ID: id, HasTests: true})
@@ -241,4 +297,65 @@ func connectedUnderCollision(members []string) bool {
 		}
 	}
 	return len(seen) == len(members)
+}
+
+// atomPlacement is where the planner and the renderer actually put every
+// selected path: which bucket index, and which invocation inside it.
+type atomPlacement struct {
+	buckets      map[int]bool
+	bucketOf     map[string]int
+	invocationOf map[string]string
+}
+
+// planPinnedUniverseAtK8 runs the real cold plan at K=8 over the pinned
+// universe and reads the placement back out of the rendered plan document.
+//
+// The store is nil, so this is a cold start: every unit is a whole file and no
+// name slicing happens, which is the shape the pinned universe is checked in.
+// The atom keys come from the production assignFilterAtoms, so what the
+// planner receives is what production would hand it.
+func planPinnedUniverseAtK8(t *testing.T, selected []string) atomPlacement {
+	t.Helper()
+	live := make([]runner.LivePackage, 0, len(selected))
+	for _, id := range selected {
+		live = append(live, runner.LivePackage{ID: id, HasTests: true})
+	}
+	AssignFilterAtoms(live)
+
+	r := mustNew(t, Options{Root: suffixRoot})
+	doc, err := core.BuildPlan(t.Context(), r, nil, "cold", core.PlanOptions{
+		K: 8, Count: 1, Live: live, Token: r.CanonicalToken(),
+		Now: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("BuildPlan at K=8: %v", err)
+	}
+
+	out := atomPlacement{
+		buckets:      map[int]bool{},
+		bucketOf:     map[string]int{},
+		invocationOf: map[string]string{},
+	}
+	for _, b := range doc.Buckets {
+		out.buckets[b.Index] = true
+		// A unit's Packages is what it actually runs: a module-atom unit
+		// covers several targets, which is the mechanism that keeps an atom
+		// together, so the placement is read per PACKAGE rather than per unit.
+		pkgsOf := map[string][]string{}
+		for _, un := range b.Units {
+			pkgsOf[un.ID] = un.Packages
+			for _, pkg := range un.Packages {
+				out.bucketOf[pkg] = b.Index
+			}
+		}
+		for i, inv := range b.Invocations {
+			label := fmt.Sprintf("bucket-%d/inv-%d", b.Index, i)
+			for _, unitID := range inv.Units {
+				for _, pkg := range pkgsOf[unitID] {
+					out.invocationOf[pkg] = label
+				}
+			}
+		}
+	}
+	return out
 }
