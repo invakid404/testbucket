@@ -3,6 +3,7 @@ package walltime
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -363,6 +364,175 @@ func ValidatePairInvariant(armB, armC BCInvariantTuple) error {
 		if lb[name] != lc[name] {
 			return fmt.Errorf("§19.2: BC-INV leaf %q differs across the arms (%v vs %v); the treatment is the planner mode and nothing else",
 				name, lb[name], lc[name])
+		}
+	}
+	return nil
+}
+
+// ArmRunProfile is the §19.4 exact profile of one arm-run: the complete planned
+// bucket set, matched by identity against the plan document.
+//
+// Eight DISTINCT rows are not sufficient. They must be the complete planned
+// set, so a K > 8 plan cannot contribute a favourable eight — which is exactly
+// what defaults, an eight-row denominator and cross-arm equality fail to give.
+type ArmRunProfile struct {
+	RunnerToken           string
+	K                     int
+	Count                 int
+	FileParallelism       int
+	PlanDigest            string
+	ExpandedUnitSetDigest string
+	// Rows is one authenticated terminal row per bucket identity.
+	Rows []ArmRunRow
+}
+
+// ArmRunRow is one bucket's identity and terminal state within an arm-run.
+type ArmRunRow struct {
+	BucketIndex int
+	BucketName  string
+	Terminal    string
+	PlanDigest  string
+}
+
+// ValidateArmRunProfile enforces §19.4 against the complete planned bucket set.
+func ValidateArmRunProfile(p ArmRunProfile, plannedNames map[int]string) error {
+	if p.RunnerToken != "vitest" {
+		return fmt.Errorf("§19.4: runner_token is %q, must be vitest", p.RunnerToken)
+	}
+	if p.K != BucketsPerRun {
+		return fmt.Errorf("§19.4: K is %d, must be %d", p.K, BucketsPerRun)
+	}
+	if p.Count != 1 {
+		return fmt.Errorf("§19.4: count is %d, must be 1", p.Count)
+	}
+	if p.FileParallelism != 1 {
+		return fmt.Errorf("§19.4: file_parallelism is %d, must be 1", p.FileParallelism)
+	}
+	if len(plannedNames) != BucketsPerRun {
+		return fmt.Errorf("§19.4: the plan declares %d buckets, not %d; a K > 8 plan cannot contribute a favourable eight",
+			len(plannedNames), BucketsPerRun)
+	}
+
+	seen := map[int]bool{}
+	for _, r := range p.Rows {
+		want, ok := plannedNames[r.BucketIndex]
+		if !ok {
+			return fmt.Errorf("§19.4: bucket index %d is not in the eight-bucket plan", r.BucketIndex)
+		}
+		if r.BucketName != want {
+			return fmt.Errorf("§19.4: bucket %d is named %q, the plan names it %q",
+				r.BucketIndex, r.BucketName, want)
+		}
+		if seen[r.BucketIndex] {
+			return fmt.Errorf("§19.4: bucket index %d appears twice", r.BucketIndex)
+		}
+		seen[r.BucketIndex] = true
+		if r.Terminal != "passed" {
+			return fmt.Errorf("§19.4: bucket %d terminal is %q; every row must be authenticated terminal", r.BucketIndex, r.Terminal)
+		}
+		// plan_digest identical across all eight observations of one arm-run.
+		if r.PlanDigest != p.PlanDigest {
+			return fmt.Errorf("§19.4: bucket %d carries plan_digest %q, the arm-run's is %q",
+				r.BucketIndex, r.PlanDigest, p.PlanDigest)
+		}
+	}
+	// The COMPLETE planned set, not merely eight distinct rows.
+	for idx := range plannedNames {
+		if !seen[idx] {
+			return fmt.Errorf("§19.4: bucket index %d of the plan has no row; the set must be complete", idx)
+		}
+	}
+	return nil
+}
+
+// ValidatePairProfile checks the two arms of one pair against §19.4 and §19.2:
+// expanded_unit_set_digest is identical across both arms, so unit topology is
+// not part of the treatment.
+func ValidatePairProfile(armB, armC ArmRunProfile, plannedNames map[int]string) error {
+	if err := ValidateArmRunProfile(armB, plannedNames); err != nil {
+		return fmt.Errorf("arm B: %w", err)
+	}
+	if err := ValidateArmRunProfile(armC, plannedNames); err != nil {
+		return fmt.Errorf("arm C: %w", err)
+	}
+	if armB.ExpandedUnitSetDigest != armC.ExpandedUnitSetDigest {
+		return fmt.Errorf("§19.2: expanded_unit_set_digest differs across the arms (%q vs %q); unit topology is not part of the treatment",
+			armB.ExpandedUnitSetDigest, armC.ExpandedUnitSetDigest)
+	}
+	return nil
+}
+
+// CampaignProvenance is §19.5's model-freeze and exclusion evidence.
+type CampaignProvenance struct {
+	// FittedAt is when the deployed model was fitted. It must PRECEDE the
+	// first authenticated campaign start.
+	FittedAt string
+	// FirstAuthenticatedStart is the earliest scored arm-run start.
+	FirstAuthenticatedStart string
+	// ExcludedRunIDs and the window are operator-side predicates: they are
+	// evaluated HERE and never in CI, and a disagreement with the rows'
+	// stored `trainable` marking fails the campaign.
+	ExcludedRunIDs      []string
+	ExcludedWindowStart string
+	ExcludedWindowEnd   string
+	// ExclusionDomains names each exclusion domain. An unnamed domain fails.
+	ExclusionDomains []string
+}
+
+// ValidateProvenance is §19.5/§17.14's cutoff and exclusion check.
+func ValidateProvenance(p CampaignProvenance, ringRunIDs []string, ringStarts map[string]string) error {
+	fitted, err := parseAuthenticatedInstant(p.FittedAt)
+	if err != nil {
+		return fmt.Errorf("fitted_at: %w", err)
+	}
+	first, err := parseAuthenticatedInstant(p.FirstAuthenticatedStart)
+	if err != nil {
+		return fmt.Errorf("first authenticated start: %w", err)
+	}
+	// The model is frozen BEFORE the first authenticated campaign start.
+	if !fitted.Before(first) {
+		return fmt.Errorf("§19.5: fitted_at %s does not precede the first authenticated start %s; the model must be frozen before the campaign begins",
+			p.FittedAt, p.FirstAuthenticatedStart)
+	}
+	// Every exclusion domain must be NAMED; a missing one fails rather than
+	// being skipped (§7 rule 10).
+	if len(p.ExclusionDomains) == 0 {
+		return fmt.Errorf("§19.5: no exclusion domain is named; a missing mandatory campaign field fails the campaign")
+	}
+	for i, d := range p.ExclusionDomains {
+		if strings.TrimSpace(d) == "" {
+			return fmt.Errorf("§19.5: exclusion domain %d is unnamed", i)
+		}
+	}
+	// A ring containing a harness run_id fails.
+	excluded := map[string]bool{}
+	for _, id := range p.ExcludedRunIDs {
+		excluded[id] = true
+	}
+	for _, id := range ringRunIDs {
+		if excluded[id] {
+			return fmt.Errorf("§19.5: the ring contains harness run_id %q, which the manifest excludes", id)
+		}
+	}
+	// A row inside the excluded window fails.
+	if p.ExcludedWindowStart != "" && p.ExcludedWindowEnd != "" {
+		ws, err := parseAuthenticatedInstant(p.ExcludedWindowStart)
+		if err != nil {
+			return fmt.Errorf("excluded_window.start: %w", err)
+		}
+		we, err := parseAuthenticatedInstant(p.ExcludedWindowEnd)
+		if err != nil {
+			return fmt.Errorf("excluded_window.end: %w", err)
+		}
+		for id, stamp := range ringStarts {
+			at, err := parseAuthenticatedInstant(stamp)
+			if err != nil {
+				return fmt.Errorf("ring row %s run_started_at: %w", id, err)
+			}
+			if !at.Before(ws) && !at.After(we) {
+				return fmt.Errorf("§19.5: ring row %s started at %s, inside the excluded window %s..%s",
+					id, stamp, p.ExcludedWindowStart, p.ExcludedWindowEnd)
+			}
 		}
 	}
 	return nil
