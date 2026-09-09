@@ -17,7 +17,14 @@ import (
 // storeSchema is the on-disk schema version of the timing store. Bump it only
 // for changes that older readers cannot tolerate; `plan` cold-starts (rather
 // than mis-reads) any store whose schema it does not recognise.
-const storeSchema = 1
+const storeSchema = 2
+
+// storeSchemaLegacy is the schema-1 layout v0.2.2 wrote. It is ACCEPTED rather
+// than cold-started: contract §15.2's `1 → 2` forward migration carries
+// `units`, `flags`, `updated_at`, `coverage` and `coverage_source` verbatim, so
+// a schema-1 store keeps every reporter EWMA it had. Only an UNKNOWN schema
+// hits the loud cold-start path (§7 rule 8).
+const storeSchemaLegacy = 1
 
 // defaultColdSeconds is the per-unit weight used when the store carries no
 // measured weight at all. Its absolute value is irrelevant to the resulting
@@ -57,6 +64,60 @@ type Store struct {
 	// (targets added or deleted since the store was recorded).
 	Coverage       []string `json:"coverage,omitempty"`
 	CoverageSource string   `json:"coverage_source,omitempty"`
+
+	// Wall is the optional schema-2 object of contract §15.1. Everything
+	// outside it keeps its schema-1 meaning byte-for-byte, which is what makes
+	// the bump additive for a consumer that never opts into wall basis.
+	Wall *WallObject `json:"wall,omitempty"`
+
+	// migratedFromLegacy records that this store was read at schema 1, so
+	// ingest can perform §15.2's forward migration. It is not serialized: the
+	// on-disk marker is `wall.migrated_from`.
+	migratedFromLegacy bool `json:"-"`
+}
+
+// NeedsWallMigration reports whether this store was read at schema 1 and still
+// owes contract §15.2's forward migration.
+func (s *Store) NeedsWallMigration() bool { return s.migratedFromLegacy && s.Wall == nil }
+
+// MigrateWall performs contract §15.2's `1 → 2` forward step, which happens in
+// `ingest` only. Reporter state is already carried verbatim by the parse; this
+// initialises `wall` with the always-present leaves, an empty history and the
+// migration marker.
+func (s *Store) MigrateWall(comparabilityKeyDigest string) {
+	if !s.NeedsWallMigration() {
+		return
+	}
+	s.Wall = NewMigratedWall(comparabilityKeyDigest)
+	s.migratedFromLegacy = false
+}
+
+// ResetWallForKeyChange applies contract §15.3's second reset rule: a
+// comparability-key change clears `wall.observations` and sets the model
+// `insufficient`, and leaves the reporter EWMAs untouched. The two reset rules
+// are independent, which is why this touches neither Units nor Coverage.
+func (s *Store) ResetWallForKeyChange(newDigest string) (discarded int) {
+	if s.Wall == nil {
+		v := WallModelVersion
+		s.Wall = &WallObject{
+			ModelVersion:           &v,
+			ComparabilityKeyDigest: newDigest,
+			Status:                 WallStatusInsufficient,
+			FailureSubtype:         SubtypeRowsBelowMinimum,
+			Observations:           []WallRingRow{},
+		}
+		return 0
+	}
+	if s.Wall.ComparabilityKeyDigest == newDigest {
+		return 0
+	}
+	discarded = len(s.Wall.Observations)
+	s.Wall.ComparabilityKeyDigest = newDigest
+	s.Wall.Observations = []WallRingRow{}
+	s.Wall.Status = WallStatusInsufficient
+	s.Wall.FailureSubtype = SubtypeRowsBelowMinimum
+	s.Wall.Fit = nil
+	return discarded
 }
 
 // UnitStat is one target's rolling weight plus its split policy.
@@ -155,7 +216,21 @@ func ParseStore(data []byte, name string) (st *Store, reason string, err error) 
 	if st.Units == nil {
 		st.Units = map[string]*UnitStat{}
 	}
-	if st.Schema != storeSchema {
+	switch st.Schema {
+	case storeSchema:
+		// Already schema 2. A `wall` object, if present, must satisfy
+		// §15.1c's presence matrix; a malformed one is refused on §7's
+		// fail-closed path rather than reinterpreted.
+		if st.Wall != nil {
+			if err := st.Wall.Validate(); err != nil {
+				return nil, fmt.Sprintf("store %s has an unusable wall object: %v", name, err), nil
+			}
+		}
+	case storeSchemaLegacy:
+		// §15.2: migrate forward in place. Reporter rows survive; no wall
+		// history is invented.
+		st.migratedFromLegacy = true
+	default:
 		return nil, fmt.Sprintf("store %s has schema %d, this tool speaks schema %d", name, st.Schema, storeSchema), nil
 	}
 	return st, "", nil
