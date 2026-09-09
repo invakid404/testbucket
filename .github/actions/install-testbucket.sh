@@ -28,8 +28,6 @@
 #   TB_BINDIR    directory to install the binary into   (created if missing)
 # Optional env:
 #   GH_TOKEN     token for `gh release list`            (only the alias path needs it)
-#   TB_RELEASE_PINS_REF  full 40-hex commit SHA carrying the pin for a release
-#                published after this action's own commit (see below)
 #   TB_CANDIDATE_BINARY_DIGEST  sha256:<64-hex> of the binary Stage 1 authorised
 #                (MANDATORY on the candidate path; derive it with
 #                `testbucket wall stage1-binary --file stage1.json` from a
@@ -376,84 +374,31 @@ tar -xzf "$work/$asset" -C "$work" testbucket
 # is metadata, and this authenticated an archive against metadata that moves
 # with it.
 #
-# `released-binary-digests.tsv` is the root that does not move with the
-# release: it lives in this repository, under review and branch protection, and
-# it names the digest of the BINARY inside each published archive. The archive
-# digest says which archive was downloaded; this says which binary is about to
-# execute, which is what Stage 1 binds.
+# THE RELEASE-PIN SECOND ROOT IS REMOVED.
 #
-# A tag with no line here is REFUSED rather than installed on the strength of
-# the co-mutable pair. That is deliberate: publishing a release includes
-# committing its digests in a reviewed change, and a release nobody pinned is a
-# release nobody vouched for outside its own asset store.
-pins="$(dirname "${BASH_SOURCE[0]}")/released-binary-digests.tsv"
-if [ ! -f "$pins" ]; then
-  echo "install-testbucket: $pins is missing; a released binary is verified against a digest committed to the repository, and there is none to check against" >&2
-  exit 1
-fi
-pinned=$(awk -F'\t' -v t="$tag" -v p="${os}_${arch}" '$1 == t && $2 == p { print $3; exit }' "$pins")
+# What stood here verified a released binary against `released-binary-digests.tsv`
+# — a reviewed file in this repository naming the digest of the binary inside
+# each published archive — plus an optional later commit named by
+# TB_RELEASE_PINS_REF for releases published after this action's own commit.
+#
+# That data file is REMOVE-classified by the component map, and a check whose
+# root of trust no longer exists cannot be kept: it would refuse every release
+# on a missing file. Release proof is excluded from this scope (the map's own
+# "candidate delivery and release proof"), so the path goes with its root.
+#
+# WHAT STILL PROTECTS THIS INSTALL, unchanged and deliberately so:
+#
+#   - the archive is enumerated COMPLETELY before anything is installed, with
+#     every offending entry counted and named — the repair R54's own parent
+#     commit landed, after `tar | grep -q` let a SIGPIPE hide a bad first entry;
+#   - the one-archive rule, the fixed member name, and the symlink and
+#     any-execute-bit refusals;
+#   - the MANDATORY TB_CANDIDATE_BINARY_DIGEST re-digest of the extracted
+#     binary, which is the check a candidate build actually runs under.
+#
+# The removed path was the second root for a PUBLISHED release; the candidate
+# path that this product uses is untouched.
 
-# A RELEASE CANNOT CONTAIN ITS OWN DIGEST, AND DOES NOT HAVE TO.
-#
-# GoReleaser embeds the tag commit and its timestamp in the binary, so the
-# digest of a release's own bytes cannot exist before the tag that produces
-# them — a pin committed beforehand would have to predict its own hash. The
-# colocated file above therefore pins releases published BEFORE the commit it
-# lives in, and the newest release is pinned by the commit that comes after it.
-#
-# TB_RELEASE_PINS_REF is that later commit, named as a FULL 40-hex commit SHA
-# and nothing else. A commit SHA is immutable and addresses one reviewed tree,
-# so the pin still comes from a root the release cannot move — a branch or a
-# tag would put the pin back under the control of whoever can move it, which is
-# the property this whole check exists for.
-if [ -n "${TB_RELEASE_PINS_REF:-}" ]; then
-  if ! printf '%s' "$TB_RELEASE_PINS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-    echo "install-testbucket: TB_RELEASE_PINS_REF is '$TB_RELEASE_PINS_REF', not a full 40-hex commit SHA" >&2
-    echo "A pin fetched through a branch or a tag is a pin whoever can move that ref controls." >&2
-    exit 1
-  fi
-  if ! command -v gh >/dev/null 2>&1; then
-    echo "install-testbucket: fetching pins from commit $TB_RELEASE_PINS_REF needs the gh CLI" >&2
-    exit 1
-  fi
-  later="$work/pins-at-ref.tsv"
-  if ! gh api "repos/${TB_REPO}/contents/.github/actions/released-binary-digests.tsv?ref=${TB_RELEASE_PINS_REF}"         -H "Accept: application/vnd.github.raw" > "$later" 2>/dev/null; then
-    echo "install-testbucket: could not read the pin file at commit $TB_RELEASE_PINS_REF in $TB_REPO" >&2
-    exit 1
-  fi
-  at_ref=$(awk -F'\t' -v t="$tag" -v p="${os}_${arch}" '$1 == t && $2 == p { print $3; exit }' "$later")
-  if [ -n "$at_ref" ]; then
-    if [ -n "$pinned" ] && [ "$pinned" != "$at_ref" ]; then
-      echo "install-testbucket: the colocated pin for $tag ${os}_${arch} is $pinned but commit $TB_RELEASE_PINS_REF says $at_ref" >&2
-      echo "Two reviewed roots disagreeing about one release's bytes is not a tie to break." >&2
-      exit 1
-    fi
-    pinned="$at_ref"
-    echo "pin for $tag ${os}_${arch} taken from commit $TB_RELEASE_PINS_REF"
-  fi
-fi
-
-if [ -z "$pinned" ]; then
-  echo "install-testbucket: no precommitted binary digest for $tag ${os}_${arch} in $pins" >&2
-  echo "The release archive and its checksums.txt are both mutable assets of the same release, so they cannot authenticate each other." >&2
-  echo "A release published AFTER this action's commit is pinned by a later commit: run the pin-release workflow, review and merge the four lines it proposes, then pass that commit as release-pins-ref (TB_RELEASE_PINS_REF)." >&2
-  exit 1
-fi
-if ! printf '%s' "$pinned" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
-  echo "install-testbucket: the precommitted digest for $tag ${os}_${arch} is '$pinned', not sha256:<64 lower-case hex>" >&2
-  exit 1
-fi
-if command -v sha256sum >/dev/null 2>&1; then
-  got="sha256:$(sha256sum "$work/testbucket" | cut -d' ' -f1)"
-else
-  got="sha256:$(shasum -a 256 "$work/testbucket" | cut -d' ' -f1)"
-fi
-if [ "$got" != "$pinned" ]; then
-  echo "install-testbucket: the $tag ${os}_${arch} binary digests to $got, not the precommitted $pinned" >&2
-  echo "The release assets were replaced after that digest was reviewed, or this is not the release it claims to be." >&2
-  exit 1
-fi
-echo "released binary matches the precommitted digest $pinned"
 
 install -m 0755 "$work/testbucket" "$bin"
 printf '%s\n' "$TB_BINDIR" >>"${GITHUB_PATH:-/dev/null}"

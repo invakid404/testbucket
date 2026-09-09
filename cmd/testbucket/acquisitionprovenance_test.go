@@ -1,101 +1,73 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
-	"github.com/invakid404/testbucket/internal/walltime"
+	"github.com/invakid404/testbucket/internal/runner/vitestrunner"
 )
 
-// TestPlanningEnvIsTheEnvironmentTheAcquisitionRanWith is the F6 regression.
+// These are the acquisition-provenance regressions, and they are asserted on
+// the RUNNER because that is where the capture lives.
 //
-// Two defects, one cause. The subprocesses ran with a nil `Cmd.Env` and
-// inherited everything, and the bundle recorded exact values only for an
-// allow-list — binding every other inherited variable by the DIGEST of its
-// value. A digest says that a variable had some value; nobody can rerun
-// `vitest list` from a hash, so the plan was derived under an environment the
-// bundle could not reconstruct, and this test used to assert that a digest was
-// sufficient.
-//
-// The record and the executed environment are now built from one read, so they
-// cannot differ, and the only values withheld are the wall-time secret and
-// capability keys — withheld from the SUBPROCESS as well, so nothing is
-// claimed to have run with a value that was not there.
-func TestPlanningEnvIsTheEnvironmentTheAcquisitionRanWith(t *testing.T) {
-	t.Setenv("PATH", "/usr/bin:/bin")
-	t.Setenv("NODE_OPTIONS", "--max-old-space-size=4096")
-	t.Setenv("TB_ARBITRARY_PLANNING_INPUT", "exact-value-needed-for-replay")
-	t.Setenv(walltime.RunKeyEnv, "a-signing-key")
+// They used to scan the `wall bundle` builder's source text for the
+// expressions that fed a planning-input bundle. That bundle bound a run to a
+// signed Stage-1 manifest and is gone; the properties it needed are not, so
+// they are checked here against the behaviour instead of against the
+// spelling — which is the stronger form, since a rewrite that keeps the words
+// and loses the property no longer passes.
 
-	record, env := planningEnvironment()
-	for _, name := range []string{"PATH", "NODE_OPTIONS", "TB_ARBITRARY_PLANNING_INPUT"} {
-		if record[name] != os.Getenv(name) {
-			t.Errorf("the retained environment records %s as %q, not the exact value %q the acquisition ran under; a replay cannot reconstruct a subprocess from a description of it",
-				name, record[name], os.Getenv(name))
-		}
+// discoveringRunner builds a runner whose discovery subprocess is a verbatim
+// stub. It is a plain shell script, not Vitest: what is under test is what the
+// acquisition RETAINS about the subprocess it ran, and a stub makes the
+// expected argv, cwd and executable exactly known.
+func discoveringRunner(t *testing.T, root string) *vitestrunner.Runner {
+	t.Helper()
+	r, err := vitestrunner.New(vitestrunner.Options{
+		Root: root,
+		// `sh -c` with a body that prints one discovered file. The runner
+		// appends nothing to a verbatim discovery command, so this argv is
+		// exactly what must come back.
+		DiscoveryCommand: []string{"sh", "-c", `printf '[{"file":"a.test.ts"}]\n'`},
+		DiscoveryMode:    "glob",
+	})
+	if err != nil {
+		t.Fatalf("vitestrunner.New: %v", err)
 	}
-	// THE RECORD IS THE ENVIRONMENT. Every KEY=VALUE handed to the subprocess
-	// is in the record with the same value, and nothing in the record claims a
-	// variable the subprocess did not get.
-	got := map[string]string{}
-	for _, kv := range env {
-		k, v, _ := strings.Cut(kv, "=")
-		got[k] = v
+	if _, err := r.Discover(context.Background()); err != nil {
+		t.Fatalf("Discover: %v", err)
 	}
-	for k, v := range record {
-		if strings.HasPrefix(k, "digest:") {
-			continue
-		}
-		if have, ok := got[k]; !ok || have != v {
-			t.Errorf("the record binds %s=%q but the subprocess environment has %q (present=%v)", k, v, have, ok)
-		}
-	}
-	for k, v := range got {
-		if record[k] != v {
-			t.Errorf("the subprocess ran with %s=%q, which the record does not bind", k, v)
-		}
-	}
-	// THE SECRET AND CAPABILITY KEYS are withheld from both, and named by
-	// digest so their presence and any change to them is still visible.
-	for _, secret := range walltime.WallTimeSecretEnv {
-		if _, leaked := got[secret]; leaked && os.Getenv(secret) != "" {
-			t.Errorf("the acquisition subprocess was handed %s", secret)
-		}
-	}
-	if record[walltime.RunKeyEnv] == "a-signing-key" {
-		t.Error("planningEnv wrote a signing key into a bundle meant to be published")
-	}
-	if record["digest:"+walltime.RunKeyEnv] == "" {
-		t.Errorf("planningEnv omits %s entirely; the recorded set is not the set the process held", walltime.RunKeyEnv)
-	}
-	for k, v := range record {
-		if v == "a-signing-key" {
-			t.Errorf("planningEnv leaked a signing key under %q", k)
-		}
-	}
+	return r
 }
 
 // TestTheAcquisitionSubprocessRunsWithTheRetainedEnvironment: the record is
 // only replayable if the subprocess was actually given it.
+//
+// A nil Cmd.Env inherits everything and states nothing, so an acquisition that
+// recorded an environment it had not applied would describe a process nobody
+// could rerun.
 func TestTheAcquisitionSubprocessRunsWithTheRetainedEnvironment(t *testing.T) {
-	b, err := os.ReadFile("wallplan.go")
-	if err != nil {
-		t.Fatal(err)
+	rnr := discoveringRunner(t, t.TempDir())
+	seen := rnr.Discovered()
+	if seen == nil {
+		t.Fatal("the runner retained no discovery provenance")
 	}
-	if !strings.Contains(string(b), "Env: planningEnvArgs(),") {
-		t.Error("the runner is not given the retained environment, so the acquisition inherits whatever is ambient and the bundle describes something else")
+	if len(seen.Env) == 0 {
+		t.Fatal("the acquisition retained no environment, so a replay cannot reconstruct the process")
 	}
-	exec, err := os.ReadFile(filepath.Join("..", "..", "internal", "runner", "vitestrunner", "exec.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(exec), "cmd.Env = t.env") {
-		t.Error("the acquisition subprocess still runs with a nil Cmd.Env")
-	}
-	if !strings.Contains(string(exec), "cmd.Path") {
-		t.Error("the acquisition does not retain the executable exec.Command actually resolved")
+	// The retained environment is the one the subprocess ran with, not an
+	// allow-list of interesting values: every variable this process holds has
+	// to be in it.
+	for _, kv := range os.Environ() {
+		if !slices.Contains(seen.Env, kv) {
+			t.Errorf("the retained environment is missing %q; it is a summary rather than the environment that ran", strings.SplitN(kv, "=", 2)[0])
+			break
+		}
 	}
 }
 
@@ -106,19 +78,23 @@ func TestTheAcquisitionSubprocessRunsWithTheRetainedEnvironment(t *testing.T) {
 // every other working directory in the world, so a replay could not know where
 // discovery had run.
 func TestTheAcquisitionRootIsTheCanonicalAbsolutePath(t *testing.T) {
-	b, err := os.ReadFile("wallplan.go")
-	if err != nil {
-		t.Fatal(err)
+	dir := t.TempDir()
+	// The caller's spelling is deliberately not canonical: a relative path
+	// with a redundant segment, which is what `--root .` amounts to.
+	t.Chdir(dir)
+
+	rnr := discoveringRunner(t, "./.")
+	root := rnr.Root()
+	if !filepath.IsAbs(root) {
+		t.Errorf("Root() = %q, which is not absolute: a replay cannot follow the caller's spelling", root)
 	}
-	source := string(b)
-	if !strings.Contains(source, "acquiredRoot := rnr.Root()") {
-		t.Error("the bundle does not record the canonical root the runner actually used")
+	if root != filepath.Clean(root) {
+		t.Errorf("Root() = %q, which is not canonical", root)
 	}
-	if strings.Contains(source, "Root: *root, Runner: \"vitest\"") {
-		t.Error("the bundle still records the caller's spelling of --root as the acquisition cwd")
-	}
-	if !strings.Contains(source, "Resolve: closureResolver(acquiredRoot, observedPaths)") {
-		t.Error("the executable closure is resolved against a root other than the one that ran")
+	// And the retained cwd is that same root — the directory the subprocess
+	// actually ran from, not the spelling it was configured with.
+	if seen := rnr.Discovered(); seen == nil || seen.Cwd != root {
+		t.Errorf("the discovery cwd is %q, want the canonical root %q", seen.Cwd, root)
 	}
 }
 
@@ -129,49 +105,42 @@ func TestTheAcquisitionRootIsTheCanonicalAbsolutePath(t *testing.T) {
 // invocation is assembled would make the bundle describe a command nobody
 // issued, and nothing would notice.
 func TestTheDiscoveryArgvComesFromTheOperationThatRanIt(t *testing.T) {
-	b, err := os.ReadFile("wallplan.go")
-	if err != nil {
-		t.Fatal(err)
+	rnr := discoveringRunner(t, t.TempDir())
+	seen := rnr.Discovered()
+	if seen == nil {
+		t.Fatal("the runner retained no discovery provenance")
 	}
-	source := string(b)
-	if !strings.Contains(source, "if seen := rnr.Discovered(); seen != nil {") {
-		t.Error("the bundle does not take the discovery argv from the operation that issued it")
+	want := []string{"sh", "-c", `printf '[{"file":"a.test.ts"}]\n'`}
+	if !reflect.DeepEqual(seen.Argv, want) {
+		t.Errorf("the retained argv is %q, want the argv that ran %q", seen.Argv, want)
 	}
-	if strings.Contains(source, "DiscoveryArgv: discoveryArgv(") {
-		t.Error("the bundle still reconstructs its own discovery argv")
+	// THE RESOLVED EXECUTABLE, not the head of the command line. A bare name
+	// is resolved on PATH, and a replay from a different directory following
+	// the unresolved name reaches different bytes or nothing at all.
+	if !filepath.IsAbs(seen.Path) {
+		t.Errorf("the retained executable %q is not absolute", seen.Path)
 	}
-}
-
-// TestTheResolvedExecutableIsAbsolute is part of F6: a relative
-// `node_modules/.bin/...` names a different program in every working
-// directory, which is an executable identity that is not an identity.
-func TestTheResolvedExecutableIsAbsolute(t *testing.T) {
-	root := t.TempDir()
-	bin := filepath.Join(root, "node_modules", ".bin")
-	if err := os.MkdirAll(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bin, "vitest"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	rel, err := filepath.Rel(mustWD(t), root)
-	if err != nil {
-		t.Skip("the temp dir is not relative to the working directory on this host")
-	}
-	got, err := delegatedProgram(rel, []string{"npx", "vitest", "list"})
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if got.path != "" && !filepath.IsAbs(got.path) {
-		t.Errorf("the resolved executable is %q, which names a different program in every working directory", got.path)
+	if filepath.Base(seen.Path) != "sh" {
+		t.Errorf("the retained executable %q is not the program that ran", seen.Path)
 	}
 }
 
-func mustWD(t *testing.T) string {
-	t.Helper()
-	wd, err := os.Getwd()
+// TestDiscoveryFromFrozenBytesRetainsNoInvocation: there is no subprocess to
+// describe when the bytes came from a file, and inventing one would be worse
+// than reporting none.
+func TestDiscoveryFromFrozenBytesRetainsNoInvocation(t *testing.T) {
+	rnr, err := vitestrunner.New(vitestrunner.Options{
+		Root:          t.TempDir(),
+		DiscoveryMode: "glob",
+		Frozen:        &vitestrunner.FrozenInputs{Discovery: []byte(`[{"file":"a.test.ts"}]`)},
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("vitestrunner.New: %v", err)
 	}
-	return wd
+	if _, err := rnr.Discover(context.Background()); err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if seen := rnr.Discovered(); seen != nil {
+		t.Errorf("a frozen discovery reported an invocation it never issued: %+v", seen)
+	}
 }

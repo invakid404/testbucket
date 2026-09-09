@@ -72,41 +72,6 @@ Most subcommands take --runner go|vitest to pick the test-runner adapter.
 run "testbucket <subcommand> -h" for the flags of each.
 `
 
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
-	}
-	var err error
-	switch os.Args[1] {
-	case "plan":
-		err = runPlan(os.Args[2:])
-	case "ingest":
-		err = runIngest(os.Args[2:])
-	case "whales":
-		err = runWhales(os.Args[2:])
-	case "audit":
-		err = runAudit(os.Args[2:])
-	case "render":
-		err = runRender(os.Args[2:])
-	case "wall":
-		err = runWall(os.Args[2:])
-	case "version", "--version", "-v":
-		printVersion()
-		return
-	case "-h", "--help", "help":
-		fmt.Fprint(os.Stderr, usage)
-		return
-	default:
-		fmt.Fprintf(os.Stderr, "testbucket: unknown subcommand %q\n\n%s", os.Args[1], usage)
-		os.Exit(2)
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "testbucket: %v\n", err)
-		os.Exit(1)
-	}
-}
-
 // printVersion writes the build metadata: the tag for a released binary, "dev"
 // for a plain checkout. The commit and date lines are omitted when unset so a
 // dev build stays terse.
@@ -302,190 +267,6 @@ func discoveryTimeoutDefault() (time.Duration, error) {
 		return 0, fmt.Errorf("TB_DISCOVERY_TIMEOUT %q must be >= 0 (0 disables the deadline)", v)
 	}
 	return d, nil
-}
-
-func runPlan(args []string) error {
-	defDiscoveryTimeout, err := discoveryTimeoutDefault()
-	if err != nil {
-		return err
-	}
-	fs := flag.NewFlagSet("plan", flag.ExitOnError)
-	k := fs.Int("k", 6, "number of buckets (the single knob: adding a lane = bumping K)")
-	store := fs.String("store", "test-timings.json", "timing store path, or - for stdin; a missing store is a cold start")
-	asJSON := fs.Bool("json", false, "write the fromJSON matrix to stdout (summary then goes to stderr)")
-	shardPlan := fs.String("shard-plan", "", "also write the full plan (buckets, invocations, summary) as JSON to this path")
-	race := fs.Bool("race", true, "weights and invocations assume -race")
-	countFlag := fs.Int("count", 100, "-count for the flake sweep; count-shards divide it (Go default 100; Vitest requires 1)")
-	timeout := fs.String("timeout", "20m", "-timeout passed to each go test invocation")
-	live := fs.String("live", "", "read the live package set from this JSON file instead of running go list")
-	wallBundle := fs.String("wall-bundle", "", "plan DETERMINISTICALLY from this frozen planning-input bundle (`testbucket wall bundle`) instead of discovering and reading the clock: every input comes from the bundle, so the plan is reproducible")
-	wallStage1 := fs.String("wall-stage1", "", "Stage-1 input manifest that authorises the bundle (--wall-bundle)")
-	wallStage2 := fs.String("wall-stage2", "", "write the Stage-2 derived-plan receipt here (--wall-bundle). It refuses to overwrite: the bound planner runs exactly once")
-	pallocScorer := fs.String("palloc-scorer", "", "frozen pre-plan scorer (--wall-bundle): KK then packs by Palloc while est_seconds keeps reporting the store's measured weights. Without it the partition uses the store weights, which is not campaign eligible")
-	wallRegistry := fs.String("wall-registry", "", "frozen Aeta component-registry template (--wall-bundle), instantiated per bucket into --wall-out-dir")
-	wallOutDir := fs.String("wall-out-dir", "", "write the per-bucket derived documents (Palloc, Pcheck, Aeta) here (--wall-bundle)")
-	wallClaimStore := fs.String("wall-claim-store", "", "DURABLE store for the one-shot planner claim (--wall-bundle). The contract allows one planner execution and refuses a replan, retry or second invocation; the claim is keyed by the Stage-1 and bundle digests, taken BEFORE planning, and created with O_EXCL so the filesystem decides the winner. It is a STORE, not an output directory: a claim kept beside the derived documents moved with the working directory, so a job rerun on a fresh runner saw no claim at all. Set this (or "+plannerClaimStoreEnv+") to a location every attempt of the job resolves; a SCORED derivation refuses to plan without one. Independent verifier replay does not claim")
-	wallAuthority := fs.String("wall-authority", "", "the EXACT protected environment the Stage-1 manifest must name, e.g. "+walltime.CampaignAuthority+". REQUIRED with --wall-bundle: the contract puts the protected authority's approval BEFORE either role plans, and a key can sign under any label — so a key check alone lets a manifest approved elsewhere drive the frozen planner")
-	var wallAuthorityKeys stringList
-	fs.Var(&wallAuthorityKeys, "wall-authority-key", "a PREDECLARED authority public key (hex); repeatable. REQUIRED with --wall-bundle: the contract puts an owner-authority signature on the planning inputs BEFORE the plan exists, and a post-run verifier can refuse a row but cannot un-run an action or restore an approval that never happened")
-	nodePrefixes := fs.String("node-prefixes", "", "comma-separated package-dir prefixes whose buckets need Node set up (empty = none; a consumer opts in)")
-	eventsDir := fs.String("events-dir", "", "if set, emitted invocations add -json and tee events into this directory")
-	fileParallelism := fs.Int("file-parallelism", 1, "intra-bucket file/package concurrency (#22): 1 keeps a bucket serial (the sum-of-weights model the balancer packs to); N>1 renders `-p=N` (Go) / `--maxWorkers=N` (Vitest), trading that estimate for more cores")
-	staleAfter := fs.Duration("stale-after", 14*24*time.Hour, "warn when the store was recorded longer ago than this (0 disables)")
-	toolchainTimeout := fs.Duration("toolchain-timeout", 10*time.Minute, "deadline for each `go` subprocess (go work edit / go list / go test -list); 0 disables")
-	runnerKind := fs.String("runner", "go", "test-runner adapter: go or vitest")
-	root := fs.String("root", "", "vitest project directory (--runner vitest); empty means the working directory")
-	vitestCommand := fs.String("vitest-command", "", "bare-vitest invocation (--runner vitest); empty means \"npx vitest\". testbucket treats it as program + leading args (whitespace-split) and APPENDS the subcommand: discovery adds \"list --filesOnly --json\" (or \"list --json\" under --vitest-discovery=list); a run bucket adds \"run --no-file-parallelism <files>\". The command must therefore accept those like bare vitest")
-	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly` — resolves files by glob WITHOUT importing them, immune to the multi-project `vitest list` collection deadlock) or list (`vitest list --json` — imports the module graph; only its per-test names matter, which file-granularity bucketing does not use today)")
-	vitestDiscoveryCommand := fs.String("vitest-discovery-command", "", "override discovery with a command run VERBATIM (--runner vitest): it OWNS its subcommand and flags (testbucket appends nothing) and must print the [{file}] / [{name,file}] JSON to stdout. Lets a run-wrapper that already owns `run` be paired with a separate discovery command. Empty = derive from --vitest-command + --vitest-discovery")
-	discoveryTimeout := fs.Duration("discovery-timeout", defDiscoveryTimeout, "fail-fast deadline for vitest test discovery (--runner vitest); a stalled `vitest list` errors here instead of hanging the whole job. 0 disables. Default overridable via TB_DISCOVERY_TIMEOUT")
-	wallDir := fs.String("wall-dir", "", "records directory for complete-action wall-time measurement (--runner vitest): every rendered invocation runs under `testbucket wall exec`, which gives it a physical envelope, a containment peer and an independent trace. Empty (the default) renders exactly the bytes v0.2.2 rendered")
-	var excludes stringList
-	fs.Var(&excludes, "exclude-module", "module dir (glob) to leave out of the module set; repeatable, replaces the defaults")
-
-	// --- contract §21 added plan inputs --------------------------------------
-	estBasis := fs.String("est-basis", string(core.BasisReporter), "which weight the partition is built from: reporter (default) or wall. Mode selection is contract §16.1; an explicit `wall` request with no fitted `ok` model is a hard error with no matrix (§0.8 outcome c), never a silent fallback")
-	scored := fs.Bool("scored", false, "this plan belongs to a scored campaign run. Nothing else can derive it — basis does not imply it, since a scored B arm runs `reporter` — so it is explicit, and it gates §0.8's phase-2 veto plus AD-8…AD-10")
-	runnerClass := fs.String("runner-class", "", "the stable execution-class leaf of the comparability key (§15.3). Required non-empty for a scored plan (AD-8); it replaces the former runner_name leaf, whose per-instance value had no cross-run stability contract")
-	runsOnLabel := fs.String("runs-on-label", "", "the caller's resolved runs-on label, the producer for the runner_image_label key leaf. No context yields it inside a composite action, so the caller passes it; run-bucket echoes it and QC12 compares them (AD-8)")
-	candidateSHA := fs.String("candidate-sha", "", "the testbucket commit the executing binary was built from, recorded as the observation's candidate_sha (AD-10, QC15)")
-	workloadCommit := fs.String("workload-commit", "", "the consumer checkout this run executes against, recorded as the observation's workload_commit (AD-10, QC15)")
-	cacheDeclarationFile := fs.String("cache-declaration-file", "", "job-local file holding the canonical cache declaration of §10.5.0, already verified against its expected digest by the plan job. plan validates only the declaration leaves and refuses before emitting a matrix; the outcome leaves do not exist yet (AD-9)")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	// §0.8's two ordered phases, and §19.3a's admission, run BEFORE any matrix
-	// is emitted — §7 rule 17 names plan as the component that must refuse.
-	basis := core.EstBasis(*estBasis)
-	if !basis.Valid() {
-		return fmt.Errorf("--est-basis %q: contract §5.1 permits exactly reporter or wall", *estBasis)
-	}
-	if *scored {
-		if err := scoredPlanAdmission(*runnerClass, *runsOnLabel, *candidateSHA, *workloadCommit, *cacheDeclarationFile); err != nil {
-			return err
-		}
-	}
-
-	// The frozen path takes over completely: a bundle carries K, the count, the
-	// token, the clock and the render configuration, so honouring a flag here
-	// as well would be a second, unbound source for the same input.
-	if *wallBundle != "" {
-		return planFromBundle(frozenPlanOptions{
-			bundlePath: *wallBundle, stage1Path: *wallStage1, stage2Path: *wallStage2,
-			shardPlan: *shardPlan, asJSON: *asJSON,
-			scorerPath: *pallocScorer, registryPath: *wallRegistry, outDir: *wallOutDir,
-			claimStore: *wallClaimStore,
-			// A frozen plan that binds a Stage-1 manifest is the scored path:
-			// that is the derivation whose one-shot rule the campaign rests
-			// on, so its claim must be durable.
-			scored:        *wallStage1 != "",
-			authorityKeys: wallAuthorityKeys, authority: *wallAuthority,
-		})
-	}
-
-	// The effective sweep count is adapter-aware (Go 100, Vitest 1); resolve it
-	// before validation, discovery or store access so a bad Vitest count fails
-	// on a line of output rather than after a full discovery sweep.
-	count, err := resolveCount(*runnerKind, *countFlag, flagWasSet(fs, "count"))
-	if err != nil {
-		return err
-	}
-	if *fileParallelism < 1 {
-		return fmt.Errorf("--file-parallelism must be >= 1, got %d", *fileParallelism)
-	}
-	if err := checkWallDirRunner(*runnerKind, *wallDir); err != nil {
-		return err
-	}
-
-	opt := core.PlanOptions{
-		K:          *k,
-		StorePath:  *store,
-		Count:      count,
-		StaleAfter: *staleAfter,
-		Now:        time.Now(),
-	}
-	// Validate before the expensive discovery: a bad --count should cost a line
-	// of output, not a full `go list` sweep of every module.
-	if err := opt.Validate(); err != nil {
-		return err
-	}
-
-	ctx := context.Background()
-	rnr, loadLive, err := newRunner(runnerConfig{
-		kind:                   *runnerKind,
-		toolchainTimeout:       *toolchainTimeout,
-		excludes:               excludes,
-		race:                   *race,
-		count:                  count,
-		timeout:                *timeout,
-		nodePrefixes:           splitPrefixes(*nodePrefixes),
-		root:                   *root,
-		vitestCommand:          *vitestCommand,
-		vitestDiscovery:        *vitestDiscovery,
-		vitestDiscoveryCommand: *vitestDiscoveryCommand,
-		discoveryTimeout:       *discoveryTimeout,
-		eventsDir:              *eventsDir,
-		fileParallelism:        *fileParallelism,
-		wallDir:                *wallDir,
-	})
-	if err != nil {
-		return err
-	}
-
-	var livePkgs []runner.LivePackage
-	if *live != "" {
-		livePkgs, err = loadLive(*live)
-	} else {
-		livePkgs, err = rnr.Discover(ctx)
-	}
-	if err != nil {
-		return err
-	}
-
-	st, reason, err := core.LoadStore(*store)
-	if err != nil {
-		return err
-	}
-
-	opt.Live = livePkgs
-	opt.Token = rnr.CanonicalToken()
-
-	doc, err := core.BuildPlan(ctx, rnr, st, reason, opt)
-	if err != nil {
-		return err
-	}
-
-	if *shardPlan != "" {
-		if err := writeJSONFile(*shardPlan, doc); err != nil {
-			return err
-		}
-	}
-
-	// The summary always reaches the job log; stdout stays machine-clean
-	// whenever the caller is capturing the matrix.
-	summaryOut := io.Writer(os.Stdout)
-	if *asJSON {
-		summaryOut = os.Stderr
-	}
-	if err := doc.WriteSummary(summaryOut, core.CommonImportPrefix(livePkgs)); err != nil {
-		return fmt.Errorf("write plan summary: %w", err)
-	}
-
-	if *asJSON {
-		matrix, err := doc.MatrixJSON()
-		if err != nil {
-			return err
-		}
-		// A short write here is the difference between a matrix and a truncated
-		// one; `matrix=$(testbucket plan --json)` would happily consume the
-		// fragment and fan out the wrong jobs.
-		if _, err := fmt.Println(string(matrix)); err != nil {
-			return fmt.Errorf("write matrix: %w", err)
-		}
-	}
-	return nil
 }
 
 func runIngest(args []string) error {
@@ -866,4 +647,207 @@ func scoredPlanAdmission(runnerClass, runsOnLabel, candidateSHA, workloadCommit,
 		}
 	}
 	return nil
+}
+
+func runPlan(args []string) error {
+	defDiscoveryTimeout, err := discoveryTimeoutDefault()
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("plan", flag.ExitOnError)
+	k := fs.Int("k", 6, "number of buckets (the single knob: adding a lane = bumping K)")
+	store := fs.String("store", "test-timings.json", "timing store path, or - for stdin; a missing store is a cold start")
+	asJSON := fs.Bool("json", false, "write the fromJSON matrix to stdout (summary then goes to stderr)")
+	shardPlan := fs.String("shard-plan", "", "also write the full plan (buckets, invocations, summary) as JSON to this path")
+	race := fs.Bool("race", true, "weights and invocations assume -race")
+	countFlag := fs.Int("count", 100, "-count for the flake sweep; count-shards divide it (Go default 100; Vitest requires 1)")
+	timeout := fs.String("timeout", "20m", "-timeout passed to each go test invocation")
+	live := fs.String("live", "", "read the live package set from this JSON file instead of running go list")
+	nodePrefixes := fs.String("node-prefixes", "", "comma-separated package-dir prefixes whose buckets need Node set up (empty = none; a consumer opts in)")
+	eventsDir := fs.String("events-dir", "", "if set, emitted invocations add -json and tee events into this directory")
+	fileParallelism := fs.Int("file-parallelism", 1, "intra-bucket file/package concurrency (#22): 1 keeps a bucket serial (the sum-of-weights model the balancer packs to); N>1 renders `-p=N` (Go) / `--maxWorkers=N` (Vitest), trading that estimate for more cores")
+	staleAfter := fs.Duration("stale-after", 14*24*time.Hour, "warn when the store was recorded longer ago than this (0 disables)")
+	toolchainTimeout := fs.Duration("toolchain-timeout", 10*time.Minute, "deadline for each `go` subprocess (go work edit / go list / go test -list); 0 disables")
+	runnerKind := fs.String("runner", "go", "test-runner adapter: go or vitest")
+	root := fs.String("root", "", "vitest project directory (--runner vitest); empty means the working directory")
+	vitestCommand := fs.String("vitest-command", "", "bare-vitest invocation (--runner vitest); empty means \"npx vitest\". testbucket treats it as program + leading args (whitespace-split) and APPENDS the subcommand: discovery adds \"list --filesOnly --json\" (or \"list --json\" under --vitest-discovery=list); a run bucket adds \"run --no-file-parallelism <files>\". The command must therefore accept those like bare vitest")
+	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly` — resolves files by glob WITHOUT importing them, immune to the multi-project `vitest list` collection deadlock) or list (`vitest list --json` — imports the module graph; only its per-test names matter, which file-granularity bucketing does not use today)")
+	vitestDiscoveryCommand := fs.String("vitest-discovery-command", "", "override discovery with a command run VERBATIM (--runner vitest): it OWNS its subcommand and flags (testbucket appends nothing) and must print the [{file}] / [{name,file}] JSON to stdout. Lets a run-wrapper that already owns `run` be paired with a separate discovery command. Empty = derive from --vitest-command + --vitest-discovery")
+	discoveryTimeout := fs.Duration("discovery-timeout", defDiscoveryTimeout, "fail-fast deadline for vitest test discovery (--runner vitest); a stalled `vitest list` errors here instead of hanging the whole job. 0 disables. Default overridable via TB_DISCOVERY_TIMEOUT")
+	wallDir := fs.String("wall-dir", "", "records directory for complete-action wall-time measurement (--runner vitest): every rendered invocation runs under `testbucket wall exec`, which gives it a physical envelope, a containment peer and an independent trace. Empty (the default) renders exactly the bytes v0.2.2 rendered")
+	var excludes stringList
+	fs.Var(&excludes, "exclude-module", "module dir (glob) to leave out of the module set; repeatable, replaces the defaults")
+
+	// --- contract §21 added plan inputs --------------------------------------
+	estBasis := fs.String("est-basis", string(core.BasisReporter), "which weight the partition is built from: reporter (default) or wall. Mode selection is contract §16.1; an explicit `wall` request with no fitted `ok` model is a hard error with no matrix (§0.8 outcome c), never a silent fallback")
+	scored := fs.Bool("scored", false, "this plan belongs to a scored campaign run. Nothing else can derive it — basis does not imply it, since a scored B arm runs `reporter` — so it is explicit, and it gates §0.8's phase-2 veto plus AD-8…AD-10")
+	runnerClass := fs.String("runner-class", "", "the stable execution-class leaf of the comparability key (§15.3). Required non-empty for a scored plan (AD-8); it replaces the former runner_name leaf, whose per-instance value had no cross-run stability contract")
+	runsOnLabel := fs.String("runs-on-label", "", "the caller's resolved runs-on label, the producer for the runner_image_label key leaf. No context yields it inside a composite action, so the caller passes it; run-bucket echoes it and QC12 compares them (AD-8)")
+	candidateSHA := fs.String("candidate-sha", "", "the testbucket commit the executing binary was built from, recorded as the observation's candidate_sha (AD-10, QC15)")
+	workloadCommit := fs.String("workload-commit", "", "the consumer checkout this run executes against, recorded as the observation's workload_commit (AD-10, QC15)")
+	cacheDeclarationFile := fs.String("cache-declaration-file", "", "job-local file holding the canonical cache declaration of §10.5.0, already verified against its expected digest by the plan job. plan validates only the declaration leaves and refuses before emitting a matrix; the outcome leaves do not exist yet (AD-9)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// §0.8's two ordered phases, and §19.3a's admission, run BEFORE any matrix
+	// is emitted — §7 rule 17 names plan as the component that must refuse.
+	basis := core.EstBasis(*estBasis)
+	if !basis.Valid() {
+		return fmt.Errorf("--est-basis %q: contract §5.1 permits exactly reporter or wall", *estBasis)
+	}
+	if *scored {
+		if err := scoredPlanAdmission(*runnerClass, *runsOnLabel, *candidateSHA, *workloadCommit, *cacheDeclarationFile); err != nil {
+			return err
+		}
+	}
+
+	// The frozen path takes over completely: a bundle carries K, the count, the
+	// token, the clock and the render configuration, so honouring a flag here
+	// as well would be a second, unbound source for the same input.
+	// The frozen-bundle planning path is removed with the Stage-1/Stage-2
+	// authority model: a bundle was authorised by a signed manifest and
+	// derived through a one-shot planner claim, none of which exists now.
+
+	// The effective sweep count is adapter-aware (Go 100, Vitest 1); resolve it
+	// before validation, discovery or store access so a bad Vitest count fails
+	// on a line of output rather than after a full discovery sweep.
+	count, err := resolveCount(*runnerKind, *countFlag, flagWasSet(fs, "count"))
+	if err != nil {
+		return err
+	}
+	if *fileParallelism < 1 {
+		return fmt.Errorf("--file-parallelism must be >= 1, got %d", *fileParallelism)
+	}
+	if err := checkWallDirRunner(*runnerKind, *wallDir); err != nil {
+		return err
+	}
+
+	opt := core.PlanOptions{
+		K:          *k,
+		StorePath:  *store,
+		Count:      count,
+		StaleAfter: *staleAfter,
+		Now:        time.Now(),
+	}
+	// Validate before the expensive discovery: a bad --count should cost a line
+	// of output, not a full `go list` sweep of every module.
+	if err := opt.Validate(); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	rnr, loadLive, err := newRunner(runnerConfig{
+		kind:                   *runnerKind,
+		toolchainTimeout:       *toolchainTimeout,
+		excludes:               excludes,
+		race:                   *race,
+		count:                  count,
+		timeout:                *timeout,
+		nodePrefixes:           splitPrefixes(*nodePrefixes),
+		root:                   *root,
+		vitestCommand:          *vitestCommand,
+		vitestDiscovery:        *vitestDiscovery,
+		vitestDiscoveryCommand: *vitestDiscoveryCommand,
+		discoveryTimeout:       *discoveryTimeout,
+		eventsDir:              *eventsDir,
+		fileParallelism:        *fileParallelism,
+		wallDir:                *wallDir,
+	})
+	if err != nil {
+		return err
+	}
+
+	var livePkgs []runner.LivePackage
+	if *live != "" {
+		livePkgs, err = loadLive(*live)
+	} else {
+		livePkgs, err = rnr.Discover(ctx)
+	}
+	if err != nil {
+		return err
+	}
+
+	st, reason, err := core.LoadStore(*store)
+	if err != nil {
+		return err
+	}
+
+	opt.Live = livePkgs
+	opt.Token = rnr.CanonicalToken()
+
+	doc, err := core.BuildPlan(ctx, rnr, st, reason, opt)
+	if err != nil {
+		return err
+	}
+
+	if *shardPlan != "" {
+		if err := writeJSONFile(*shardPlan, doc); err != nil {
+			return err
+		}
+	}
+
+	// The summary always reaches the job log; stdout stays machine-clean
+	// whenever the caller is capturing the matrix.
+	summaryOut := io.Writer(os.Stdout)
+	if *asJSON {
+		summaryOut = os.Stderr
+	}
+	if err := doc.WriteSummary(summaryOut, core.CommonImportPrefix(livePkgs)); err != nil {
+		return fmt.Errorf("write plan summary: %w", err)
+	}
+
+	if *asJSON {
+		matrix, err := doc.MatrixJSON()
+		if err != nil {
+			return err
+		}
+		// A short write here is the difference between a matrix and a truncated
+		// one; `matrix=$(testbucket plan --json)` would happily consume the
+		// fragment and fan out the wrong jobs.
+		if _, err := fmt.Println(string(matrix)); err != nil {
+			return fmt.Errorf("write matrix: %w", err)
+		}
+	}
+	return nil
+}
+
+// main dispatches the subcommands that survive the removal plan. The wall
+// verbs that went with the protected-authority, observer and campaign-proof
+// models are no longer reachable; `wall` itself remains, because the rendered
+// bucket script invokes `testbucket wall exec`.
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprint(os.Stderr, usage)
+		os.Exit(2)
+	}
+	var err error
+	switch os.Args[1] {
+	case "plan":
+		err = runPlan(os.Args[2:])
+	case "ingest":
+		err = runIngest(os.Args[2:])
+	case "whales":
+		err = runWhales(os.Args[2:])
+	case "audit":
+		err = runAudit(os.Args[2:])
+	case "render":
+		err = runRender(os.Args[2:])
+	case "wall":
+		err = runWall(os.Args[2:])
+	case "version", "--version", "-v":
+		printVersion()
+		return
+	case "-h", "--help", "help":
+		fmt.Fprint(os.Stderr, usage)
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "testbucket: unknown subcommand %q\n\n%s", os.Args[1], usage)
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "testbucket: %v\n", err)
+		os.Exit(1)
+	}
 }

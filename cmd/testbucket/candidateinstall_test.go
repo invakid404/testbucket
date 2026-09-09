@@ -3,10 +3,8 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"fmt"
-	"github.com/invakid404/testbucket/internal/walltime"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -239,37 +237,6 @@ func TestTheCandidateInstallerRunsOnlyThePinnedArchive(t *testing.T) {
 			t.Errorf("the attested binary was refused: %v\n%s", err, out)
 		}
 	})
-}
-
-// fixtureAuthorityKey stands in for the protected campaign authority, minted
-// once so every fixture claim verifies against the same predeclared key.
-var fixtureAuthorityKey = func() ed25519.PrivateKey {
-	k, err := walltime.NewSigningKey()
-	if err != nil {
-		panic(err)
-	}
-	return k
-}()
-
-// fixtureClaim is the one-shot planner claim a derivation is performed under.
-//
-// It carries what the schema requires rather than what a fixture could simply
-// assert: the CANONICAL key, which any checker recomputes from the two
-// parents, and the authority's real signature over the store identity. A
-// hand-authored `Durable: true` beside `Key: "fixture"` used to pass, so
-// Stage 2 could not tell an earned claim from a declared one.
-func fixtureClaim(stage1, bundle walltime.Digest) *walltime.PlannerClaimReceipt {
-	const store = "authority/durable-claims"
-	// The authority that signed this claim is the predeclared one, registered
-	// here so the pairing does not depend on which test ran first.
-	walltime.RegisterCampaignAuthorityKeys([]string{walltime.PublicKeyOf(fixtureAuthorityKey)})
-	subject := walltime.PlannerClaimStoreSubject(store)
-	return &walltime.PlannerClaimReceipt{
-		Store: store, Durable: true,
-		Key: walltime.PlannerClaimKey(stage1, bundle), Stage1: stage1, Bundle: bundle,
-		Attestation:   walltime.SignApproval(walltime.CampaignAuthority, fixtureAuthorityKey, subject),
-		AuthorityKeys: []string{walltime.PublicKeyOf(fixtureAuthorityKey)},
-	}
 }
 
 // THE DELIVERY IS VERIFIED AT THE THING THAT EXECUTES.

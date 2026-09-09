@@ -1,8 +1,0 @@
-{
-  "name": "testbucket-vitest-sample",
-  "private": true,
-  "type": "module",
-  "devDependencies": {
-    "vitest": "4.1.10"
-  }
-}

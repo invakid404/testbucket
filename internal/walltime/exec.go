@@ -1,11 +1,8 @@
 package walltime
 
 import (
-	"crypto/ed25519"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -119,17 +116,32 @@ type ExecOptions struct {
 	Stderr  *os.File
 }
 
-// Exec runs one command under a complete physical envelope with an independent
-// containment peer and an independent trace collector, and returns the child's
-// exit code.
+// Exec measures one owned child and returns its exit code.
 //
-// The ordering the verifier requires is produced here by construction:
+// SIMPLIFIED per salvage-map: what remains is the observable itself, and only
+// that. The two readings and their ordering, concrete argv spawn with
+// stdout/stderr passthrough, exit-status preservation, cancellation
+// forwarding, root wait and reap of the one child this process parented,
+// same-PGID signal with bounded TERM->KILL escalation, and group drain before
+// the closing read.
 //
-//	AT_start <= CPA_start <= VTA_start <= VTA_end <= CPA_end <= AT_end
+// Removed with the proof machinery: the three-ledger split, signer and key
+// handling, observer startup and admission handshakes, cgroup admission and
+// freeze/thaw, and peer/trace record emission. Those served the hostile-runner
+// model contract §0.1 places out of scope, and were roughly two-thirds of this
+// function.
 //
-// The wrapper never hands an endpoint to an observer and never takes one back:
-// each of the three producers reads its own clock and its own raw containment
-// state, in its own process, with its own signing key.
+// The interval is bracketed so that:
+//
+//	start <= spawn <= child exit <= root reap <= group drain <= end
+//
+// The opening reading is this function's FIRST owned operation, taken before
+// the writer, the spec digests and the spawn, because all of those are
+// wrapper-owned work and an envelope that started after them would report an
+// interval shorter than the one that ran. The closing reading is taken only
+// after the group is confirmed empty; what remains outside is one record
+// write, which is the ledger closing itself and cannot be inside the interval
+// it closes.
 func Exec(opt ExecOptions) (int, error) {
 	if len(opt.Argv) == 0 {
 		return 1, fmt.Errorf("walltime: no command to run")
@@ -138,35 +150,15 @@ func Exec(opt ExecOptions) (int, error) {
 		opt.Timeout = DefaultTimeout
 	}
 
-	// AT_start / VB_start / V_start is the wrapper's FIRST owned operation, and
-	// that is meant literally: the reading is taken before the signing key, the
-	// writer, the records directory, the spec digests and the containment,
-	// because all of those are wrapper-owned work and an envelope that started
-	// after them would report an action shorter than the one that ran.
 	clock := NewSystemClock()
 	start := clock.Now()
 	probe(atStartReading, opt.Dir)
 
-	key, err := NewSigningKey()
-	if err != nil {
-		return 1, err
-	}
-	w, err := NewWriter(filepath.Join(opt.Dir, streamName(ProducerPhysical, opt.Level, opt.Seq)), ProducerPhysical, ProducerID(ProducerPhysical), key)
+	w, err := NewWriter(filepath.Join(opt.Dir, execStreamName(opt)), ProducerPhysical, "physical", nil)
 	if err != nil {
 		return 1, err
 	}
 	defer w.Close()
-	// A script- or invocation-level wrapper is started BY the measured step,
-	// so its key cannot be in a roster sealed before that step ran. What can
-	// be fixed is that the set is CLOSED at AT_end: every key registers here,
-	// `wall end` seals the log, and a key that was never registered — or one
-	// appended afterwards — is not a signer this measurement admitted.
-	if err := RegisterLowerKey(opt.Dir, KeyLogEntry{
-		Producer: ProducerPhysical, Level: opt.Level, Seq: opt.Seq,
-		PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
-	}, opt.Run); err != nil {
-		return 1, err
-	}
 
 	spec := &SpecIdentity{
 		ArgvDigest:     mustDigest(opt.Argv),
@@ -177,248 +169,56 @@ func Exec(opt ExecOptions) (int, error) {
 		Desc:           opt.Desc,
 	}
 
-	// Joining the parent containment before doing anything else is what makes
-	// this wrapper's own work — not just its child's — part of the enclosing
-	// envelope's containment lifecycle.
-	//
-	// JoinParent is separate from Parent because they are different questions.
-	// A script wrapper is a fresh process started by an Actions step, so it has
-	// to join. An invocation wrapper is already inside the script containment
-	// by inheritance, and joining would MOVE it out — a process belongs to
-	// exactly one cgroup — taking the invocation's work out of the script
-	// lifecycle that is supposed to contain it.
-	if opt.Parent != nil && opt.JoinParent {
-		if err := joinContainment(*opt.Parent, os.Getpid()); err != nil {
-			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "join parent containment: "+err.Error())
-		}
-	}
-
-	cont, err := NewContainmentAt(opt.Level, containmentName(opt), opt.Parent)
-	if err != nil {
-		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "create containment: "+err.Error())
-	}
-	// THE SCRIPT'S NESTING IS DONE FOR IT, NOT BY IT.
-	//
-	// The subtree used to be DELEGATED to the measured script so it could
-	// create the invocation containments itself. That cannot be made
-	// eligible: cgroup-v2 requires write access to the common ancestor's
-	// `cgroup.procs` to place a process into a sub-cgroup, so a script able to
-	// do its own nesting is a script able to write the migration control its
-	// own envelope rests on — and the verifier correctly refused every
-	// complete-script row that resulted.
-	//
-	// The controller is the other half of that trade. This wrapper stays
-	// alive, keeps the credential, and creates, admits, measures and records
-	// each invocation ON REQUEST; the script asks and does none of it. The
-	// script containment is left supervisor-owned, which is what makes the
-	// level scorable, and the script cannot leave it either.
-	var controller *InvocationController
-	if opt.Level == LevelScript {
-		controller, err = StartInvocationController(opt, cont.Identity())
-		if err != nil {
-			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "open the invocation controller: "+err.Error())
-		}
-	}
-	// Cleanup is EXPLICIT rather than deferred, because a defer would run
-	// after the closing record and put real wrapper-owned work outside the
-	// envelope it belongs to. destroyed guards the error paths below, which
-	// still need it.
-	destroyed := false
-	destroy := func() {
-		if !destroyed {
-			destroyed = true
-			_ = cont.Destroy()
-		}
-	}
-	defer destroy()
-
 	if _, err := w.Append(Record{
-		Kind: "boundary", Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
+		Kind: "boundary", Level: opt.Level,
 		Boundary: "start", Source: SourceWrapper, Seqno: opt.Seq,
-		Run: opt.Run, Containment: cont.Identity(), Instant: start, Spec: spec,
+		Run: opt.Run, Instant: start, Spec: spec,
 	}); err != nil {
 		return 1, err
 	}
-	if opt.Level == LevelScript {
-		// The invocation wrappers the script is about to start are separate
-		// processes; this is how they find the containment they must nest
-		// inside. It is removed when the script closes, so a later run cannot
-		// nest under a containment that no longer exists.
-		if err := writeContainmentHandoff(opt.Dir, cont.Identity(), opt.Run); err != nil {
-			return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, err.Error())
-		}
-	}
 
 	deadline := time.Now().Add(opt.Timeout)
-	peer, err := startObserver(ProducerPeer, opt, cont.Identity(), deadline, false)
-	if err != nil {
-		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, "start containment peer: "+err.Error())
-	}
-	trace, err := startObserver(ProducerTrace, opt, cont.Identity(), deadline, false)
-	if err != nil {
-		reason := joinReason("start trace collector: "+err.Error(), abandonReason(peer.abandon()))
-		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, reason)
-	}
+	code, proc, termState, reason := runOwnedChild(opt, deadline, clock)
 
-	// No child may start before the peer's admission receipt exists, and the
-	// trace admits after the peer so that the peer brackets it. Both are
-	// verified by reading the observers' OWN records, not by trusting a return
-	// code.
-	// BOTH observers end when either admission fails. Abandoning only the
-	// other one left the observer whose admission failed running: it is
-	// already started, it is watching the containment, and the wrapper is
-	// about to return a terminal record saying the lifecycle never opened.
-	if err := peer.admit(deadline); err != nil {
-		reason := joinReason(err.Error(), abandonReason(peer.abandon()))
-		reason = joinReason(reason, abandonReason(trace.abandon()))
-		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, reason)
-	}
-	if err := trace.admit(deadline); err != nil {
-		reason := joinReason(err.Error(), abandonReason(trace.abandon()))
-		// The peer admitted, so it is given the chance to close cleanly and
-		// leave a closing record; abandon is the fallback when it will not.
-		if closeErr := peer.close(deadline); closeErr != nil {
-			reason = joinReason(reason, abandonReason(peer.abandon()))
-		}
-		return 1, terminalExec(w, opt, spec, start, clock, TerminalWrapperError, reason)
-	}
-
-	code, proc, termState, reason := runChild(opt, cont, deadline, w, clock)
-
-	// The wrapper's own view of emptiness is physical suffix work; the
-	// observers still take their own reads, and the VERIFIER decides closure.
-	// Anything still alive is killed and reaped here rather than merely
-	// labelled, because the wrapper is the last thing that can reach it.
-	emptyReaped, emptyErr := enforceContainmentEmpty(cont, deadline)
-
-	// Trace closes first, then the peer: the resulting endpoint order is the
-	// contract's, and it is established by the protocol rather than asserted
-	// after the fact.
-	traceErr := trace.close(deadline)
-	peerErr := peer.close(deadline)
-
-	// And the CLOSING membership: the drained containment, retained with the
-	// same raw evidence, so "nothing was left" is as checkable as "the child
-	// was in it".
-	retainProcessTree(w, opt, clock, cont, proc, "end")
-
-	if emptyErr != nil {
-		// An ESCAPE is a descendant that outlived a run which ended on its own
-		// terms. After a cancellation the wrapper has just killed the whole
-		// containment itself, so members still draining a moment later are the
-		// tail of that kill — and calling it `crash_unclosed` would report an
-		// escape the wrapper caused, hiding the cancellation that is the real
-		// terminal state. The distinction is exactly whether the containment
-		// was successfully reaped.
-		if termState == TerminalCancelled && emptyReaped {
-			reason = joinReason(reason, "the containment was verified empty after the cancellation kill: "+emptyErr.Error())
-		} else {
-			termState, reason = TerminalCrashUnclosed, emptyErr.Error()
-		}
-	}
-	for _, e := range []error{traceErr, peerErr} {
-		if e != nil && termState == TerminalPassed {
-			termState, reason = TerminalWrapperError, e.Error()
-		}
-	}
-
-	if opt.Level == LevelScript {
-		// The handoff is script-owned work; removing it here rather than in a
-		// defer keeps it inside the envelope. The controller closes with it:
-		// the channel must not outlive the interval it served.
-		_ = os.Remove(scriptHandoffPath(opt.Dir))
-		_ = controller.Close()
-	}
-	destroy()
 	probe(atEndReading, opt.Dir)
-
-	// Only now, with the observers reaped, the containment destroyed and every
-	// other record flushed, is the closing reading taken. What remains outside
-	// is exactly one record write, which is the ledger closing itself and
-	// cannot be inside the interval it closes; the note says so rather than
-	// leaving a reader to assume otherwise.
 	if _, err := w.Append(Record{
-		Kind: "boundary", Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
+		Kind: "boundary", Level: opt.Level,
 		Boundary: "end", Source: SourceWrapper, Seqno: opt.Seq, Run: opt.Run,
-		Containment: cont.Identity(), Instant: clock.Now(), Spec: spec,
-		Proc: proc, Terminal: termState, Reason: reason,
-		Note: "observers reaped, containment destroyed and all other records flushed before this reading; only this record's own write follows it",
+		Instant: clock.Now(), Spec: spec,
+		Proc: procOrZero(proc), Terminal: termState, Reason: reason,
+		Note: "root child reaped and the process group drained before this reading; only this record's own write follows it",
 	}); err != nil {
 		return code, err
 	}
 	return code, nil
 }
 
-// runChild starts the command INSIDE the containment and waits for it. The
-// child is created in the containment (never moved into it afterwards), so
-// there is no window in which action-owned work exists outside the lifecycle
-// the peer and trace are bracketing.
-func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, clock Clock) (int, ProcIdentity, string, string) {
-	// THE MEASURED COMMAND, under the credential its level calls for. At the
-	// invocation level that is the workload account; above it the wrapper
-	// chain keeps its own, because it has containments to create and evidence
-	// to write that the workload must not be able to touch.
-	argv := workloadArgv(opt.Level, opt.Argv)
-	// RESOLVED HERE, so a command that does not exist is still this wrapper's
-	// spawn error rather than an exit status from the held child below.
-	if _, lookErr := exec.LookPath(argv[0]); lookErr != nil {
-		return 1, ProcIdentity{}, TerminalSpawnError, lookErr.Error()
-	}
-	// THE CHILD IS HELD, NOT FROZEN.
-	//
-	// Admission has to be race-free: a child that has already run can have
-	// forked, and "exactly one member" would then be an assertion the protocol
-	// never established. The previous answer was to FREEZE the containment
-	// before `Start`, so the child was created stopped — and on a real
-	// cgroup-v2 kernel that deadlocks. Go's `Start` waits for the child to
-	// report back over its close-on-exec error pipe, and a child born frozen
-	// never reaches that point; the parent is blocked inside `Start` and can
-	// never reach the thaw. `wall exec` hung, with the child parked in
-	// do_freezer_trap, and no cancellation could repair the ordering.
-	//
-	// So the child is born unfrozen INSIDE the containment (clone-into-cgroup,
-	// unchanged) as this binary at a barrier: it reads one byte from an
-	// inherited pipe and then execs the measured command in place. `Start`
-	// completes, because the barrier does reach its exec. The membership read
-	// below then observes a containment holding exactly that one process,
-	// which is our own reviewed bytes and has done nothing but block on a
-	// read — it has not run the measured command and cannot have forked. The
-	// measured work begins when the barrier is released, after the reading.
-	hold, release, err := os.Pipe()
-	if err != nil {
-		return 1, ProcIdentity{}, TerminalSpawnError, "open the measured-child barrier: " + err.Error()
-	}
-	defer func() {
-		_ = hold.Close()
-		_ = release.Close()
-	}()
-	cmd, err := HeldChildLauncher(argv)
-	if err != nil {
-		return 1, ProcIdentity{}, TerminalSpawnError, "build the measured child: " + err.Error()
-	}
-	cmd.ExtraFiles = []*os.File{hold}
+// execStreamName names the one stream this wrapper writes. The three-ledger
+// fan-out is gone, so there is exactly one producer and the name no longer
+// has to disambiguate between them.
+func execStreamName(opt ExecOptions) string {
+	return fmt.Sprintf("physical-%s-%02d.jsonl", sanitize(string(opt.Level)), opt.Seq)
+}
+
+// runOwnedChild spawns the argv in its OWN process group, forwards
+// cancellation, then performs contract §3.3's three teardown steps through
+// DrainGroup: wait and reap the root child, signal the group by negative PGID
+// with bounded escalation, and drain it.
+//
+// The reap runs concurrently with the escalation inside DrainGroup, because
+// sequencing them either way deadlocks: a killed root child is a zombie that
+// keeps the PGID alive, but a child ignoring TERM does not exit until KILL.
+func runOwnedChild(opt ExecOptions, deadline time.Time, clock Clock) (code int, proc *ProcIdentity, termState, reason string) {
+	cmd := exec.Command(opt.Argv[0], opt.Argv[1:]...)
 	cmd.Dir = opt.Cwd
-	// Assign the concrete *os.File values, not the struct fields directly: a
-	// nil *os.File stored in an io.Writer is a NON-nil interface holding a nil
-	// pointer, so `cmd.Stdout == nil` would be false and the child's output
-	// would go nowhere. The tests measured this the hard way — a wrapper that
+	// Passthrough, not capture: the measured command's output is the job log's,
+	// and buffering it here would change what a consumer sees.
+	//
+	// The CONCRETE *os.File values are tested, not the assigned struct fields:
+	// a nil *os.File stored in an io.Writer is a NON-nil interface holding a
+	// nil pointer, so `cmd.Stdout == nil` would be false and the child's
+	// output would go nowhere. This was measured the hard way — a wrapper that
 	// swallows the test log is worse than no wrapper.
-	// THE MEASURED CHILD GETS A SCRUBBED ENVIRONMENT, BEFORE IT STARTS.
-	//
-	// cmd.Env was left nil, which hands the child the complete parent
-	// environment — every run key, authority key, verifier, replay, builder,
-	// workload-user, script-user and signer-delegate capability this wrapper
-	// holds. The observers and the action-owned children were filtered; the
-	// process actually being measured, which runs the consumer's test code,
-	// was not.
-	//
-	// A later credential drop is not a substitute: it is not a filter applied
-	// before the child is created, and it does not run at all when no account
-	// is configured. The boundary the contract asks for is the launch itself.
-	// Scrubbed from the LAUNCHER's environment rather than replacing it: the
-	// barrier is started by re-executing this binary, and the launcher is the
-	// only thing that can tell that process it is the barrier.
-	cmd.Env = scrubSecrets(cmd.Env)
 	stdout, stderr := opt.Stdout, opt.Stderr
 	if stdout == nil {
 		stdout = os.Stdout
@@ -430,159 +230,128 @@ func runChild(opt ExecOptions, cont Containment, deadline time.Time, w *Writer, 
 	if opt.Stdin != nil {
 		cmd.Stdin = opt.Stdin
 	}
-	attr, cleanup, err := containmentSysProc(cont)
-	if err != nil {
-		return 1, ProcIdentity{}, TerminalSpawnError, err.Error()
-	}
-	defer cleanup()
-	cmd.SysProcAttr = attr
+	cmd.Env = os.Environ()
+	ownProcessGroup(cmd)
 
-	// Cancellation must reach the whole containment, be waited for, and be
-	// RETAINED — never converted into a shorter successful measurement.
-	sigs := make(chan os.Signal, 4)
+	if err := cmd.Start(); err != nil {
+		return 1, nil, TerminalWrapperError, "start the child: " + err.Error()
+	}
+
+	pgid, pgidErr := childProcessGroup(cmd)
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- cmd.Wait() }()
+
+	// CANCELLATION FORWARDING is retained: a signal this process receives is
+	// the operator or the runner asking the whole run to stop, and it has to
+	// reach the child. Without it a TERM-ignoring child hangs the wrapper
+	// until the deadline, which is exactly the shape the retained
+	// cancellation regression drives.
+	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigs)
 
-	if err := cmd.Start(); err != nil {
-		return 1, ProcIdentity{}, TerminalSpawnError, err.Error()
-	}
-	if err := postSpawnAdmit(cont, cmd.Process.Pid); err != nil {
-		// The child is running but is not in the containment, so nothing
-		// downstream can account for it — and returning here abandoned it
-		// with no handle for anyone else to reap. A child that cannot be
-		// admitted is a child that must not run. It is still held, so it has
-		// not executed the measured command and never will.
-		pid := cmd.Process.Pid
-		err = reapStarted(ProducerPhysical, cmd, fmt.Errorf("admit child: %w", err))
-		return 1, ProcIdentity{PID: pid}, TerminalSpawnError, err.Error()
-	}
+	// Whether cmd.Wait has ALREADY returned decides two later things: the reap
+	// the drain performs must not wait a second time on a channel that will
+	// never deliver again, and the escape probe is only askable once the root
+	// is out of its own group.
+	rootReaped, rootWait := false, error(nil)
 
-	// THE MEMBERSHIP, READ WHILE THE ONLY MEMBER IS THE HELD BARRIER.
-	//
-	// The only process-tree record this wrapper used to write was taken after
-	// the containment had been drained and the child reaped, so its membership
-	// snapshot was empty by construction. An empty close snapshot is proof
-	// that nothing escaped; it is not proof that the measured process was ever
-	// inside, and those are different claims. This read happens at the one
-	// moment the containment provably holds exactly the admitted child —
-	// before the thaw, so nothing has run and nothing can have forked — and it
-	// retains the same raw evidence a peer or trace endpoint does: the exact
-	// kernel bytes and a digest binding them to this observer's own read.
-	admittedEvent, _, admittedErr := cont.Observe(string(ProducerPhysical))
-
-	// RELEASED, and only now does the measured work begin. Writing the byte
-	// AND closing the pipe means a barrier this wrapper never reaches sees an
-	// EOF and refuses to run the command, rather than waiting for ever.
-	if _, err := release.Write([]byte{1}); err != nil {
-		_ = reapStarted(ProducerPhysical, cmd, err)
-		return 1, ProcIdentity{PID: cmd.Process.Pid}, TerminalWrapperError, "release the measured-child barrier: " + err.Error()
-	}
-	if err := release.Close(); err != nil {
-		_ = reapStarted(ProducerPhysical, cmd, err)
-		return 1, ProcIdentity{PID: cmd.Process.Pid}, TerminalWrapperError, "close the measured-child barrier: " + err.Error()
-	}
-
-	// THE CREDENTIAL DROP, AWAITED — THEN the identity is sampled.
-	//
-	// This is the ordering the whole boundary turns on, and it used to run the
-	// other way round. The child is HELD so that the admission read is
-	// race-free, and a held child has not run `sudo`, has not changed
-	// credentials and has not exec'd the workload. Sampling its uid before the
-	// release therefore read the WRAPPER's credential every time, and the
-	// record then stated that the measured process ran as an account it never
-	// ran as — the one fact the credential separation is decided from.
-	//
-	// So the sample waits for the drop to be observable on the measured pid,
-	// and it never fabricates it: when the credential does not arrive — the
-	// drop failed, or `sudo` interposed a monitor process so the pid being
-	// watched is not the workload's — what is retained is whatever was
-	// actually read, plus a note saying so, and the verifier refuses to score
-	// a measured process whose uid is the credential owning its containment.
-	dropNote := awaitWorkloadCredential(cmd.Process.Pid, expectedWorkloadUID(opt.Level))
-	proc := ProcIdentity{
-		PID:       cmd.Process.Pid,
-		PGID:      processGroupOf(cmd.Process.Pid),
-		StartID:   processStartID(cmd.Process.Pid),
-		SessionID: processSessionOf(cmd.Process.Pid),
-		ParentPID: os.Getpid(),
-		UID:       processUIDOf(cmd.Process.Pid),
-	}
-	proc.GID, proc.Groups = processGroupsOf(cmd.Process.Pid)
-	appendProcessTree(w, opt, clock, cont, proc, "start", admittedEvent, admittedErr,
-		joinReason("membership read while the containment held only the held barrier, before the measured command could run; identity read after the release, when the credential drop is observable", dropNote))
-
-	// An INDEPENDENT sampler runs beside the child: it re-reads the child's
-	// identity and the containment's membership while the process exists, and
-	// keeps the last successful pair.
-	//
-	// Reusing the admission identity for the closing record made reparenting,
-	// a session change, a PGID change and a start-identity change unobservable
-	// — the two records were one sample written twice. Sampling here is the
-	// only way to observe them, because after cmd.Wait reaps the child there
-	// is nothing left in /proc to read.
-	sampler := newIdentitySampler(cmd.Process.Pid, cont, os.Getpid())
-	sampler.start()
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	cancelled, escalation, waitErr := awaitChild(cont, sigs, done, deadline)
-	observed, observedEvent := sampler.stop()
-
-	// A late re-read can only ADD what the live sample could not have known;
-	// it never overwrites a fact taken while the process existed.
-	if proc.PGID == 0 {
-		proc.PGID = processGroupOf(cmd.Process.Pid)
-	}
-	if proc.StartID == "" {
-		proc.StartID = processStartID(cmd.Process.Pid)
-	}
-	// The LAST OBSERVED state, retained beside the admission read: the
-	// identity as it was seen last, and the membership as it was last seen —
-	// which is where a descendant that existed during the interval appears.
-	retainObservedTree(w, opt, clock, cont, observed, observedEvent)
-	code := 0
-	state := TerminalPassed
-	reason := ""
-	if waitErr == errUnreaped {
-		// cmd.Wait has NOT returned, so cmd.ProcessState is still being
-		// written by the goroutine waiting on it and must not be read here.
-		// The envelope did not end where a closing record would claim it did,
-		// which is exactly what crash_unclosed means.
-		proc.ExitKind = TerminalCrashUnclosed
-		reason = joinReason(escalation, "the root was not reaped within "+reapGrace.String()+" of the whole-containment KILL")
-		if cancelled != "" {
-			reason = joinReason("wrapper received "+cancelled, reason)
+	termState, reason = TerminalPassed, ""
+	select {
+	case err := <-waitErr:
+		rootReaped, rootWait = true, err
+		code = exitCodeOf(err)
+		if code != 0 {
+			termState = TerminalFailed
+			if err != nil {
+				reason = err.Error()
+			}
 		}
-		return 1, proc, TerminalCrashUnclosed, reason
+	case sig := <-sigs:
+		code, termState = 1, TerminalCancelled
+		reason = "cancelled by " + sig.String()
+	case <-time.After(time.Until(deadline)):
+		// The deadline is a real endpoint, not a suggestion: a child that
+		// never exits must not hang the wrapper with no record.
+		code, termState, reason = 1, TerminalCancelled, "the cancellation deadline passed"
 	}
-	if cmd.ProcessState != nil {
-		code = cmd.ProcessState.ExitCode()
-		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			proc.Signal = ws.Signal().String()
-			state, reason = TerminalSignalled, "child signalled with "+proc.Signal
+
+	// Teardown, and only then may the caller take the closing reading.
+	if pgidErr == nil && pgid > 1 {
+		// The graces come from the FROZEN CANCELLATION POLICY, not from the
+		// drain's own defaults. CancellationPolicyID is derived from these
+		// same two values, so a manifest cannot declare a policy the wrapper
+		// does not implement — and a test that shortens the policy has to
+		// actually shorten the escalation, which is what the retained
+		// cancellation regressions check.
+		// The ESCAPE PROBE is taken BEFORE the teardown signal, because the
+		// signal would mask exactly what it asks. In the exited paths the root
+		// has already been reaped and is out of its own group, so a group that
+		// is still populated after a bounded settle holds a descendant that
+		// outlived the process it belonged to. In the cancelled paths the
+		// wrapper is itself about to kill the group, so members draining a
+		// moment later are the tail of that kill and calling them an escape
+		// would report a defect the wrapper caused — hiding the cancellation
+		// that is the real terminal state. Not asking the question there is
+		// the distinction, not an omission.
+		escaped := rootReaped && groupProbeSupported() && !groupEmptyWithin(pgid, cancellationGrace)
+
+		out, err := DrainGroup(DrainRequest{
+			PGID: pgid, TermGrace: cancellationGrace, KillGrace: reapGrace,
+			ImmediateKill: escaped,
+			ReapRoot: func() error {
+				// Reaping twice is not possible: when the select already took
+				// the wait result, the reap is done and its outcome is
+				// replayed rather than waited for again.
+				if rootReaped {
+					return rootWait
+				}
+				return <-waitErr
+			},
+		})
+		if err != nil {
+			reason = joinReason(reason, err.Error())
+			if termState == TerminalPassed {
+				termState = TerminalWrapperError
+			}
+		}
+		switch {
+		case escaped:
+			// An escape is TERMINAL and is never rounded down to a finished
+			// run: the envelope did not end where the closing record would
+			// claim. What the forced kill changes is that the descendant no
+			// longer survives the wrapper that was supposed to contain it —
+			// so the reason names the escape AND what the reap achieved,
+			// because "it escaped" and "it escaped and is still running" call
+			// for different responses from whoever reads the receipt.
+			termState = TerminalCrashUnclosed
+			reason = joinReason(reason, "a descendant outlived its root: the process group was still populated after the root was reaped, and was then killed")
+			if !out.GroupEmpty {
+				reason = joinReason(reason, "the killed group was STILL not confirmed empty after "+reapGrace.String())
+			}
+		case out.Escalated:
+			// A cancelled run that had to be KILLED and one that stopped when
+			// asked are different facts, and the row keeps which happened.
+			reason = joinReason(reason, "the process group was killed after the "+cancellationGrace.String()+" grace")
+		}
+		if lim := out.Limitation(); lim != "" {
+			reason = joinReason(reason, lim)
 		}
 	}
-	proc.ExitCode = code
-	if code != 0 && state == TerminalPassed {
-		state, reason = TerminalFailed, fmt.Sprintf("child exited %d", code)
+	return code, proc, termState, reason
+}
+
+// exitCodeOf preserves the child's exit status, which is the whole point of
+// wrapping it: a measured run that lost its status would report a pass.
+func exitCodeOf(err error) int {
+	if err == nil {
+		return 0
 	}
-	proc.ExitKind = state
-	if cancelled != "" {
-		state, reason = TerminalCancelled, "wrapper received "+cancelled
-		if escalation != "" {
-			// The escalation is RETAINED, not summarised away. "cancelled"
-			// and "cancelled after the containment had to be killed" are
-			// different facts about the same run, and only the second one
-			// says the workload did not stop when it was asked to.
-			reason += "; " + escalation
-		}
-	} else if escalation != "" {
-		state, reason = TerminalCancelled, escalation
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
 	}
-	if waitErr != nil && state == TerminalPassed {
-		state, reason = TerminalWrapperError, waitErr.Error()
-	}
-	return code, proc, state, reason
+	return 1
 }
 
 // awaitChild waits for the child under the frozen bounded cancellation policy.
@@ -675,10 +444,6 @@ func joinReason(a, b string) string {
 var (
 	atStartReading func(dir string)
 	atEndReading   func(dir string)
-	// atContainmentJoin fires after this process has joined the enclosing
-	// containment and before it spawns anything, so a test can prove the
-	// ordering the inheritance depends on.
-	atContainmentJoin func(dir string)
 	// atRecordsDir fires after the records directory exists and before the
 	// signing key, so a test can INJECT a failure into the window between
 	// AT_start and the first writer. That window is the one place a bootstrap
@@ -707,58 +472,6 @@ func probeErr(hook func(string) error, dir string) error {
 // because "the child failed" and "the wrapper could not reap the child" are
 // different terminal states.
 var errUnreaped = fmt.Errorf("the root was not reaped after the whole containment was killed")
-
-// enforceContainmentEmpty waits for the containment to drain and, if it does
-// not, KILLS AND REAPS what is left.
-//
-// The escape is still terminal — a descendant that outlived its root means the
-// envelope did not end where the closing record would claim, and no amount of
-// cleanup changes that. What changes is that the descendant no longer survives
-// the wrapper. Callers used to take `waitContainmentEmpty`'s error, write
-// `crash_unclosed` and return, leaving the process running on the runner for
-// whatever came next; the contract asks for a guaranteed reap, and recording
-// an escape is not reaping it.
-//
-// The returned error is the retained reason: it names the escape AND what the
-// forced reap achieved, because "it escaped" and "it escaped and is still
-// running" call for different responses from whoever reads the receipt.
-func enforceContainmentEmpty(cont Containment, deadline time.Time) (reaped bool, err error) {
-	escape := waitContainmentEmpty(cont, deadline)
-	if escape == nil {
-		return true, nil
-	}
-	if killErr := cont.Signal(syscall.SIGKILL); killErr != nil {
-		return false, fmt.Errorf("%w; the whole-containment KILL failed: %v", escape, killErr)
-	}
-	if waitErr := waitContainmentEmpty(cont, time.Now().Add(reapGrace)); waitErr != nil {
-		return false, fmt.Errorf("%w; the containment was killed and was STILL not empty after %s: %v", escape, reapGrace, waitErr)
-	}
-	// Reaped, but it should not have needed reaping. The caller decides what
-	// that means: after a cancellation the wrapper itself killed the
-	// containment, so members still draining are the END of that cancellation
-	// rather than an escape from a completed run.
-	return true, fmt.Errorf("%w; the whole containment was then killed and verified empty", escape)
-}
-
-// waitContainmentEmpty is the wrapper's own post-exit verification. A root
-// that returned while a descendant is still alive is an escape, and an escape
-// is terminal — it is never rounded down to "the tests finished".
-func waitContainmentEmpty(cont Containment, deadline time.Time) error {
-	for {
-		_, populated, err := cont.Observe("physical")
-		if err != nil {
-			return fmt.Errorf("containment read: %w", err)
-		}
-		if !populated {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			pids, _ := cont.Procs()
-			return fmt.Errorf("containment %s still populated after root exit (%d member(s))", cont.Identity().ID, len(pids))
-		}
-		time.Sleep(pollInterval)
-	}
-}
 
 // membershipSnapshot returns the containment membership at close. The LIST is
 // retained, not a count: "0 members" and "these are the members" answer
@@ -889,58 +602,10 @@ func workloadAccount(level Level) string {
 	return ""
 }
 
-// expectedWorkloadUID is the uid the measured child must be running as once
-// its drop has happened, or -1 when this level declares no account.
-func expectedWorkloadUID(level Level) int {
-	user := workloadAccount(level)
-	if user == "" {
-		return -1
-	}
-	return resolveWorkloadCredential(user).UID
-}
-
 // credentialDropWait bounds how long the wrapper waits for the drop to become
 // observable. It is a spawn-and-exec of one program; a second is generous, and
 // the wait ends the moment the credential arrives.
 const credentialDropWait = time.Second
-
-// awaitWorkloadCredential waits until the measured pid is observably running
-// as want, and says what it saw.
-//
-// It exists because the drop is not instantaneous and is not guaranteed. The
-// child is thawed, and only then does it exec `sudo`, which sets the
-// credential and execs the workload — all on the same pid. Reading the uid
-// immediately after the thaw would race that, and reading it before the thaw
-// (which is what this wrapper did) could only ever return the wrapper's.
-//
-// It NEVER reports success it did not observe. A drop that never lands leaves
-// the note that says so, the record keeps the credential actually read, and
-// the verifier refuses the row: `sudo` configured with `use_pty` interposes a
-// monitor process, so the pid this wrapper holds would stay the wrapper's
-// credential forever — and a boundary that cannot be observed on the measured
-// process is not a boundary this contract admits.
-func awaitWorkloadCredential(pid, want int) string {
-	if want < 0 {
-		return "no workload uid could be established for this level — either no account is declared or this host cannot resolve one — so the measured process runs as the wrapper's own credential and the row is ineligible for want of the boundary"
-	}
-	deadline := time.Now().Add(credentialDropWait)
-	for {
-		got := processUIDOf(pid)
-		switch {
-		case got == want:
-			return fmt.Sprintf("the measured process was observed running as the declared account (uid %d) before its identity was read", want)
-		case got < 0:
-			// The process is gone, or its credential cannot be read at all.
-			// Waiting out the deadline would add a second to every short
-			// invocation and still establish nothing.
-			return fmt.Sprintf("the measured process's credential could not be read, so the drop to uid %d was not observed on the measured pid", want)
-		case !time.Now().Before(deadline):
-			return fmt.Sprintf("the measured process was still uid %d after %s, not the declared account's uid %d; the credential drop was not observed on the measured pid and the row cannot be scored on an unobserved boundary",
-				got, credentialDropWait, want)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-}
 
 func membershipSnapshot(cont Containment) ([]int, string) {
 	pids, err := cont.Procs()
@@ -960,182 +625,6 @@ var ObserverLauncher = func(args []string) (*exec.Cmd, error) {
 		return nil, err
 	}
 	return exec.Command(self, append([]string{"wall", "observe"}, args...)...), nil
-}
-
-// observerProc is the wrapper's handle on one independent observer process.
-type observerProc struct {
-	producer Producer
-	cmd      *exec.Cmd
-	// proc is the OS PROCESS HANDLE, retained when this process launched the
-	// observer and has not yet reaped it.
-	//
-	// It is the strongest form of ownership available, and the only one that
-	// needs no comparison: an unreaped child holds its pid, so the kernel
-	// cannot hand that number to anything else while this handle is held.
-	// A later step in the same process recovers it through the observer
-	// registry rather than rebuilding a bare number and hoping.
-	proc *os.Process
-	// pid is the observer's process id, retained SEPARATELY from cmd.
-	//
-	// A detached action observer outlives the step that started it, so the
-	// later step reconstructs this handle from the action state and has no
-	// cmd. Without a pid there was then nothing to kill: a lifecycle that
-	// could not be completed left a live observer watching the containment,
-	// and the one process able to reach it had thrown away its address.
-	pid int
-	// start is the observer's PROCESS-START IDENTITY, read when it was
-	// launched. A pid alone is a number the kernel reuses, and this handle is
-	// reconstructed in a later step of the job — by which time that number may
-	// name an unrelated process. Signalling it then would kill whatever
-	// happened to inherit it, and "the pid is gone" would be read as "the
-	// observer exited" when the observer may still be running under a pid we
-	// no longer recognise. The pair (pid, start) is an identity; the pid alone
-	// is a guess.
-	//
-	// It is empty on a platform that cannot supply one. That is not a licence
-	// to signal blindly — see abandon.
-	start  string
-	ctl    control
-	stream string
-	// pin and identify override the two KERNEL FACILITIES this handle's
-	// authority rests on: pinned-handle signalling, and reading who is at a
-	// pid. Production leaves both nil and gets the platform implementations.
-	//
-	// They exist so the refusal path can be exercised on every host. That
-	// path only runs where a handle is authenticated but no stable kernel
-	// handle can be obtained — a combination no machine this suite runs on
-	// produces, because Linux supplies pidfd and hosts without process
-	// identities fail authentication earlier. It decides whether the wrapper
-	// signals a pid it cannot pin, so leaving it to whichever host happens to
-	// reach it is how it went unchecked in the first place.
-	//
-	// They are per-observer rather than package variables so that tests
-	// installing them cannot race each other.
-	pin      func(int, string, syscall.Signal) bool
-	identify func(int) string
-	// pub is the observer's signing identity, kept so the wrapper can declare
-	// it in the roster or register it in the key log. The PRIVATE half never
-	// comes back here — it goes down a pipe into the child and nowhere else.
-	pub string
-}
-
-// startObserver spawns a peer or trace collector as a SEPARATE PROCESS with
-// its own signing key. Independence is structural: the observer never sees the
-// wrapper's records and the wrapper never sees the observer's clock.
-func startObserver(p Producer, opt ExecOptions, ident ContainmentIdentity, deadline time.Time, detached bool) (*observerProc, error) {
-	key, err := NewSigningKey()
-	if err != nil {
-		return nil, err
-	}
-	identJSON, err := json.Marshal(ident)
-	if err != nil {
-		return nil, err
-	}
-	runJSON, err := json.Marshal(opt.Run)
-	if err != nil {
-		return nil, err
-	}
-	base := filepath.Join(opt.Dir, fmt.Sprintf("ctl.%s.%s.%03d", opt.Level, p, opt.Seq))
-	args := []string{
-		"--producer", string(p),
-		"--level", string(opt.Level),
-		"--seq", fmt.Sprint(opt.Seq),
-		"--dir", opt.Dir,
-		"--control", base,
-		"--containment", string(identJSON),
-		"--run", string(runJSON),
-		// The key travels down an inherited pipe, NOT in argv. Argv is
-		// world-readable in the process table, so a key passed that way is
-		// readable by every process on the runner — not merely by the measured
-		// script, but by anything sharing the machine. A signer set nobody
-		// else can read is the point of having one.
-		"--key-fd", fmt.Sprint(observerKeyFD),
-		"--timeout", time.Until(deadline).String(),
-	}
-	cmd, err := ObserverLauncher(args)
-	if err != nil {
-		return nil, err
-	}
-	keyR, keyW, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	defer keyR.Close()
-	cmd.ExtraFiles = append(cmd.ExtraFiles, keyR)
-	// The observer's environment is SCRUBBED of every wall-time secret.
-	//
-	// A nil Cmd.Env hands the child this process's whole environment, and
-	// `wall begin` holds the run key while it launches these two. The action
-	// level then detaches them so they outlive the opening step and span the
-	// measured work — so an inherited key would sit in a live process for the
-	// entire window the measured script runs in, readable by any same-uid
-	// workload through /proc/<pid>/environ.
-	//
-	// That would hand a hostile workload the ability to sign replacement
-	// rosters and closing seals: not an ineligible row, but a forged
-	// attestation that verifies. The observer needs none of these values — its
-	// own signing key arrives on an inherited descriptor — so it gets none.
-	cmd.Env = scrubSecrets(cmd.Env)
-	if detached {
-		// The action-level observers outlive the step that started them:
-		// `wall begin` and `wall end` are two different Actions steps, so the
-		// peer and the collector are given their own session.
-		cmd.SysProcAttr = detachedSysProc()
-	}
-	logPath := filepath.Join(opt.Dir, fmt.Sprintf("observer.%s.%s.%03d.log", opt.Level, p, opt.Seq))
-	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stdout, cmd.Stderr = logf, logf
-	if err := cmd.Start(); err != nil {
-		logf.Close()
-		keyW.Close()
-		return nil, err
-	}
-	logf.Close()
-	// EVERY failure from here on has already started a child.
-	//
-	// Returning (nil, err) hands the caller no handle, so nothing else can
-	// reap it — and the process is a real observer that will sit watching the
-	// containment for its whole timeout, writing records for a launch that was
-	// refused. It contaminates exactly what it was meant to measure: the
-	// lifecycle boundaries and the timing of whatever runs next.
-	//
-	// reapStarted kills and waits before the error leaves this function, so a
-	// refused launch leaves nothing behind. It is the same rule the wrapper
-	// applies to its measured child; an observer is not exempt because it is
-	// ours.
-	fail := func(err error) (*observerProc, error) {
-		return nil, reapStarted(p, cmd, err)
-	}
-	// Write and close AFTER Start: the child holds the read end, so the write
-	// end must be closed here or the child's read never sees EOF.
-	_, writeErr := io.WriteString(keyW, EncodeKey(key))
-	closeErr := keyW.Close()
-	if writeErr != nil {
-		return fail(fmt.Errorf("walltime: hand the %s its key: %w", p, writeErr))
-	}
-	if closeErr != nil {
-		return fail(fmt.Errorf("walltime: hand the %s its key: %w", p, closeErr))
-	}
-	if opt.Level != LevelAction {
-		// Action-level observers are declared in the roster instead; anything
-		// below it registers, for the same reason the physical wrapper does.
-		if err := RegisterLowerKey(opt.Dir, KeyLogEntry{
-			Producer: p, Level: opt.Level, Seq: opt.Seq,
-			PublicKey: PublicKeyOf(key), Binary: SelfDigest(),
-		}, opt.Run); err != nil {
-			return fail(err)
-		}
-	}
-	rememberObserver(cmd.Process)
-	return &observerProc{
-		producer: p, cmd: cmd, pid: cmd.Process.Pid, start: processStartID(cmd.Process.Pid),
-		proc: cmd.Process,
-		ctl:  control{base: base}, pub: PublicKeyOf(key),
-		stream: filepath.Join(opt.Dir, streamName(p, opt.Level, opt.Seq)),
-	}, nil
 }
 
 // reapStarted terminates and waits for an observer this function started but
@@ -1210,40 +699,6 @@ const (
 	// replace.
 	RunnerKeyEnv = "TB_WALL_RUNNER_KEY"
 )
-
-// WallTimeSecretEnv is every environment variable this package treats as a
-// secret. A process that does not need one must not carry one: these are
-// capabilities, and a capability that outlives the step it was granted to is
-// no longer scoped to that step.
-var WallTimeSecretEnv = []string{
-	RunKeyEnv,       // signs the roster and the closing seal
-	AuthorityKeyEnv, // approves Stage-1 inputs
-	VerifierKeyEnv,  // signs a verifier verdict
-	ReplayKeyEnv,    // signs an independent replay attestation
-	BuilderKeyEnv,   // signs a build attestation
-	// A CAPABILITY IS NOT ONLY A KEY. The measured accounts are the credentials
-	// the measured work runs under, and an observer that inherits one of their
-	// names can be asked to drop to it — an observer must never be able to
-	// become the thing it observes. The list is "what confers a capability",
-	// not "what looks like a secret", and the earlier list was the second.
-	//
-	// BOTH drop selectors belong here. `workloadArgv` turns either name into
-	// `sudo -n -u <value>` at its own level, so they are the same capability at
-	// two levels; the script selector was introduced with the second measured
-	// party and was not added to this list, which left it inherited by all four
-	// production observers — the attached peer and trace and the detached
-	// action peer and trace.
-	WorkloadUserEnv,
-	ScriptUserEnv,
-	// The signer delegation is a capability too: whoever holds that private
-	// key can make a lower-level key-log registration admissible. The wrapper
-	// chain needs it; an observer does not, and an observer able to authorize
-	// its own signer would be vouching for itself.
-	SignerDelegateKeyEnv,
-	// The fleet key attests which image a host was booted from. A measured
-	// process that holds it can attest its own runner.
-	RunnerKeyEnv,
-}
 
 // GitHubFileCommandEnv names the writable file channels an Actions step is
 // handed. They are not secrets; they are something worse to inherit — paths to
@@ -1320,301 +775,6 @@ func scrubFileCommandSiblings(env []string) []string {
 	return out
 }
 
-// scrubSecrets removes every wall-time secret from an environment.
-//
-// A nil env means "inherit", which is what exec.Cmd does by default, so nil is
-// resolved to the current environment HERE rather than left to the child. It
-// scrubs whatever the launcher supplied rather than rebuilding from
-// os.Environ(), so a caller that deliberately set something on the command —
-// a test harness selecting its dispatch mode, say — keeps it.
-//
-// It is a denylist rather than an allowlist because an observer legitimately
-// needs the ambient environment — PATH, HOME, the cgroup root, the runner's
-// own variables — and an allowlist would silently break on the first runner
-// that requires something nobody enumerated. What must not travel is
-// enumerable and short: the wall-time capabilities, and the GitHub file
-// command channels a later step's capability is delivered through.
-func scrubSecrets(env []string) []string {
-	if env == nil {
-		env = os.Environ()
-	}
-	// The siblings are removed FIRST, while the named channels are still
-	// present to say which directory they live in.
-	env = scrubFileCommandSiblings(env)
-	out := make([]string, 0, len(env))
-	for _, kv := range env {
-		name, _, _ := strings.Cut(kv, "=")
-		if slices.Contains(WallTimeSecretEnv, name) || slices.Contains(GitHubFileCommandEnv, name) {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return out
-}
-
-// ReadKeyFD reads a signing key handed down an inherited descriptor.
-func ReadKeyFD(fd int) (ed25519.PrivateKey, error) {
-	f := os.NewFile(uintptr(fd), "walltime-key")
-	if f == nil {
-		return nil, fmt.Errorf("walltime: no key on fd %d", fd)
-	}
-	defer f.Close()
-	b, err := io.ReadAll(f)
-	if err != nil {
-		return nil, fmt.Errorf("walltime: read key from fd %d: %w", fd, err)
-	}
-	return DecodeKey(strings.TrimSpace(string(b)))
-}
-
-// admit releases the observer's admission read and waits for the RECORD it
-// wrote — not for an exit code. The wrapper proceeds only once the receipt
-// exists on disk.
-func (o *observerProc) admit(deadline time.Time) error {
-	if err := o.ctl.signal(phaseAdmit); err != nil {
-		return fmt.Errorf("signal %s admit: %w", o.producer, err)
-	}
-	return o.awaitBoundary("start", deadline)
-}
-
-// close releases the observer's verified-empty read, waits for its closing
-// record, and reaps the process.
-func (o *observerProc) close(deadline time.Time) error {
-	if err := o.ctl.signal(phaseClose); err != nil {
-		// The observer never learned to stop. Returning here left it running
-		// for its whole timeout with the caller holding an error and no
-		// intention of trying again.
-		abandonErr := o.abandon()
-		if abandonErr != nil {
-			return fmt.Errorf("signal %s close: %w; %s", o.producer, err, abandonErr)
-		}
-		return fmt.Errorf("signal %s close: %w", o.producer, err)
-	}
-	if err := o.awaitBoundary("end", deadline); err != nil {
-		if abandonErr := o.abandon(); abandonErr != nil {
-			return fmt.Errorf("%w; %s", err, abandonErr)
-		}
-		return err
-	}
-	if o.cmd == nil {
-		// A DETACHED observer is not this process's child, so there is no
-		// Wait to call — but "it wrote its closing record" is not "it exited".
-		// Returning here let EndAction record that the observers had been
-		// reaped while they were still running, and the contract makes
-		// failure to reap after the containment signal terminal rather than
-		// something a note may assert.
-		//
-		// Because it is not our child it also cannot become a zombie for us:
-		// once it exits, init reaps it and the pid stops resolving. So its
-		// disappearance IS the exit proof, and waiting for it is honest.
-		return o.awaitExit(deadline)
-	}
-	// A COMPLETED WAIT IS A REAP. The registry's promise is that the kernel
-	// cannot reuse this pid while we hold an unreaped child at it, and that
-	// promise ends here, so the entry goes with it.
-	err := o.cmd.Wait()
-	o.release()
-	return err
-}
-
-// awaitExit waits for a detached observer to actually be gone.
-//
-// Gone means one of two things, and both are conclusive: the pid no longer
-// resolves at all, or it resolves to a process whose start identity is not the
-// one we launched — a reused number, which means ours is long finished. A
-// timeout is NOT gone, and is reported as such: the caller can refuse a row it
-// could not close, but it must not claim a reap that never happened.
-func (o *observerProc) awaitExit(deadline time.Time) error {
-	if o.pid <= 0 {
-		return fmt.Errorf("%s observer has no process identity to confirm exit for", o.producer)
-	}
-	// A BARE NUMBER PROVES NOTHING, so it is not allowed to look like proof.
-	// Where the platform can identify processes, a detached handle without an
-	// identity can neither confirm the observer exited nor rule out that its
-	// pid now names something else. Returning "exited" from that position
-	// would close a lifecycle on a guess; the lifecycle stays incomplete
-	// instead, and the caller records it as such.
-	if o.cmd == nil && o.proc == nil && o.start == "" {
-		return fmt.Errorf("%s observer %d was reconstructed without a start identity; a bare pid cannot show that the observer exited", o.producer, o.pid)
-	}
-	for {
-		if !o.stillRunning() {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%s observer %d wrote its closing record but had not exited by the deadline; a lifecycle is not closed until the observer is gone", o.producer, o.pid)
-		}
-		time.Sleep(pollInterval)
-	}
-}
-
-// stillRunning reports whether the process THIS handle launched is still
-// there. A pid that resolves to a different start identity is a reused number
-// and is not our observer.
-// stillRunning reports whether the observer process is ALIVE — not merely
-// whether its pid still resolves.
-//
-// A process that has exited but has not been reaped is a ZOMBIE, and a zombie
-// answers signal 0 exactly like a running process: the pid entry survives to
-// hold an exit status nobody has collected. The exit proof read that as "still
-// running" and waited out the entire deadline, which is not a slow observer,
-// it is a finished one nobody buried.
-//
-// In production the observer is not this process's child — `wall begin`
-// returns and init reaps it — so its pid stops resolving and the old check was
-// right by accident. Whenever the opening and closing steps run in ONE process,
-// which is what the test suites and CI do, the observer stays this process's
-// child and nothing reaps it, so the closer burned its whole budget on the
-// first observer and left the second none: the peer's closing record was then
-// missing and the envelope was terminal WT-004.
-//
-// So the answer is taken from what the process IS: reap it if it is ours,
-// which turns an exited child into the disappearance the proof looks for, and
-// otherwise ask the kernel for its state rather than for its existence.
-// ownsPID reports whether this handle is entitled to ACT on the number it
-// holds — to wait for it, reap it, or signal it.
-//
-// OBSERVING A PID IS FREE; ACTING ON ONE IS NOT. Reaping consumes an exited
-// child's status and takes it away from whoever was actually waiting for it,
-// and signalling ends whatever is there now. Both need the handle to own the
-// process at that number, and a bare pid cannot establish that: the kernel
-// reuses pids, and this handle is rebuilt in a later step of the job, by which
-// time the number may name unrelated work. Only the pair (pid, start) is an
-// identity, so the pair is checked BEFORE any of those actions, never after.
-func (o *observerProc) ownsPID() bool {
-	if o.pid <= 0 {
-		return false
-	}
-	if o.cmd != nil {
-		// STILL OUR LIVE CHILD. The process handle is held here and has not
-		// been reaped, so the kernel cannot hand this number to anything else
-		// behind our back: the pid is ours by construction.
-		return true
-	}
-	if o.proc != nil {
-		// The OS handle for a child we have not reaped, and it must be THE
-		// handle the registry still holds for this pid — not merely some
-		// handle registered at that number.
-		//
-		// Comparing by key presence let a stale object be authorised by a NEW
-		// entry: once the old process was reaped and the pid recycled and
-		// registered for a different one, `recallObserver(pid) != nil` was
-		// true again and the stale object could signal through its own
-		// pid-based handle. Identity, not occupancy, is what ownership means
-		// here.
-		return recallObserver(o.pid) == o.proc
-	}
-	if o.start == "" {
-		// DETACHED, WITH NOTHING TO AUTHENTICATE IT — on any platform.
-		//
-		// This used to answer "true wherever start identities are
-		// unobtainable", on the reasoning that existence was then the
-		// strongest available claim. Existence is an OBSERVATION; it is not
-		// ownership, and being unable to identify a process is not a licence
-		// to signal it. On that branch a handle holding nothing but a reusable
-		// integer killed an unrelated live process and reaped an unrelated
-		// exited one. A platform that cannot identify processes gets no
-		// authority here — it gets an incomplete lifecycle, which is the
-		// honest record.
-		return false
-	}
-	return o.identityOf(o.pid) == o.start
-}
-
-// identityOf reads who is at a pid, through the platform unless a test has
-// installed a stand-in.
-func (o *observerProc) identityOf(pid int) string {
-	if o.identify != nil {
-		return o.identify(pid)
-	}
-	return processStartID(pid)
-}
-
-func (o *observerProc) stillRunning() bool {
-	if o.pid <= 0 {
-		return false
-	}
-	// AUTHENTICATE FIRST, THEN COLLECT. Reaping is an action, so it happens
-	// only once the pair says this process is ours: a handle whose start
-	// identity does not match the process now at its pid would otherwise
-	// consume an unrelated child's exit status on its way to deciding it
-	// owned nothing.
-	if o.ownsPID() && reapExitedChild(o.pid) {
-		// Ours and finished. A reaped child is gone, which is the strongest
-		// form of the exit proof, and WNOHANG costs nothing when it is still
-		// running or was never ours.
-		return false
-	}
-	// signal 0 probes for existence without delivering anything.
-	if err := syscall.Kill(o.pid, syscall.Signal(0)); err != nil {
-		// GONE, AND NOT BY OUR HAND. The retained handle stops vouching here
-		// too, not only where this function did the reaping: the registry's
-		// promise is that the kernel cannot reuse a pid while we hold an
-		// unreaped child at it, and that promise ends the moment the process
-		// is gone however it went. Releasing only on our own reap left an
-		// entry behind whenever something else collected the child first, and
-		// a stale entry is the bare-pid authority the registry exists to
-		// replace.
-		o.release()
-		return false
-	}
-	// EXISTS, BUT AS WHAT. A zombie exists and has exited; where the platform
-	// can say so, that is the answer.
-	if processIsZombie(o.pid) {
-		// THE WINDOW BETWEEN THE TWO QUESTIONS. The non-blocking wait above
-		// asked "has it finished" while the process was still running, and it
-		// finished before this line. Reporting "not running" and stopping
-		// there left an exited child unreaped and its registry entry standing,
-		// so a pid the kernel was free to reuse kept its ownership handle.
-		// Ask once more now that we know it has exited, and let the number go
-		// either way: it is not running, and this handle no longer speaks for
-		// it.
-		if o.ownsPID() {
-			reapExitedChild(o.pid)
-		}
-		o.release()
-		return false
-	}
-	if o.start == "" {
-		// No identity was ever available on this platform, so existence is
-		// all that can be said. It is deliberately NOT enough to act on —
-		// see ownsPID.
-		return true
-	}
-	if o.identityOf(o.pid) == o.start {
-		return true
-	}
-	// The number now names something else, so our observer is gone and the
-	// registry must not go on answering for the pid.
-	o.release()
-	return false
-}
-
-// release drops this observer's retained handle. It is called wherever the
-// process is established to be gone, so the registry's answer and the kernel's
-// are never allowed to drift apart.
-func (o *observerProc) release() {
-	// IDEMPOTENT, AND IT ONLY DROPS THIS HANDLE'S OWN ENTRY.
-	//
-	// An attached observer reaps through its cmd and never populates proc, so
-	// gating on proc left exactly the paths that DO reap unable to release —
-	// hence the unconditional form. But deleting by pid alone let a stale
-	// object evict the entry belonging to a DIFFERENT process that had since
-	// been registered at the recycled number, which is the same confusion in
-	// the other direction.
-	//
-	// So: forget the pid when the registry still holds this handle, or when
-	// this handle never held one (the attached case, where cmd did the
-	// reaping and there is nothing of anyone else's to delete).
-	if o.pid <= 0 {
-		return
-	}
-	if o.proc != nil {
-		forgetObserverHandle(o.pid, o.proc)
-		return
-	}
-	forgetObserver(o.pid)
-}
-
 // reapExitedChild collects an exited child without blocking, and reports
 // whether this pid is now gone because of it.
 //
@@ -1634,112 +794,6 @@ func reapExitedChild(pid int) bool {
 	return true
 }
 
-// abandon kills an observer whose lifecycle cannot be completed. Its partial
-// stream stays on disk: a truncated observation is evidence, and deleting it
-// would turn an ineligible row into a missing one.
-func (o *observerProc) abandon() error {
-	if o.cmd != nil && o.cmd.Process != nil {
-		_ = o.cmd.Process.Kill()
-		_ = o.cmd.Wait()
-		// Killed AND reaped, so the number is the kernel's again.
-		o.release()
-		return nil
-	}
-	// A DETACHED observer reconstructed from the action state has no cmd, and
-	// a lifecycle that cannot be completed still has to end. It is not this
-	// process's child any more, so there is nothing to reap — but it is still
-	// killable, and leaving it watching the containment would let a refused
-	// lifecycle keep writing records over whatever runs next.
-	//
-	// ONLY IF IT IS STILL OURS. Begin and end are separate steps of the job,
-	// and the kernel reuses pids; a bare number from an earlier step may by
-	// then name the runner's own work. Killing it would be a wrapper that
-	// terminates an unrelated process to tidy up its own bookkeeping, which is
-	// worse than the leak it prevents. When the identity does not match there
-	// is nothing of ours to kill: either the observer already exited, or it is
-	// not at this pid.
-	//
-	// A platform that cannot supply a start identity gets existence alone,
-	// which is the strongest claim available there; the observer's own timeout
-	// still ends it.
-	//
-	// FAIL CLOSED. Where the platform can identify processes, a handle that
-	// has no start identity is refused the kill outright: the alternative is
-	// signalling a number on nothing but the belief that it is still the same
-	// process, and a wrapper that kills the runner's unrelated work to tidy up
-	// its own bookkeeping has done more damage than the leak it was avoiding.
-	// The observer's own timeout still ends it, and the lifecycle stays
-	// incomplete, which is the honest record.
-	if !o.ownsPID() {
-		return nil
-	}
-	// THROUGH A HANDLE WHERE ONE EXISTS, because ownsPID answering yes and the
-	// signal landing are two moments, and the pid may change hands between
-	// them.
-	if o.proc != nil {
-		// Our own unreaped child: the handle cannot be redirected, and the
-		// kernel cannot reuse the number while we hold it.
-		_ = o.proc.Signal(syscall.SIGKILL)
-		return nil
-	}
-	if o.pinnedSignal()(o.pid, o.start, syscall.SIGKILL) {
-		return nil
-	}
-	// NO STABLE HANDLE, SO NO SIGNAL.
-	//
-	// What used to be here was a last-resort kill by number, guarded by one
-	// more identity check. That guard cannot work: the check and the signal
-	// are two syscalls with a scheduling point between them, so the process
-	// can exit and the kernel can hand its pid to something else in the gap —
-	// and the signal then lands on whatever now holds the number. The check
-	// makes the window narrow, not absent, and the thing on the other side of
-	// it is the runner's unrelated work.
-	//
-	// The observer is left to its own timeout, which ends it without anyone
-	// having to guess. That leaves the lifecycle incomplete, which is a fact
-	// the caller records rather than a failure to act: an incomplete lifecycle
-	// is recoverable, and killing an unrelated process is not.
-	return fmt.Errorf("the %s observer (pid %d) could not be ended safely: no stable kernel handle for it was available, and signalling the bare number could reach a process that has since taken it; the observer's own timeout must end it", o.producer, o.pid)
-}
-
-// pinnedSignal is the platform's pinned-handle signalling, or the override a
-// test installs to exercise a host WITHOUT one.
-//
-// The override exists because the refusal above is unreachable on the hosts
-// this suite runs on: Linux supplies pidfd, and where pidfd is missing the
-// only handles that reach this point already failed ownsPID. A branch that
-// cannot be exercised is a branch nobody has checked, and this one decides
-// whether the wrapper signals a pid it cannot pin.
-func (o *observerProc) pinnedSignal() func(int, string, syscall.Signal) bool {
-	if o.pin != nil {
-		return o.pin
-	}
-	return signalByIdentity
-}
-
-func (o *observerProc) awaitBoundary(boundary string, deadline time.Time) error {
-	for {
-		recs, err := ReadRecords(o.stream)
-		if err == nil {
-			for _, r := range recs {
-				if r.Kind == "boundary" && r.Boundary == boundary {
-					return nil
-				}
-				if r.Kind == "terminal" {
-					return fmt.Errorf("%s terminal before %s: %s", o.producer, boundary, r.Reason)
-				}
-			}
-		}
-		if o.cmd != nil && o.cmd.ProcessState != nil {
-			return fmt.Errorf("%s exited before writing its %s record", o.producer, boundary)
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for the %s %s record", o.producer, boundary)
-		}
-		time.Sleep(pollInterval)
-	}
-}
-
 // terminalExec retains a wrapper-level failure with its reason and no
 // duration.
 func terminalExec(w *Writer, opt ExecOptions, spec *SpecIdentity, start Instant, clock Clock, state, reason string) error {
@@ -1755,119 +809,8 @@ func terminalExec(w *Writer, opt ExecOptions, spec *SpecIdentity, start Instant,
 // for the invocation wrappers its own script starts.
 func scriptHandoffPath(dir string) string { return filepath.Join(dir, "script-containment.json") }
 
-// ScriptHandoff is the script containment identity, SIGNED by the run key.
-//
-// The identity used to be written as bare JSON, mode 0644, into the measured
-// records directory — a directory the measured script can write. The script
-// could therefore rewrite it to name any containment at all, and the
-// invocation wrappers it starts would nest under whatever it said. Signing it
-// with the run key is what makes it a handoff rather than a suggestion: the
-// key is bound to the envelope steps and never to the measured work, so the
-// script can delete the file (which fails closed) but cannot mint a new one.
-type ScriptHandoff struct {
-	Kind        string              `json:"kind"`
-	Containment ContainmentIdentity `json:"containment"`
-	Run         RunIdentity         `json:"run"`
-	Signature   *Signature          `json:"signature,omitempty"`
-}
-
 // ScriptHandoffKind identifies the handoff document.
 const ScriptHandoffKind = "tb.walltime.script-handoff/v1"
-
-// DigestOf is the canonical digest the signature covers.
-func (h ScriptHandoff) DigestOf() (Digest, error) {
-	h.Signature = nil
-	return DigestJSON(h)
-}
-
-func writeContainmentHandoff(dir string, ident ContainmentIdentity, run RunIdentity) error {
-	key, err := RunKeyFromEnv()
-	if err != nil {
-		return err
-	}
-	if key == nil {
-		// NOTHING IS WRITTEN when there is no key to sign with.
-		//
-		// This is the production path: the run key is scoped to `wall begin`
-		// and `wall end`, and the script wrapper that writes this file runs in
-		// the measured step, which does not hold it. So the file was always
-		// unsigned, always sat in a directory the measured script can write,
-		// and mode 0600 protects nothing from the same uid that owns it — the
-		// document deciding which containment an invocation is measured inside
-		// was one the measured work could rewrite.
-		//
-		// An unauthenticated handoff is worse than none, because the reader
-		// must then either trust it or refuse it, and refusing it breaks the
-		// legitimate case. Writing nothing leaves the invocation wrappers to
-		// ask the kernel where they are, which is the answer the workload
-		// cannot forge.
-		return nil
-	}
-	h := ScriptHandoff{Kind: ScriptHandoffKind, Containment: ident, Run: run}
-	d, err := h.DigestOf()
-	if err != nil {
-		return err
-	}
-	h.Signature = &Signature{
-		Authority: run.CampaignID, KeyID: PublicKeyOf(key), Digest: d,
-		Value: SignApproval(run.CampaignID, key, d),
-	}
-	b, err := json.MarshalIndent(h, "", "  ")
-	if err != nil {
-		return err
-	}
-	// 0600, not 0644. The handoff is addressed to the wrapper processes this
-	// step starts, not to everything that can reach the records directory.
-	if err := os.WriteFile(scriptHandoffPath(dir), b, 0o600); err != nil {
-		return fmt.Errorf("write the script containment handoff: %w", err)
-	}
-	return nil
-}
-
-// ScriptContainment reads that handoff and AUTHENTICATES it.
-//
-// A missing one is not an error: an invocation run outside a measured script
-// simply has no enclosing script containment. What is an error is a handoff
-// that is present and unattributable, and the difference matters because the
-// caller's fallback for "absent" is to nest under the action — which is a
-// legitimate topology, and must not become the silent outcome of a measured
-// script having tampered with the file. The second return value distinguishes
-// "there is none" from "there is one and it cannot be trusted".
-func ScriptContainment(dir string) (*ContainmentIdentity, bool, error) {
-	b, err := os.ReadFile(scriptHandoffPath(dir))
-	if err != nil {
-		return nil, false, nil
-	}
-	var h ScriptHandoff
-	if err := json.Unmarshal(b, &h); err != nil {
-		return nil, false, fmt.Errorf("the script containment handoff is present but unreadable: %w", err)
-	}
-	if h.Kind != ScriptHandoffKind {
-		return nil, false, fmt.Errorf("the script containment handoff names kind %q, want %q", h.Kind, ScriptHandoffKind)
-	}
-	// AN UNSIGNED HANDOFF IS NEVER ACCEPTED, with or without a key to check it
-	// against. The reader used to accept one whenever it held no run key,
-	// which is precisely the production configuration — so the real path
-	// accepted whatever the file said, every time.
-	if h.Signature == nil {
-		return nil, false, fmt.Errorf("the script containment handoff is unsigned; a measured script can write this file, so an unsigned one names whatever it chose")
-	}
-	key, err := RunKeyFromEnv()
-	if err != nil {
-		return nil, false, err
-	}
-	if key == nil {
-		return nil, false, fmt.Errorf("the script containment handoff is signed but this process holds no run key to check it against; an unverifiable handoff is not a handoff")
-	}
-	d, err := h.DigestOf()
-	if err != nil {
-		return nil, false, err
-	}
-	if err := VerifySigned(h.Signature, d, []string{PublicKeyOf(key)}); err != nil {
-		return nil, false, fmt.Errorf("the script containment handoff is not signed by this run's key: %w", err)
-	}
-	return &h.Containment, true, nil
-}
 
 func containmentName(opt ExecOptions) string {
 	base := fmt.Sprintf("tb-%s", opt.Level)
@@ -1961,4 +904,17 @@ func forgetObserver(pid int) {
 // different process that was registered at a recycled number.
 func forgetObserverHandle(pid int, p *os.Process) {
 	observerHandles.CompareAndDelete(pid, p)
+}
+
+// errNoChildProcess is returned when a process-group question is asked before
+// the child exists.
+var errNoChildProcess = errors.New("walltime: no child process")
+
+// procOrZero renders an absent process identity as the zero value, so a
+// terminal record can still be written when the spawn itself failed.
+func procOrZero(p *ProcIdentity) ProcIdentity {
+	if p == nil {
+		return ProcIdentity{}
+	}
+	return *p
 }

@@ -60,7 +60,9 @@ func TestCampaignOrderIsCounterbalancedNotRandomized(t *testing.T) {
 		// requires, so the check reads a context window rather than one line:
 		// a denial routinely wraps across lines and would otherwise convict
 		// itself.
-		files := []string{"campaign_practical.go", "gates.go", "campaign.go", "schedule.go"}
+		// campaign.go and schedule.go are deleted by the removal plan, so the
+		// scan is over what still ships.
+		files := []string{"campaign_practical.go", "gates.go"}
 		negations := []string{"not randomized", "never", "no document", "fails on",
 			"is not a", "rather than a draw", "not a draw", "no seed"}
 		for _, file := range files {

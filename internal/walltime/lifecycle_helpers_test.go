@@ -81,25 +81,3 @@ func setMembership(r *Record, procs string) {
 	r.RawProcs = parsed
 	r.RawProcsDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawProcsBytes...))
 }
-
-// fixtureAuthorityKey is minted once so every fixture claim verifies against
-// the same predeclared key, exactly as a real deployment's would. Ported from
-// the deleted stage2match_test.go, because verify_test.go's retained
-// authority regressions still exercise the machinery verify.go still carries.
-var fixtureAuthorityKey = mustSigningKey()
-
-// fixtureClaim builds a durable planner claim signed by the predeclared
-// authority. Registering the key here rather than in an init keeps the pairing
-// independent of which test ran first: a command test that registered its own
-// set would otherwise leave a fixture claim vouched for by nobody.
-func fixtureClaim(stage1, bundle Digest) *PlannerClaimReceipt {
-	const store = "authority/durable-claims"
-	RegisterCampaignAuthorityKeys([]string{PublicKeyOf(fixtureAuthorityKey)})
-	subject := PlannerClaimStoreSubject(store)
-	return &PlannerClaimReceipt{
-		Store: store, Durable: true,
-		Key: PlannerClaimKey(stage1, bundle), Stage1: stage1, Bundle: bundle,
-		Attestation:   SignApproval(CampaignAuthority, fixtureAuthorityKey, subject),
-		AuthorityKeys: []string{PublicKeyOf(fixtureAuthorityKey)},
-	}
-}

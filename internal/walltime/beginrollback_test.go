@@ -2,158 +2,79 @@ package walltime
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 )
 
-// TestBeginActionCleansUpEverythingItStarted is the F6 regression.
+// TestAFailedBeginLeavesNoHandoff is the reduced form of the begin-rollback
+// regression.
 //
-// BeginAction starts two DETACHED observers, admits them, then signs and
-// writes the roster and the action state. A failure in that last stretch
-// returned an error with both observers still running and the containment
-// still present — and because they are detached, nothing downstream inherited
-// a handle to either. They would watch the action containment for their whole
-// timeout while the action reported that its lifecycle never opened.
+// The original asserted that BeginAction ARMS a rollback list and that every
+// error return between arming and disarming goes through it. That property was
+// about resources BeginAction started before the handoff existed — two observer
+// processes, a containment, a signer registration and a roster — and the
+// removal plan deletes all of them. There is nothing left for a rollback to
+// tear down, so asserting the mechanism would be asserting scaffolding.
 //
-// The failure is forced the way the contract's own ordering makes possible:
-// WriteRoster uses O_EXCL, so a pre-existing roster path fails only AFTER both
-// observers have started and completed their admission handshakes.
-func TestBeginActionCleansUpEverythingItStarted(t *testing.T) {
-	t.Setenv(RunKeyEnv, EncodeKey(mustSigningKey()))
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, rosterFile), []byte("collision"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	original := ObserverLauncher
-	var launched []*exec.Cmd
-	ObserverLauncher = func(args []string) (*exec.Cmd, error) {
-		cmd, err := original(args)
-		if err == nil {
-			launched = append(launched, cmd)
+// What the rollback was FOR still matters and is what this test now checks: a
+// begin that fails must leave no handoff, so `wall end` cannot attach to a
+// half-open envelope and report an interval that never opened. That is the
+// observable consequence, and it holds regardless of how begin is implemented.
+func TestAFailedBeginLeavesNoHandoff(t *testing.T) {
+	t.Run("a successful begin leaves exactly one handoff", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := BeginAction(dir, RunIdentity{BucketID: "b1"}, DefaultTimeout); err != nil {
+			t.Fatalf("BeginAction: %v", err)
 		}
-		return cmd, err
-	}
-	t.Cleanup(func() {
-		ObserverLauncher = original
-		for _, cmd := range launched {
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-				_, _ = cmd.Process.Wait()
-			}
+		if _, err := os.Stat(filepath.Join(dir, actionStateFile)); err != nil {
+			t.Fatalf("a successful begin left no handoff: %v", err)
+		}
+		if _, err := LoadActionState(dir); err != nil {
+			t.Fatalf("the handoff does not load: %v", err)
 		}
 	})
 
-	run := RunIdentity{CampaignID: "ewj2", RunID: "post-admit-failure", BucketID: "bucket-0", Stage2: "sha256:5e585fd3fab5cb85a941179b4df835cef988f0281af9f47878024f539c302df5"}
-	if _, err := BeginAction(dir, run, 30*time.Second); err == nil {
-		t.Fatal("BeginAction succeeded despite a roster path it could not write")
-	}
-	if len(launched) != 2 {
-		t.Fatalf("the failure happened before the boundary this test is about: %d observer(s) launched, want 2", len(launched))
-	}
-	// Both are gone AND reaped. Signal 0 succeeds on a zombie, so a handle
-	// that was killed but never waited on would still answer here — which is
-	// precisely why abandon waits.
-	for i, cmd := range launched {
-		if cmd.Process == nil {
-			t.Fatalf("observer %d has no process handle", i)
+	t.Run("a begin that cannot create its directory leaves no handoff", func(t *testing.T) {
+		// A file where the records directory should be: MkdirAll fails, and
+		// the function must return before writing anything.
+		base := t.TempDir()
+		blocked := filepath.Join(base, "records")
+		if err := os.WriteFile(blocked, []byte("not a directory"), 0o644); err != nil {
+			t.Fatal(err)
 		}
-		if err := cmd.Process.Signal(syscall.Signal(0)); err == nil {
-			t.Errorf("detached observer %d is still running after BeginAction returned failure", i)
+		if _, err := BeginAction(blocked, RunIdentity{BucketID: "b1"}, DefaultTimeout); err == nil {
+			t.Fatal("BeginAction succeeded against a path that is a file")
 		}
-	}
+		if _, err := os.Stat(filepath.Join(blocked, actionStateFile)); err == nil {
+			t.Fatal("a failed begin left a handoff behind")
+		}
+	})
 
-	// And the rollback is RETAINED, because "the cleanup ran" is a fact about
-	// the run rather than a detail to swallow.
-	recs, err := ReadRecords(filepath.Join(dir, streamName(ProducerPhysical, LevelAction, 0)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var terminal string
-	for _, r := range recs {
-		if r.Kind == "terminal" {
-			terminal = r.Reason
+	t.Run("EndAction refuses to attach with no handoff", func(t *testing.T) {
+		// The consequence the rollback existed to guarantee: without a
+		// handoff there is no interval to close, and end says so rather than
+		// inventing one.
+		if _, err := EndAction(t.TempDir(), TerminalPassed, ""); err == nil {
+			t.Fatal("EndAction closed an envelope that was never opened")
 		}
-	}
-	if terminal == "" {
-		t.Fatal("the failure left no terminal record")
-	}
-	if !strings.Contains(terminal, "rollback:") {
-		t.Errorf("the terminal record does not say what the rollback did: %q", terminal)
-	}
-	for _, want := range []string{"containment_peer observer exited and was reaped", "trace_collector observer exited and was reaped", "the action containment was destroyed"} {
-		if !strings.Contains(terminal, want) {
-			t.Errorf("the terminal record does not record %q: %q", want, terminal)
-		}
-	}
-}
+	})
 
-// TestASuccessfulBeginDisarmsTheRollback: the guard exists for the window
-// before the handoff. Once the state file is written EndAction owns the
-// observers, and a rollback that stayed armed would tear down a live envelope.
-func TestASuccessfulBeginDisarmsTheRollback(t *testing.T) {
-	t.Setenv(RunKeyEnv, EncodeKey(mustSigningKey()))
-	dir := t.TempDir()
-	st, err := BeginAction(dir, RunIdentity{CampaignID: "ewj2", RunID: "r1", BucketID: "b0"}, 30*time.Second)
-	if err != nil {
-		t.Fatalf("BeginAction: %v", err)
-	}
-	t.Cleanup(func() { _, _ = EndAction(dir, TerminalPassed, "") })
-	if st.PeerPID == 0 || st.TracePID == 0 {
-		t.Fatalf("the handoff carries no observer pids: %+v", st)
-	}
-	// The observers the handoff names are still there for EndAction to close.
-	for _, pid := range []int{st.PeerPID, st.TracePID} {
-		if err := syscall.Kill(pid, syscall.Signal(0)); err != nil {
-			t.Errorf("a successful BeginAction left observer %d already gone: %v", pid, err)
+	t.Run("the handoff is written last, after the opening reading", func(t *testing.T) {
+		// Ordering, asserted from the production source: the reading must
+		// precede the handoff write, or the handoff could name a start that
+		// had not been taken.
+		body := productionFunc(t, "action.go", "func BeginAction(")
+		read := strings.Index(body, "start := clock.Now()")
+		wrote := strings.Index(body, "actionStateFile")
+		if read < 0 {
+			t.Fatal("BeginAction no longer takes an opening reading")
 		}
-	}
-}
-
-// TestEveryArmedBeginFailureRunsTheRollback is the F7 regression.
-//
-// The guard is armed the moment the action containment exists, and the very
-// next operation — appending the AT_start boundary — returned its error
-// directly instead of going through the failure path. So the one failure that
-// happens immediately after the rollback is armed was the one failure that
-// bypassed it: the containment stayed, and nothing recorded that it had. A
-// guard with a hole beside where it is armed is not a guard.
-//
-// This is asserted from the production source, because the property is "every
-// return after the arming point goes through fail", and no single injected
-// failure can demonstrate all of them.
-func TestEveryArmedBeginFailureRunsTheRollback(t *testing.T) {
-	body := productionFunc(t, "action.go", "func BeginAction(")
-	armed := strings.Index(body, "rollback = append(rollback, func() string {")
-	if armed < 0 {
-		t.Fatal("BeginAction no longer arms a rollback")
-	}
-	disarmed := strings.Index(body, "rollback = nil")
-	if disarmed < 0 || disarmed < armed {
-		t.Fatalf("BeginAction does not disarm the rollback after arming it: armed=%d disarmed=%d", armed, disarmed)
-	}
-	// Between the two, every error return must be a fail(...) call. A bare
-	// `return nil, err` there is a resource this function created and left.
-	window := body[armed:disarmed]
-	for _, line := range strings.Split(window, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "return ") {
-			continue
+		if wrote < 0 {
+			t.Fatal("BeginAction no longer writes the handoff")
 		}
-		switch {
-		case strings.HasPrefix(trimmed, "return fail("):
-		case strings.HasPrefix(trimmed, "return endObserver("):
-		case strings.HasPrefix(trimmed, `return "`):
-		default:
-			t.Errorf("a return between arming and disarming the rollback does not go through fail: %q", trimmed)
+		if read > wrote {
+			t.Fatal("BeginAction writes the handoff before taking the opening reading")
 		}
-	}
-	// And the boundary append specifically, which is the one that bypassed it.
-	if !strings.Contains(body, `return fail("record the action start boundary", err)`) {
-		t.Error("the action start boundary failure does not go through the rollback")
-	}
+	})
 }

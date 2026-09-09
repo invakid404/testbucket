@@ -83,6 +83,14 @@ type DrainRequest struct {
 	// ReapRoot waits for and reaps the ROOT CHILD the wrapper started. It is
 	// supplied by the exec path, which owns the child handle.
 	ReapRoot func() error
+	// ImmediateKill skips the bounded TERM interval and escalates at once. It
+	// is set for an ESCAPE — a descendant found alive after its root had
+	// already been reaped. The interval a TERM grace exists to protect is a
+	// child shutting itself down cooperatively, and the process this one
+	// belonged to has already exited: there is nothing left to ask, and the
+	// only remaining question is whether the wrapper leaves it running on the
+	// runner for whatever comes next.
+	ImmediateKill bool
 }
 
 // DrainGroup performs contract §3.3's three steps for one owned process group
@@ -135,10 +143,12 @@ func DrainGroup(req DrainRequest) (DrainOutcome, error) {
 	}
 
 	// Step 2: TERM by negative PGID.
-	if err := signalGroup(pgid, sigTERM); err != nil && !isNoSuchProcess(err) {
-		return out, fmt.Errorf("drain: TERM to group %d: %w", pgid, err)
+	if !req.ImmediateKill {
+		if err := signalGroup(pgid, sigTERM); err != nil && !isNoSuchProcess(err) {
+			return out, fmt.Errorf("drain: TERM to group %d: %w", pgid, err)
+		}
+		out.Signalled = true
 	}
-	out.Signalled = true
 
 	if !out.Probeable {
 		// Nothing to poll: the platform cannot answer the question. §3.3 says
@@ -150,7 +160,7 @@ func DrainGroup(req DrainRequest) (DrainOutcome, error) {
 
 	// Step 3, first attempt: the group may go quiet under TERM alone, but only
 	// once the root zombie has been reaped.
-	if out.drainWithin(pgid, reaped, req.TermGrace) {
+	if !req.ImmediateKill && out.drainWithin(pgid, reaped, req.TermGrace) {
 		out.GroupEmpty = true
 		return out, nil
 	}
@@ -205,5 +215,27 @@ func (o *DrainOutcome) collectReap(reaped chan error, bound time.Duration) {
 			}
 		}
 	case <-time.After(bound):
+	}
+}
+
+// groupEmptyWithin polls for an empty process group until the bound expires.
+//
+// It is the ESCAPE PROBE, and it is only meaningful once the root child has
+// been reaped: the root is a member of its own group and a reaped-but-unwaited
+// root is a zombie that keeps the group alive, so before the reap this
+// question cannot be asked. After it, what the probe answers is whether any
+// DESCENDANT outlived the process it belonged to. The bound is what separates
+// a member that is merely the tail of the root's own exit from one that has
+// genuinely been left behind.
+func groupEmptyWithin(pgid int, bound time.Duration) bool {
+	deadline := time.Now().Add(bound)
+	for {
+		if !groupExists(pgid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(drainPollEvery)
 	}
 }

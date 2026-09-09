@@ -39,26 +39,6 @@ type FeatureBuilder struct {
 	atomSize map[string]int
 }
 
-// NewFeatureBuilder derives the lookup tables from the bundle and the
-// discovered target set. Both come from frozen bytes: the listings are in the
-// bundle, and the targets were parsed from the bundle's discovery snapshot.
-func NewFeatureBuilder(b *walltime.PlanningInputBundle, live []runner.LivePackage, stage1 walltime.Digest) *FeatureBuilder {
-	fb := &FeatureBuilder{
-		stage1:        stage1,
-		runnableCount: map[string]int{},
-		atomSize:      map[string]int{},
-	}
-	for _, r := range b.Runnables {
-		fb.runnableCount[r.TargetID] = len(r.Names)
-	}
-	for _, p := range live {
-		if k := p.AtomKey(); k != "" {
-			fb.atomSize[k]++
-		}
-	}
-	return fb
-}
-
 // Vector builds one unit's feature vector. Every feature carries the
 // provenance the scorer checks, so exclusion is proven by reading the vector
 // rather than by trusting this function.

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -254,55 +253,6 @@ func (c ContainmentIdentity) SameRoot(o ContainmentIdentity) bool {
 	return c.RootPID == o.RootPID && c.RootStart == o.RootStart
 }
 
-// Same reports whether two records name the same stable containment. Identity
-// is the pair (id, inode) plus boot: a path that was destroyed and re-created
-// is a DIFFERENT containment even though its name is unchanged.
-func (c ContainmentIdentity) Same(o ContainmentIdentity) bool {
-	return c.Primitive == o.Primitive && c.ID == o.ID && c.Inode == o.Inode && c.BootID == o.BootID &&
-		// AND THE SAME MEMBERSHIP FACTS.
-		//
-		// Two records naming one path, inode and boot were treated as the same
-		// containment however they described its ownership — so a record could
-		// keep the identity and restate the owner, the mode or the conclusion,
-		// and the disagreement was invisible. These fields are what the
-		// membership rule is rerun over; producers that disagree about them
-		// did not observe the same containment.
-		c.OwnerUID == o.OwnerUID && c.OwnerGID == o.OwnerGID && c.Mode == o.Mode &&
-		c.MembershipControl == o.MembershipControl &&
-		c.WorkloadUID == o.WorkloadUID && sameInts(c.WorkloadGIDs, o.WorkloadGIDs)
-}
-
-// Differs names the first field on which two identities disagree, in words a
-// reader can act on.
-//
-// The mismatch message used to print the path and the inode, which are exactly
-// the fields that are equal when the disagreement is about the owner, the mode
-// or the membership conclusion — so a record that restated the ownership of a
-// containment produced a finding saying it named "X, not this envelope's X".
-func (c ContainmentIdentity) Differs(o ContainmentIdentity) string {
-	for _, f := range []struct {
-		what    string
-		a, b    any
-		differs bool
-	}{
-		{"primitive", c.Primitive, o.Primitive, c.Primitive != o.Primitive},
-		{"path", c.ID, o.ID, c.ID != o.ID},
-		{"inode", c.Inode, o.Inode, c.Inode != o.Inode},
-		{"boot", c.BootID, o.BootID, c.BootID != o.BootID},
-		{"cgroup.procs owner uid", c.OwnerUID, o.OwnerUID, c.OwnerUID != o.OwnerUID},
-		{"cgroup.procs owner gid", c.OwnerGID, o.OwnerGID, c.OwnerGID != o.OwnerGID},
-		{"cgroup.procs mode", c.Mode, o.Mode, c.Mode != o.Mode},
-		{"membership control", c.MembershipControl, o.MembershipControl, c.MembershipControl != o.MembershipControl},
-		{"retained workload uid", c.WorkloadUID, o.WorkloadUID, c.WorkloadUID != o.WorkloadUID},
-		{"retained workload groups", c.WorkloadGIDs, o.WorkloadGIDs, !sameInts(c.WorkloadGIDs, o.WorkloadGIDs)},
-	} {
-		if f.differs {
-			return fmt.Sprintf("%s %v, not this envelope's %v", f.what, f.a, f.b)
-		}
-	}
-	return ""
-}
-
 // ProcIdentity is the process-tree fact a record carries.
 type ProcIdentity struct {
 	PID     int    `json:"pid,omitempty"`
@@ -475,10 +425,11 @@ func NewWriter(path string, p Producer, producerID string, key ed25519.PrivateKe
 	if err != nil {
 		return nil, fmt.Errorf("walltime: open records %s: %w", path, err)
 	}
-	w := &Writer{f: f, producer: p, id: producerID, binary: SelfDigest(), key: key}
-	if key != nil {
-		w.signer = hex.EncodeToString(key.Public().(ed25519.PublicKey))
-	}
+	// No binary digest and no signer: salvage-map removes the signer identity
+	// with the rest of the multi-role ledger. What the writer still owes is
+	// one document per bucket, written atomically, with canonical JSON and a
+	// content digest — none of which needs a key.
+	w := &Writer{f: f, producer: p, id: producerID}
 	// Resume an existing stream rather than restarting its sequence: the
 	// action level writes its start and end from two different processes.
 	if seq, prev, err := tailChain(path); err == nil {
@@ -601,9 +552,10 @@ func ReadDir(dir string) ([]Record, error) {
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		// The key log shares the .jsonl suffix but is not a record stream:
-		// reading it as one would report every line as a malformed record.
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") || e.Name() == keyLogFile {
+		// The key-log exclusion that stood here is gone with the key log
+		// itself: there is no longer a .jsonl file in this directory that is
+		// not a record stream.
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
 		names = append(names, e.Name())

@@ -589,7 +589,11 @@ jobs:
       # Derived ONCE, here, from the signed Stage-1 manifest, and consumed by
       # every downstream job that installs the candidate. One derivation is the
       # point: a value each job resolved for itself could differ between them.
-      candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}
+      # Passed through from the caller rather than derived. The resolution step
+      # that produced it from a signed Stage-1 manifest is removed with the
+      # protected-authority model, so the caller is now the only party that
+      # knows which binary it authorised.
+      candidate-binary-digest: ${{ inputs.candidate-binary-digest }}
       # §10.5.2 step 2: the declaration crosses the job boundary as CONTENT
       # plus a digest, because two jobs on two runners share no filesystem and
       # a pathname would transport nothing.
@@ -718,46 +722,13 @@ jobs:
           [ "$fail" -eq 0 ] || exit 1
           echo "frozen plan: the frozen inputs, the protected authority and its key are all bound before planning"
 
-      # THE MANDATORY CANDIDATE BINARY DIGEST IS DERIVED, NOT TYPED.
-      #
-      # The installer refuses a `candidate:` pin whose binary digest nobody
-      # stated in advance. That rule was unusable through the supported route:
-      # nothing produced the value, so the only way to supply it was to type
-      # one in — and a digest the caller typed names the bytes the caller
-      # wanted to run, not the bytes an authority approved.
-      #
-      # So it is read out of the signed Stage-1 manifest, which is already the
-      # authority on it: validating that manifest verifies the builder's
-      # attestation for the delivered binary against the manifest's own
-      # predeclared builder keys, requires the verifier's countersignature over
-      # the same subject, and requires the delivered binary, the attested
-      # subject and the approved physical wrapper to be one digest.
-      #
-      # It is read by a PUBLISHED release installed for that purpose. Asking
-      # the candidate to produce its own approval would be the delivery
-      # vouching for itself.
-      # The resolution is its OWN action, so the shell that decides which
-      # resolver may be trusted is a reviewed, tested file rather than an
-      # inline block. The previous inline guard rejected only a `candidate:`
-      # spelling and let `local` through — and `local` BUILDS THE CHECKED-OUT
-      # TREE, which on a candidate run is the candidate, so the delivery
-      # authenticated itself through the one route the guard existed to close.
-      - name: Resolve the attested candidate binary digest
-        id: candidate-binary
-        if: startsWith(inputs.testbucket-version, 'candidate:')
-        uses: $/.github/actions/candidate-digest
-        with:
-          resolver-version: ${{ inputs.candidate-resolver-version }}
-          stage1-file: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
-          authority: ${{ inputs.authority }}
-          authority-key: ${{ inputs.authority-key }}
-          expect: ${{ inputs.candidate-binary-digest }}
+      # The attested-candidate-digest resolution that stood here is removed with
+      # the protected-authority model: it derived a candidate binary digest from
+      # a signed Stage-1 manifest through its own reviewed resolver action, and
+      # §21 deletes that action. The install step still enforces
+      # TB_CANDIDATE_BINARY_DIGEST when a caller supplies one; what is gone is
+      # deriving it from a signature.
 
-      # §10.5.2 hop 0, steps 0b-0c. The caller's bytes are written to a
-      # JOB-LOCAL file and the digest is recomputed over what was actually
-      # written; a mismatch fails the job BEFORE `plan` is invoked, so no
-      # matrix is emitted. A perturbation of either the bytes or the expected
-      # digest fails here, independently.
       - name: Materialize and verify the cache declaration
         id: cache-declaration
         if: inputs.cache-declaration-json != ''
@@ -803,7 +774,7 @@ jobs:
           shard-plan: ${{ runner.temp }}/shard-plan.json
           version: ${{ inputs.testbucket-version }}
           release-pins-ref: ${{ inputs.release-pins-ref }}
-          candidate-binary-digest: ${{ steps.candidate-binary.outputs.digest }}
+          candidate-binary-digest: ${{ inputs.candidate-binary-digest }}
           working-directory: ${{ inputs.working-directory }}
           vitest-command: ${{ inputs.runner == 'vitest' && inputs.test-command || '' }}
           node-prefixes: ${{ inputs.node-prefixes }}
@@ -1052,52 +1023,12 @@ jobs:
           name: testbucket-shard-plan-${{ inputs.cache-scope }}
           path: ${{ runner.temp }}/testbucket-plan
 
-      # PRE-FLIGHT, before `wall begin` opens the action envelope.
-      #
-      # The contract puts an independent re-derivation of the plan, and the
-      # authority approval of its inputs, BEFORE AT_start. Verification after
-      # the action can refuse the row; it cannot un-run it. This step re-plans
-      # from the frozen bundle, checks it reproduces the issued receipt exactly
-      # — bindings and pre-plan approval included — and fails the bucket closed
-      # if it does not, so no envelope opens over an unauthorised plan.
-      - name: Pre-flight the frozen plan
-        # MANDATORY for an eligible request. The guard at the top of this job
-        # has already refused an eligible request with no frozen inputs, so
-        # this cannot be skipped into for a scored row.
-        if: inputs.wall-time-dir != '' && (inputs.frozen-inputs-artifact != '' || inputs.verify-require == 'eligible')
-        uses: $/.github/actions/preflight
-        with:
-          version: ${{ inputs.testbucket-version }}
-          release-pins-ref: ${{ inputs.release-pins-ref }}
-          candidate-binary-digest: ${{ needs.plan.outputs.candidate-binary-digest }}
-          bundle: ${{ runner.temp }}/testbucket-frozen-inputs/bundle.json
-          stage1: ${{ runner.temp }}/testbucket-frozen-inputs/stage1.json
-          stage2: ${{ runner.temp }}/testbucket-derived/stage2.json
-          registry: ${{ runner.temp }}/testbucket-frozen-inputs/registry.json
-          scorer: ${{ inputs.frozen-scorer-file != '' && format('{0}/testbucket-frozen-inputs/{1}', runner.temp, inputs.frozen-scorer-file) || '' }}
-          authority-key: ${{ inputs.authority-key }}
-          # The EXACT protected environment, not just its key. A key can sign
-          # under any label, and which environment approved is the question the
-          # contract asks before AT_start.
-          authority: ${{ inputs.authority }}
-          # The four identities run-bucket stamps onto every measured record,
-          # compared here with what the replay derives. Without them a
-          # mismatched or empty record identity opened the envelope, ran the
-          # tests, and was refused only by verification afterwards.
-          stage1-digest: ${{ inputs.stage1-digest }}
-          stage2-digest: ${{ inputs.stage2-digest }}
-          registry-digest: ${{ inputs.registry-digest }}
-          verifier-id: ${{ inputs.verifier-id }}
-          # The signed replay this row will be verified against, so the
-          # verifier identity above is compared with the one that actually
-          # attested the plan — here, rather than after the bucket has run.
-          replay-attestation: ${{ inputs.frozen-documents-artifact != '' && format('{0}/testbucket-frozen/replay.json', runner.temp) || '' }}
+      # The frozen-plan pre-flight that stood here is removed with the Stage-1/
+      # Stage-2 model: it re-planned from a signed bundle and required the
+      # result to reproduce an issued receipt before the envelope opened. There
+      # is no bundle, no receipt and no protected authority to approve them, and
+      # §21 deletes the action.
 
-      # The wrapper is installed BEFORE the measured action, by the caller.
-      # The physical action envelope opens on run-bucket's first owned
-      # operation and the wrapper cannot read a clock before it exists, so
-      # installing inside that action would put action-owned work outside A
-      # permanently.
       - name: Install testbucket for the measured action
         if: inputs.wall-time-dir != ''
         uses: $/.github/actions/install

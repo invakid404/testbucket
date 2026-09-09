@@ -244,11 +244,18 @@ func TestTheArchiveEnumerationUsesNoShortCircuitingPipeline(t *testing.T) {
 		}
 	}
 	// The installed-byte checks that follow are untouched.
+	//
+	// "not the precommitted" is deliberately NOT in this list any more. It was
+	// the release-pin comparison against released-binary-digests.tsv — a
+	// second root of trust rooted in a later commit — and the pin file is
+	// gone, so an assertion naming it would demand the path back. The
+	// installed-byte identity it was grouped with is the re-digest of the
+	// EXTRACTED binary, which is retained and named here instead.
 	for _, keep := range []string{
 		"TB_CANDIDATE_BINARY_DIGEST",
 		"the installed candidate binary digests to",
 		"a candidate archive carries one binary",
-		"not the precommitted",
+		"not the attested",
 	} {
 		if !strings.Contains(sh, keep) {
 			t.Errorf("an installed-byte identity check was lost: %q", keep)
