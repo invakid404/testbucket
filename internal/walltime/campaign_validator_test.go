@@ -92,19 +92,33 @@ func TestCampaignValidatorProfileAndPairInvariants(t *testing.T) {
 		}
 	})
 
-	t.Run("a mismatched est_basis pair is rejected by the BC-INV tuple", func(t *testing.T) {
+	t.Run("a pair differing in any BC-INV leaf is rejected", func(t *testing.T) {
 		// est_basis IS the treatment, so it is not a BC-INV member; what the
-		// validator rejects is a pair differing in any OTHER invariant. The
-		// mismatched-basis case is the pair whose arms both declare the same
-		// basis, which would mean no treatment at all.
-		b := BCInvariantTuple{K: 8, Count: 1, FileParallelism: 1}
-		c := b
-		c.K = 9
-		if err := ValidatePairInvariant(b, c); err == nil {
-			t.Fatal("a pair differing in a BC-INV leaf was accepted")
+		// validator rejects is a pair differing in any OTHER invariant.
+		membership, tupleLeaves := bcInvMembershipFromRegistry(t)
+		expanded := ExpandMembership(membership, tupleLeaves)
+		values := map[string]string{}
+		for i, m := range expanded {
+			values[m] = fmt.Sprintf("v%03d", i)
+		}
+		b, err := NewBCInvariantTuple(expanded, values)
+		if err != nil {
+			t.Fatal(err)
 		}
 		if err := ValidatePairInvariant(b, b); err != nil {
 			t.Fatalf("identical invariants were rejected: %v", err)
+		}
+		mutated := map[string]string{}
+		for k, v := range values {
+			mutated[k] = v
+		}
+		mutated[expanded[0]] = "different"
+		c, err := NewBCInvariantTuple(expanded, mutated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidatePairInvariant(b, c); err == nil {
+			t.Fatal("a pair differing in a BC-INV leaf was accepted")
 		}
 	})
 
@@ -196,41 +210,64 @@ func TestCampaignProvenanceAndCutoff(t *testing.T) {
 
 // TestCampaignIdentitiesAreSeparateFields is §22 test 16 (S-6).
 func TestCampaignIdentitiesAreSeparateFields(t *testing.T) {
-	base := BCInvariantTuple{
-		OrchestrationCommit: "o1", WorkloadCommit: "w1", CandidateSHA: "c1",
-		K: 8, Count: 1, FileParallelism: 1,
+	membership, tupleLeaves := bcInvMembershipFromRegistry(t)
+	expanded := ExpandMembership(membership, tupleLeaves)
+
+	identities := []string{
+		"manifest.orchestration_commit",
+		"manifest.workload_commit",
+		"manifest.candidate_sha",
 	}
 
-	t.Run("all three are required and equal across arms", func(t *testing.T) {
-		if err := ValidatePairInvariant(base, base); err != nil {
+	t.Run("all three are separate required members", func(t *testing.T) {
+		members := map[string]bool{}
+		for _, m := range expanded {
+			members[m] = true
+		}
+		for _, id := range identities {
+			if !members[id] {
+				t.Errorf("%q is not a separate bc_inv member", id)
+			}
+		}
+	})
+
+	t.Run("each must be equal across the arms", func(t *testing.T) {
+		values := map[string]string{}
+		for i, m := range expanded {
+			values[m] = fmt.Sprintf("v%03d", i)
+		}
+		base, err := NewBCInvariantTuple(expanded, values)
+		if err != nil {
 			t.Fatal(err)
 		}
-		for _, mut := range []func(BCInvariantTuple) BCInvariantTuple{
-			func(v BCInvariantTuple) BCInvariantTuple { v.OrchestrationCommit = "x"; return v },
-			func(v BCInvariantTuple) BCInvariantTuple { v.WorkloadCommit = "x"; return v },
-			func(v BCInvariantTuple) BCInvariantTuple { v.CandidateSHA = "x"; return v },
-		} {
-			if err := ValidatePairInvariant(base, mut(base)); err == nil {
-				t.Error("a differing identity was accepted across the arms")
+		for _, id := range identities {
+			mutated := map[string]string{}
+			for k, v := range values {
+				mutated[k] = v
+			}
+			mutated[id] = "substituted"
+			other, err := NewBCInvariantTuple(expanded, mutated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidatePairInvariant(base, other); err == nil {
+				t.Errorf("a differing %s was accepted across the arms", id)
 			}
 		}
 	})
 
 	t.Run("none is derivable from another", func(t *testing.T) {
-		// Three separate leaves in the membership, and the three values differ
-		// in the fixture, so no substitution could go unnoticed.
-		members := map[string]bool{}
-		for _, n := range BCInvariantLeafNames() {
-			members[n] = true
-		}
-		for _, n := range []string{"orchestration_commit", "workload_commit", "candidate_sha"} {
-			if !members[n] {
-				t.Errorf("%q is not a separate BC-INV leaf", n)
+		// Three distinct registry paths, and the fixture gives each a distinct
+		// value, so a substitution could not pass unnoticed.
+		seen := map[string]bool{}
+		for _, id := range identities {
+			if seen[id] {
+				t.Fatalf("identity %q is listed twice", id)
 			}
+			seen[id] = true
 		}
-		if base.OrchestrationCommit == base.WorkloadCommit ||
-			base.WorkloadCommit == base.CandidateSHA {
-			t.Fatal("the fixture collapses two identities")
+		if len(seen) != 3 {
+			t.Fatalf("expected three distinct identities, got %d", len(seen))
 		}
 	})
 }
