@@ -102,10 +102,14 @@ func TestTheReusableWorkflowJobsDeclareLeastPrivilege(t *testing.T) {
 	want := map[string]map[string]string{
 		// Checkout, the timing-store cache and same-run artifacts.
 		"plan": {"contents": "read"},
-		// The one job that reads the Actions API: the A_GH collector reads
-		// this job's own step timestamps back, and without it no invocation
-		// can produce an eligible row.
-		"test": {"contents": "read", "actions": "read"},
+		// Checkout, the measured buckets, and same-run artifacts. It used to
+		// also declare `actions: read`, for the A_GH collector that read this
+		// job's own step timestamps back through the Actions API. A_GH was a
+		// DIAGNOSTIC that never entered a gate, and it left with the
+		// collector — so the scope left with it. Narrowing a declaration is
+		// as much a decision as widening one, which is why it is asserted
+		// exactly here rather than as a lower bound.
+		"test": {"contents": "read"},
 		// Checkout, same-run artifacts, and the store written back through the
 		// cache rather than the repository.
 		"record": {"contents": "read"},
@@ -133,8 +137,8 @@ func TestTheReusableWorkflowJobsDeclareLeastPrivilege(t *testing.T) {
 // AND THE CALLERS IN THIS REPOSITORY GRANT WHAT THOSE JOBS DECLARE.
 //
 // A called workflow may only retain or reduce what its caller granted, so a
-// job declaring `actions: read` fails at startup for a caller that grants
-// less. That regression shipped once already. The declarations and the grants
+// job declaring a scope its caller does not grant fails at startup. That
+// regression shipped once already. The declarations and the grants
 // are two halves of one versioned migration, and this is what stops them
 // drifting apart again.
 func TestEveryCallerGrantsWhatTheCalledJobsDeclare(t *testing.T) {

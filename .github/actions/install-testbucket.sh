@@ -28,10 +28,10 @@
 #   TB_BINDIR    directory to install the binary into   (created if missing)
 # Optional env:
 #   GH_TOKEN     token for `gh release list`            (only the alias path needs it)
-#   TB_CANDIDATE_BINARY_DIGEST  sha256:<64-hex> of the binary Stage 1 authorised
-#                (MANDATORY on the candidate path; derive it with
-#                `testbucket wall stage1-binary --file stage1.json` from a
-#                PUBLISHED release, never by typing a digest in)
+#   TB_CANDIDATE_BINARY_DIGEST  sha256:<64-hex> of the candidate binary
+#                (MANDATORY on the candidate path; it is the digest of the
+#                binary about to execute, and it is re-derived from the
+#                extracted bytes below rather than trusted)
 set -euo pipefail
 
 : "${TB_VERSION:?TB_VERSION is required (local | vX | vX.Y | vX.Y.Z)}"
@@ -378,8 +378,8 @@ tar -xzf "$work/$asset" -C "$work" testbucket
 #
 # What stood here verified a released binary against `released-binary-digests.tsv`
 # — a reviewed file in this repository naming the digest of the binary inside
-# each published archive — plus an optional later commit named by
-# TB_RELEASE_PINS_REF for releases published after this action's own commit.
+# each published archive — together with an optional later commit that carried
+# the pin for a release published after this action's own.
 #
 # That data file is REMOVE-classified by the component map, and a check whose
 # root of trust no longer exists cannot be kept: it would refuse every release
