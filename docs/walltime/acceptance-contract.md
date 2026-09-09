@@ -4136,7 +4136,7 @@ is **never** an input and never a key leaf (`scope.md` §2A, S-4).
     | **full rank** | `[1,10,1,0]` `[1,20,1,0]` `[1,10,0,1]` `[1,30,0,2]` | 4 | `[]` | **accepted** |
     | **column 4 dead** | `[1,10,1,0]` `[1,20,1,0]` `[1,30,1,0]` `[1,40,1,0]` | 2 | `[3, 4]` | rejected |
     | **column 3 dead** | `[1,10,0,1]` `[1,20,0,2]` `[1,30,0,3]` `[1,40,0,4]` | 2 | `[3, 4]` | rejected |
-    | **hidden collinearity** | `[1,1,0,0]` `[1,2,0,1]` `[1,2,1,0]` `[1,4,1,2]` | 3 | `[4]` | rejected — column 2 = column 1 + column 3 + column 4, which no prose heuristic catches |
+    | **hidden collinearity** | `[1,1,0,0]` `[1,2,0,1]` `[1,2,1,0]` `[1,4,1,2]` | 3 | `[3]` | rejected — column 2 = column 1 + column 3 + column 4, which no prose heuristic catches |
 
     The test also asserts the pivot immediately **below** `tol` is rejected and immediately **above**
     is accepted, that `sigma_max`, `tolerance` and `min_pivot` serialize as shortest round-tripping

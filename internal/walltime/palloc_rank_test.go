@@ -52,24 +52,20 @@ func TestWallRankToleranceBoundary(t *testing.T) {
 			// column 2 = column 1 + column 3 + column 4, which no prose
 			// heuristic catches — that is the point of the fixture.
 			//
-			// deficient_columns is [3] here, NOT the [4] §22 test 54's table
-			// prints. That cell is not producible by the algorithm §6.6
-			// freezes, and the reason is arithmetic rather than a tolerance
-			// choice: §6.6 pivots on MAXIMUM remaining norm, and at the step
-			// where column 4 could be dropped its remaining norm is the
-			// LARGEST of the three candidates (1.0, against 0.8718 for column
-			// 1 and 0.7483 for column 3). Max-norm pivoting therefore selects
-			// column 4 SECOND and can never leave it last, so no tie-break
-			// reading reaches [4]; only a minimum-norm rule would, and that is
-			// not rank-revealing QR.
+			// deficient_columns is [3], which is what §6.6's
+			// maximum-remaining-norm QR pivoting actually produces: at the
+			// deciding step column 4's remaining norm is the LARGEST of the
+			// three candidates (1.0, against 0.8718 for column 1 and 0.7483
+			// for column 3), so it is selected second and can never be left
+			// last. Its pivot ends at 1.0 while column 3's falls to 1.33e-16
+			// against a tolerance of 4.44e-06.
 			//
-			// The two load-bearing values — rank 3 and REJECTED — agree with
-			// the contract, and they are what admission turns on. The
-			// discrepancy is recorded in implementation.md as a
-			// PRODUCT_DECISION item rather than resolved here in either
-			// direction: silently asserting [4] would require abandoning the
-			// frozen pivot rule, and silently asserting [3] without saying so
-			// would hide a defect in a published fixture.
+			// The contract printed [4] until at-042. That value was
+			// unreachable under the frozen pivot rule — only a minimum-norm
+			// rule would produce it, and that is not rank-revealing QR — and
+			// the owner resolved it under option A by correcting the cell
+			// rather than the algorithm. Rank 3 and REJECTED, the two values
+			// admission turns on, were correct throughout and are unchanged.
 			name: "hidden collinearity",
 			x: [][]float64{
 				{1, 1 * b, 0, 0},
@@ -104,10 +100,11 @@ func TestWallRankToleranceBoundary(t *testing.T) {
 	}
 
 	t.Run("column 4 cannot be pivoted last on the hidden-collinearity fixture", func(t *testing.T) {
-		// The executable form of the finding above: §6.6's rule is maximum
-		// remaining norm, and column 4's remaining norm at the deciding step
-		// exceeds both rivals, so the published [4] is unreachable under the
-		// frozen algorithm regardless of how ties are broken.
+		// The executable form of why the cell reads [3]: §6.6's rule is
+		// maximum remaining norm, and column 4's remaining norm at the
+		// deciding step exceeds both rivals, so no tie-break reading can leave
+		// it last. This subtest is what makes the corrected cell checkable
+		// rather than merely asserted.
 		x := [][]float64{
 			{1, 1 * b, 0, 0},
 			{1, 2 * b, 0, 1},
