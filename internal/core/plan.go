@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"strconv"
 	"text/tabwriter"
 	"time"
 
+	"github.com/invakid404/testbucket/internal/nsmath"
 	"github.com/invakid404/testbucket/internal/runner"
 )
 
@@ -108,6 +110,16 @@ type PlanDocument struct {
 	// store-derived in both, so only the partition differs.
 	ExpandedUnitSetDigest string `json:"expanded_unit_set_digest,omitempty"`
 
+	// Profile is §13.0's canonical profile, carried opaquely: the plan states
+	// the shape it was built under, and the observation copies it VERBATIM so
+	// QC13 can compare the two without either side re-deriving it.
+	Profile json.RawMessage `json:"profile,omitempty"`
+
+	// ComparabilityKeyDigest is §15.3's key: which wall history this plan's
+	// measurements may join. A row measured under a different key belongs to a
+	// different population, so the plan says which one it is.
+	ComparabilityKeyDigest string `json:"comparability_key_digest,omitempty"`
+
 	// RuntimeProfileDeclared and its digest ride in the plan document, which
 	// is already transported to every bucket job. §21 fixes the plan job's
 	// output set at matrix, cache-declaration-json and cache-declaration-digest,
@@ -201,6 +213,28 @@ type PlanOptions struct {
 	// Runnables method is used; it is an injection seam for tests that drive
 	// the planner against a synthetic tree with no toolchain.
 	Runnables runnableNamer
+	// --- the practical basis, decided by the caller before planning ---
+
+	// Basis is the DECIDED basis, not the requested one: §0.8's two ordered
+	// phases run in the caller, which is where the store status and the scored
+	// flag both are, and the decision arrives here already made. Empty means
+	// reporter, so a caller that never opted in is unchanged.
+	Basis EstBasis
+	// WallModel is the fitted model the wall basis packs by. It is REQUIRED
+	// when Basis is wall and must be absent otherwise: a wall plan built
+	// without the model it claims would be a reporter plan wearing a label.
+	WallModel *WallModel
+	// Profile, ComparabilityKeyDigest, RuntimeProfileDeclared and its digest
+	// are the practical metadata the plan document carries. They are computed
+	// by the caller — the profile from the flags it parsed, the key and the
+	// runtime profile from the environment it is running in — because none of
+	// them is derivable from the live set and the store alone.
+	Profile                      json.RawMessage
+	ComparabilityKeyDigest       string
+	ExpandedUnitSetDigest        string
+	RuntimeProfileDeclared       map[string]string
+	RuntimeProfileDeclaredDigest string
+
 	// FileParallelism is the intra-bucket concurrency the buckets were
 	// rendered under. Core does not use it to pack — the sum-of-weights model
 	// is unchanged — but §16.4 requires the human report to SUPPRESS its
@@ -285,17 +319,62 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 		items = append(items, it)
 		byID[u.ID] = u
 	}
-	groups := karmarkarKarp(items, opt.K)
-
-	buckets := make([]runner.Bucket, opt.K)
-	for i, g := range groups {
-		b := runner.Bucket{Index: i}
-		for _, it := range g {
-			u := byID[it.ID]
-			b.Units = append(b.Units, u)
-			b.Seconds += u.Seconds
+	// THE PARTITION FOLLOWS THE BASIS.
+	//
+	// Under the reporter basis the split is the store's measured weights
+	// through the existing KK, exactly as it has always been. Under the wall
+	// basis it is §6.5's two-stage integer allocator over A_eta_ns, and the
+	// SAME objective value is what the document then displays — one
+	// expression, evaluated once, so the number a reader compares against the
+	// balance is the number the balance was computed from.
+	var buckets []runner.Bucket
+	var wallCosts []int64
+	if opt.Basis == BasisWall {
+		if opt.WallModel == nil {
+			return nil, fmt.Errorf("wall basis requires a fitted model; none was supplied")
 		}
-		buckets[i] = b
+		alloc := make([]AllocUnit, 0, len(ex.Units))
+		for _, u := range ex.Units {
+			baseNs, err := reporterNsOf(u)
+			if err != nil {
+				return nil, fmt.Errorf("unit %s: %w", u.ID, err)
+			}
+			alloc = append(alloc, AllocUnit{
+				ID:      u.ID,
+				BaseNs:  baseNs,
+				IsSlice: u.Kind == runner.KindRunSlice || u.Kind == runner.KindCountShard,
+			})
+		}
+		part, err := AllocateWall(*opt.WallModel, alloc, opt.K)
+		if err != nil {
+			return nil, fmt.Errorf("wall allocation: %w", err)
+		}
+		wallCosts, err = part.Costs(*opt.WallModel)
+		if err != nil {
+			return nil, fmt.Errorf("wall objective: %w", err)
+		}
+		buckets = make([]runner.Bucket, opt.K)
+		for i := range part.Buckets {
+			b := runner.Bucket{Index: i}
+			for _, ui := range part.Buckets[i] {
+				u := byID[part.Units[ui].ID]
+				b.Units = append(b.Units, u)
+				b.Seconds += u.Seconds
+			}
+			buckets[i] = b
+		}
+	} else {
+		groups := karmarkarKarp(items, opt.K)
+		buckets = make([]runner.Bucket, opt.K)
+		for i, g := range groups {
+			b := runner.Bucket{Index: i}
+			for _, it := range g {
+				u := byID[it.ID]
+				b.Units = append(b.Units, u)
+				b.Seconds += u.Seconds
+			}
+			buckets[i] = b
+		}
 	}
 
 	// The gate runs on the FINAL buckets, after partitioning — the point is to
@@ -311,6 +390,10 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 		return nil, err
 	}
 
+	basis := opt.Basis
+	if basis == "" {
+		basis = BasisReporter
+	}
 	doc := &PlanDocument{
 		K:               opt.K,
 		Flags:           token,
@@ -319,6 +402,16 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 		UpdatedAt:       st.UpdatedAt,
 		Notes:           ex.Notes,
 		fileParallelism: opt.FileParallelism,
+
+		EstBasis:                     basis,
+		Profile:                      opt.Profile,
+		ComparabilityKeyDigest:       opt.ComparabilityKeyDigest,
+		ExpandedUnitSetDigest:        opt.ExpandedUnitSetDigest,
+		RuntimeProfileDeclared:       opt.RuntimeProfileDeclared,
+		RuntimeProfileDeclaredDigest: opt.RuntimeProfileDeclaredDigest,
+	}
+	if basis == BasisWall {
+		doc.Algorithm = "two-stage integer allocation over A_eta_ns (contract §6.5)"
 	}
 	if opt.AllocationScore != nil {
 		// Say so out loud: a reader comparing bucket estimates against the
@@ -328,7 +421,16 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 			"buckets were packed by the frozen pre-plan allocation score; est_seconds still reports the store's measured weights")
 	}
 	for _, b := range buckets {
-		doc.Buckets = append(doc.Buckets, renderPlanBucket(b, rnr.Render(b)))
+		pb := renderPlanBucket(b, rnr.Render(b))
+		if basis == BasisWall && b.Index < len(wallCosts) {
+			// §5.1: under the wall basis est_seconds is exactly
+			// round1(a_eta_ns / 1e9), so the displayed number and the
+			// optimised one cannot drift.
+			ns := Nanos(wallCosts[b.Index])
+			pb.AEtaNs = &ns
+			pb.Seconds = nsmath.Round1Seconds(wallCosts[b.Index])
+		}
+		doc.Buckets = append(doc.Buckets, pb)
 	}
 
 	stale, staleOK := st.age(opt.Now)
@@ -551,3 +653,57 @@ func (d *PlanDocument) WriteSummary(out io.Writer, shortenPrefix string) error {
 	}
 	return ew.err
 }
+
+// reporterNsOf converts a unit's stored weight to the exact integer
+// nanoseconds the wall objective consumes.
+//
+// The store keeps one-decimal SECONDS as a float64, and the objective is
+// defined on integer nanoseconds, so a conversion is unavoidable at exactly
+// this boundary. It goes through the exact rational domain rather than
+// `seconds * 1e9` in float64: that product passes 2^53 at about 9e6 seconds,
+// which is inside the range a long-running suite can reach, and above it two
+// distinct stored weights would land on one nanosecond count.
+func reporterNsOf(u runner.Unit) (int64, error) {
+	q := new(big.Rat).SetFloat64(u.Seconds)
+	if q == nil {
+		return 0, fmt.Errorf("unit weight %v is not a finite number", u.Seconds)
+	}
+	q.Mul(q, new(big.Rat).SetInt64(1_000_000_000))
+	return nsmath.RoundHalfUpRat("reporter_sum_ns", q)
+}
+
+// ExpandUnitsFor is the planner's unit expansion, exposed for the calibration
+// proposer of contract §17.3a.
+//
+// It exists so the proposer searches over the units a plan would ACTUALLY
+// schedule — the same whale expansion, the same cold-start weights, the same
+// slicing — rather than a second derivation that could drift from the
+// planner's. §6.5 makes that reuse the rule for the packer; the universe the
+// packer runs over deserves the same treatment.
+func ExpandUnitsFor(ctx context.Context, rnr runner.Runner, st *Store, opt PlanOptions) ([]runner.Unit, error) {
+	if st == nil {
+		st = NewStore(opt.Token)
+	}
+	runnables := opt.Runnables
+	if runnables == nil {
+		runnables = func(p runner.LivePackage) ([]string, error) {
+			return rnr.Runnables(ctx, p)
+		}
+	}
+	mean, _, _ := st.meanWeight(opt.Live)
+	ex, err := expandUnits(opt.Live, st, expandOptions{
+		K:           opt.K,
+		BaseCount:   opt.Count,
+		MeanSeconds: mean,
+		Runnables:   runnables,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ex.Units, nil
+}
+
+// ReporterNs is reporterNsOf, exposed for the same reason ExpandUnitsFor is:
+// the design matrix a calibration proposal is built from must be in the exact
+// integer domain the objective is evaluated in, converted the one way.
+func ReporterNs(u runner.Unit) (int64, error) { return reporterNsOf(u) }

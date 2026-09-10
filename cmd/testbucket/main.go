@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -687,6 +688,11 @@ func runPlan(args []string) error {
 	workloadCommit := fs.String("workload-commit", "", "the consumer checkout this run executes against, recorded as the observation's workload_commit (AD-10, QC15)")
 	cacheDeclarationFile := fs.String("cache-declaration-file", "", "job-local file holding the canonical cache declaration of §10.5.0, already verified against its expected digest by the plan job. plan validates only the declaration leaves and refuses before emitting a matrix; the outcome leaves do not exist yet (AD-9)")
 
+	// --- contract §17.3a calibration ------------------------------------------
+	calibrate := fs.Bool("calibrate", false, "propose the calibration plan set of §17.3a instead of emitting a matrix: the design rows a fit needs to reach rank, packed by the same deterministic KK the reporter basis uses")
+	calibrationOut := fs.String("calibration-out", "", "write the proposed calibration plans here as JSON (required with --calibrate); the file is written atomically so a reader never sees a partial proposal")
+	calibrationMaxPlans := fs.Int("calibration-max-plans", 8, "the bounded search budget of §17.3a: at most this many plans are proposed before the proposer returns NOT_FOUND_WITHIN_BUDGET rather than searching without end")
+
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -701,6 +707,31 @@ func runPlan(args []string) error {
 		if err := scoredPlanAdmission(*runnerClass, *runsOnLabel, *candidateSHA, *workloadCommit, *cacheDeclarationFile); err != nil {
 			return err
 		}
+	}
+	if *calibrate && strings.TrimSpace(*calibrationOut) == "" {
+		return fmt.Errorf("--calibrate needs --calibration-out: a proposal nobody can read is not a proposal")
+	}
+
+	// THE CACHE DECLARATION IS VALIDATED, NOT MERELY NAMED.
+	//
+	// AD-9 requires a scored plan to carry one, and §10.5.0 fixes its leaves.
+	// Reading it here means a declaration that is malformed, or that names a
+	// mode and producer that cannot occur together, refuses BEFORE a matrix
+	// exists rather than after every bucket has run under it.
+	var cacheDecl *walltime.CacheDeclaration
+	if strings.TrimSpace(*cacheDeclarationFile) != "" {
+		raw, err := os.ReadFile(*cacheDeclarationFile)
+		if err != nil {
+			return fmt.Errorf("--cache-declaration-file: %w", err)
+		}
+		var d walltime.CacheDeclaration
+		if err := json.Unmarshal(raw, &d); err != nil {
+			return fmt.Errorf("--cache-declaration-file: %w", err)
+		}
+		if err := d.Validate(); err != nil {
+			return fmt.Errorf("--cache-declaration-file: %w; no matrix is emitted", err)
+		}
+		cacheDecl = &d
 	}
 
 	// The frozen path takes over completely: a bundle carries K, the count, the
@@ -759,6 +790,44 @@ func runPlan(args []string) error {
 		return err
 	}
 
+	// THE STORE IS READ BEFORE DISCOVERY, because the basis decision depends on
+	// it and an unusable one must refuse before an expensive `go list` or
+	// `vitest list` sweep — not after.
+	st, reason, err := core.LoadStore(*store)
+	if err != nil {
+		return err
+	}
+
+	// §0.8's two ordered phases, over the store that actually exists. An
+	// explicit `--est-basis wall` with no fitted `ok` model is outcome (c): a
+	// hard error with NO matrix, never a silent reporter fallback.
+	status := core.WallStatusAbsent
+	var fitted *core.WallModel
+	if st != nil && st.Wall != nil {
+		status = st.Wall.Status
+		if f := st.Wall.Fit; f != nil {
+			fitted = &core.WallModel{
+				FixedNs:                   f.FixedNs,
+				Scale:                     f.Scale,
+				WholeInvocationOverheadNs: f.WholeInvocationOverheadNs,
+				PerSliceOverheadNs:        f.PerSliceOverheadNs,
+			}
+		}
+	}
+	decision, err := core.SelectBasis(
+		core.BasisRequest{Basis: basis, Explicit: flagWasSet(fs, "est-basis")},
+		st != nil, status, *scored, *fileParallelism)
+	if err != nil {
+		return err
+	}
+	if decision.Basis == core.BasisWall && fitted == nil {
+		return fmt.Errorf("%w: the store reports status ok but carries no fit",
+			core.ErrWallModelUnusable)
+	}
+	if decision.ColdStart && decision.Reason != "" {
+		fmt.Fprintf(os.Stderr, "testbucket plan: %s\n", decision.Reason)
+	}
+
 	var livePkgs []runner.LivePackage
 	if *live != "" {
 		livePkgs, err = loadLive(*live)
@@ -769,13 +838,85 @@ func runPlan(args []string) error {
 		return err
 	}
 
-	st, reason, err := core.LoadStore(*store)
-	if err != nil {
-		return err
-	}
-
 	opt.Live = livePkgs
 	opt.Token = rnr.CanonicalToken()
+	opt.Basis = decision.Basis
+	if decision.Basis == core.BasisWall {
+		opt.WallModel = fitted
+	}
+
+	// THE RUNTIME PROFILE IS OBSERVED, not asserted: §15.3a's leaves come from
+	// the toolchain this process can actually see, so a declaration and the
+	// execution that follows it can be compared rather than assumed equal.
+	rtProfile := buildRuntimeProfile(runtimeProfileInputs{
+		runnerKind:    *runnerKind,
+		root:          *root,
+		workingDir:    *root,
+		vitestCommand: *vitestCommand,
+		cacheDecl:     cacheDecl,
+	})
+	opt.RuntimeProfileDeclared = runtimeProfileMap(rtProfile)
+	opt.RuntimeProfileDeclaredDigest = string(walltime.RuntimeProfileDigest(rtProfile))
+
+	// §15.3's comparability key: which wall history these measurements may
+	// join. It is derived from the DECLARED leaves, never from a per-job
+	// outcome, so ordinary cache behaviour cannot reset the population.
+	keyProfile := walltime.ComparabilityProfile{
+		RunnerClass:      *runnerClass,
+		RunnerImageLabel: *runsOnLabel,
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		NodeVersion:      rtProfile.NodeVersion,
+		PnpmVersion:      rtProfile.PnpmVersion,
+		VitestVersion:    rtProfile.VitestVersion,
+		TestbucketSHA256: rtProfile.TestbucketSHA256,
+		WorkingDir:       *root,
+		FacadeCommand:    rtProfile.FacadeCommand,
+		SetupCommand:     "",
+		LockSHA256:       rtProfile.LockSHA256,
+		DiscoveryMode:    *vitestDiscovery,
+		Exclusions:       []string(excludes),
+	}
+	if cacheDecl != nil {
+		keyProfile.CacheDeclarationDigest = string(cacheDecl.Digest())
+	}
+	keyDigest, err := walltime.ComparabilityKeyDigest(keyProfile)
+	if err != nil {
+		return fmt.Errorf("comparability key: %w", err)
+	}
+	opt.ComparabilityKeyDigest = string(keyDigest)
+
+	// §13.0's canonical profile: the shape this plan was built under, carried
+	// verbatim into every observation so QC13 compares one value rather than
+	// two derivations of it.
+	expandedDigest := expandedUnitSetDigest(livePkgs)
+	profile := walltime.CanonicalProfile{
+		Scored:                *scored,
+		RunnerToken:           rnr.CanonicalToken(),
+		K:                     *k,
+		Count:                 count,
+		FileParallelism:       *fileParallelism,
+		BucketIndices:         bucketIndices(*k),
+		EstBasis:              walltime.EstBasis(decision.Basis),
+		StoreSHA256:           storeDigest(*store),
+		ExpandedUnitSetDigest: expandedDigest,
+	}
+	if *scored {
+		if err := walltime.AdmitScoredProfile(profile, *runnerClass, *runsOnLabel,
+			*candidateSHA, *workloadCommit, cacheDecl != nil); err != nil {
+			return fmt.Errorf("%w; no matrix is emitted", err)
+		}
+	}
+	profileJSON, err := json.Marshal(profile)
+	if err != nil {
+		return fmt.Errorf("canonical profile: %w", err)
+	}
+	opt.Profile = profileJSON
+	opt.ExpandedUnitSetDigest = expandedDigest
+
+	if *calibrate {
+		return runCalibration(rnr, opt, *calibrationOut, *calibrationMaxPlans)
+	}
 
 	doc, err := core.BuildPlan(ctx, rnr, st, reason, opt)
 	if err != nil {
