@@ -487,13 +487,13 @@ type Verdict struct {
 	// operation and this gap should be nothing but the runner's own step
 	// startup. That ORDERING is the control; this number is how a reader sees
 	// it, not how it is enforced.
-	BootstrapGapNs int64   `json:"bootstrap_gap_ns,omitempty"`
-	ScriptNs       int64   `json:"script_ns"`
+	BootstrapGapNs int64 `json:"bootstrap_gap_ns,omitempty"`
+	ScriptNs       int64 `json:"script_ns"`
 	// SetupNs is the action-owned setup command's interval, derived from its
 	// own boundary pair. §3.1's floor is `A >= setup_ns + script_ns`, so the
 	// verdict carries the term rather than leaving it to be supplied.
-	SetupNs int64 `json:"setup_ns,omitempty"`
-	InvocationNs   []int64 `json:"invocation_ns,omitempty"`
+	SetupNs      int64   `json:"setup_ns,omitempty"`
+	InvocationNs []int64 `json:"invocation_ns,omitempty"`
 }
 
 // add records a finding, collapsing an exact repeat. The same defect reached
