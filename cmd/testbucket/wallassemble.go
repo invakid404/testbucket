@@ -297,9 +297,18 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 	obs.RealtimeEnd = endBefore.UTC().Format(time.RFC3339Nano)
 	obs.BootIDStart = action.start.Instant.BootID
 	obs.BootIDEnd = action.end.Instant.BootID
+	// AN ABSENT TERMINAL IS AN INCOMPLETE CLOSING RECORD, not a pass.
+	//
+	// This defaulted it to "passed", which is the most consequential default
+	// in the document: QC9 admits a row for training on `terminal == passed`,
+	// so a closing record that never said how the interval ended became a
+	// trainable measurement of a run nobody could describe. The assembler
+	// refuses instead — the records are the evidence, and this one is missing
+	// the field it exists to carry.
 	obs.Terminal = action.end.Terminal
-	if obs.Terminal == "" {
-		obs.Terminal = "passed"
+	if strings.TrimSpace(obs.Terminal) == "" {
+		return fmt.Errorf("the action's closing record carries no terminal state; "+
+			"an observation is not assembled from an incomplete closing record (records dir %s)", dir)
 	}
 	// §13's "how it ended", which was being thrown away.
 	//

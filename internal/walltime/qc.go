@@ -13,6 +13,15 @@ type PlanBucketRef struct {
 	UnitIDs     []string
 	ArgvDigests []Digest
 	CwdDigests  []Digest
+	// EstSeconds is the estimate the plan DISPLAYED for this bucket, and
+	// AEtaNs the objective it was optimized against, present iff the plan was
+	// built under the wall basis.
+	//
+	// Neither was carried before, so no check could compare an observation's
+	// estimate against the plan's — the row echoed a number and the gate took
+	// its word for it. QC18 below is what makes the echo checkable.
+	EstSeconds float64
+	AEtaNs     *Nanos
 }
 
 // PlanContext is the plan-side half of the qualification checks: the shard plan
@@ -211,6 +220,31 @@ func QualifyObservation(o Observation, plan PlanContext, ring RingFacts) error {
 	if err := QC17(plan.RuntimeProfileDeclared, o.RuntimeProfile,
 		plan.RuntimeProfileDeclaredDigest, o.RuntimeProfileDigest); err != nil {
 		return err
+	}
+
+	// QC18 — the row's estimate is the PLAN'S estimate.
+	//
+	// §5.1 makes est_seconds and a_eta_ns echoes of what the plan decided, and
+	// nothing compared them: an observation could report any objective at all
+	// so long as its own two fields agreed with each other, which they do by
+	// construction because the assembler derives one from the other. An echo
+	// nobody checks is a field, not evidence.
+	if ref, ok := plan.Buckets[o.BucketName]; ok {
+		switch {
+		case ref.AEtaNs == nil && o.AEtaNs != nil:
+			return fmt.Errorf("QC18: the row reports a_eta_ns %d for a bucket the plan optimized no objective for",
+				int64(*o.AEtaNs))
+		case ref.AEtaNs != nil && o.AEtaNs == nil:
+			return fmt.Errorf("QC18: the plan optimized a_eta_ns %d for %s and the row reports none",
+				int64(*ref.AEtaNs), o.BucketName)
+		case ref.AEtaNs != nil && int64(*o.AEtaNs) != int64(*ref.AEtaNs):
+			return fmt.Errorf("QC18: the row reports a_eta_ns %d, the plan optimized %d",
+				int64(*o.AEtaNs), int64(*ref.AEtaNs))
+		}
+		if ref.EstSeconds != 0 && o.EstSeconds != ref.EstSeconds {
+			return fmt.Errorf("QC18: the row displays est_seconds %v, the plan displayed %v",
+				o.EstSeconds, ref.EstSeconds)
+		}
 	}
 
 	// QC16 — the recency stamp parses, and the intrinsic id is not already in

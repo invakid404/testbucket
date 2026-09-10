@@ -537,9 +537,21 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 // verifySchema is check 1. A schema change is a new epoch, not a migration:
 // this binary cannot know what a later schema means, and guessing would make a
 // verdict about records it did not understand.
+//
+// AN ABSENT SCHEMA IS NOT A PASS. This refused a schema only when one was
+// present and wrong, so a record carrying none at all went through silently —
+// the discriminant failed OPEN on exactly the input it cannot interpret. A
+// reader that does not know which epoch a record belongs to knows less than
+// one holding a wrong version, not more.
 func verifySchema(v *Verdict, recs []Record) {
 	for _, r := range recs {
-		if r.Schema != "" && r.Schema != SchemaVersion {
+		if r.Schema == "" {
+			v.add("WT-001", SeverityTerminal,
+				fmt.Sprintf("%s/%s record %d carries no schema; the epoch a record belongs to is never inferred",
+					r.Producer, r.Level, r.Seq))
+			continue
+		}
+		if r.Schema != SchemaVersion {
 			v.add("WT-001", SeverityTerminal,
 				fmt.Sprintf("%s/%s record %d has schema %q, want %q; a schema change is a new epoch, not a migration",
 					r.Producer, r.Level, r.Seq, r.Schema, SchemaVersion))
@@ -629,7 +641,18 @@ func verifyIntervals(v *Verdict, envs []Envelope) {
 						label, b, e.Physical.end.Instant.BootID))
 			}
 		}
-		if e.Terminal != "" && e.Terminal != TerminalPassed {
+		// AN ABSENT TERMINAL IS NOT A PASS EITHER. This too refused only a
+		// terminal that was present and not `passed`, so a closing record
+		// carrying none read as a clean finish. "How it ended" is the one
+		// question a closing record exists to answer.
+		switch {
+		case e.Terminal == "":
+			v.add("WT-014", SeverityTerminal,
+				fmt.Sprintf("%s carries no terminal state; a closing record that does not say how the interval ended is not a measurement", label))
+		case !validTerminal(e.Terminal):
+			v.add("WT-014", SeverityTerminal,
+				fmt.Sprintf("%s terminated %q, which is outside the retained terminal vocabulary", label, e.Terminal))
+		case e.Terminal != TerminalPassed:
 			v.add("WT-014", SeverityIneligible,
 				fmt.Sprintf("%s terminated %s: %s (retained, never scored)", label, e.Terminal, e.Reason))
 		}
@@ -762,4 +785,16 @@ func summariseDurations(v *Verdict, envs []Envelope) {
 			v.SetupNs = e.Physical.Duration()
 		}
 	}
+}
+
+// validTerminal reports whether a terminal state is one this package retains.
+// The set is closed: an unrecognised string is a record this reader cannot
+// interpret, and interpreting it anyway is what "fails open" means.
+func validTerminal(t string) bool {
+	switch t {
+	case TerminalPassed, TerminalFailed, TerminalSignalled, TerminalCancelled,
+		TerminalSpawnError, TerminalWrapperError, TerminalCrashUnclosed:
+		return true
+	}
+	return false
 }

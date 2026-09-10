@@ -27,6 +27,11 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 				UnitIDs:     []string{"a.spec.ts", "b.spec.ts"},
 				ArgvDigests: []Digest{"sha256:argv0"},
 				CwdDigests:  []Digest{"sha256:cwd0"},
+				// What the PLAN decided. QC18 compares the row's echo against
+				// these; without them the fixture's observation agreed only
+				// with itself.
+				EstSeconds: 20.0,
+				AEtaNs:     NanosPtr(20_000_000_000),
 			},
 		},
 		ProfileBlock:                 blk,

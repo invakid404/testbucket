@@ -494,12 +494,21 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 		}
 	}
 	ideal := total / float64(opt.K)
-	if basis == BasisWall {
-		objective := 0.0
-		for _, v := range balance {
-			objective += v
+	if basis == BasisWall && len(wallCosts) == len(buckets) {
+		// THE MEAN IS TAKEN IN INTEGER NANOSECONDS, then displayed.
+		//
+		// This summed the ALREADY-ROUNDED per-bucket seconds, so the mean
+		// carried K roundings of up to 50 ms each before the division. Two
+		// buckets of 160 ms and 140 ms round to 0.2 and 0.1, sum to 0.3, and
+		// report an ideal of 0.15 → 0.1 — where the objective's own mean is
+		// 150 ms, which displays as 0.2. §0.9 fixes A_eta in the exact integer
+		// domain precisely so a display rounding never becomes an input to
+		// another number.
+		sum, err := nsmath.SumNs("a_eta_ns_total", wallCosts...)
+		if err != nil {
+			return nil, fmt.Errorf("wall summary: %w", err)
 		}
-		ideal = objective / float64(opt.K)
+		ideal = nsmath.Round1Seconds(sum / int64(opt.K))
 	}
 	maxSec, minSec := 0.0, 0.0
 	for i, v := range balance {

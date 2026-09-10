@@ -541,6 +541,19 @@ func runIngest(args []string) error {
 			res.FitterCalls)
 	}
 
+	// VALIDATED BEFORE IT IS WRITTEN, not on the next load.
+	//
+	// §15.1c's presence matrix is what a reader enforces when it opens the
+	// store, and this path wrote a wall object without ever asking it. A
+	// degraded fit whose group had been cleared therefore reached disk intact
+	// and failed on the NEXT run, where the failure reads as a cold start
+	// rather than as the write that caused it. Refusing here names the
+	// producer.
+	if st.Wall != nil {
+		if err := st.Wall.Validate(); err != nil {
+			return fmt.Errorf("refusing to save an invalid wall object: %w", err)
+		}
+	}
 	if err := st.Save(*store); err != nil {
 		return err
 	}
@@ -921,10 +934,16 @@ func runPlan(args []string) error {
 		TestbucketSHA256: rtProfile.TestbucketSHA256,
 		WorkingDir:       *root,
 		FacadeCommand:    rtProfile.FacadeCommand,
-		SetupCommand:     strings.TrimSpace(*setupCommand),
-		LockSHA256:       rtProfile.LockSHA256,
-		DiscoveryMode:    *vitestDiscovery,
-		Exclusions:       []string(excludes),
+		// VERBATIM, and that means the exact bytes. TrimSpace collapsed
+		// `printf x` and `  printf x  ` onto one key, so two provisioning
+		// commands that build different environments shared a wall history —
+		// which is the one thing §15.3's key exists to prevent. The plan
+		// action passes `inputs.setup-command` unmodified; the key hashes
+		// exactly that.
+		SetupCommand:  *setupCommand,
+		LockSHA256:    rtProfile.LockSHA256,
+		DiscoveryMode: *vitestDiscovery,
+		Exclusions:    []string(excludes),
 	}
 	if cacheDecl != nil {
 		keyProfile.CacheDeclarationDigest = string(cacheDecl.Digest())
@@ -968,7 +987,15 @@ func runPlan(args []string) error {
 				emptyAsNone(st.Wall.ComparabilityKeyDigest), keyDigest)
 		} else {
 			status = st.Wall.Status
-			if f := st.Wall.Fit; f != nil {
+			// ONLY AN `ok` MODEL IS A MODEL. A degraded fit HAS coefficients —
+			// that is why §15.1c keeps them — and this took the group's mere
+			// presence as permission to use it, so §5.1's `wall_est_seconds`
+			// shadow was emitted from a fit whose residuals had already
+			// exceeded the ceiling. The shadow is permitted for reporter basis
+			// AND status ok, and for nothing else; the wall basis's own
+			// admission is SelectBasis's, which refuses a non-ok status
+			// separately.
+			if f := st.Wall.Fit; f != nil && st.Wall.Status == core.WallStatusOK {
 				fitted = &core.WallModel{
 					FixedNs:                   f.FixedNs,
 					Scale:                     f.Scale,

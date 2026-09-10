@@ -239,6 +239,16 @@ func (w *WallObject) Validate() error {
 		return fmt.Errorf("wall object has no observations container; it is always present once wall exists, empty if there is no history")
 	}
 
+	// THE STATUS VOCABULARY IS CLOSED, and it is checked FIRST.
+	//
+	// Everything below branches on `== WallStatusOK` and treats every other
+	// string as a generic failure, so `unknown-status` loaded as a valid
+	// non-ok wall object: a reader that cannot name a status was deciding
+	// subtype and fit presence from it anyway. §15.1c spells three.
+	if !validWallStatus(w.Status) {
+		return fmt.Errorf("wall object status %q is outside §15.1c's vocabulary (ok, degraded, insufficient)", w.Status)
+	}
+
 	// failure_subtype is required for every non-ok status and absent for ok.
 	if w.Status == WallStatusOK {
 		if w.FailureSubtype != "" {
@@ -575,4 +585,14 @@ func (w *WallObject) UnmarshalJSON(b []byte) error {
 	}
 	w.Fit = fit
 	return nil
+}
+
+// validWallStatus reports whether a status is one §15.1c spells. The set is
+// closed: an unrecognised string is a store this reader cannot interpret.
+func validWallStatus(s WallStatus) bool {
+	switch s {
+	case WallStatusOK, WallStatusDegraded, WallStatusInsufficient:
+		return true
+	}
+	return false
 }

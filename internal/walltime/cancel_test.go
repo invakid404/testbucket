@@ -23,17 +23,49 @@ func withShortCancellationPolicy(t *testing.T, grace, reap time.Duration) {
 // recorded for a run.
 func terminalOf(t *testing.T, dir string) (string, string) {
 	t.Helper()
+	r := closingRecord(t, dir)
+	return r.Terminal, r.Reason
+}
+
+// closingRecord returns the physical closing boundary, so a test can assert on
+// the process identity it carries and not only on the terminal string.
+func closingRecord(t *testing.T, dir string) Record {
+	t.Helper()
 	recs, err := ReadDir(dir)
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
 	for _, r := range recs {
 		if r.Producer == ProducerPhysical && r.Kind == "boundary" && r.Boundary == "end" {
-			return r.Terminal, r.Reason
+			return r
 		}
 	}
 	t.Fatal("no physical closing record was retained")
-	return "", ""
+	return Record{}
+}
+
+// assertTheReapWasNotReported checks the shape of the reap bookkeeping defect:
+// the drain reaped the root, nothing wrote that back, and the deferred
+// fallback then killed an already-reaped process, waited out ReapGrace on a
+// channel that could not deliver again, and stamped a false crash.
+//
+// The elapsed bound is part of the assertion, not decoration. The wrong
+// behaviour was CORRECT-LOOKING apart from costing ten seconds — a reader of
+// the record saw `crash_unclosed` and believed it.
+func assertTheReapWasNotReported(t *testing.T, dir string, elapsed, bound time.Duration) {
+	t.Helper()
+	r := closingRecord(t, dir)
+	if r.Proc.ExitKind == TerminalCrashUnclosed {
+		t.Errorf("proc.exit_kind is %q on a run whose root the drain reaped; reason was %q",
+			r.Proc.ExitKind, r.Reason)
+	}
+	if strings.Contains(r.Reason, "was not reaped") {
+		t.Errorf("the closing reason claims the root was not reaped: %q", r.Reason)
+	}
+	if elapsed > bound {
+		t.Errorf("the wrapper took %s; a reaped root must not cost the %s reap grace as well",
+			elapsed, bound)
+	}
 }
 
 // TestATermIgnoringRootIsKilledAtTheGrace is the F4 regression for the
@@ -69,11 +101,16 @@ func TestATermIgnoringRootIsKilledAtTheGrace(t *testing.T) {
 			t.Errorf("Exec: %v", err)
 		}
 	}()
+	started := time.Now()
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
 		t.Fatal("the wrapper never returned: a TERM-ignoring root still hangs it")
 	}
+	// The policy here is a 300ms TERM grace and a 5s reap grace. A run that
+	// pays the reap grace a SECOND time, for a root the drain already reaped,
+	// cannot fit in three seconds.
+	assertTheReapWasNotReported(t, dir, time.Since(started), 3*time.Second)
 
 	terminal, reason := terminalOf(t, dir)
 	if terminal != TerminalCancelled {
@@ -112,11 +149,17 @@ func TestTheDeadlineIsAnEndpointNotASuggestion(t *testing.T) {
 			t.Errorf("Exec: %v", err)
 		}
 	}()
+	started := time.Now()
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
 		t.Fatal("the wrapper never returned: the cancellation deadline is not enforced")
 	}
+	// Same bound, same reason: the deadline path is the other route that never
+	// took the wait result itself, so it is the other one that paid the reap
+	// grace twice and reported a crash that had not happened.
+	assertTheReapWasNotReported(t, dir, time.Since(started), 3*time.Second)
+
 	terminal, reason := terminalOf(t, dir)
 	if terminal != TerminalCancelled {
 		t.Errorf("terminal = %q, want %q", terminal, TerminalCancelled)

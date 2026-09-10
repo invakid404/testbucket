@@ -358,6 +358,24 @@ func runOwnedChild(opt ExecOptions, deadline time.Time, clock Clock) (code int, 
 				termState = TerminalWrapperError
 			}
 		}
+		// THE DRAIN'S REAP COUNTS AS THE REAP.
+		//
+		// On the cancelled and deadline paths the select never took the wait
+		// result, so `rootReaped` was false when DrainGroup ran — and the
+		// drain's own ReapRoot consumed the only value `waitErr` will ever
+		// deliver. Nothing wrote that back, so the deferred fallback below
+		// still believed the root was unwaited: it killed a process that had
+		// already been reaped, blocked on a channel that could not deliver
+		// again, and after ReapGrace stamped `crash_unclosed` with "the root
+		// was not reaped" on a run whose root was reaped seconds earlier.
+		// Every cancellation paid ten seconds for a false terminal state.
+		//
+		// out.Reaped is read AFTER DrainGroup returns, when the drain has
+		// already collected that result — taking it from the closure instead
+		// would race the fallback's read of the same variable.
+		if out.Reaped {
+			rootReaped = true
+		}
 		switch {
 		case escaped:
 			// An escape is TERMINAL and is never rounded down to a finished

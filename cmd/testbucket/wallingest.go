@@ -198,7 +198,7 @@ func wallFitter(st *core.Store) walltime.Fitter {
 		}
 		st.Wall.Status = core.WallStatus(res.Status)
 		st.Wall.FailureSubtype = core.WallFailureSubtype(res.Subtype)
-		if res.Status != walltime.FitOK {
+		if res.Status == walltime.FitInsufficient {
 			// A model that did not reach rank is recorded as INSUFFICIENT with
 			// no coefficients: §15.1c makes presence status-indexed, so an
 			// unusable model must not leave a fit group behind for a later
@@ -206,6 +206,15 @@ func wallFitter(st *core.Store) walltime.Fitter {
 			st.Wall.Fit = nil
 			return nil
 		}
+		// DEGRADED KEEPS ITS COEFFICIENTS. §15.1c's presence matrix requires
+		// the fit group for ok AND degraded, and this cleared it for every
+		// status but ok — so a degraded fit produced a store that failed its
+		// own validation on the next load ("status \"degraded\" requires the
+		// fit group to be present") and cold-started instead. A degraded model
+		// is one whose residuals exceeded the ceiling, not one that has no
+		// coefficients: the numbers exist, they are what makes the degradation
+		// diagnosable, and the planner already refuses to allocate from
+		// anything but ok.
 		st.Wall.Fit = &core.WallFitGroup{
 			FixedNs:                   res.Model.FixedNs,
 			Scale:                     res.Model.Scale,
@@ -328,7 +337,12 @@ func planContextOf(doc *core.PlanDocument, runsOnLabel string, st *core.Store) (
 		}
 	}
 	for _, b := range doc.Buckets {
-		ref := walltime.PlanBucketRef{Index: b.Index}
+		ref := walltime.PlanBucketRef{Index: b.Index, EstSeconds: b.Seconds}
+		// The objective the plan optimized, so QC18 can compare the row's
+		// echo against it rather than against the row's own other field.
+		if b.AEtaNs != nil {
+			ref.AEtaNs = walltime.NanosPtr(int64(*b.AEtaNs))
+		}
 		// §15.1a's PLAN-FROZEN regressors, computed once from the plan.
 		f := planFrozen{StoreSHA256: storeSHA}
 		var terms []int64

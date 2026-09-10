@@ -196,12 +196,16 @@ func observationFixture(bucket string, index int, runID string, planDigest wallt
 		BucketName:             bucket,
 		PlanDigest:             planDigest,
 		Profile:                block,
-		EstSeconds:             10.0,
-		AEtaNs:                 walltime.NanosPtr(10_000_000_000),
-		ProcessGroupID:         "pg-1",
-		ActualRunnerName:       "runner-1",
-		ObservedRunsOnLabel:    "ubuntu-latest",
-		UnitIDs:                []string{"f0.test.ts"},
+		// NO a_eta_ns: this fixture's profile block declares the REPORTER
+		// basis, and §5.1 gives the objective to a wall-basis plan only. The
+		// fixture carried one and the schema accepted it because it agreed
+		// with est_seconds — which the assembler derives from it, so the
+		// agreement was free.
+		EstSeconds:          10.0,
+		ProcessGroupID:      "pg-1",
+		ActualRunnerName:    "runner-1",
+		ObservedRunsOnLabel: "ubuntu-latest",
+		UnitIDs:             []string{"f0.test.ts"},
 		Invocations: []walltime.Invocation{{
 			Seq: 0, Units: []string{"f0.test.ts"},
 			// Derived from the SAME argv and cwd the plan declares, through

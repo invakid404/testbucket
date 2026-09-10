@@ -186,11 +186,21 @@ func (o *Observation) Validate() error {
 	// basis there is no objective, a_eta_ns is absent, and est_seconds is the
 	// reporter estimate the plan displayed. Requiring the pair unconditionally
 	// is what forced a reporter observation to invent an objective.
-	if o.AEtaNs != nil {
+	switch {
+	case o.AEtaNs != nil && prof.EstBasis != BasisWall:
+		// ABSENT, not merely consistent. This accepted an a_eta_ns under the
+		// reporter basis whenever it agreed with est_seconds — and the
+		// assembler derives one from the other, so the agreement was free.
+		// §5.1 gives the objective to a wall-basis plan and to no other: a
+		// reporter row reporting one describes an optimization that did not
+		// happen.
+		return fmt.Errorf("a %s-basis observation carries a_eta_ns %d; the objective exists only under the wall basis",
+			prof.EstBasis, int64(*o.AEtaNs))
+	case o.AEtaNs != nil:
 		if want := Round1Seconds(int64(*o.AEtaNs)); o.EstSeconds != want {
 			return fmt.Errorf("est_seconds is %v, must be round1(a_eta_ns/1e9) = %v", o.EstSeconds, want)
 		}
-	} else if prof.EstBasis == BasisWall {
+	case prof.EstBasis == BasisWall:
 		return fmt.Errorf("a wall-basis observation carries no a_eta_ns; the objective it was planned against is what §5.1 displays")
 	}
 	if got := RuntimeProfileDigest(o.RuntimeProfile); got != o.RuntimeProfileDigest {
