@@ -1,4 +1,4 @@
-// Package walltime implements the EWJ-2R13 complete-action wall-time
+// Package walltime implements the run-bucket wall-time
 // measurement architecture: the testbucket-owned PHYSICAL envelopes (AT, VB,
 // V), their separately recorded CONTAINMENT PEERS (CPA, CPB, CPV), the
 // INDEPENDENT TRACE (VTA, VTB, VT), the frozen two-stage planning input

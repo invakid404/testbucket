@@ -60,7 +60,10 @@ func scanShipped(t *testing.T, files map[string]string, re *regexp.Regexp, exemp
 			if !re.MatchString(line) {
 				continue
 			}
-			lo, hi := i-3, i+4
+			// ONE LINE EITHER SIDE. A denial three lines away is usually
+			// about something else; requiring it adjacent is what makes the
+			// exemption mean "this sentence refuses the claim".
+			lo, hi := i-1, i+2
 			if lo < 0 {
 				lo = 0
 			}
@@ -97,10 +100,19 @@ func itoaLocal(n int) string {
 
 // negations are the phrasings a required denial uses, so a sentence that
 // forbids a claim is not convicted of making it.
+// negations exempt a hit whose own neighbourhood REFUSES the claim.
+//
+// It used to include "rather than", "asserts", "cannot", "forbid", "repair"
+// and "§16.4" over a seven-line window. Those appear in ordinary prose all
+// over this package, so a sentence that overstated the measurement was exempt
+// whenever any of them happened to sit within three lines — which is how the
+// hyphenated "complete-action" surfaces would have survived even had the
+// pattern matched them. What remains is the small set that actually denies the
+// claim, read over a window of one line either side rather than three.
 var negations = []string{
-	"never", "not the job", "is not ", "no such", "outside", "rather than",
-	"must not", "cannot", "forbid", "asserts", "fails on", "repair", "§16.4",
-	"withdrawn", "superseded", "no document", "not a proxy",
+	"never", "not the job", "is not ", "no such", "outside",
+	"must not", "no longer", "withdrawn", "superseded", "not a proxy",
+	"not the complete action", "excludes",
 }
 
 // TestNoShippedStringOverstatesTheMeasurement is §22 tests 13 and 24. It is one
@@ -118,8 +130,15 @@ func TestNoShippedStringOverstatesTheMeasurement(t *testing.T) {
 		// job says nothing about the measured interval, so the scan requires a
 		// measurement subject in the same window — otherwise it convicts
 		// unrelated prose and the real violations drown in it.
-		re := regexp.MustCompile(`(?i)complete action|whole wrapper|job's actual wall time|actual wall time of the job`)
-		subject := regexp.MustCompile(`(?i)\bA\b|\bV\b|elapsed|wall|interval|envelope|observation|est_seconds|makespan|measured`)
+		//
+		// THE SEPARATOR IS PART OF THE PATTERN. This matched "complete action"
+		// with a space and missed the hyphenated "complete-action" that every
+		// shipped surface actually used — the CLI usage, the package doc, two
+		// action inputs, the reusable workflow's input and the README heading.
+		// A punctuation variant is the same claim, so the separator is a
+		// character class rather than a literal space.
+		re := regexp.MustCompile(`(?i)complete[- ]action|whole[- ]wrapper|entire[- ]action|job's actual wall time|actual wall time of the job`)
+		subject := regexp.MustCompile(`(?i)\bA\b|\bV\b|elapsed|wall|interval|envelope|observation|est_seconds|makespan|measured|timing|duration`)
 		hits := scanShipped(t, files, re, negations)
 		var describing []string
 		for _, h := range hits {

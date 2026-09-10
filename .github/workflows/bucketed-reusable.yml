@@ -120,7 +120,7 @@ on:
       wall-time-dir:
         description: >-
           Forwarded to plan + test (runner: vitest): records directory for
-          complete-action wall-time measurement. When set, the whole Run-bucket
+          run-bucket wall-time measurement. When set, the whole Run-bucket
           action runs inside a physical envelope, and each invocation gets one
           of its own. Empty = no measurement ⇒ unchanged behavior.
         type: string

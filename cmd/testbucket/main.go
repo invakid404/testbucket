@@ -58,7 +58,7 @@ usage:
                               the plan it was fanned out from: every target
                               covered exactly as scheduled, shards and slices
                               accounted for
-  testbucket wall    <sub>    complete-action wall-time measurement: open and
+  testbucket wall    <sub>    run-bucket wall-time measurement: open and
                               close the physical action envelope, run a command
                               under a physical envelope with its own containment
                               peer and independent trace, and verify a records
@@ -234,7 +234,7 @@ func checkWallDirRunner(runnerKind, wallDir string) error {
 	if strings.TrimSpace(wallDir) == "" || runnerKind == "vitest" {
 		return nil
 	}
-	return fmt.Errorf("--wall-dir needs --runner vitest: complete-action wall-time measurement is Vitest-only today, and the Go adapter is deliberately left unchanged")
+	return fmt.Errorf("--wall-dir needs --runner vitest: run-bucket wall-time measurement is Vitest-only today, and the Go adapter is deliberately left unchanged")
 }
 
 // splitPrefixes turns a comma-separated flag into a prefix list, empty for the
@@ -778,7 +778,7 @@ func runPlan(args []string) error {
 	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly` — resolves files by glob WITHOUT importing them, immune to the multi-project `vitest list` collection deadlock) or list (`vitest list --json` — imports the module graph; only its per-test names matter, which file-granularity bucketing does not use today)")
 	vitestDiscoveryCommand := fs.String("vitest-discovery-command", "", "override discovery with a command run VERBATIM (--runner vitest): it OWNS its subcommand and flags (testbucket appends nothing) and must print the [{file}] / [{name,file}] JSON to stdout. Lets a run-wrapper that already owns `run` be paired with a separate discovery command. Empty = derive from --vitest-command + --vitest-discovery")
 	discoveryTimeout := fs.Duration("discovery-timeout", defDiscoveryTimeout, "fail-fast deadline for vitest test discovery (--runner vitest); a stalled `vitest list` errors here instead of hanging the whole job. 0 disables. Default overridable via TB_DISCOVERY_TIMEOUT")
-	wallDir := fs.String("wall-dir", "", "records directory for complete-action wall-time measurement (--runner vitest): every rendered invocation runs under `testbucket wall exec`, which gives it a physical envelope, a containment peer and an independent trace. Empty (the default) renders exactly the bytes v0.2.2 rendered")
+	wallDir := fs.String("wall-dir", "", "records directory for run-bucket wall-time measurement (--runner vitest): every rendered invocation runs under `testbucket wall exec`, which gives it its own measured envelope. A is the instrumented run-bucket interval and excludes acquisition and install. Empty (the default) renders exactly the bytes v0.2.2 rendered")
 	var excludes stringList
 	fs.Var(&excludes, "exclude-module", "module dir (glob) to leave out of the module set; repeatable, replaces the defaults")
 

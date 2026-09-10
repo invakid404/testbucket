@@ -76,7 +76,7 @@ inputs:
     default: ""
   wall-time-dir:
     description: >-
-      Optional records directory for complete-action wall-time measurement
+      Optional records directory for run-bucket wall-time measurement
       (runner: vitest). When set, every rendered invocation in the generated
       script runs under `testbucket wall exec`, so it gets its own measured
       envelope. It MUST match the

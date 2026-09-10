@@ -14,7 +14,7 @@ import (
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
-const wallUsage = `testbucket wall — complete-action wall-time measurement
+const wallUsage = `testbucket wall — run-bucket wall-time measurement
 
 usage:
   testbucket wall begin   [flags]  open the physical action envelope (AT_start)

@@ -40,7 +40,7 @@ testbucket plan   [flags]   compute K buckets and emit a GH-Actions matrix
 testbucket ingest [flags]   fold a run's timings back into the store
 testbucket whales [flags]   show the per-runnable distribution behind each split
 testbucket audit  [flags]   check a finished run's events against its plan
-testbucket wall   <sub>     complete-action wall-time measurement (opt-in)
+testbucket wall   <sub>     run-bucket wall-time measurement (opt-in)
 ```
 
 A run of the loop, by hand:
@@ -308,14 +308,21 @@ subcommand and flags; testbucket appends nothing) and must print the same
 `[{file}]` / `[{name,file}]` JSON on stdout — letting a run-wrapper be paired with
 a separate discovery command without a second façade.
 
-## Complete-action wall time
+## Run-bucket wall time
 
 Everything above balances buckets by the timing store: a rolling EWMA of what
 the *reporter* said each file took. That is a good split and a bad measurement.
-It cannot tell you how long the **action** took — install, setup, script
-preparation, every invocation and its whole process tree, the gaps between
-them, the epilogue — and a number that leaves work out cannot be the thing you
-optimise.
+It cannot tell you how long the instrumented **run-bucket** interval took —
+the setup command, script preparation, every invocation and its whole process
+tree, the gaps between them, the epilogue — and a number that leaves work out
+cannot be the thing you optimise.
+
+That interval is `A`, and it is narrower than the job and narrower than the
+action as a whole: **acquisition and install are outside it**, deliberately.
+The wrapper cannot read a clock before it exists, so measuring its own
+installation is not something an honest envelope can offer. Anything a caller
+does before `run-bucket` — checkout, toolchain setup, dependency install — is
+outside `A` too.
 
 `testbucket wall` measures that interval, and it is **opt-in**: without
 `--wall-dir` / `wall-time-dir`, every rendered byte, every matrix field and

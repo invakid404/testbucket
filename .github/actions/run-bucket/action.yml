@@ -62,7 +62,7 @@ inputs:
     default: ""
   wall-time-dir:
     description: >-
-      Optional records directory for complete-action wall-time measurement
+      Optional records directory for run-bucket wall-time measurement
       (--runner vitest). When set, the whole action runs inside a physical
       envelope: `wall begin` opens it before setup, the setup command and the
       bucket script run inside it, and `wall end` closes it after the measured
