@@ -43,7 +43,7 @@ func TestProductionObservationIngestCycle(t *testing.T) {
 			"observations":             []any{},
 		},
 	})
-	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0)
+	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0, []string{"run", "f0.test.ts"}, ".")
 	writeFixture(t, filepath.Join(obsDir, "b0.json"), observationFixture("bucket-0", 0, "run-1", planDigest))
 
 	events := filepath.Join(dir, "ev.ndjson")
@@ -119,7 +119,7 @@ func TestAnUnqualifiedObservationNeverReachesTheRing(t *testing.T) {
 
 	// §3.1's floor is A >= setup_ns + script_ns. This row breaks it, so QC7
 	// must refuse it.
-	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0)
+	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0, []string{"run", "f0.test.ts"}, ".")
 	bad := observationFixture("bucket-0", 0, "run-2", planDigest)
 	bad.ElapsedNs = 1
 	bad.SetupNs = 1_000_000_000
@@ -281,7 +281,7 @@ const sharedComparabilityKey = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 // been fanned out from, with the one invocation the fixture records. The
 // argv/cwd digests are computed the way the planner computes them, so QC6
 // compares two independently derived values rather than one value with itself.
-func writePlanFor(t *testing.T, dir, bucket string, index int) (string, walltime.Digest) {
+func writePlanFor(t *testing.T, dir, bucket string, index int, argv []string, cwd string) (string, walltime.Digest) {
 	t.Helper()
 	path := filepath.Join(dir, "shard-plan.json")
 	rp := sharedRuntimeProfile()
@@ -303,7 +303,7 @@ func writePlanFor(t *testing.T, dir, bucket string, index int) (string, walltime
 			"units": []map[string]any{{"id": "f0.test.ts", "kind": "package",
 				"packages": []string{"f0.test.ts"}, "est_seconds": 10.0}},
 			"invocations": []map[string]any{{
-				"dir": ".", "args": []string{"run", "f0.test.ts"},
+				"dir": cwd, "args": argv,
 				"desc": "f0.test.ts", "units": []string{"f0.test.ts"},
 				"selector": []string{"./f0.test.ts"},
 			}},
@@ -367,7 +367,7 @@ func TestAssembledObservationSurvivesIngest(t *testing.T) {
 		"--cwd", dir, "--", "sh", "-c", inner)
 	run("wall", "end", "--dir", records, "--terminal", "passed")
 
-	plan, _ := writePlanFor(t, dir, "bucket-0", 0)
+	plan, _ := writePlanFor(t, dir, "bucket-0", 0, []string{"sh", "-c", "true"}, dir)
 	obsFile := filepath.Join(obsDir, "bucket-0.json")
 	cmd := exec.Command(bin, "wall", "assemble-observation",
 		"--dir", records, "--shard-plan", plan, "--bucket-name", "bucket-0",
@@ -396,6 +396,75 @@ func TestAssembledObservationSurvivesIngest(t *testing.T) {
 			t.Errorf("the assembled observation carries no %s", field)
 		}
 	}
+
+	// AND IT MUST SURVIVE THE GATE IT WAS BUILT FOR.
+	//
+	// This test used to stop at the JSON shape, which is why an assembler
+	// whose every output the shipped ingest REJECTED could pass it. A producer
+	// is only correct with respect to its consumer, so the consumer runs here.
+	store := filepath.Join(dir, "store.json")
+	writeFixture(t, store, map[string]any{
+		"schema": 2, "flags": "vitest", "updated_at": "2026-09-01T00:00:00Z",
+		"units": map[string]any{"f0.test.ts": map[string]any{"seconds": 10.0, "samples": 4}},
+		"wall": map[string]any{
+			"model_version":            1,
+			"comparability_key_digest": sharedComparabilityKey,
+			"status":                   "insufficient",
+			"failure_subtype":          "migrated_no_history",
+			"observations":             []any{},
+		},
+	})
+	events := filepath.Join(dir, "ev.ndjson")
+	if err := os.WriteFile(events, []byte(
+		`{"Action":"pass","Package":"f0.test.ts","Elapsed":1}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ing := exec.Command(bin, "ingest", "--store", store, "--no-golist",
+		"--wall-observations", obsDir, "--wall-shard-plan", plan,
+		"--runs-on-label", "ubuntu-latest", events)
+	var ingErr strings.Builder
+	ing.Stderr = &ingErr
+	if err := ing.Run(); err != nil {
+		t.Fatalf("ingest of the assembled observation failed: %v\n%s", err, ingErr.String())
+	}
+	if strings.Contains(ingErr.String(), "REJECT") {
+		t.Fatalf("the shipped ingest REJECTED the shipped assembler's own output:\n%s", ingErr.String())
+	}
+
+	var saved struct {
+		Wall struct {
+			Observations []core.WallRingRow `json:"observations"`
+		} `json:"wall"`
+	}
+	sb, err := os.ReadFile(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(sb, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Wall.Observations) != 1 {
+		t.Fatalf("the assembled observation did not reach the ring (%d row(s)):\n%s",
+			len(saved.Wall.Observations), ingErr.String())
+	}
+	// THE PERSISTED REGRESSORS MUST BE THE PLAN'S, NOT THE OBSERVATION'S.
+	//
+	// The bucket's single unit weighs 10.0s, so the plan-frozen reporter sum
+	// is exactly 10e9 ns. The old row read `int64(est_seconds * 1e9)` off the
+	// observation, which under the wall basis is the model's own A_eta
+	// display — the model regressing on its own output.
+	row := saved.Wall.Observations[0]
+	if row.ReporterSumNs != 10_000_000_000 {
+		t.Errorf("reporter_sum_ns is %d, want the plan's 10000000000", row.ReporterSumNs)
+	}
+	if row.StoreSHA256 == "" {
+		t.Error("store_sha256 is empty; the plan's canonical profile carries one")
+	}
+	if row.WholeFileCount != 1 || row.SliceCount != 0 || row.IAnyWholeFile != 1 {
+		t.Errorf("topology is whole=%d slice=%d indicator=%d, want the plan's 1/0/1",
+			row.WholeFileCount, row.SliceCount, row.IAnyWholeFile)
+	}
+
 	// setup_ns is the term §3.1's floor needs and the one that was previously
 	// underivable: `wall run` recorded no interval at all.
 	if s, _ := obs["setup_ns"].(string); s == "" || s == "0" {
@@ -403,5 +472,58 @@ func TestAssembledObservationSurvivesIngest(t *testing.T) {
 	}
 	if len(obs["invocations"].([]any)) != 1 {
 		t.Errorf("the observation records %v invocations, want the one that ran", obs["invocations"])
+	}
+}
+
+// TestPlanFrozenRegressorsCountSlicesTheObservationCannotSee is the sliced half
+// of the same defect.
+//
+// Topology used to be inferred from `obs.invocations[].selector`, which the
+// production assembler leaves nil, so slice_count was structurally zero for
+// every row ever admitted and the fit's slice term could never be identified.
+// The plan's selectors are always populated, so they are what is counted.
+func TestPlanFrozenRegressorsCountSlicesTheObservationCannotSee(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shard-plan.json")
+	writeFixture(t, path, map[string]any{
+		"k": 8, "flags": "vitest", "algorithm": "karmarkar-karp",
+		"store": "test-timings.json", "est_basis": "wall",
+		"comparability_key_digest": sharedComparabilityKey,
+		"profile":                  json.RawMessage(sharedProfileBlock(t).Raw()),
+		"buckets": []map[string]any{{
+			"bucket": 0, "name": "bucket-0", "est_seconds": 999.0, "needs_node": true,
+			"units": []map[string]any{
+				{"id": "a.test.ts", "kind": "package", "packages": []string{"a.test.ts"}, "est_seconds": 1.5},
+				{"id": "b.test.ts[x]", "kind": "run-slice", "packages": []string{"b.test.ts"},
+					"run": []string{"x"}, "est_seconds": 0.25},
+			},
+			"invocations": []map[string]any{
+				{"dir": ".", "args": []string{"vitest", "run"}, "desc": "a", "units": []string{"a.test.ts"},
+					"selector": []string{"./a.test.ts"}},
+				{"dir": ".", "args": []string{"vitest", "run"}, "desc": "b", "units": []string{"b.test.ts[x]"},
+					"selector": []string{"./b.test.ts", "-t", "^x$"}},
+			},
+			"script": "vitest run\n",
+		}},
+	})
+	st := core.NewStore("vitest")
+	_, frozen, err := planContextOf(path, "ubuntu-latest", st)
+	if err != nil {
+		t.Fatalf("planContextOf: %v", err)
+	}
+	got, ok := frozen["bucket-0"]
+	if !ok {
+		t.Fatal("the plan's bucket carries no frozen regressors")
+	}
+	// 1.5s + 0.25s, through the exact rational conversion — NOT the bucket's
+	// 999.0 est_seconds, which under the wall basis is the A_eta display.
+	if got.ReporterSumNs != 1_750_000_000 {
+		t.Errorf("reporter_sum_ns is %d, want 1750000000", got.ReporterSumNs)
+	}
+	if got.WholeFiles != 1 || got.Slices != 1 {
+		t.Errorf("topology is whole=%d slice=%d, want 1 whole and 1 slice", got.WholeFiles, got.Slices)
+	}
+	if got.StoreSHA256 == "" {
+		t.Error("store_sha256 did not come off the plan's canonical profile")
 	}
 }

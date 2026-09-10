@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/invakid404/testbucket/internal/core"
+	"github.com/invakid404/testbucket/internal/nsmath"
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
@@ -28,11 +29,33 @@ import (
 // row that fails must never reach the ring at all — and putting the gate at
 // the append boundary means there is no path into the ring that skips it.
 type wallRingStore struct {
-	st    *core.Store
-	plan  walltime.PlanContext
-	ring  walltime.RingFacts
-	seq   int64
-	notes []string
+	st   *core.Store
+	plan walltime.PlanContext
+	ring walltime.RingFacts
+	// frozen carries §15.1a's PLAN-FROZEN regressors per bucket. They are the
+	// fit's inputs, and they belong to the plan rather than to the row: a
+	// value re-derived from the observation is a value the measurement could
+	// move.
+	frozen map[string]planFrozen
+	seq    int64
+}
+
+// planFrozen is the regressor triple a fit consumes, taken from the plan the
+// bucket was fanned out from.
+type planFrozen struct {
+	// ReporterSumNs is the sum of the bucket's PLAN-TIME reporter weights. It
+	// is not est_seconds: under the wall basis est_seconds is the model's
+	// A_eta display, so using it would feed the model its own output.
+	ReporterSumNs int64
+	// WholeFiles and Slices are the invocation topology the PLAN rendered.
+	// Inferring them from the observation's selectors made every invocation
+	// whole and slice_count always zero, because the assembler left selectors
+	// nil.
+	WholeFiles int
+	Slices     int
+	// StoreSHA256 is the store state the plan was built from, carried in the
+	// canonical profile.
+	StoreSHA256 string
 }
 
 // SelectedIdentities is the SELECTED trainable population, in selection order.
@@ -59,7 +82,14 @@ func (w *wallRingStore) Append(obs walltime.Observation, trainable bool) error {
 	if err := walltime.QualifyObservation(obs, w.plan, w.ring); err != nil {
 		return err
 	}
-	row := ringRowOf(obs, trainable, w.nextSeq())
+	frozen, ok := w.frozen[obs.BucketName]
+	if !ok {
+		// Without this the map miss would hand back a zero planFrozen and the
+		// row would train on reporter_sum_ns=0 — the silent shape the derived
+		// regressors had.
+		return fmt.Errorf("bucket %q is not in the shard plan, so its plan-frozen regressors are unknown", obs.BucketName)
+	}
+	row := ringRowOf(obs, trainable, w.nextSeq(), frozen)
 	// QC15 and QC16 are the ring's own admission: the three provenance
 	// identities, and a recency key that is a total order against what is
 	// already stored.
@@ -86,22 +116,15 @@ func (w *wallRingStore) nextSeq() int64 {
 
 // ringRowOf projects an observation onto the ring row §15.1a stores.
 //
-// The four model inputs — reporter_sum_ns, the whole-file indicator, the slice
-// count and the elapsed interval — are what a fit reads, so they are derived
-// from the observation's own invocation shape rather than restated by the
-// producer: a row whose shape disagreed with the invocations it describes
-// would train the model on a bucket that did not run.
-func ringRowOf(obs walltime.Observation, trainable bool, seq int64) core.WallRingRow {
-	whole, slices := 0, 0
-	for _, inv := range obs.Invocations {
-		if len(inv.Selector) > 0 && hasNameFilter(inv.Selector) {
-			slices++
-			continue
-		}
-		whole++
-	}
+// Three of the four model inputs — reporter_sum_ns, the whole-file indicator
+// and the slice count — are PLAN-FROZEN (§15.1a): they describe the workload
+// the bucket was asked to run, and they are read off the one parsed plan, not
+// off the observation. Only the elapsed interval is measured. Deriving the
+// regressors from the observation instead let the model regress on its own
+// output and on selectors the assembler never populated.
+func ringRowOf(obs walltime.Observation, trainable bool, seq int64, frozen planFrozen) core.WallRingRow {
 	indicator := 0
-	if whole > 0 {
+	if frozen.WholeFiles > 0 {
 		indicator = 1
 	}
 	return core.WallRingRow{
@@ -122,34 +145,22 @@ func ringRowOf(obs walltime.Observation, trainable bool, seq int64) core.WallRin
 		PlanDigest:             string(obs.PlanDigest),
 		ComparabilityKeyDigest: string(obs.ComparabilityKeyDigest),
 
-		ReporterSumNs: reporterSumNsOf(obs),
+		// THE PLAN'S VALUES, VERBATIM. Every one of these used to be derived
+		// from the observation: reporter_sum_ns from est_seconds through a
+		// float truncation, the topology from selectors the assembler never
+		// set, and store_sha256 not at all.
+		ReporterSumNs: frozen.ReporterSumNs,
 		IAnyWholeFile: indicator,
-		SliceCount:    slices,
+		SliceCount:    frozen.Slices,
+		StoreSHA256:   frozen.StoreSHA256,
 
 		ElapsedNs: int64(obs.ElapsedNs),
 
-		WholeFileCount:  whole,
+		WholeFileCount:  frozen.WholeFiles,
 		InvocationCount: len(obs.Invocations),
 
 		Terminal: obs.Terminal,
 	}
-}
-
-// hasNameFilter reports whether a selector carries a `-t` name filter, which
-// is what makes an invocation a name SLICE rather than a whole file.
-func hasNameFilter(selector []string) bool {
-	for _, s := range selector {
-		if s == "-t" || s == "--testNamePattern" {
-			return true
-		}
-	}
-	return false
-}
-
-// reporterSumNsOf is the bucket's reporter-work weight in nanoseconds, taken
-// from the estimate the plan displayed for it.
-func reporterSumNsOf(obs walltime.Observation) int64 {
-	return int64(obs.EstSeconds * 1e9)
 }
 
 // wallFitter is §6.8's fit, run over the ring's SELECTED trainable population
@@ -252,11 +263,12 @@ func rankSupportOf(r walltime.RankResult) []string {
 // canonical profile the plan carried, QC17 against the runtime profile it
 // declared. A context assembled from the rows would make every one of those
 // checks compare a row against itself and pass unconditionally.
-func planContextOf(planPath, runsOnLabel string, st *core.Store) (walltime.PlanContext, error) {
+func planContextOf(planPath, runsOnLabel string, st *core.Store) (walltime.PlanContext, map[string]planFrozen, error) {
 	doc, err := core.ParseShardPlan(planPath)
 	if err != nil {
-		return walltime.PlanContext{}, fmt.Errorf("--wall-shard-plan: %w", err)
+		return walltime.PlanContext{}, nil, fmt.Errorf("--wall-shard-plan: %w", err)
 	}
+	frozen := map[string]planFrozen{}
 	ctx := walltime.PlanContext{
 		Buckets:             map[string]walltime.PlanBucketRef{},
 		CoverageAuditPasses: map[string]bool{},
@@ -279,8 +291,40 @@ func planContextOf(planPath, runsOnLabel string, st *core.Store) (walltime.PlanC
 			ctx.ProfileBlock = block
 		}
 	}
+	storeSHA := ""
+	if len(doc.Profile) > 0 {
+		var prof struct {
+			StoreSHA256 string `json:"store_sha256"`
+		}
+		if err := json.Unmarshal(doc.Profile, &prof); err == nil {
+			storeSHA = prof.StoreSHA256
+		}
+	}
 	for _, b := range doc.Buckets {
 		ref := walltime.PlanBucketRef{Index: b.Index}
+		// §15.1a's PLAN-FROZEN regressors, computed once from the plan.
+		f := planFrozen{StoreSHA256: storeSHA}
+		var terms []int64
+		for _, u := range b.Units {
+			ns, err := core.ReporterNsFromSeconds(u.Seconds)
+			if err != nil {
+				return walltime.PlanContext{}, nil, fmt.Errorf("bucket %s unit %s: %w", b.Name, u.ID, err)
+			}
+			terms = append(terms, ns)
+		}
+		sum, err := nsmath.SumNs("plan_reporter_sum_ns", terms...)
+		if err != nil {
+			return walltime.PlanContext{}, nil, fmt.Errorf("bucket %s: %w", b.Name, err)
+		}
+		f.ReporterSumNs = sum
+		for _, inv := range b.Invocations {
+			if selectorHasNameFilter(inv.Selector) {
+				f.Slices++
+				continue
+			}
+			f.WholeFiles++
+		}
+		frozen[b.Name] = f
 		for _, u := range b.Units {
 			ref.UnitIDs = append(ref.UnitIDs, u.ID)
 		}
@@ -296,7 +340,20 @@ func planContextOf(planPath, runsOnLabel string, st *core.Store) (walltime.PlanC
 		// something took and never what it skipped.
 		ctx.CoverageAuditPasses[b.Name] = true
 	}
-	return ctx, nil
+	return ctx, frozen, nil
+}
+
+// selectorHasNameFilter reports whether a rendered selector carries a name
+// filter, which is what makes an invocation a name SLICE rather than a whole
+// file. It reads the PLAN's selector, which is always populated; the
+// observation's was not.
+func selectorHasNameFilter(selector []string) bool {
+	for _, s := range selector {
+		if s == "-t" || s == "--testNamePattern" {
+			return true
+		}
+	}
+	return false
 }
 
 // runtimeProfileFromMap reads the plan's declared runtime object back into the

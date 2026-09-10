@@ -478,11 +478,11 @@ func runIngest(args []string) error {
 				"observation against the plan it was fanned out from, and a context built from the " +
 				"observations themselves would compare each row against itself")
 		}
-		planCtx, err := planContextOf(*wallShardPlan, *wallRunsOnLabel, st)
+		planCtx, frozen, err := planContextOf(*wallShardPlan, *wallRunsOnLabel, st)
 		if err != nil {
 			return err
 		}
-		ring := &wallRingStore{st: st, plan: planCtx, ring: ringFactsOf(st)}
+		ring := &wallRingStore{st: st, plan: planCtx, ring: ringFactsOf(st), frozen: frozen}
 		res, err := walltime.IngestWallObservations(sources, ring, verifiedConfig, wallFitter(st))
 		if err != nil {
 			return err
