@@ -3,6 +3,7 @@ package walltime
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 )
 
 // Cache modes, dispositions and producers of contract §10.5.0. Each is a
@@ -166,16 +167,26 @@ func DeriveDisposition(d CacheDeclaration, r ProducerResult) (matchedKey, dispos
 		return "", DispositionDisabled, nil
 
 	case ProducerAction:
-		// The restore runs inside run-bucket, which reads its own step
-		// outputs, so the companion inputs must be absent — supplying both
-		// producers is rejected.
-		if companionsPresent {
-			return "", "", fmt.Errorf("cache: producer action with a companion input present; supplying two producers is rejected")
+		// The action-owned restore reports its result through the same
+		// companion fields as ProducerCaller. The absence of both is the
+		// only rejected case: it means the restore step ran but its outputs
+		// were never wired to this call, which fails closed.
+		if r.Hit == nil || r.MatchedKey == nil {
+			return "", "", fmt.Errorf("cache: producer action requires both dependency-cache-hit and dependency-cache-matched-key from the action's own restore step")
 		}
-		// An action-owned restore still has to report something; with no
-		// wire representation of its result the row fails closed rather than
-		// defaulting.
-		return "", "", fmt.Errorf("cache: producer action supplied no restore result; a scored exact-key run with no producer result fails closed")
+		hit, mk := *r.Hit, *r.MatchedKey
+		switch {
+		case hit && mk == d.DependencyCachePrimaryKey:
+			return mk, DispositionExactHit, nil
+		case !hit && mk == "":
+			return "", DispositionMiss, nil
+		case hit && mk != "" && mk != d.DependencyCachePrimaryKey:
+			return "", "", fmt.Errorf("cache: producer action prefix fallback rejected — matched key %q differs from primary key %q", mk, d.DependencyCachePrimaryKey)
+		case hit && mk == "":
+			return "", "", fmt.Errorf("cache: producer action incoherent result — hit true with an empty matched key")
+		default: // !hit && mk != ""
+			return "", "", fmt.Errorf("cache: producer action incoherent result — hit false with a non-empty matched key %q", mk)
+		}
 
 	case ProducerCaller:
 		if r.Hit == nil || r.MatchedKey == nil {
@@ -236,6 +247,22 @@ func QC14(c CacheState) error {
 	return nil
 }
 
+// validSHA256 reports whether s is a well-formed SHA-256 hex digest (exactly
+// 64 lower-case hex characters). The contract requires the shortest round-trip
+// representation, so upper-case hex and leading zeros are not an equivalence.
+func validSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 // QC14b is the record job's half: it runs over the UPLOADED ROW ONLY.
 //
 // It accepts a well-formed row whose `mongo_binary_path` does not exist on the
@@ -245,6 +272,19 @@ func QC14(c CacheState) error {
 func QC14b(c CacheState) error {
 	if err := QC14(c); err != nil {
 		return err
+	}
+	// §10.5.6: the executed-binary SHA-256 must be a well-formed lower-case hex
+	// digest. An arbitrary equal string is not a digest — the grammar prevents
+	// a future reader from misinterpreting the value.
+	if !validSHA256(c.MongoBinarySHA256) {
+		return fmt.Errorf("QC14b: mongo_binary_sha256 %q is not a well-formed 64-character lower-case hex SHA-256", c.MongoBinarySHA256)
+	}
+	// §10.5.6: the binary path must be present and absolute so a downstream
+	// reader can distinguish "no path recorded" from "root-relative path". A
+	// path that exists on another runner but is well-formed can still be
+	// validated structurally.
+	if c.MongoBinaryPath == "" || !filepath.IsAbs(c.MongoBinaryPath) {
+		return fmt.Errorf("QC14b: mongo_binary_path %q is absent or not an absolute path", c.MongoBinaryPath)
 	}
 	if !c.MongoBinaryVerifiedOnRunner {
 		return fmt.Errorf("QC14b: mongo_binary_verified_on_runner is false; a row that did not pass QC14a on its own runner is not ingestible")

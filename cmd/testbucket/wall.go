@@ -14,17 +14,6 @@ import (
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
-// verifierKeyEnv is where the verifier's own signing key is read from, for
-// the same reason the authority key is: a key on a command line is a key in
-// the process table.
-const verifierKeyEnv = walltime.VerifierKeyEnv
-
-// replayKeyEnv is the INDEPENDENT replay party's own signing key. It is a
-// separate variable from the authority key because the whole value of a replay
-// is that a different party produced it; sharing one key would make the
-// distinction editorial.
-const replayKeyEnv = walltime.ReplayKeyEnv
-
 const wallUsage = `testbucket wall — complete-action wall-time measurement
 
 usage:
@@ -63,8 +52,6 @@ type runIdentityFlags struct {
 	campaign, run, attempt, bucket string
 	repository, workflowRun        string
 	job, step, stepAttempt         string
-	stage1, stage2                 string
-	registry, verifier             string
 }
 
 func (f *runIdentityFlags) bind(fs *flag.FlagSet) {
@@ -77,10 +64,6 @@ func (f *runIdentityFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&f.job, "job", "", "GitHub job id")
 	fs.StringVar(&f.step, "step", "", "GitHub step id")
 	fs.StringVar(&f.stepAttempt, "step-attempt", "", "GitHub step attempt id")
-	fs.StringVar(&f.stage1, "stage1", "", "Stage-1 input manifest digest this run is bound to")
-	fs.StringVar(&f.stage2, "stage2", "", "Stage-2 derived-plan receipt digest this run is bound to")
-	fs.StringVar(&f.registry, "registry", "", "Aeta component-registry digest in force")
-	fs.StringVar(&f.verifier, "verifier-id", "", "delivery-bound verifier identity")
 }
 
 func (f *runIdentityFlags) identity() walltime.RunIdentity {
@@ -88,15 +71,6 @@ func (f *runIdentityFlags) identity() walltime.RunIdentity {
 		CampaignID: f.campaign, RunID: f.run, AttemptID: f.attempt, BucketID: f.bucket,
 		Repository: f.repository, WorkflowRun: f.workflowRun, Job: f.job,
 		Step: f.step, StepAttempt: f.stepAttempt,
-		Stage1: walltime.Digest(f.stage1), Stage2: walltime.Digest(f.stage2),
-		ComponentRegistry: walltime.Digest(f.registry), VerifierID: f.verifier,
-		// THE EXECUTING HOST, OBSERVED HERE. These are read from the runner's
-		// own environment on the machine that runs the row, not passed in by
-		// the caller and not taken from any attestation: a fleet's signed
-		// statement says what the fleet BOOTED, and which host executed this
-		// matrix row is a different claim. The verifier compares the two, so
-		// one statement naming a host can no longer be replayed across jobs
-		// and buckets that never ran on it.
 		RunnerName: strings.TrimSpace(os.Getenv("RUNNER_NAME")),
 		RunnerOS:   strings.TrimSpace(os.Getenv("RUNNER_OS")),
 		RunnerArch: strings.TrimSpace(os.Getenv("RUNNER_ARCH")),

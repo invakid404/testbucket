@@ -8,13 +8,17 @@ import (
 func ptrBool(v bool) *bool    { return &v }
 func ptrStr(v string) *string { return &v }
 
+// testMongoBinarySHA256 is a well-formed 64-character lower-case hex SHA-256 for
+// use in test fixtures. QC14b enforces the grammar since F8.
+const testMongoBinarySHA256 = "000000000000000000000000000000000000000000000000000000000000cafe"
+
 func declExact() CacheDeclaration {
 	return CacheDeclaration{
 		DependencyCacheMode:       CacheModeExactKey,
 		DependencyCachePrimaryKey: "pnpm-linux-abc",
 		TransformCacheMode:        CacheModeDisabled,
 		DependencyCacheProducer:   ProducerCaller,
-		ExpectedMongoBinarySHA256: "sha256:mongo",
+		ExpectedMongoBinarySHA256: testMongoBinarySHA256,
 	}
 }
 
@@ -24,7 +28,7 @@ func declDisabled() CacheDeclaration {
 		DependencyCachePrimaryKey: "",
 		TransformCacheMode:        CacheModeDisabled,
 		DependencyCacheProducer:   ProducerNone,
-		ExpectedMongoBinarySHA256: "sha256:mongo",
+		ExpectedMongoBinarySHA256: testMongoBinarySHA256,
 	}
 }
 
@@ -39,10 +43,10 @@ func stateExact(hit bool, matched string, disp string) CacheState {
 		TransformCacheMode:          d.TransformCacheMode,
 		DependencyCacheProducer:     d.DependencyCacheProducer,
 		DependencyCacheHit:          ptrBool(hit),
-		MongoBinarySHA256:           "sha256:mongo",
+		MongoBinarySHA256:           testMongoBinarySHA256,
 		MongoBinaryPath:             "/tmp/mongodb-binaries/mongod",
 		MongoBinaryVerifiedOnRunner: true,
-		ExpectedMongoBinarySHA256:   "sha256:mongo",
+		ExpectedMongoBinarySHA256:   testMongoBinarySHA256,
 	}
 }
 
@@ -53,10 +57,10 @@ func stateDisabled() CacheState {
 		DependencyCacheDisposition:  DispositionDisabled,
 		TransformCacheMode:          d.TransformCacheMode,
 		DependencyCacheProducer:     ProducerNone,
-		MongoBinarySHA256:           "sha256:mongo",
+		MongoBinarySHA256:           testMongoBinarySHA256,
 		MongoBinaryPath:             "/tmp/mongodb-binaries/mongod",
 		MongoBinaryVerifiedOnRunner: true,
-		ExpectedMongoBinarySHA256:   "sha256:mongo",
+		ExpectedMongoBinarySHA256:   testMongoBinarySHA256,
 	}
 }
 
@@ -370,11 +374,24 @@ func TestScoredCacheDeclarationTransportAndBinaryBinding(t *testing.T) {
 		}
 	})
 
-	t.Run("supplying both producers fails, never silently resolved", func(t *testing.T) {
+	t.Run("producer action uses its own restore-step outputs, never companion inputs", func(t *testing.T) {
+		// F8: DeriveDisposition now handles ProducerAction by reading the
+		// action's own restore-step Hit/MatchedKey (same fields as caller, but
+		// sourced from the action's own `actions/cache/restore` step, not a
+		// companion job). An exact hit must succeed; absent restore-step inputs
+		// must fail because the action's own step did not run.
 		d := declExact()
 		d.DependencyCacheProducer = ProducerAction
-		if _, _, err := DeriveDisposition(d, ProducerResult{Hit: ptrBool(true), MatchedKey: ptrStr("pnpm-linux-abc")}); err == nil {
-			t.Fatal("producer action with companion inputs present must fail")
+		mk, disp, err := DeriveDisposition(d, ProducerResult{Hit: ptrBool(true), MatchedKey: ptrStr("pnpm-linux-abc")})
+		if err != nil {
+			t.Fatalf("producer action exact-hit must succeed (F8): %v", err)
+		}
+		if mk != "pnpm-linux-abc" || disp != DispositionExactHit {
+			t.Fatalf("derived (%q, %q), want (pnpm-linux-abc, exact_hit)", mk, disp)
+		}
+		// Absent restore-step inputs: the action's own restore step did not run.
+		if _, _, err := DeriveDisposition(d, ProducerResult{}); err == nil {
+			t.Fatal("producer action with absent restore-step inputs must fail")
 		}
 	})
 
