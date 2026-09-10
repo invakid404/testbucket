@@ -298,7 +298,31 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 	if obs.Terminal == "" {
 		obs.Terminal = "passed"
 	}
-	obs.ExitCode = action.end.Proc.ExitCode
+	// §13's "how it ended", which was being thrown away.
+	//
+	// The action-end record carries a terminal and a reason and NO process
+	// block — an action is not a process, so `wall end` has none to record.
+	// Reading `action.end.Proc.ExitCode` therefore read the zero value, and an
+	// action that failed because its script exited 7 was serialized as
+	// `"terminal": "failed", "exit_code": 0, "failure_reason": ""`: the
+	// observation reported a failure it could not describe.
+	//
+	// The status the step actually exited with is the first non-zero one among
+	// the commands the action contained, in lifecycle order — the setup
+	// command, then the bucket script. The reason the action itself gave wins
+	// over theirs, because `wall end` is where a caller states why.
+	obs.FailureReason = action.end.Reason
+	for _, level := range []walltime.Level{walltime.LevelSetup, walltime.LevelScript} {
+		p := byLevel[level]
+		if p == nil || p.end == nil || p.end.Proc.ExitCode == 0 {
+			continue
+		}
+		obs.ExitCode = p.end.Proc.ExitCode
+		if obs.FailureReason == "" {
+			obs.FailureReason = p.end.Reason
+		}
+		break
+	}
 
 	if p := byLevel[walltime.LevelSetup]; p != nil && p.start != nil && p.end != nil {
 		obs.SetupNs = walltime.Nanos(p.end.Instant.Mono - p.start.Instant.Mono)
