@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/invakid404/testbucket/internal/core"
 	"github.com/invakid404/testbucket/internal/nsmath"
@@ -133,7 +134,7 @@ func runWallAssemble(args []string) error {
 		obs.UnitIDs = append(obs.UnitIDs, u.ID)
 	}
 
-	if err := fillIntervals(&obs, v, *dir); err != nil {
+	if err := fillIntervals(&obs, &bucket, *dir); err != nil {
 		return err
 	}
 
@@ -164,7 +165,14 @@ func runWallAssemble(args []string) error {
 	if err := obs.Validate(); err != nil {
 		return fmt.Errorf("the assembled observation is not valid: %w", err)
 	}
-	if err := atomicWriteJSON(*out, obs); err != nil {
+	// WRITTEN COMPACT, and that is not a style choice.
+	//
+	// The observation carries the plan's canonical profile block VERBATIM, and
+	// QC13 compares it byte for byte. `json.MarshalIndent` re-indents embedded
+	// raw JSON, so a pretty-printed document arrived with a reformatted block
+	// and was rejected by the one consumer it exists for. A canonical value
+	// only stays canonical if nothing on its path reformats it.
+	if err := atomicWriteJSONCompact(*out, obs); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "testbucket wall: assembled the observation for %s into %s\n", *bucketName, *out)
@@ -181,52 +189,133 @@ func planBucketNamed(doc *core.PlanDocument, name string) (core.PlanBucket, erro
 	return core.PlanBucket{}, fmt.Errorf("the plan has no bucket named %q", name)
 }
 
-// fillIntervals copies §3.1's spans out of the verified records and derives the
-// two component spans in the checked domain.
-func fillIntervals(obs *walltime.Observation, v *walltime.Verdict, dir string) error {
-	obs.ElapsedNs = walltime.Nanos(v.ActionNs)
-	obs.SetupNs = walltime.Nanos(v.SetupNs)
-	obs.ScriptNs = walltime.Nanos(v.ScriptNs)
-	obs.Terminal = v.Terminal
-	if obs.Terminal == "" {
-		obs.Terminal = "passed"
-	}
-	obs.RealtimeStart = v.StartedAt
-
+// fillIntervals derives every endpoint, identity and span from the RECORDS.
+//
+// It used to copy the three aggregate durations and leave the rest zero: the
+// action and every invocation carried `started_mono_ns` and `ended_mono_ns` of
+// 0, both boot identities empty, `realtime_end` empty, and the verifier's
+// realtime BRACKET — two instants — in the single-instant `realtime_start`.
+// The shipped ingest rejected every such document, so the assembler's whole
+// output was unusable by the only consumer it has.
+//
+// The endpoints exist in the records; nothing needed inventing. Each boundary
+// pair is read where it was written, which is also what makes the invocation
+// endpoints distinct from the envelope's — QC7 rejects an invocation that
+// reuses them, and zeroes made every one of them identical.
+func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string) error {
 	recs, err := walltime.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-	var invNs []int64
-	seq := 0
-	for _, r := range recs {
-		if r.Kind != "boundary" || r.Level != walltime.LevelInvocation {
+
+	type pair struct{ start, end *walltime.Record }
+	byLevel := map[walltime.Level]*pair{}
+	var invPairs []*pair
+	for i := range recs {
+		r := &recs[i]
+		if r.Kind != "boundary" {
 			continue
+		}
+		if r.Level == walltime.LevelInvocation {
+			if r.Boundary == "start" {
+				invPairs = append(invPairs, &pair{start: r})
+				continue
+			}
+			// Close the most recent open invocation: they nest inside the
+			// script and are written in order.
+			for j := len(invPairs) - 1; j >= 0; j-- {
+				if invPairs[j].end == nil {
+					invPairs[j].end = r
+					break
+				}
+			}
+			continue
+		}
+		p := byLevel[r.Level]
+		if p == nil {
+			p = &pair{}
+			byLevel[r.Level] = p
 		}
 		if r.Boundary == "start" {
-			continue
+			p.start = r
+		} else {
+			p.end = r
 		}
-		// One invocation per closing record, in the order the records carry.
+	}
+
+	action := byLevel[walltime.LevelAction]
+	if action == nil || action.start == nil || action.end == nil {
+		return fmt.Errorf("the records carry no closed action envelope; there is no interval to report")
+	}
+	obs.StartedMonoNs = walltime.Nanos(action.start.Instant.Mono)
+	obs.EndedMonoNs = walltime.Nanos(action.end.Instant.Mono)
+	obs.ElapsedNs = obs.EndedMonoNs - obs.StartedMonoNs
+	// ONE INSTANT EACH, taken from the record's own bracket.
+	//
+	// A record's `realtime` is a BEFORE/AFTER pair straddling the monotonic
+	// read, written as "a/b". Copying that string whole gave the observation a
+	// two-instant value in a single-instant field, and QC16 -- which parses it
+	// as the recency key -- rejected every row. The conservative edge of each
+	// bracket is the one that cannot overstate the interval: the LATER edge of
+	// the opening bracket, and the EARLIER edge of the closing one.
+	startBefore, startAfter, err := action.start.Instant.RealtimeBracket()
+	if err != nil {
+		return fmt.Errorf("action opening reading: %w", err)
+	}
+	endBefore, _, err := action.end.Instant.RealtimeBracket()
+	if err != nil {
+		return fmt.Errorf("action closing reading: %w", err)
+	}
+	_ = startBefore
+	obs.RealtimeStart = startAfter.UTC().Format(time.RFC3339Nano)
+	obs.RealtimeEnd = endBefore.UTC().Format(time.RFC3339Nano)
+	obs.BootIDStart = action.start.Instant.BootID
+	obs.BootIDEnd = action.end.Instant.BootID
+	obs.Terminal = action.end.Terminal
+	if obs.Terminal == "" {
+		obs.Terminal = "passed"
+	}
+	obs.ExitCode = action.end.Proc.ExitCode
+
+	if p := byLevel[walltime.LevelSetup]; p != nil && p.start != nil && p.end != nil {
+		obs.SetupNs = walltime.Nanos(p.end.Instant.Mono - p.start.Instant.Mono)
+	}
+	if p := byLevel[walltime.LevelScript]; p != nil && p.start != nil && p.end != nil {
+		obs.ScriptNs = walltime.Nanos(p.end.Instant.Mono - p.start.Instant.Mono)
+		if obs.ProcessGroupID == "" && p.end.Proc.PGID != 0 {
+			obs.ProcessGroupID = fmt.Sprintf("%d", p.end.Proc.PGID)
+		}
+	}
+
+	var invNs []int64
+	for seq, ip := range invPairs {
+		if ip.start == nil || ip.end == nil {
+			return fmt.Errorf("invocation %d has no closed start/end pair", seq)
+		}
 		inv := walltime.Invocation{
 			Seq:            seq,
-			ProcessGroupID: fmt.Sprintf("%d", r.Proc.PGID),
-			ExitCode:       r.Proc.ExitCode,
+			StartedMonoNs:  walltime.Nanos(ip.start.Instant.Mono),
+			EndedMonoNs:    walltime.Nanos(ip.end.Instant.Mono),
+			ElapsedNs:      walltime.Nanos(ip.end.Instant.Mono - ip.start.Instant.Mono),
+			ProcessGroupID: fmt.Sprintf("%d", ip.end.Proc.PGID),
+			ExitCode:       ip.end.Proc.ExitCode,
 		}
-		if r.Spec != nil {
-			inv.ArgvDigest = r.Spec.ArgvDigest
-			inv.CwdDigest = walltime.DigestJSONOrEmpty(r.Spec.Cwd)
+		if ip.end.Spec != nil {
+			inv.ArgvDigest = ip.end.Spec.ArgvDigest
+			inv.CwdDigest = walltime.DigestJSONOrEmpty(ip.end.Spec.Cwd)
+		}
+		// THE MEMBERSHIP COMES FROM THE PLAN. Units, selector and atoms are
+		// what the plan RENDERED; the records carry digests of them, not the
+		// lists, and an observation that omitted them left the audit with
+		// nothing to attribute the interval to.
+		if plan != nil && seq < len(plan.Invocations) {
+			pi := plan.Invocations[seq]
+			inv.Units = pi.Units
+			inv.Selector = pi.Selector
+			inv.Atoms = pi.Atoms
 		}
 		obs.Invocations = append(obs.Invocations, inv)
-		seq++
-	}
-	for i := range obs.Invocations {
-		invNs = append(invNs, int64(obs.Invocations[i].ElapsedNs))
-	}
-	if len(v.InvocationNs) == len(obs.Invocations) {
-		for i, ns := range v.InvocationNs {
-			obs.Invocations[i].ElapsedNs = walltime.Nanos(ns)
-		}
-		invNs = v.InvocationNs
+		invNs = append(invNs, int64(inv.ElapsedNs))
 	}
 	if obs.ProcessGroupID == "" && len(obs.Invocations) > 0 {
 		obs.ProcessGroupID = obs.Invocations[0].ProcessGroupID

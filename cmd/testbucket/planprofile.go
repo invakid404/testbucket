@@ -281,3 +281,23 @@ func kkPacker(units []walltime.CalibrationUnit, slots int) [][]walltime.Calibrat
 	}
 	return out
 }
+
+// atomicWriteJSONCompact writes a document WITHOUT re-indenting it, for
+// documents that carry canonical bytes another party will compare exactly.
+// Pretty-printing rewrites embedded raw JSON, which silently breaks any
+// byte-for-byte comparison downstream.
+func atomicWriteJSONCompact(path string, doc any) error {
+	b, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename %s: %w", tmp, err)
+	}
+	return nil
+}
