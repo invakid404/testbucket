@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -107,25 +108,39 @@ type ObservationSource struct {
 // same-run artifact download half of §14.1: R54 uploaded a wall artifact that
 // nothing downloaded, which is the open end of the loop ID-14 closes.
 func ReadWallObservations(dir string) ([]ObservationSource, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("read wall observations: %w", err)
-	}
+	// RECURSIVE, deliberately.
+	//
+	// This listed one level and skipped every directory. An artifact download
+	// that lands each bucket's document under its own artifact-named
+	// subdirectory then yielded NOTHING, and the caller reported "0 of 0
+	// observations", exited 0 and saved the reporter update — learning
+	// silently from no rows, which is indistinguishable from having no rows to
+	// learn from.
+	//
+	// The download layout is fixed elsewhere, and this is fixed here as well
+	// on purpose: a reader that only works for one layout makes the next
+	// layout change a silent regression rather than a loud one.
 	var out []ObservationSource
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
-			continue
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		p := filepath.Join(dir, e.Name())
+		if d.IsDir() || filepath.Ext(d.Name()) != ".json" {
+			return nil
+		}
 		b, err := os.ReadFile(p)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", p, err)
+			return fmt.Errorf("read %s: %w", p, err)
 		}
 		var obs Observation
 		if err := json.Unmarshal(b, &obs); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", p, err)
+			return fmt.Errorf("parse %s: %w", p, err)
 		}
 		out = append(out, ObservationSource{Path: p, Obs: obs})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read wall observations: %w", err)
 	}
 	// A deterministic order, so the accept/reject table is reproducible.
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })

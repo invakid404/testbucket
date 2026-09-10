@@ -563,7 +563,10 @@ runs:
         TB_CACHE_DECLARATION_FILE: ${{ inputs.cache-declaration-file }}
       run: |
         set -euo pipefail
-        out="${RUNNER_TEMP}/testbucket-observation.json"
+        # NAMED FOR ITS BUCKET. The record job merges every bucket's artifact
+        # into one directory, so a fixed name would have each upload overwrite
+        # the last and the run would learn from exactly one bucket.
+        out="${RUNNER_TEMP}/observation-${BUCKET_NAME}.json"
         args=(
           --dir "$TB_WALL_DIR"
           --shard-plan "$TB_SHARD_PLAN"
@@ -595,6 +598,6 @@ runs:
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: testbucket-wall-obs-${{ inputs.name }}-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/testbucket-observation.json
+        path: ${{ runner.temp }}/observation-${{ inputs.name }}.json
         if-no-files-found: warn
         retention-days: 14

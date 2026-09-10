@@ -528,3 +528,43 @@ func TestRecordInputReachesIngestFlags(t *testing.T) {
 		}
 	})
 }
+
+// TestObservationsAreFoundBelowArtifactSubdirectories is the V1-F1 regression.
+//
+// `actions/download-artifact` with `merge-multiple: false` puts each artifact
+// under its own name, so the documents arrive one level down. The reader
+// listed a single level and skipped directories, so ingest found nothing,
+// reported "0 of 0 observations", exited 0 and saved the reporter update —
+// learning silently from no rows, which looks exactly like having none.
+//
+// The workflow now merges into one directory AND the reader walks, because a
+// reader that only works for one layout turns the next layout change back into
+// a silent regression.
+func TestObservationsAreFoundBelowArtifactSubdirectories(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "testbucket-wall-obs-bucket-0-42-1")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	obs := buildObservation(t, false, "", "workload-1", "head-1", 0)
+	b, err := json.Marshal(obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "observation-bucket-0.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// And one at the top level, which is what a merged download produces.
+	if err := os.WriteFile(filepath.Join(root, "observation-bucket-1.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadWallObservations(root)
+	if err != nil {
+		t.Fatalf("ReadWallObservations: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("read %d observation(s), want both the nested and the top-level document; "+
+			"a reader that misses one reports 0 of 0 and exits 0", len(got))
+	}
+}
