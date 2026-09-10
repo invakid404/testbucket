@@ -537,3 +537,64 @@ runs:
           reason="the bucket step outcome was $TB_OUTCOME"
         fi
         testbucket wall end --dir "$TB_WALL_DIR" --terminal "$terminal" --reason "$reason"
+
+    # THE OBSERVATION, ASSEMBLED WHERE THE EVIDENCE IS.
+    #
+    # This is the step that was missing: the job uploaded raw record
+    # directories and the record job downloaded events and a plan, and nothing
+    # turned the two into the document `ingest` reads. `shard-plan` was
+    # declared on this action and referenced nowhere, which is why the verbatim
+    # profile copy QC13 compares had no producer.
+    #
+    # It runs AFTER `wall end`, because the closing reading is part of the
+    # interval the observation reports and an assembly inside the envelope
+    # would measure itself.
+    - name: Assemble the wall observation
+      if: always() && inputs.wall-time-dir != '' && inputs.shard-plan != ''
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        TB_SHARD_PLAN: ${{ inputs.shard-plan }}
+        BUCKET_NAME: ${{ inputs.name }}
+        TB_RUNS_ON_LABEL: ${{ inputs.runs-on-label }}
+        TB_CANDIDATE_SHA: ${{ inputs.candidate-sha }}
+        TB_WORKLOAD_COMMIT: ${{ inputs.workload-commit }}
+        TB_CAMPAIGN_ID: ${{ inputs.campaign-id }}
+        TB_CACHE_DECLARATION_FILE: ${{ inputs.cache-declaration-file }}
+      run: |
+        set -euo pipefail
+        out="${RUNNER_TEMP}/testbucket-observation.json"
+        args=(
+          --dir "$TB_WALL_DIR"
+          --shard-plan "$TB_SHARD_PLAN"
+          --bucket-name "$BUCKET_NAME"
+          --out "$out"
+          --runs-on-label "$TB_RUNS_ON_LABEL"
+          --actual-runner-name "${RUNNER_NAME:-}"
+          --repository "${GITHUB_REPOSITORY:-}"
+          --run-id "${GITHUB_RUN_ID:-}"
+          --attempt-id "${GITHUB_RUN_ATTEMPT:-}"
+          --job "${GITHUB_JOB:-}"
+          --head-sha "${GITHUB_SHA:-}"
+          --candidate-sha "$TB_CANDIDATE_SHA"
+          --workload-commit "$TB_WORKLOAD_COMMIT"
+        )
+        if [ -n "$TB_CAMPAIGN_ID" ]; then args+=(--campaign-id "$TB_CAMPAIGN_ID"); fi
+        if [ -n "$TB_CACHE_DECLARATION_FILE" ]; then
+          args+=(--cache-declaration-file "$TB_CACHE_DECLARATION_FILE")
+        fi
+        if [ -n "${TB_CACHE_STATE_FILE:-}" ]; then
+          args+=(--cache-state "$TB_CACHE_STATE_FILE")
+        fi
+        testbucket wall assemble-observation "${args[@]}"
+
+    # UNIQUELY NAMED PER BUCKET, so the record job can download every bucket's
+    # observation into one directory without them overwriting each other.
+    - name: Upload the wall observation
+      if: always() && inputs.wall-time-dir != '' && inputs.shard-plan != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: testbucket-wall-obs-${{ inputs.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/testbucket-observation.json
+        if-no-files-found: warn
+        retention-days: 14

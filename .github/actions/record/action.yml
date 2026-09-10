@@ -190,7 +190,23 @@ runs:
         # the verify step above produced, never the caller's content, so an
         # unverified config cannot reach append.
         if [ -n "${TB_WALL_OBSERVATIONS:-}" ]; then
+          # The plan and the label travel WITH the observations, because §7.1
+          # compares each row against the plan it was fanned out from -- QC6
+          # against the rendered invocations, QC13 against the profile block,
+          # QC12 against the label the run was dispatched under. Qualifying a
+          # row against a context derived from the row itself would pass
+          # unconditionally.
           extra+=(--wall-observations "$TB_WALL_OBSERVATIONS")
+          extra+=(--wall-shard-plan "$TB_SHARD_PLAN")
+          # THE LABEL COMES FROM THE JOB ENVIRONMENT, not from an input.
+          #
+          # QC12 compares the label the run was DISPATCHED under against the
+          # one each bucket OBSERVED, so ingest needs the plan-side value --
+          # and the component map does not give this action a `runs-on-label`
+          # input. A composite step inherits the job's environment, so the
+          # caller sets it there and this reads it, rather than the map being
+          # amended to fit the wiring.
+          extra+=(--runs-on-label "${TB_RUNS_ON_LABEL:-}")
         fi
         if [ -n "${TB_CAMPAIGN_CONFIG:-}" ]; then
           extra+=(--campaign-config "$TB_CAMPAIGN_CONFIG")
