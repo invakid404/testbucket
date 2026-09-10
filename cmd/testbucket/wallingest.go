@@ -82,6 +82,11 @@ func (w *wallRingStore) Append(obs walltime.Observation, trainable bool) error {
 	if err := walltime.QualifyObservation(obs, w.plan, w.ring); err != nil {
 		return err
 	}
+	// MARKED BEFORE THE ROW IS WRITTEN. The execution key is claimed the moment
+	// this observation qualifies for it, so a second observation carrying it
+	// cannot slip in behind a later failure — a key that was qualified for is
+	// taken whether or not the row that qualified reached the ring.
+	w.ring.SeenObservationKeys[walltime.ObservationKey(obs)] = true
 	frozen, ok := w.frozen[obs.BucketName]
 	if !ok {
 		// Without this the map miss would hand back a zero planFrozen and the
@@ -104,7 +109,6 @@ func (w *wallRingStore) Append(obs walltime.Observation, trainable bool) error {
 	// The ring facts move with the ring: a second row in this same invocation
 	// that duplicates an identity must be refused by the same check that
 	// refuses one duplicating a stored row.
-	w.ring.SeenObservationKeys[[4]string{obs.HeadSHA, obs.RunID, obs.RunAttempt, obs.BucketName}] = true
 	w.ring.SeenIntrinsicIDs[row.IntrinsicID()] = true
 	return nil
 }
@@ -220,9 +224,23 @@ func wallFitter(st *core.Store) walltime.Fitter {
 	}
 }
 
-// ringFactsOf builds the duplicate-identity facts QC16 and QC3 read, from the
+// ringFactsOf builds the duplicate-identity facts QC11 and QC16 read, from the
 // rows the store already holds.
-func ringFactsOf(st *core.Store) walltime.RingFacts {
+//
+// SeenObservationKeys used to be left EMPTY here, so QC11's uniqueness was
+// forgotten the moment the store was saved: two observations of one execution
+// key that differed only in job_id — a re-run of the same bucket under a new
+// job — had distinct intrinsic ids, passed QC16, and both entered the ring as
+// trainable rows, refitting the model twice for one execution.
+//
+// The row does not store bucket_name; it stores bucket_index, and §15.1a fixes
+// that field set. The name is recovered from the PLAN being ingested against,
+// which is the same plan those rows were fanned out from whenever the key can
+// actually collide: an execution key pins head_sha, run_id and run_attempt, so
+// two rows sharing it came from one run and therefore one plan, where name and
+// index are a bijection. A row whose index the plan does not name contributes
+// no key rather than a guessed one.
+func ringFactsOf(st *core.Store, plan walltime.PlanContext) walltime.RingFacts {
 	facts := walltime.RingFacts{
 		SeenObservationKeys: map[[4]string]bool{},
 		SeenIntrinsicIDs:    map[[6]string]bool{},
@@ -230,8 +248,15 @@ func ringFactsOf(st *core.Store) walltime.RingFacts {
 	if st.Wall == nil {
 		return facts
 	}
+	names := make(map[int]string, len(plan.Buckets))
+	for name, ref := range plan.Buckets {
+		names[ref.Index] = name
+	}
 	for _, r := range st.Wall.Observations {
 		facts.SeenIntrinsicIDs[r.IntrinsicID()] = true
+		if name, ok := names[r.BucketIndex]; ok {
+			facts.SeenObservationKeys[[4]string{r.HeadSHA, r.RunID, r.RunAttempt, name}] = true
+		}
 	}
 	return facts
 }

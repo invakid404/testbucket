@@ -289,6 +289,12 @@ func TestCampaignRowsNeverRefitTheModel(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			o := buildObservation(t, true, "cmp-1", "w1", "h1", i%8)
 			o.JobID = fmt.Sprintf("job-%d", i)
+			// EACH ITS OWN EXECUTION KEY. Twenty rows over eight bucket names
+			// meant twelve of them repeated (head_sha, run_id, run_attempt,
+			// bucket_name), which QC11 forbids outright — the fixture was a
+			// shape no legal run produces. Twenty diagnostics from twenty runs
+			// is the shape this subtest is about.
+			o.RunID = fmt.Sprintf("run-%d", i)
 			obs = append(obs, o)
 		}
 		writeObservations(t, dir, obs)

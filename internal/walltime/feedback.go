@@ -240,6 +240,27 @@ func IngestWallObservations(sources []ObservationSource, store RingStore, cfg *V
 	before := append([]string(nil), store.SelectedIdentities()...)
 	var res IngestResult
 
+	// QC11 IS PRECLASSIFIED OVER THE WHOLE BATCH, before anything is appended.
+	//
+	// §7.1 permits exactly one observation per execution key and says a
+	// duplicate rejects ALL rows for that key. Deciding it inside the loop
+	// made it FIRST-WINS: the first arrival was appended and refitted, and only
+	// the second was refused — so which of two contradictory measurements
+	// trained the model was decided by directory order. A key that appears
+	// more than once is unresolvable by construction, and every row carrying
+	// it is refused.
+	//
+	// Only sources that pass validation are counted, so a malformed document
+	// is reported as malformed rather than as one half of a collision on the
+	// empty key.
+	occurrences := map[[4]string]int{}
+	for _, s := range sources {
+		if s.Obs.Validate() != nil {
+			continue
+		}
+		occurrences[ObservationKey(s.Obs)]++
+	}
+
 	for _, s := range sources {
 		name := s.Obs.BucketName
 		if name == "" {
@@ -249,6 +270,15 @@ func IngestWallObservations(sources []ObservationSource, store RingStore, cfg *V
 		if err := s.Obs.Validate(); err != nil {
 			res.Decisions = append(res.Decisions, IngestDecision{
 				BucketName: name, Accepted: false, Reason: err.Error(),
+			})
+			continue
+		}
+
+		if n := occurrences[ObservationKey(s.Obs)]; n > 1 {
+			res.Decisions = append(res.Decisions, IngestDecision{
+				BucketName: name, Accepted: false,
+				Reason: fmt.Sprintf("QC11: execution key %v appears %d times in this batch; a duplicate rejects ALL rows for the key",
+					ObservationKey(s.Obs), n),
 			})
 			continue
 		}

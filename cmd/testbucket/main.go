@@ -521,7 +521,7 @@ func runIngest(args []string) error {
 		if err != nil {
 			return err
 		}
-		ring := &wallRingStore{st: st, plan: planCtx, ring: ringFactsOf(st), frozen: frozen}
+		ring := &wallRingStore{st: st, plan: planCtx, ring: ringFactsOf(st, planCtx), frozen: frozen}
 		res, err := walltime.IngestWallObservations(sources, ring, verifiedConfig, wallFitter(st))
 		if err != nil {
 			return err
