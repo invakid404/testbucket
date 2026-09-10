@@ -48,6 +48,46 @@ func TestNoProhibitedProofSymbolSurvives(t *testing.T) {
 		// which outlived the planner they configured.
 		{"type frozenPlanOptions struct", "the frozen planner's options"},
 		{"func machineClaimStore(", "the one-shot planner claim store"},
+		// The containment evidence/control schema. The practical runner owns a
+		// process group directly; this interface promised admission,
+		// membership snapshots, whole-container signalling, verified emptiness
+		// and destroy, and had no caller on the shipped path.
+		{"type Containment interface", "the containment evidence/control schema"},
+		{"func NewContainment(", "the containment factory"},
+		{"type ContainmentIdentity struct", "the containment identity schema"},
+		{"type processGroup struct", "the containment wrapper over a pgid"},
+		{"func newProcessGroupContainment(", "the unscored containment fallback"},
+		{"func awaitChild(", "the disconnected cancellation policy"},
+		{"func membershipSnapshot(", "the cgroup-membership snapshot"},
+		{"func reapExitedChild(", "the observer reaper"},
+		{"func rememberObserver(", "the observer process-handle registry"},
+		{"func observerCloseBy(", "the observer closing budget"},
+		{"func scriptHandoffPath(", "the script-containment handoff"},
+		{"func containmentSysProc(", "the containment spawn attributes"},
+		{"func joinContainment(", "the containment join"},
+	}
+	// Dead identifiers that are not declarations of their own: constants,
+	// package-level variables and struct FIELDS. A field is the shape this
+	// control has missed twice now — first the Stage-2 slot, then the
+	// always-absent containment pointer — so they are listed by name.
+	//
+	// Each is matched as a line that BEGINS with the identifier after one tab,
+	// which is a const-block entry, a var-block entry or a struct field, and
+	// never prose: a comment line begins with `//`. The tombstones that record
+	// each removal name these identifiers, and must stay legal — a removal
+	// nobody can explain in the source is one the next reader undoes.
+	prohibitedMembers := []struct{ name, why string }{
+		{"ObserverCloseGrace", "the observer closing grace"},
+		{"CancellationPolicyID", "the frozen cancellation-policy string"},
+		{"observerHandles", "the observer process-handle registry"},
+		{"observerCloseGrace", "the observer closing grace"},
+		{"PrimitiveCgroup2", "the cgroup-v2 containment primitive"},
+		{"PrimitiveProcessGroup", "the unscored containment primitive"},
+		{"ScriptHandoffKind", "the script-containment handoff document"},
+		{"Parent *ContainmentIdentity", "ExecOptions.Parent"},
+		{"JoinParent bool", "ExecOptions.JoinParent"},
+		{"Containment *ContainmentIdentity", "Record.Containment"},
+		{"Containment ContainmentIdentity", "Record.Containment"},
 	}
 	// PROHIBITED TEXT, not prohibited tags.
 	//
@@ -58,6 +98,7 @@ func TestNoProhibitedProofSymbolSurvives(t *testing.T) {
 	// name is prohibited however its options are spelled, so the tag name is
 	// matched without them.
 	prohibitedTags := []struct{ name, why string }{
+		{"containment", "the containment identity slot"},
 		{"stage2_digest", "the Stage-2 binding"},
 		{"stage1_digest", "the Stage-1 binding"},
 		{"registry_digest", "the Aeta component registry"},
@@ -132,6 +173,11 @@ func TestNoProhibitedProofSymbolSurvives(t *testing.T) {
 				if strings.Contains(src, form) {
 					t.Errorf("%s serializes %s — %s is REMOVE-classified", path, form, tag.why)
 				}
+			}
+		}
+		for _, m := range prohibitedMembers {
+			if strings.Contains(src, "\n\t"+m.name) {
+				t.Errorf("%s declares %s — %s is REMOVE-classified", path, m.name, m.why)
 			}
 		}
 		for _, e := range prohibitedEnv {

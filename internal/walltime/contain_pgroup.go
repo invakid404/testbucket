@@ -1,80 +1,19 @@
 package walltime
 
-import (
-	"fmt"
-	"os"
-	"strconv"
-	"sync"
-	"syscall"
-)
-
-// processGroup is the UNSCORED containment fallback. It records everything a
-// cgroup containment would, and its identity says plainly that it is a process
-// group: the verifier refuses to score any lifecycle it delimits, so a run on
-// a laptop or on a runner with no delegated cgroup tree produces a complete,
-// honest, ineligible receipt instead of a plausible number.
+// THE PROCESS-GROUP CONTAINMENT WRAPPER LIVED HERE.
 //
-// It is not a "degraded mode" in the usual sense. It cannot see a descendant
-// that left the group, which is precisely the escape the scored primitive
-// exists to detect, so its emptiness answer is advisory and marked as such.
-type processGroup struct {
-	mu     sync.Mutex
-	pgid   int
-	reason string
-	ident  ContainmentIdentity
-}
-
-func newProcessGroupContainment(_, reason string) (Containment, error) {
-	self := os.Getpid()
-	return &processGroup{
-		reason: reason,
-		ident: ContainmentIdentity{
-			Primitive: PrimitiveProcessGroup,
-			ID:        strconv.Itoa(self),
-		},
-	}, nil
-}
-
-func (p *processGroup) Identity() ContainmentIdentity { return p.ident }
-
-// Admit records the process group of the child. There is nothing to write:
-// membership is established by the child's own setpgid at spawn.
-func (p *processGroup) Admit(pid int) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.pgid = pid
-	p.ident.ID = strconv.Itoa(pid)
-	return nil
-}
-
-// Procs cannot enumerate a process group portably, so it reports nothing
-// rather than guessing. The verifier treats an unenumerable membership as
-// unscorable.
-func (p *processGroup) Procs() ([]int, error) { return nil, nil }
-
-// Freeze cannot be done to a process group: there is no kernel object to
-// suspend as a unit, and SIGSTOP to a group races the very fork it is meant to
-// exclude. Saying so is better than pretending, and a run on this primitive is
-// unscorable regardless.
-func (p *processGroup) Freeze(bool) error {
-	return fmt.Errorf("walltime: a process group cannot be frozen as a unit (%s)", p.reason)
-}
-
-func (p *processGroup) Signal(sig syscall.Signal) error {
-	p.mu.Lock()
-	pgid := p.pgid
-	p.mu.Unlock()
-	if pgid == 0 {
-		return nil
-	}
-	if err := syscall.Kill(-pgid, sig); err != nil && err != syscall.ESRCH {
-		return err
-	}
-	return nil
-}
-
-func (p *processGroup) Destroy() error { return nil }
-
-// Reason explains why the scored primitive was unavailable. It is carried into
-// the receipt so an ineligible run says why.
-func (p *processGroup) Reason() string { return p.reason }
+// `processGroup` implemented the removed Containment interface over a pgid:
+// Identity returned a ContainmentIdentity, Admit recorded the child's group,
+// Procs reported nothing because a process group cannot be enumerated
+// portably, Signal delivered to the negative pgid, and Destroy was a no-op.
+// It described itself as the UNSCORED fallback, which is a scoring distinction
+// the practical contract does not draw.
+//
+// The behaviour that mattered is not gone, it is direct: exec.go's
+// runOwnedChild starts the child in its own process group and calls
+// DrainGroup, which reaps the root, signals the group by negative PGID with
+// bounded escalation and drains it — §3.3's three steps, with no abstraction
+// between the runner and the group it owns.
+//
+// The file stays because the component map lists it SIMPLIFY, and a SIMPLIFY
+// path is reduced rather than deleted. There is nothing left to reduce.

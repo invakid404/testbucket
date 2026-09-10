@@ -110,22 +110,6 @@ type RunIdentity struct {
 	RunnerArch string `json:"runner_arch,omitempty"`
 }
 
-// ContainmentIdentity is the process group a record's measured tree belonged
-// to.
-//
-// It described a cgroup-v2 subtree — primitive, path, inode, boot id and the
-// root process's start identity — and every leaf serialized EMPTY once the
-// cgroup implementation was removed: records read
-// `"containment":{"primitive":"","id":""}`. What a record can still say
-// truthfully is which process group it signalled and drained, which the Proc
-// block already carries, so this type carries only what a reader can check.
-type ContainmentIdentity struct {
-	// Primitive is the containment mechanism. There is one.
-	Primitive string `json:"primitive,omitempty"`
-	// ID is the process-group id the measured tree ran under.
-	ID string `json:"id,omitempty"`
-}
-
 // ProcIdentity is the process-tree fact a record carries.
 type ProcIdentity struct {
 	PID     int    `json:"pid,omitempty"`
@@ -169,12 +153,13 @@ type Record struct {
 
 	Run  RunIdentity  `json:"run"`
 	Proc ProcIdentity `json:"proc,omitzero"`
-	// Containment is the process group the measured tree ran under. It is a
-	// POINTER so an absent one is absent: as a value it serialized `{}` on
-	// every record after the cgroup implementation was removed, which reads as
-	// "a containment exists and could not be described".
-	Containment *ContainmentIdentity `json:"containment,omitzero"`
-	Instant     Instant              `json:"instant"`
+	// The containment identity is gone. It named a cgroup-v2 subtree; as a
+	// value it serialized `{}` on every record once that implementation was
+	// removed, and as a pointer it serialized nothing while leaving the
+	// proof-era schema constructible. The process group the measured tree ran
+	// under is already in Proc.PGID, which is a fact the wrapper reads rather
+	// than a container it claims to own.
+	Instant Instant `json:"instant"`
 
 	// Spec is the invocation identity: serialised argv, cwd and selector
 	// digests. It is what makes "this V measured that invocation" checkable

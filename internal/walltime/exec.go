@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -32,46 +31,37 @@ const DefaultTimeout = 30 * time.Minute
 // wrapper had no bound and no second step — and the contract asks for the
 // bound, the escalation and the reap by name.
 const (
-	// CancellationGrace is how long the containment has to exit after the
-	// whole-containment TERM before the KILL. It is generous, because a
-	// worker flushing a report is not a defect, and FINITE, because a
-	// lifecycle that never closes must become a terminal record rather than a
-	// hung job.
-	CancellationGrace = 30 * time.Second
-	// ReapGrace bounds the wait AFTER the whole-containment KILL. Nothing
-	// survives SIGKILL, so exceeding this means the wrapper could not reap
-	// what it killed, which is itself terminal and must be recorded rather
-	// than waited on.
-	ReapGrace = 10 * time.Second
-	// ObserverCloseGrace bounds the wait for ONE observer to stop and exit,
-	// so a single stuck observer cannot spend the whole closing budget.
+	// THE POLICY, STATED HERE. It used to be restated as an exported
+	// CancellationPolicyID string "the frozen policy Stage 1 declares", so a
+	// manifest could not declare a policy the wrapper did not implement. There
+	// is no manifest, nothing read the string, and the policy is these two
+	// numbers and §3.3's three steps:
 	//
-	// The closer tears down the trace collector and then the containment peer
-	// against one shared deadline, and the first one took all of it: the
-	// second was then asked to close with no time left, its closing record was
-	// never collected, and the envelope was terminal for a missing endpoint
-	// that had nothing to do with it. Bounding each teardown separately means
-	// a stuck observer is reported as a stuck observer while the other is
-	// still proved. The overall deadline still bounds the whole close; this
-	// only stops one step consuming it.
-	ObserverCloseGrace = 15 * time.Second
+	//	on a signal or the deadline, SIGTERM the process group; SIGKILL after
+	//	CancellationGrace; the root is reaped and the group drained within
+	//	ReapGrace, and an incomplete measurement is retained as terminal.
+	//
+	// CancellationGrace is how long the group has to exit after the TERM
+	// before the KILL. It is generous, because a worker flushing a report is
+	// not a defect, and FINITE, because a lifecycle that never closes must
+	// become a terminal record rather than a hung job.
+	CancellationGrace = 30 * time.Second
+	// ReapGrace bounds the wait AFTER the KILL. Nothing survives SIGKILL, so
+	// exceeding this means the wrapper could not reap what it killed, which is
+	// itself terminal and must be recorded rather than waited on.
+	ReapGrace = 10 * time.Second
 )
-
-// CancellationPolicyID is the frozen policy Stage 1 declares. It is derived
-// from the constants above rather than written out beside them, so a manifest
-// cannot declare a policy the wrapper does not implement.
-var CancellationPolicyID = fmt.Sprintf(
-	"whole-containment SIGTERM on signal or deadline; SIGKILL after a %s grace; verified empty and reaped within %s; the incomplete receipt is retained",
-	CancellationGrace, ReapGrace)
 
 // The same two values as variables, so a test can shorten the policy without
 // waiting out a real cancellation. Production never assigns them; every
 // assignment in the tree is in a _test file, exactly as the probe hooks below
 // are.
+//
+// observerCloseGrace went with ObserverCloseGrace: it bounded the wait for one
+// observer to stop and exit, and there are no observers.
 var (
-	cancellationGrace  = CancellationGrace
-	reapGrace          = ReapGrace
-	observerCloseGrace = ObserverCloseGrace
+	cancellationGrace = CancellationGrace
+	reapGrace         = ReapGrace
 )
 
 // ExecOptions describes one physical wrapper: the exact command it starts, the
@@ -98,17 +88,6 @@ type ExecOptions struct {
 	Desc       string
 	UnitDigest Digest
 	AtomDigest Digest
-
-	// Parent, when set, is the ENCLOSING containment: this wrapper's own
-	// containment is created inside it, so a nested envelope's processes stay
-	// inside the lifecycle that is supposed to contain them.
-	Parent *ContainmentIdentity
-	// JoinParent additionally moves THIS process into the parent containment
-	// before it does any work. It is true for a script wrapper, which an
-	// Actions step starts fresh from outside the action containment, and false
-	// for an invocation wrapper, which is already inside the script
-	// containment by inheritance and would be moved OUT by joining.
-	JoinParent bool
 
 	Timeout time.Duration
 	Stdin   *os.File
@@ -422,61 +401,6 @@ func exitCodeOf(err error) int {
 	return 1
 }
 
-// awaitChild waits for the child under the frozen bounded cancellation policy.
-//
-// There are three sources of an ending and they are deliberately not
-// interchangeable: the child exiting, a signal reaching the wrapper, and the
-// deadline passing. The last two both mean "stop", and both used to mean
-// "send SIGTERM and then wait forever" — the deadline did not even reach here,
-// so a child that simply never exited hung the wrapper with no record.
-//
-// It returns what cancelled the run, what escalation was needed, and the
-// wait error (errUnreaped when the root outlived a whole-containment KILL).
-func awaitChild(cont Containment, sigs <-chan os.Signal, done <-chan error, deadline time.Time) (cancelled, escalation string, waitErr error) {
-	// Phase 0: ordinary running. The deadline is a real endpoint, not a
-	// suggestion: the contract makes a cancellation timeout terminal.
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
-	select {
-	case err := <-done:
-		return "", "", err
-	case s := <-sigs:
-		cancelled = s.String()
-	case <-timer.C:
-		escalation = "the run did not finish before its cancellation deadline"
-	}
-
-	// Phase 1: the bounded grace. TERM reaches the WHOLE containment, not just
-	// the root: a root that exits while its workers keep running has not
-	// stopped, and the containment is the only thing that names all of them.
-	_ = cont.Signal(syscall.SIGTERM)
-	grace := cancellationGrace
-	if until := time.Until(deadline); until > 0 && until < grace {
-		grace = until
-	}
-	graceTimer := time.NewTimer(grace)
-	defer graceTimer.Stop()
-	select {
-	case err := <-done:
-		return cancelled, escalation, err
-	case <-graceTimer.C:
-	}
-
-	// Phase 2: escalation. Nothing survives a whole-containment SIGKILL, and
-	// on Linux cgroup.kill makes it atomic — there is no window for a
-	// descendant to fork out from under the enumeration.
-	_ = cont.Signal(syscall.SIGKILL)
-	escalation = joinReason(escalation, "the containment did not exit within "+grace.String()+" of SIGTERM and was killed")
-	reapTimer := time.NewTimer(reapGrace)
-	defer reapTimer.Stop()
-	select {
-	case err := <-done:
-		return cancelled, escalation, err
-	case <-reapTimer.C:
-		return cancelled, escalation, errUnreaped
-	}
-}
-
 // abandonReason renders a refusal to signal as text for the record. An
 // observer that could not be ended safely is part of what happened, so it
 // travels with the terminal reason rather than being dropped on the floor.
@@ -533,29 +457,6 @@ func probeErr(hook func(string) error, dir string) error {
 		return nil
 	}
 	return hook(dir)
-}
-
-// errUnreaped is returned when the root outlived a whole-containment SIGKILL
-// long enough for the bounded reap window to expire. It is a distinct value
-// because "the child failed" and "the wrapper could not reap the child" are
-// different terminal states.
-var errUnreaped = fmt.Errorf("the root was not reaped after the whole containment was killed")
-
-// membershipSnapshot returns the containment membership at close. The LIST is
-// retained, not a count: "0 members" and "these are the members" answer
-// different questions, and only the second one lets a reader check the first.
-
-// credentialDropWait bounds how long the wrapper waits for the drop to become
-// observable. It is a spawn-and-exec of one program; a second is generous, and
-// the wait ends the moment the credential arrives.
-const credentialDropWait = time.Second
-
-func membershipSnapshot(cont Containment) ([]int, string) {
-	pids, err := cont.Procs()
-	if err != nil {
-		return nil, "cgroup.procs unreadable: " + err.Error()
-	}
-	return pids, fmt.Sprintf("cgroup.procs members at close: %d", len(pids))
 }
 
 // THE PRIVATE SIGNING CAPABILITIES ARE GONE, and with them the observers.
@@ -649,25 +550,6 @@ func scrubFileCommandSiblings(env []string) []string {
 	return out
 }
 
-// reapExitedChild collects an exited child without blocking, and reports
-// whether this pid is now gone because of it.
-//
-// WNOHANG means a live child costs one syscall and answers false; a pid that
-// is not our child answers ECHILD and also false, which leaves the callers
-// that rely on init having reaped it exactly as they were.
-func reapExitedChild(pid int) bool {
-	var status syscall.WaitStatus
-	got, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
-	if err != nil || got != pid {
-		return false
-	}
-	// REAPED, SO THE PID IS THE KERNEL'S AGAIN. The retained handle must not
-	// outlive the process it names, or the registry would go on vouching for a
-	// number that has been released for reuse.
-	forgetObserver(pid)
-	return true
-}
-
 // terminalExec retains a wrapper-level failure with its reason and no
 // duration.
 func terminalExec(w *Writer, opt ExecOptions, spec *SpecIdentity, start Instant, clock Clock, state, reason string) error {
@@ -677,24 +559,6 @@ func terminalExec(w *Writer, opt ExecOptions, spec *SpecIdentity, start Instant,
 		Spec: spec, Terminal: state, Reason: reason,
 	})
 	return fmt.Errorf("walltime: %s", reason)
-}
-
-// scriptHandoffPath is where a script wrapper leaves its containment identity
-// for the invocation wrappers its own script starts.
-func scriptHandoffPath(dir string) string { return filepath.Join(dir, "script-containment.json") }
-
-// ScriptHandoffKind identifies the handoff document.
-const ScriptHandoffKind = "tb.walltime.script-handoff/v1"
-
-func containmentName(opt ExecOptions) string {
-	base := fmt.Sprintf("tb-%s", opt.Level)
-	if opt.Run.BucketID != "" {
-		base += "-" + sanitize(opt.Run.BucketID)
-	}
-	if opt.Level == LevelInvocation {
-		base += fmt.Sprintf("-%03d", opt.Seq)
-	}
-	return base + fmt.Sprintf("-%d", os.Getpid())
 }
 
 func sanitize(s string) string {
@@ -716,64 +580,6 @@ func mustDigest(v any) Digest {
 	return d
 }
 
-// observerCloseBy is one observer's share of the closing budget: a bounded
-// grace, never beyond the envelope's own deadline.
-func observerCloseBy(deadline time.Time) time.Time {
-	grace := time.Now().Add(observerCloseGrace)
-	if grace.After(deadline) {
-		return deadline
-	}
-	return grace
-}
-
-// THE OBSERVER REGISTRY: process handles this process is still holding.
-//
-// A detached observer is reconstructed by a LATER STEP from the action state,
-// which can only carry numbers and strings. When that step runs in the same
-// process that launched the observer — a single-step action, and every test —
-// the live OS handle is still here, and it is a better answer than any pair of
-// numbers: an unreaped child holds its pid, so the handle proves ownership
-// instead of arguing for it.
-//
-// Across processes there is nothing to recover and the reconstruction falls
-// back to the (pid, start) pair, which is why that pair is still recorded.
-var observerHandles sync.Map // pid -> *os.Process
-
-func rememberObserver(p *os.Process) {
-	if p != nil {
-		observerHandles.Store(p.Pid, p)
-	}
-}
-
-// recallObserver returns the retained handle for a pid, if this process is the
-// one that launched it and has not forgotten it.
-func recallObserver(pid int) *os.Process {
-	if pid <= 0 {
-		return nil
-	}
-	if v, ok := observerHandles.Load(pid); ok {
-		if p, ok := v.(*os.Process); ok {
-			return p
-		}
-	}
-	return nil
-}
-
-// forgetObserver drops a handle once its process has been reaped, so the
-// registry cannot hand out ownership of a pid the kernel is free to reuse.
-func forgetObserver(pid int) {
-	observerHandles.Delete(pid)
-}
-
-// forgetObserverHandle drops a pid's entry only when the registry still holds
-// THIS handle for it, so a stale object cannot evict the entry belonging to a
-// different process that was registered at a recycled number.
-func forgetObserverHandle(pid int, p *os.Process) {
-	observerHandles.CompareAndDelete(pid, p)
-}
-
-// errNoChildProcess is returned when a process-group question is asked before
-// the child exists.
 var errNoChildProcess = errors.New("walltime: no child process")
 
 // procOrZero renders an absent process identity as the zero value, so a

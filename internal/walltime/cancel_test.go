@@ -1,124 +1,13 @@
 package walltime
 
 import (
-	"fmt"
 	"os"
+	"os/exec"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
-
-// recordingContainment records the signals the policy sends it and nothing
-// else. It exists so the escalation sequence can be asserted directly rather
-// than inferred from whether a real process happened to die.
-type recordingContainment struct {
-	mu   sync.Mutex
-	sent []syscall.Signal
-}
-
-func (c *recordingContainment) Identity() ContainmentIdentity { return ContainmentIdentity{ID: "test"} }
-func (c *recordingContainment) Admit(int) error               { return nil }
-
-func (c *recordingContainment) Procs() ([]int, error) { return nil, nil }
-func (c *recordingContainment) Signal(sig syscall.Signal) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.sent = append(c.sent, sig)
-	return nil
-}
-func (c *recordingContainment) Destroy() error { return nil }
-func (c *recordingContainment) signals() []syscall.Signal {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]syscall.Signal(nil), c.sent...)
-}
-
-// TestTheCancellationPolicyEscalatesExactlyOnce drives the policy directly.
-//
-// The three endings are asserted separately because they are separately
-// wrong-able: an exit needs no signal at all, a cancellation that stops in the
-// grace must NOT be killed, and one that does not must be killed and then
-// reported unreaped rather than waited on forever.
-func TestTheCancellationPolicyEscalatesExactlyOnce(t *testing.T) {
-	t.Run("a child that exits is never signalled", func(t *testing.T) {
-		withShortCancellationPolicy(t, 50*time.Millisecond, 50*time.Millisecond)
-		cont := &recordingContainment{}
-		done := make(chan error, 1)
-		done <- nil
-		cancelled, escalation, err := awaitChild(cont, make(chan os.Signal), done, time.Now().Add(time.Minute))
-		if cancelled != "" || escalation != "" || err != nil {
-			t.Fatalf("a clean exit reported cancelled=%q escalation=%q err=%v", cancelled, escalation, err)
-		}
-		if got := cont.signals(); len(got) != 0 {
-			t.Errorf("a clean exit signalled the containment: %v", got)
-		}
-	})
-
-	t.Run("a cancellation that stops inside the grace is not killed", func(t *testing.T) {
-		withShortCancellationPolicy(t, 2*time.Second, time.Second)
-		cont := &recordingContainment{}
-		sigs := make(chan os.Signal, 1)
-		done := make(chan error, 1)
-		sigs <- syscall.SIGINT
-		go func() {
-			time.Sleep(50 * time.Millisecond)
-			done <- nil
-		}()
-		cancelled, escalation, err := awaitChild(cont, sigs, done, time.Now().Add(time.Minute))
-		if cancelled == "" {
-			t.Error("the cancellation was not recorded")
-		}
-		if escalation != "" {
-			t.Errorf("a child that stopped when asked was escalated: %q", escalation)
-		}
-		if err != nil {
-			t.Errorf("err = %v", err)
-		}
-		if got := cont.signals(); len(got) != 1 || got[0] != syscall.SIGTERM {
-			t.Errorf("signals = %v, want exactly one SIGTERM", got)
-		}
-	})
-
-	t.Run("a child that ignores TERM is killed and then reported unreaped", func(t *testing.T) {
-		withShortCancellationPolicy(t, 50*time.Millisecond, 50*time.Millisecond)
-		cont := &recordingContainment{}
-		sigs := make(chan os.Signal, 1)
-		sigs <- syscall.SIGTERM
-		// A wait that never returns: the shape that used to hang the wrapper.
-		cancelled, escalation, err := awaitChild(cont, sigs, make(chan error), time.Now().Add(time.Minute))
-		if cancelled == "" {
-			t.Error("the cancellation was not recorded")
-		}
-		if !strings.Contains(escalation, "was killed") {
-			t.Errorf("escalation %q does not record the kill", escalation)
-		}
-		if err != errUnreaped {
-			t.Errorf("err = %v, want errUnreaped", err)
-		}
-		want := []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}
-		if got := cont.signals(); fmt.Sprint(got) != fmt.Sprint(want) {
-			t.Errorf("signals = %v, want %v", got, want)
-		}
-	})
-
-	t.Run("the deadline escalates on its own", func(t *testing.T) {
-		withShortCancellationPolicy(t, 50*time.Millisecond, 50*time.Millisecond)
-		cont := &recordingContainment{}
-		_, escalation, err := awaitChild(cont, make(chan os.Signal), make(chan error), time.Now().Add(20*time.Millisecond))
-		if !strings.Contains(escalation, "cancellation deadline") {
-			t.Errorf("escalation %q does not name the deadline", escalation)
-		}
-		if err != errUnreaped {
-			t.Errorf("err = %v, want errUnreaped", err)
-		}
-		want := []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}
-		if got := cont.signals(); fmt.Sprint(got) != fmt.Sprint(want) {
-			t.Errorf("signals = %v, want %v", got, want)
-		}
-	})
-}
 
 // withShortCancellationPolicy shortens the frozen bounds for the duration of
 // one test. Production never assigns them; a test that waited out the real
@@ -293,13 +182,133 @@ func TestADetachedDescendantIsKilledAndReaped(t *testing.T) {
 	}
 }
 
-// TestTheDeclaredCancellationPolicyIsTheImplementedOne: Stage 1 declares the
-// policy as an instrumentation identity, and a manifest that declared bounds
-// the wrapper does not implement would be authorising behaviour nobody wrote.
-func TestTheDeclaredCancellationPolicyIsTheImplementedOne(t *testing.T) {
-	for _, want := range []string{CancellationGrace.String(), ReapGrace.String(), "SIGTERM", "SIGKILL", "reaped"} {
-		if !strings.Contains(CancellationPolicyID, want) {
-			t.Errorf("the declared policy %q does not name %q", CancellationPolicyID, want)
+// TestTheEscalationPolicyRunsOnTheGroupTheRunnerOwns replaces a test that
+// drove a REMOVED code path.
+//
+// The escalation used to be asserted through `awaitChild(Containment, …)`
+// against a recording double that counted signals. `awaitChild` had no
+// production caller — the shipped runner reaps its root and calls DrainGroup —
+// so the sequence was proved on one implementation while another one ran. The
+// double also made "the containment was signalled" checkable without any
+// process existing, which is exactly the confidence the removal was about.
+//
+// This drives DrainGroup over a REAL process group and asserts what §3.3
+// fixes: a group that stops when asked is not escalated, the root is reaped and
+// the group confirmed empty before the drain returns, and an escape is killed
+// at once with no cooperative grace to serve.
+//
+// The TERM-IGNORING escalation is deliberately not re-asserted here.
+// TestATermIgnoringRootIsKilledAtTheGrace above already drives it end to end
+// through the shipped Exec path, which is where it matters; reproducing a
+// stubborn child in isolation depends on the host's /bin/sh honouring
+// `trap \'\' TERM`, and this one does not.
+func TestTheEscalationPolicyRunsOnTheGroupTheRunnerOwns(t *testing.T) {
+	// startGroup launches one shell in its own process group and returns the
+	// pgid plus a reap function, which is what the exec path hands DrainGroup.
+	startGroup := func(t *testing.T, script string) (int, func() error) {
+		t.Helper()
+		cmd := exec.Command("sh", "-c", script)
+		ownProcessGroup(cmd)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
 		}
+		pgid, err := childProcessGroup(cmd)
+		if err != nil || pgid <= 1 {
+			t.Fatalf("child process group = %d, %v", pgid, err)
+		}
+		return pgid, cmd.Wait
+	}
+
+	t.Run("a group that stops when asked is not killed", func(t *testing.T) {
+		// Default TERM disposition: the shell dies on the first signal.
+		pgid, reap := startGroup(t, "while :; do sleep 0.05; done")
+		out, err := DrainGroup(DrainRequest{
+			PGID: pgid, TermGrace: 5 * time.Second, KillGrace: 5 * time.Second,
+			ReapRoot: reap,
+		})
+		if err != nil {
+			t.Fatalf("DrainGroup: %v", err)
+		}
+		if !out.Signalled {
+			t.Error("the group was never signalled")
+		}
+		if out.Escalated {
+			t.Error("a group that stopped on TERM was escalated to KILL")
+		}
+		if !out.Reaped {
+			t.Error("the root was not reaped")
+		}
+	})
+
+	t.Run("the root is reaped and the group confirmed empty before returning", func(t *testing.T) {
+		// The ORDERING is the measurable content of §3.3: the caller must not
+		// take its closing reading while any member remains, so the drain does
+		// not return until the root is reaped AND the group reads empty.
+		pgid, reap := startGroup(t, "while :; do sleep 0.05; done")
+		out, err := DrainGroup(DrainRequest{
+			PGID: pgid, TermGrace: 5 * time.Second, KillGrace: 5 * time.Second,
+			ReapRoot: reap,
+		})
+		if err != nil {
+			t.Fatalf("DrainGroup: %v", err)
+		}
+		if !out.Reaped {
+			t.Error("the drain returned without reaping the root")
+		}
+		if out.Probeable && !out.GroupEmpty {
+			t.Error("the drain returned on a probeable platform without confirming an empty group")
+		}
+		if !out.Probeable && out.Limitation() == "" {
+			t.Error("a platform that cannot probe must state the limitation rather than imply an empty group")
+		}
+	})
+
+	t.Run("an escape is killed at once, with no grace to wait out", func(t *testing.T) {
+		// ImmediateKill is the ESCAPE path: the root has already been reaped,
+		// so there is nothing left to ask cooperatively.
+		pgid, reap := startGroup(t, "trap '' TERM; while :; do sleep 0.05; done")
+		start := time.Now()
+		out, err := DrainGroup(DrainRequest{
+			PGID: pgid, TermGrace: 10 * time.Second, KillGrace: 5 * time.Second,
+			ReapRoot: reap, ImmediateKill: true,
+		})
+		if err != nil {
+			t.Fatalf("DrainGroup: %v", err)
+		}
+		if !out.Escalated {
+			t.Error("an escape was not killed")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("an immediate kill waited %s; it must not serve the TERM grace", elapsed)
+		}
+	})
+}
+
+// TestTheCancellationPolicyIsStatedWhereItIsImplemented replaces an assertion
+// over a REMOVED exported string.
+//
+// `CancellationPolicyID` restated the policy as "the frozen policy Stage 1
+// declares", derived from the constants so a manifest could not declare
+// something the wrapper did not implement. There is no manifest and nothing
+// read the string. What still has to be true is that the two numbers the drain
+// actually uses are the two the package documents.
+func TestTheCancellationPolicyIsStatedWhereItIsImplemented(t *testing.T) {
+	b, err := os.ReadFile("exec.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{"SIGTERM", "SIGKILL", "CancellationGrace", "ReapGrace", "reaped"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the stated policy does not name %q", want)
+		}
+	}
+	// And the variables the drain reads ARE the declared constants, so a test
+	// shortening the policy cannot be mistaken for the shipped one.
+	if cancellationGrace != CancellationGrace {
+		t.Errorf("cancellationGrace = %s, want the declared %s", cancellationGrace, CancellationGrace)
+	}
+	if reapGrace != ReapGrace {
+		t.Errorf("reapGrace = %s, want the declared %s", reapGrace, ReapGrace)
 	}
 }

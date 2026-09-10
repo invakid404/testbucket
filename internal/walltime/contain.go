@@ -1,45 +1,26 @@
 package walltime
 
-import "syscall"
-
-// Containment primitives. Only PrimitiveCgroup2 can delimit a SCORED
-// lifecycle: it is the one primitive here whose membership the workload cannot
-// modify and whose emptiness the kernel reports as an event rather than as a
-// guess.
-const (
-	// PrimitiveCgroup2 is a dedicated cgroup-v2 subtree.
-	PrimitiveCgroup2 = "cgroup2"
-	// PrimitiveProcessGroup is the diagnostic fallback for a platform or a
-	// runner with no delegated cgroup tree. A workload can leave a process
-	// group at will, so a lifecycle delimited by one is NEVER scored — it
-	// exists so a developer run still produces an honest, complete, ineligible
-	// receipt.
-	PrimitiveProcessGroup = "process_group_unscored"
-)
-
-// Containment is the level-owned process container. The physical wrapper
-// creates it, admits the child before the child can run, and the verifier —
-// never the wrapper — decides when it is empty.
-type Containment interface {
-	// Identity is the stable containment identity every producer must name.
-	Identity() ContainmentIdentity
-	// Admit places a process in the containment. It is called BEFORE the child
-	// is allowed to execute; a child that starts first is unaccounted, which is
-	// terminal.
-	Admit(pid int) error
-	// Procs snapshots current membership.
-	//
-	// Observe and Freeze are gone with the cgroup-v2 primitive: they existed
-	// so two independent observers could each take their own raw kernel read
-	// of a containment neither could migrate out of, and there are no
-	// independent observers.
-	Procs() ([]int, error)
-	// Signal forwards a signal to every member.
-	Signal(sig syscall.Signal) error
-	// Destroy removes the containment after it is verified empty.
-	Destroy() error
-}
-
-func NewContainment(name string, parent *ContainmentIdentity) (Containment, error) {
-	return newContainment(name, parent)
-}
+// THE CONTAINMENT ABSTRACTION LIVED HERE, and this file is what is left of it.
+//
+// It declared two primitives — PrimitiveCgroup2, a dedicated cgroup-v2 subtree
+// that alone could delimit a SCORED lifecycle, and PrimitiveProcessGroup, the
+// unscored fallback — plus the exported `Containment` interface (Identity,
+// Admit, Procs, Signal, Destroy) and the `NewContainment` factory that chose
+// between them.
+//
+// The component map classifies that evidence/control schema REMOVE and says
+// the practical runner needs an internal process-group controller rather than
+// an evidence schema. It has one: exec.go's runOwnedChild puts the child in
+// its own process group at spawn and hands the group to DrainGroup, which
+// performs §3.3's three steps — reap the root, signal the group by negative
+// PGID with bounded escalation, drain it. No caller of NewContainment ever
+// existed on that path.
+//
+// What the interface promised beyond that was the proof model: admission
+// before the child can run, membership snapshots read from the kernel, whole-
+// container signalling, verified emptiness, and destroy. Those answer "can the
+// measured workload have moved itself out of what contains it", which §3's
+// trusted-CI boundary does not ask.
+//
+// The file stays because the component map lists it SIMPLIFY, and a SIMPLIFY
+// path is reduced rather than deleted. There is nothing left to reduce.
