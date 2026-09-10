@@ -716,8 +716,17 @@ func writeJSONFile(path string, v any) (err error) {
 			err = fmt.Errorf("close %s: %w", path, closeErr)
 		}
 	}()
+	// WRITTEN COMPACT, and that is not a style choice.
+	//
+	// The plan carries §13.0's canonical profile as raw bytes, and QC13
+	// compares the observation's copy against these BYTE FOR BYTE. An indenting
+	// encoder re-indents embedded raw JSON, so the artifact this planner wrote
+	// no longer held the canonical block at all: the shipped
+	// planner -> assembler -> ingest path rejected its own valid observation
+	// with "observation profile block is not the plan's block verbatim", and
+	// the learning loop appended nothing. A canonical value only stays
+	// canonical if nothing on its path reformats it.
 	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}

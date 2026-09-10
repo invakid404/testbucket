@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/invakid404/testbucket/internal/core"
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
 // These are BLACK-BOX tests: they build the shipped binary and run it, because
@@ -305,5 +309,54 @@ func TestTheWallBasisPacksAndDisplaysOneObjective(t *testing.T) {
 			t.Errorf("bucket %d displays %v s but its objective is %d ns (want %v s)",
 				bk.Index, bk.Seconds, ns, want)
 		}
+	}
+}
+
+// TestThePlanArtifactCarriesTheCanonicalProfileVerbatim is the byte path QC13
+// depends on, taken over the SHIPPED planner's own output.
+//
+// The planner wrote the shard plan with an indenting encoder. json.Indent
+// reformats embedded raw JSON, so the artifact no longer held §13.0's
+// canonical block at all: the assembler copied the block it was given, wrote
+// it compactly as a canonical value must be written, and ingest rejected the
+// row with "observation profile block is not the plan's block verbatim". Every
+// unit test passed, because every fixture was already compact.
+func TestThePlanArtifactCarriesTheCanonicalProfileVerbatim(t *testing.T) {
+	bin := planBinary(t)
+	dir := t.TempDir()
+	live := filepath.Join(dir, "live.json")
+	store := filepath.Join(dir, "store.json")
+	plan := filepath.Join(dir, "plan.json")
+	writeFixture(t, live, liveSet(8))
+	writeFixture(t, store, warmStore(8))
+
+	cmd := exec.Command(bin, "plan", "--runner", "vitest", "--count", "1", "--k", "8",
+		"--live", live, "--store", store, "--json", "--shard-plan", plan)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("plan failed: %v\n%s", err, stderr.String())
+	}
+
+	doc, err := core.ParseShardPlan(plan)
+	if err != nil {
+		t.Fatalf("ParseShardPlan: %v", err)
+	}
+	if len(doc.Profile) == 0 {
+		t.Fatal("the plan artifact carries no profile block")
+	}
+	// The bytes on disk must BE the canonical serialization of their own
+	// values — which is what an observation copies and QC13 compares.
+	var cp walltime.CanonicalProfile
+	if err := json.Unmarshal(doc.Profile, &cp); err != nil {
+		t.Fatalf("the profile block does not parse: %v\n%s", err, doc.Profile)
+	}
+	want, err := walltime.NewProfileBlock(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal([]byte(doc.Profile), want.Raw()) {
+		t.Errorf("the plan artifact's profile block is not canonical, so no observation can copy it verbatim:\n  on disk: %s\n  canonical: %s",
+			doc.Profile, want.Raw())
 	}
 }

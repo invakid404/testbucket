@@ -325,7 +325,18 @@ func writePlanDeclaring(t *testing.T, dir, bucket string, index int, argv []stri
 			"script": "vitest run f0.test.ts\n",
 		}},
 	}
-	writeFixture(t, path, doc)
+	// THROUGH THE PRODUCTION WRITER, not a compact test encoder.
+	//
+	// The plan carries the canonical profile block as raw bytes and QC13
+	// compares the observation's copy byte for byte. This fixture used to be
+	// written with json.Marshal, which happens to be compact — so the test
+	// passed while the shipped planner wrote the same document INDENTED and
+	// the shipped ingest rejected the shipped assembler's own observation. A
+	// fixture written differently from production tests a composition that
+	// does not ship.
+	if err := writeJSONFile(path, doc); err != nil {
+		t.Fatal(err)
+	}
 	// The digest QC3 compares against is the one the record job derives by
 	// PARSING the plan, so the test derives it the same way rather than
 	// hashing the bytes it just wrote.
