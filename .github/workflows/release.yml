@@ -1,0 +1,118 @@
+name: Release
+
+# THE SIMPLE RELEASE PATH.
+#
+# A `v*` tag builds the cross-platform matrix with goreleaser and publishes it.
+# That is the whole path.
+#
+# What used to sit between the build and the publish is gone: an unpublished
+# pre-release binary, a campaign gate over its digests, a second independent
+# signature over the same bytes, and a separate uploader for the gated bytes. The practical
+# contract removes that cycle, and with it the reason the build and the publish
+# were ever two steps — one build produces the bytes that ship, so the bytes
+# that were checked and the bytes that were published cannot differ.
+#
+# Third-party actions stay pinned to reviewed commit SHAs, which the component
+# map keeps independently of the proof cycle it removes.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.27"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating the release and uploading its assets.
+      contents: write
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # goreleaser derives the changelog from history, so it needs all of it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: goreleaser release
+        # The same reviewed action SHA and goreleaser version the CI dry-run
+        # uses, so `release --snapshot` there validates what actually ships.
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "2.18.0"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  alias:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    steps:
+      - name: Point v<major> at this release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Only a plain stable vMAJOR.MINOR.PATCH tag moves an alias; a
+          # pre-release (v1.2.3-rc.1) or a bare major tag does not.
+          if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag $TAG is not a stable release tag; leaving aliases untouched"
+            exit 0
+          fi
+          major="${TAG%%.*}"
+
+          # THE v0 ALIAS IS FROZEN, AND THIS JOB IS WHERE THAT PROMISE IS KEPT.
+          #
+          # A moving alias delivers whatever it points at to every consumer that
+          # pinned it, without the consumer doing anything. So an alias may only
+          # move across a compatible boundary, and 0.3.x is not one: the
+          # practical contract REMOVES inputs the reusable workflow and the
+          # composite actions used to accept — the authority, replay, registry,
+          # stage, cgroup, account-separation, key/signer and candidate-delivery
+          # surfaces. A caller still passing any of them resolves `@v0` and
+          # fails on an undeclared input.
+          #
+          # The freeze is executable rather than documentary, because a
+          # documentary promise is one publish away from being broken: this job
+          # derives the alias from the tag, so without this branch the first
+          # successful v0.3.x publish would move `v0` to it automatically.
+          #
+          # The release still publishes. The exact vMAJOR.MINOR.PATCH tag is the
+          # delivery identity a consumer re-pins to, deliberately. Lifting this
+          # is an edit here, made together with the README and the reusable
+          # workflow's compatibility text — never a side effect of publishing.
+          if [ "$major" = "v0" ]; then
+            echo "alias v0 is FROZEN across the practical-contract input removals; $TAG published, v0 deliberately not moved"
+            echo "Consumers adopt this release by pinning ${TAG} explicitly."
+            exit 0
+          fi
+
+          # The alias points at the commit this release was built from.
+          if gh api "repos/${REPO}/git/refs/tags/${major}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${REPO}/git/refs/tags/${major}" \
+              -f sha="$SHA" -F force=true >/dev/null
+            echo "moved ${major} -> ${SHA}"
+          else
+            gh api -X POST "repos/${REPO}/git/refs" \
+              -f ref="refs/tags/${major}" -f sha="$SHA" >/dev/null
+            echo "created ${major} -> ${SHA}"
+          fi

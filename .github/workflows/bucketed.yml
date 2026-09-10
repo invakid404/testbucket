@@ -95,3 +95,14 @@ jobs:
       testbucket-version: local
       working-directory: testdata/vitest-sample
       node-version: "24.19.0"
+      # THE DOGFOOD LANE MEASURES.
+      #
+      # Without this the Vitest lane exercises planning and running but never
+      # the wall-time path, so nothing in CI would notice a measured run that
+      # crashes, records no process identity, or produces an observation the
+      # record job cannot ingest. Those are exactly the failures that reached a
+      # published candidate while every green test asserted helpers.
+      #
+      # The Go lane above stays unwrapped deliberately: wall-time is
+      # Vitest-only, and `--wall-dir` with `--runner go` is refused.
+      wall-time-dir: /tmp/testbucket-wall
