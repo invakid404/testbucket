@@ -115,10 +115,8 @@ type VerifyOptions struct {
 	// Records lets a caller supply an already-loaded stream (a test, or a
 	// verifier reading from an archive rather than a directory).
 	Records []Record
-	// StepAttemptPath is the GitHub step-attempt diagnostic (A_GH). It is
-	// never a gate — GitHub reports seconds — but it is what makes the
-	// unmeasurable binary-install prefix visible instead of merely absent.
-	StepAttemptPath string
+	// StepAttemptPath, the GitHub step-attempt diagnostic (A_GH), is gone with
+	// the other eleven controls this struct accepted and VerifyDir never read.
 	// Invocations resolves the per-bucket invocation manifest: what the
 	// authorised plan rendered. Without it a measured Spec is an assertion
 	// travelling beside the plan rather than a claim checked against it.
@@ -309,17 +307,16 @@ type Verdict struct {
 	Schema string `json:"schema"`
 	Dir    string `json:"dir"`
 	// RecordsDigest binds this verdict to the EXACT records it was derived
-	// from, and VerifierBinary to the build that derived it. Without both, a
-	// campaign row is a JSON file asserting its own eligibility — and a forged
-	// one is indistinguishable from a real one.
-	RecordsDigest  Digest `json:"records_digest"`
-	VerifierBinary Digest `json:"verifier_binary"`
-	// Samples are the row's own gate observations, retained so the campaign
-	// can compute the population-wide means the contract requires. A row that
-	// discards them leaves an 80-row MAE uncomputable, and 80 individually
-	// acceptable rows can still miss it.
-	AetaSample      *AetaSample       `json:"aeta_sample,omitempty"`
-	PredictorSample []PredictorSample `json:"predictor_samples,omitempty"`
+	// from.
+	//
+	// VerifierBinary named the build that derived it, so that a verdict could
+	// not be a JSON file asserting its own eligibility. Nothing ever assigned
+	// it, so every verdict shipped `"verifier_binary": ""` — a slot where a
+	// binding belongs, which reads as a binding that could not be taken rather
+	// than as one that is not claimed. The aeta and predictor sample arrays
+	// went the same way: they fed campaign gates the practical harness does
+	// not run.
+	RecordsDigest Digest `json:"records_digest"`
 	// Audit is the exact-run coverage evidence for this bucket. A verdict
 	// without it says only that the measurement was well formed, never that
 	// the measured work was the work the plan scheduled.
@@ -353,12 +350,15 @@ type Verdict struct {
 	// `reconciliation` is gone from this document with the peer/trace ledgers:
 	// it reported like-for-like trace-minus-peer deltas, and nothing has
 	// produced a peer or a trace record since the observers were removed.
-	Eligible  bool         `json:"eligible"`
-	Envelopes []Envelope   `json:"envelopes"`
-	Phases    []Phase      `json:"phases"`
-	Gates     []GateResult `json:"gates"`
-	Findings  []Finding    `json:"findings"`
-	ActionNs  int64        `json:"action_ns"`
+	Eligible  bool       `json:"eligible"`
+	Envelopes []Envelope `json:"envelopes"`
+	// Phases and Gates carry omitempty: a practical verdict runs the six
+	// retained checks and produces neither, and an empty array reads as
+	// "evaluated, found nothing" rather than "not part of this verdict".
+	Phases   []Phase      `json:"phases,omitempty"`
+	Gates    []GateResult `json:"gates,omitempty"`
+	Findings []Finding    `json:"findings"`
+	ActionNs int64        `json:"action_ns"`
 	// ActionGHNs is A_GH: the GitHub step's own whole-second elapsed. It is a
 	// DIAGNOSTIC and never enters a gate, a balance or a prediction; it is
 	// recorded so a reader can see the action envelope against the step

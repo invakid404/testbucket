@@ -203,19 +203,15 @@ on:
           The default `ubuntu-latest` is a MOVING ALIAS and is fine for an
           unscored lane.
 
-          A SCORED arm must name an immutable image instead — a value ending in
-          a complete `@sha256:<64 hex>` or `@sha512:<128 hex>` digest — because
-          the pair's equality check compares that binding. Two arms scheduled
-          through `ubuntu-latest` can execute on two different physical images
-          while both claim the same identity. The plan job refuses a scored
-          request whose runner is an alias, before anything is planned.
-
-          RESIDUAL, DISCLOSED: GitHub does not report the image it actually
-          selected back to the job, so nothing inside the run can compare the
-          executing runner with the declared one. Refusing an alias makes the
-          asserted identity at least unambiguous and immutable; it does not make
-          it mechanically verified. Closing that needs an attested runner
-          identity GitHub does not currently expose.
+          §15.3 takes the label as given: the comparability key records the
+          runner_image_label a run was dispatched under, and QC12 compares it
+          against what each bucket observed. A digest-pinned image was once
+          required of a scored arm, on the reasoning that two arms scheduled
+          through `ubuntu-latest` may execute on two different physical images
+          while claiming one identity. That is true and it is a STATED
+          LIMITATION of a mutable label, not a requirement: §3 draws a
+          trusted-CI boundary, and nothing inside a run can compare the
+          executing runner with the declared one in any case.
         type: string
         default: ubuntu-latest
       cache-declaration-json:
@@ -507,13 +503,6 @@ jobs:
           # plan to copy the profile block from, and QC6 with no rendered
           # invocations to compare the measured ones against.
           shard-plan: ${{ inputs.wall-time-dir != '' && format('{0}/testbucket-plan/shard-plan.json', runner.temp) || '' }}
-          # Bound by the ACTION to `wall begin` and `wall end` only. It must
-          # never reach the setup command or the measured script: those are the
-          # work being attested, and a signer set the measured work can produce
-          # attests nothing.
-          # The declared secret first, so an EXTERNAL caller can supply it;
-          # the named-lookup form second, which is how an in-org caller using
-          # `secrets: inherit` passes it. Either works, neither is required.
           est-seconds: ${{ matrix.est_seconds }}
           events-dir: /tmp/testbucket-events
           version: ${{ inputs.testbucket-version }}

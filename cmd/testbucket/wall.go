@@ -82,9 +82,6 @@ func (f *runIdentityFlags) identity() walltime.RunIdentity {
 		CampaignID: f.campaign, RunID: f.run, AttemptID: f.attempt, BucketID: f.bucket,
 		Repository: f.repository, WorkflowRun: f.workflowRun, Job: f.job,
 		Step: f.step, StepAttempt: f.stepAttempt,
-		RunnerName: strings.TrimSpace(os.Getenv("RUNNER_NAME")),
-		RunnerOS:   strings.TrimSpace(os.Getenv("RUNNER_OS")),
-		RunnerArch: strings.TrimSpace(os.Getenv("RUNNER_ARCH")),
 	}
 }
 

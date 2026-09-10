@@ -94,20 +94,14 @@ type RunIdentity struct {
 	// single authorised derived plan, an Aeta registry template and a
 	// delivery-bound verifier identity, none of which exists. What identifies
 	// a record now is the run that produced it.
-	// RunnerName, RunnerOS and RunnerArch are the EXECUTING HOST as the job
-	// itself observes it — $RUNNER_NAME, $RUNNER_OS, $RUNNER_ARCH, read by the
-	// wrapper on the machine that runs the row.
-	//
-	// They exist because a fleet's signed statement says what the fleet
-	// BOOTED, and that is a different claim from which host executed this
-	// matrix row. Without an independently observed identity, one valid
-	// statement naming `runner-a` could be replayed across every job and
-	// bucket of a run — none of which need have executed on `runner-a` — and
-	// every signature check would still pass. The verifier compares the two,
-	// so the fleet's word and the row's own observation have to agree.
-	RunnerName string `json:"runner_name,omitempty"`
-	RunnerOS   string `json:"runner_os,omitempty"`
-	RunnerArch string `json:"runner_arch,omitempty"`
+	// RunnerName, RunnerOS and RunnerArch are gone. They existed to be
+	// COMPARED against a fleet's signed statement of what it had booted: an
+	// independently observed host identity is what stops one valid statement
+	// naming `runner-a` from being replayed across every job of a run. There
+	// is no fleet statement and no signature to check it against, and the
+	// runner a bucket actually ran on is already a registered §13 diagnostic
+	// on the observation — `actual_runner_name` — so repeating it on every
+	// record answered nothing the observation does not.
 }
 
 // ProcIdentity is the process-tree fact a record carries.
@@ -115,20 +109,12 @@ type ProcIdentity struct {
 	PID     int    `json:"pid,omitempty"`
 	PGID    int    `json:"pgid,omitempty"`
 	StartID string `json:"start_id,omitempty"`
-	// UID is the credential the measured process actually ran under, read from
-	// the kernel rather than declared. It is what turns the workload account
-	// from a caller's assertion into a fact: a containment owned by one
-	// credential and a measured process running under another is the boundary
-	// itself, observed.
-	UID int `json:"uid,omitempty"`
-	// GID and Groups are the process's ACTUAL group vector, read from the
-	// launched process rather than resolved from /etc files. Account
-	// resolution may go through NSS, LDAP or SSSD, so parsing /etc/group
-	// establishes what those files say and not what the process received. The
-	// kernel's own answer is what decides whether a group-writable containment
-	// excluded this process.
-	GID       int    `json:"gid,omitempty"`
-	Groups    []int  `json:"groups,omitempty"`
+	// UID, GID and Groups are gone with the credential boundary they measured.
+	// They recorded the credential and group vector the measured process
+	// actually ran under, so a verifier could decide whether a containment
+	// owned by one credential had excluded a process running as another. There
+	// is no second credential: §3's trusted-CI boundary does not ask whether
+	// the workload could have rewritten its own containment.
 	ParentPID int    `json:"ppid,omitempty"`
 	ExitKind  string `json:"exit_kind,omitempty"`
 	ExitCode  int    `json:"exit_code,omitempty"`

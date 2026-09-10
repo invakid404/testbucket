@@ -1884,7 +1884,7 @@ directions, so a field cannot be added to one without the other. There is **no l
   "runtime_profile_digest": "sha256:…",
   "terminal": "passed", "exit_code": 0, "failure_reason": "",
   "limitations": [
-    "V is the Exec-envelope interval: it contains wrapper and containment overhead, and excludes wall-exec CLI startup and the spec-file write",
+    "V is the Exec-envelope interval: it contains wrapper and process-group overhead, and excludes wall-exec CLI startup and the spec-file write",
     "invocation time includes the consumer's whole spawned command chain, not Vitest alone",
     "root child waited and reaped; process group signalled and drained where the platform permits probing. A setsid/double-forked descendant leaves the group and is neither signalled nor drained; descendants are never reaped.",
     "this is the instrumented run-bucket interval, not the complete action and not job wall time",

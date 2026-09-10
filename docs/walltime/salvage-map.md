@@ -22,10 +22,9 @@ claim cannot be produced, identified, or compared without it.
 ## exec.go — SIMPLIFY, necessary
 
 **Why necessary.** It *is* the observable. Its first monotonic reading precedes wrapper setup and
-child spawn; its closing reading follows root child wait and reap, same-PGID signal, group drain,
-observer/controller close,
-and containment teardown. That bracket is the `Exec` envelope `V` the contract names, and no other
-component can produce it.
+child spawn; its closing reading follows root child wait and reap, same-PGID signal with bounded
+escalation, and group drain — §3.3's three steps, and nothing after them. That bracket is the
+`Exec` envelope `V` the contract names, and no other component can produce it.
 
 **Keep:** the two readings and their ordering; concrete argv spawn with stdout/stderr passthrough;
 exit-status preservation; cancellation forwarding; **root wait and reap** of the one child it
@@ -44,17 +43,17 @@ file and serve the hostile-runner model that §0.1 of the contract places out of
 ## action.go — SIMPLIFY, necessary
 
 **Why necessary.** It defines the second observable, the instrumented run-bucket interval `A`:
-`BeginAction` takes the opening reading, `EndAction` the closing one after containment destroy and
-handoff removal. The contract's boundary — including what sits outside it at both ends — is stated
-against this file's actual ordering.
+`BeginAction` takes the opening reading, `EndAction` the closing one after the action-state handoff
+removal and after the measured process group has been drained. The contract's boundary — including
+what sits outside it at both ends — is stated against this file's actual ordering.
 
 **Keep:** begin/end readings and their placement relative to teardown; the action-state handoff
 between steps; terminal-state and reason recording; the rollback path that cleans up resources
 started before a failed begin.
 
 **Remove from it:** observer process startup (`BeginAction` currently launches two), peer/trace
-brackets, signing, and the sealed-directory step. The closing record write and directory seal stay
-*outside* the interval by construction and are named as such in §3.2 rather than hidden.
+brackets, signing, and the sealed-directory step. The closing record write stays *outside* the
+interval by construction and is named as such in §3.2 rather than hidden.
 
 ## record.go — SIMPLIFY, necessary but much smaller
 

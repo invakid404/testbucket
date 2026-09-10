@@ -88,6 +88,14 @@ func TestNoProhibitedProofSymbolSurvives(t *testing.T) {
 		{"JoinParent bool", "ExecOptions.JoinParent"},
 		{"Containment *ContainmentIdentity", "Record.Containment"},
 		{"Containment ContainmentIdentity", "Record.Containment"},
+		{"VerifierBinary Digest", "Verdict.VerifierBinary"},
+		{"AetaSample      *AetaSample", "Verdict.AetaSample"},
+		{"PredictorSample []PredictorSample", "Verdict.PredictorSample"},
+		{"StepAttemptPath string", "VerifyOptions.StepAttemptPath"},
+		{"RunnerName string", "Record runner identity"},
+		{"UID int", "ProcIdentity.UID"},
+		{"GID       int", "ProcIdentity.GID"},
+		{"Groups    []int", "ProcIdentity.Groups"},
 	}
 	// PROHIBITED TEXT, not prohibited tags.
 	//
@@ -99,6 +107,15 @@ func TestNoProhibitedProofSymbolSurvives(t *testing.T) {
 	// matched without them.
 	prohibitedTags := []struct{ name, why string }{
 		{"containment", "the containment identity slot"},
+		{"verifier_binary", "the verifier-binary binding"},
+		{"aeta_sample", "the Aeta gate sample"},
+		{"predictor_samples", "the predictor gate samples"},
+		{"runner_name", "the replay-comparison runner identity"},
+		{"runner_os", "the replay-comparison runner identity"},
+		{"runner_arch", "the replay-comparison runner identity"},
+		{"uid", "the credential-containment proof"},
+		{"gid", "the credential-containment proof"},
+		{"groups", "the credential-containment proof"},
 		{"stage2_digest", "the Stage-2 binding"},
 		{"stage1_digest", "the Stage-1 binding"},
 		{"registry_digest", "the Aeta component registry"},
@@ -506,5 +523,73 @@ func TestTheContractDefinesTheIntervalsItAlsoExcludes(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(contractSection(t, src, "### 0.1")), "out of scope") {
 		t.Error("§0.1 no longer states what is out of scope")
+	}
+}
+
+// TestNoShippedDescriptionPromisesRemovedMachinery is the prose half of F5.
+//
+// The semantic control reads Go declarations and serialized tags; it has never
+// read the action metadata, the reusable workflow's input documentation, or the
+// salvage map. Each of those went on describing containment peers, independent
+// traces, observer admission, credential drops, a directory seal, a signer set
+// and an attested runner identity as CURRENT behaviour, long after the code was
+// gone. A consumer reads those descriptions to decide what the action does.
+func TestNoShippedDescriptionPromisesRemovedMachinery(t *testing.T) {
+	// Phrases that describe removed machinery as something the product has.
+	// A sentence RECORDING a removal stays legal — a removal nobody can
+	// explain is one the next reader undoes — so each hit is checked against
+	// the removal vocabulary on its own line.
+	removed := []string{
+		"containment peer", "independent trace", "trace collector",
+		"observer admission", "admits it to the ACTION",
+		"attested runner identity", "being attested",
+		"directory seal", "key log",
+	}
+	explains := []string{
+		"is gone", "are gone", "went with", "used to", "no longer", "removed",
+		"is removed", "was once", "historical",
+		// The salvage map's own "Remove from it:" clauses are the removal
+		// instructions themselves. A document whose job is to say what goes
+		// must be able to name what goes.
+		"remove from it", "**remove", "delete",
+	}
+	for _, rel := range []string{
+		filepath.Join(".github", "actions", "run-bucket", "action.yml"),
+		filepath.Join(".github", "actions", "plan", "action.yml"),
+		filepath.Join(".github", "workflows", "bucketed-reusable.yml"),
+		filepath.Join("docs", "walltime", "salvage-map.md"),
+	} {
+		b, err := os.ReadFile(filepath.Join("..", "..", rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		lines := strings.Split(string(b), "\n")
+		for i, line := range lines {
+			low := strings.ToLower(line)
+			// The window is this line and the one before it, because prose
+			// wraps: "**Remove from it:** … and the key log" puts the clause
+			// and the phrase it removes on two lines. One line of context, not
+			// three — a denial further away is usually about something else.
+			ctx := low
+			if i > 0 {
+				ctx = strings.ToLower(lines[i-1]) + " " + low
+			}
+			for _, phrase := range removed {
+				if !strings.Contains(low, strings.ToLower(phrase)) {
+					continue
+				}
+				explained := false
+				for _, e := range explains {
+					if strings.Contains(ctx, e) {
+						explained = true
+						break
+					}
+				}
+				if !explained {
+					t.Errorf("%s:%d describes %q as current behaviour: %s",
+						rel, i+1, phrase, strings.TrimSpace(line))
+				}
+			}
+		}
 	}
 }

@@ -151,10 +151,9 @@ runs:
       run: bash "${{ github.action_path }}/../install-testbucket.sh"
 
     # AT_start. This is the FIRST action-owned operation, and it is first in
-    # the step list for that reason: the containment, the two observer
-    # processes and their admission handshakes are all real action time, and
-    # anything this action did before them would be action-owned work outside
-    # the interval that claims to contain it.
+    # the step list for that reason: anything this action did before the
+    # opening reading would be action-owned work outside the interval that
+    # claims to contain it.
     #
     # The wrapper must therefore already be on PATH — a measured caller runs
     # the `install` action first. A missing wrapper fails here, before the
@@ -189,13 +188,13 @@ runs:
     # splicing it into a run: line is how a workflow grows an injection. `-e` so a
     # failed provisioning step fails the bucket instead of leaking into the tests.
     #
-    # Under measurement it runs through `wall run`, which admits it to the ACTION
-    # containment first: setup is real action-owned work, and work outside the
-    # containment is work the trace cannot see.
+    # Under measurement it runs through `wall run`, which records its own setup
+    # lifecycle inside the action interval: setup is real action-owned work,
+    # and §3.1's floor is A >= setup_ns + script_ns.
     # THE ACTION-OWNED PRECHECKS RUN INSIDE THE ENVELOPE.
     #
     # They used to run BEFORE `wall begin`. §3.2 lists what may sit outside A
-    # -- the wrapper install, the closing record write, the directory seal --
+    # -- the wrapper install and the closing record write --
     # and these are not on it: verifying the declaration, validating the
     # producer and hashing the executed MongoDB binary are action-owned work,
     # so an interval that excluded them was not the complete run-bucket action
@@ -522,25 +521,19 @@ runs:
       run: |
         set -euo pipefail
         # Under measurement, EVERYTHING this step owns runs inside one
-        # `wall run`, which admits itself to the action containment before
-        # spawning its child — so the child, and everything the child starts,
-        # inherits that cgroup.
-        #
-        # Preparing here and wrapping only the script would not work: this
-        # Actions shell is already running, `wall run` moves only its own
-        # process, and a child cannot retroactively admit its parent. The
-        # preparation would sit inside A's clock interval while the peer and
-        # the trace never saw it.
+        # `wall run --wrapper-chain`, which hands off to the script's own
+        # measured envelope. The script and each rendered invocation are
+        # measured by `wall exec`, which starts its child in its OWN process
+        # group and hands that group to the drain: §3.3's root wait/reap,
+        # negative-PGID signal with bounded escalation, and group drain.
         #
         # The measured body is single-quoted, so the generated script is never
         # spliced into a command line; the inner shell reads it from the
         # environment, exactly as the unmeasured path does.
-        # THE CREDENTIAL DROPS HAPPEN INSIDE THE WRAPPER, at both measured
-        # levels. This shell must not wrap anything: the wrapper chain needs
-        # the credential that can create and admit containments and write the
-        # evidence directory, and each measured process tree drops from it —
-        # the bucket script to TB_WALL_SCRIPT_USER, the test code inside each
-        # invocation to TB_WALL_WORKLOAD_USER.
+        # THE CREDENTIAL DROPS ARE GONE with the containment they served. Each
+        # measured process tree used to drop to a separate account so a
+        # verifier could decide whether the workload could rewrite its own
+        # containment; §3's trusted-CI boundary does not ask that.
         #
         # A guard here used to build a `sudo` prefix from two variables that no
         # longer exist — one belonging to the removed supervisor, one never
@@ -631,7 +624,8 @@ runs:
         set -e
         exit "$status"
 
-    # AT_end, after verified-empty containment. It runs even when the bucket
+    # AT_end, taken after the measured process group has been drained. It runs
+    # even when the bucket
     # failed: a failed bucket is still a complete measurement of a failed
     # bucket, and an envelope left open would be a missing row rather than a
     # recorded failure.
@@ -640,14 +634,8 @@ runs:
       shell: bash
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
-        # The account the MEASURED WORK runs under. The wrapper stays as this
-        # step's user, which may write the delegated subtree; the measured
-        # command is executed as this account, which may not. Empty means no
-        # boundary was established, and the row is recorded in full and
-        # reported INELIGIBLE rather than scored.
-        # The run key again, scoped to THIS step. `wall end` seals the exact
-        # bytes of every stream and of the key log with it, after the measured
-        # script has finished and in a step that script was never in.
+        # `wall end` takes the closing reading in a step the measured script
+        # was never in, which is why the outcome has to be passed to it.
         TB_OUTCOME: ${{ steps.run.outcome }}
       run: |
         set -euo pipefail

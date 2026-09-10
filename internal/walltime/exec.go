@@ -237,8 +237,6 @@ func runOwnedChild(opt ExecOptions, deadline time.Time, clock Clock) (code int, 
 		PGID:      pgid,
 		StartID:   processStartID(cmd.Process.Pid),
 		ParentPID: os.Getpid(),
-		UID:       os.Getuid(),
-		GID:       os.Getgid(),
 	}
 	if pgidErr != nil {
 		// A platform that cannot report the group is a stated limitation, not

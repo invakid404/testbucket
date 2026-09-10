@@ -232,7 +232,7 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 		pgid, _ := childProcessGroup(cmd)
 		proc = ProcIdentity{
 			PID: cmd.Process.Pid, PGID: pgid, StartID: processStartID(cmd.Process.Pid),
-			ParentPID: os.Getpid(), UID: os.Getuid(), GID: os.Getgid(),
+			ParentPID: os.Getpid(),
 		}
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()

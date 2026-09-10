@@ -27,8 +27,9 @@ type renderConfig struct {
 	// heaviest file than its sum — for using more of a runner's cores.
 	fileParallelism int
 	// wallDir, when set, runs each invocation under `testbucket wall exec` so
-	// it gets a physical envelope (V), a containment peer (CPV) and an
-	// independent trace (VT). Empty — the default — renders exactly the bytes
+	// it gets its own measured envelope (V): a monotonic reading before the
+	// child is started, and one after its process group has been signalled and
+	// drained. Empty — the default — renders exactly the bytes
 	// v0.2.2 rendered: measurement is opt-in, and a consumer that does not ask
 	// for it sees no change at all.
 	wallDir string
