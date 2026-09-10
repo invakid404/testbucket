@@ -73,6 +73,11 @@ jobs:
       cache-scope: dogfood
       testbucket-version: local
       go-version: "1.27"
+      # SUPPLIED, NOT DEFAULTED. One input schedules the jobs and identifies
+      # the runner in the comparability key; QC12 rejects an empty observed
+      # label unconditionally, so the value the dogfood lane runs under is
+      # stated here rather than left to a default nobody reads.
+      runs-on-label: ubuntu-latest
 
   # ---------------------------------------------------------------------------
   # Bucketed (Vitest): the SAME reusable workflow driving the Vitest adapter over
@@ -95,6 +100,10 @@ jobs:
       testbucket-version: local
       working-directory: testdata/vitest-sample
       node-version: "24.19.0"
+      # Same input, same reason: see the `bucketed` job above. The Vitest lane
+      # is the one that MEASURES, so an empty label here would mean the dogfood
+      # observation could never qualify.
+      runs-on-label: ubuntu-latest
       # THE DOGFOOD LANE MEASURES.
       #
       # Without this the Vitest lane exercises planning and running but never

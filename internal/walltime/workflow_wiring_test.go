@@ -609,3 +609,71 @@ func TestTheRecordActionCarriesTheComparabilityKeyOnEveryIngest(t *testing.T) {
 			"a reporter-only ingest over a schema-1 store then has no key and cannot migrate")
 	}
 }
+
+// TestTheReusableWorkflowSchedulesAndIdentifiesWithOneExpression is F2.
+//
+// Jobs ran on a `runs-on` input that defaulted to `ubuntu-latest` while plan,
+// run and record identity came from a separate `runs-on-label` that defaulted
+// to EMPTY — and QC12 rejects an empty observed label unconditionally. This
+// repository's own default measured run therefore could not qualify or train,
+// whatever it measured, and no test noticed because every test passes an
+// explicit label.
+//
+// One input now does both, so the two cannot come apart again.
+func TestTheReusableWorkflowSchedulesAndIdentifiesWithOneExpression(t *testing.T) {
+	wf := readRepoFile(t, ".github/workflows/bucketed-reusable.yml")
+
+	// Every job schedules on the identity expression.
+	sched := regexp.MustCompile(`(?m)^    runs-on:\s*(.+)$`)
+	found := sched.FindAllStringSubmatch(wf, -1)
+	if len(found) == 0 {
+		t.Fatal("the reusable workflow schedules no jobs")
+	}
+	for _, m := range found {
+		if got := strings.TrimSpace(m[1]); got != "${{ inputs.runs-on-label }}" {
+			t.Errorf("a job schedules on %q; scheduling and identity must be the one expression", got)
+		}
+	}
+	// And there is no second scheduling input left to diverge from it.
+	if regexp.MustCompile(`(?m)^      runs-on:\s*$`).MatchString(wf) {
+		t.Error("a separate `runs-on` input still exists; two inputs is how the label came apart")
+	}
+
+	// THE DEFAULT PATH MUST PASS QC12. The label the workflow uses when a
+	// caller supplies nothing is read out of the file and put through the
+	// production check, rather than asserted to be non-empty.
+	label := workflowInputDefault(t, wf, "runs-on-label")
+	if label == "" {
+		t.Fatal("runs-on-label has no default; the default measured run records an empty label and QC12 refuses it")
+	}
+	if err := QC12(label, label, 1); err != nil {
+		t.Errorf("the default reusable-workflow path fails QC12: %v", err)
+	}
+
+	// The repository's own caller supplies it explicitly rather than relying on
+	// the default, because a default nobody reads is how the empty value
+	// survived.
+	caller := readRepoFile(t, ".github/workflows/bucketed.yml")
+	if n := strings.Count(caller, "runs-on-label:"); n < 2 {
+		t.Errorf("bucketed.yml passes runs-on-label to %d of its two reusable-workflow jobs", n)
+	}
+}
+
+// workflowInputDefault reads the `default:` of one workflow_call input.
+func workflowInputDefault(t *testing.T, wf, name string) string {
+	t.Helper()
+	at := regexp.MustCompile(`(?m)^      ` + regexp.QuoteMeta(name) + `:\s*$`).FindStringIndex(wf)
+	if at == nil {
+		t.Fatalf("the workflow declares no %q input", name)
+	}
+	rest := wf[at[1]:]
+	// The next input begins at the same indentation; stop there.
+	if next := regexp.MustCompile(`(?m)^      [a-z0-9-]+:\s*$`).FindStringIndex(rest); next != nil {
+		rest = rest[:next[0]]
+	}
+	m := regexp.MustCompile(`(?m)^        default:\s*(.*)$`).FindStringSubmatch(rest)
+	if m == nil {
+		return ""
+	}
+	return strings.Trim(strings.TrimSpace(m[1]), `"'`)
+}

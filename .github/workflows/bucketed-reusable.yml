@@ -129,27 +129,6 @@ on:
         description: 'Campaign identity stamped on every wall-time record.'
         type: string
         default: ""
-      runs-on:
-        description: >-
-          Runner label for every job. The default `ubuntu-latest` is a MOVING
-          ALIAS and is fine for an unscored lane.
-
-          A SCORED arm must name an immutable image instead — a value ending in
-          a complete `@sha256:<64 hex>` or `@sha512:<128 hex>` digest — because
-          the Stage-1 manifest binds a runner image and the pair's equality
-          check compares that binding. Two arms scheduled through
-          `ubuntu-latest` can execute on two different physical images while
-          both signed manifests claim the same identity. The plan job refuses a
-          scored request whose runner is an alias, before anything is planned.
-
-          RESIDUAL, DISCLOSED: GitHub does not report the image it actually
-          selected back to the job, so nothing inside the run can compare the
-          executing runner with `Consumer.RunnerImage`. Refusing an alias makes
-          the asserted identity at least unambiguous and immutable; it does not
-          make it mechanically verified. Closing that needs an attested runner
-          identity GitHub does not currently expose.
-        type: string
-        default: ubuntu-latest
 
 # EXPLICIT, EXECUTABLE JOB PERMISSIONS — and a versioned boundary.
 #
@@ -207,11 +186,38 @@ on:
         default: ""
       runs-on-label:
         description: >-
-          The caller's resolved `runs-on` label. No context yields it inside a
-          composite action, so the caller passes it to both `plan` and
-          `run-bucket`; QC12 compares the two (AD-8).
+          The runner label. ONE INPUT SCHEDULES AND IDENTIFIES: every job's
+          `runs-on` is this value, and it is also what `plan`, `run-bucket` and
+          `record` record as the comparability key's `runner_image_label` and
+          the observation's `observed_runs_on_label` (AD-8).
+
+          They used to be two inputs. Jobs ran on a `runs-on` that defaulted to
+          `ubuntu-latest` while identity came from a `runs-on-label` that
+          defaulted to EMPTY, and QC12 rejects an empty observed label
+          unconditionally — so this repository's own default measured run could
+          never qualify or train, whatever it measured. No context inside a
+          composite action yields the resolved label, which is why it has to be
+          passed at all; passing a second, separate one is how the two came
+          apart.
+
+          The default `ubuntu-latest` is a MOVING ALIAS and is fine for an
+          unscored lane.
+
+          A SCORED arm must name an immutable image instead — a value ending in
+          a complete `@sha256:<64 hex>` or `@sha512:<128 hex>` digest — because
+          the pair's equality check compares that binding. Two arms scheduled
+          through `ubuntu-latest` can execute on two different physical images
+          while both claim the same identity. The plan job refuses a scored
+          request whose runner is an alias, before anything is planned.
+
+          RESIDUAL, DISCLOSED: GitHub does not report the image it actually
+          selected back to the job, so nothing inside the run can compare the
+          executing runner with the declared one. Refusing an alias makes the
+          asserted identity at least unambiguous and immutable; it does not make
+          it mechanically verified. Closing that needs an attested runner
+          identity GitHub does not currently expose.
         type: string
-        default: ""
+        default: ubuntu-latest
       cache-declaration-json:
         description: >-
           The canonical cache declaration of §10.5.0 as CONTENT. A pathname
@@ -283,7 +289,7 @@ on:
 jobs:
   # 1/3 — PLAN. Cheap, and the gate for everything downstream.
   plan:
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ inputs.runs-on-label }}
     # Checkout, the timing-store cache and same-run artifacts. It never reads
     # the Actions API, so `actions` stays none.
     permissions:
@@ -420,7 +426,7 @@ jobs:
   # 2/3 — TEST. One job per bucket, each running only its own slice.
   test:
     needs: plan
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ inputs.runs-on-label }}
     permissions:
       contents: read
     strategy:
@@ -578,7 +584,7 @@ jobs:
     # a cancelled one whose artifacts are arbitrary partial captures. Only the
     # consumer's default branch is authoritative for the shared store.
     if: ${{ !cancelled() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ inputs.runs-on-label }}
     # Checkout, same-run artifacts and the timing-store cache. The store is
     # written back through the cache, not through the repository, so `contents`
     # stays read and nothing here needs the Actions API.
