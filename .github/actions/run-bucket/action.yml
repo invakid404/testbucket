@@ -100,13 +100,18 @@ inputs:
       §10.5.3's "the workflow declares which". `none` is required when the
       declared mode is `disabled` and illegal otherwise; `action` and `caller`
       are legal only under `exact-key`. Required for a scored run.
+
+      Under `action` this action owns the restore: it resolves the adapter's own
+      dependency cache directory and restores the declaration's primary key with
+      no restore-keys, then reads that step's outputs. Under `caller` the job
+      restores first and passes its outputs in.
     default: ""
   dependency-cache-matched-key:
     description: >-
       The caller's restore step's matched key, possibly empty. Required
       (possibly empty) iff the producer is `caller`, and must be ABSENT under
-      `action` and `none` — supplying it under another producer fails the job
-      rather than being silently resolved.
+      `action` and `none` — supplying it under another producer fails the job rather than
+      being silently resolved.
     default: ""
   dependency-cache-hit:
     description: >-
@@ -301,6 +306,67 @@ runs:
           fi
         fi
 
+    # --- §10.5.3 producer A: the action-owned restore ------------------------
+    #
+    # This action accepted `dependency-cache-producer: action` and then
+    # contained no restore step at all, so the mode validated and produced
+    # nothing — while §10.5.3 defines producer A as "the dependency-cache
+    # restore runs INSIDE run-bucket, which reads its own step outputs".
+    #
+    # It runs INSIDE the wall-time envelope on purpose: a restore this action
+    # owns is action-owned work, and measuring the action without it would
+    # report an interval shorter than the one that ran.
+    - name: Resolve the action-owned dependency cache
+      id: dep-cache-path
+      if: inputs.cache-declaration-file != '' && inputs.dependency-cache-producer == 'action'
+      shell: bash
+      env:
+        TB_DECL_FILE: ${{ inputs.cache-declaration-file }}
+        TB_RUNNER: ${{ inputs.runner }}
+        TB_WORKDIR: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        # THE ADAPTER'S OWN CACHE, asked of the adapter's own tooling. There is
+        # no input naming a directory, and inventing one would restore a cache
+        # nobody asked for; a tool that cannot answer fails the job here,
+        # before the bucket script starts, which is what §10.5.3 requires of a
+        # producer that supplied no result.
+        case "$TB_RUNNER" in
+          vitest)
+            if ! command -v pnpm >/dev/null 2>&1; then
+              echo "dependency-cache-producer action needs pnpm on PATH to resolve the store it would restore" >&2
+              exit 1
+            fi
+            path=$(cd "$TB_WORKDIR" && pnpm store path --silent) ;;
+          go)
+            path=$(go env GOMODCACHE) ;;
+          *)
+            echo "dependency-cache-producer action has no dependency cache defined for runner \"$TB_RUNNER\"" >&2
+            exit 1 ;;
+        esac
+        if [ -z "$path" ]; then
+          echo "the $TB_RUNNER dependency cache path resolved empty; a restore cannot be configured from it" >&2
+          exit 1
+        fi
+        key=$(grep -o '"dependency_cache_primary_key":"[^"]*"' "$TB_DECL_FILE" | head -1 | cut -d'"' -f4)
+        if [ -z "$key" ]; then
+          echo "the declaration carries no dependency_cache_primary_key; producer action has nothing to restore" >&2
+          exit 1
+        fi
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+        echo "key=$key" >> "$GITHUB_OUTPUT"
+
+    # NO `restore-keys`. §10.5.1 admits an exact primary-key match or nothing;
+    # a prefix fallback fails the row, so a restore that could produce one is
+    # a way to fail rows rather than a convenience.
+    - name: Restore the action-owned dependency cache
+      id: dep-cache
+      if: inputs.cache-declaration-file != '' && inputs.dependency-cache-producer == 'action'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.dep-cache-path.outputs.path }}
+        key: ${{ steps.dep-cache-path.outputs.key }}
+
     # --- QC14a: the hashed binary is the EXECUTED binary --------------------
     #
     # On the bucket runner, before artifact upload. The digest is taken over
@@ -330,6 +396,63 @@ runs:
           exit 1
         fi
         echo "QC14a: executed binary $MONGOMS_SYSTEM_BINARY verified on this runner"
+
+    # --- §10.5.0's cache state, materialized ---------------------------------
+    #
+    # The assemble step below reads $TB_CACHE_STATE_FILE. Nothing ever assigned
+    # it and no step wrote the document, so the assembler serialized an
+    # all-zero CacheState and QC14b refused every scored row. This step is the
+    # missing producer: the declaration half is copied out of the file whose
+    # digest was verified above, and the outcome half is derived from the
+    # restore result and the binary QC14a just bound.
+    - name: Materialize the cache state
+      if: inputs.cache-declaration-file != ''
+      shell: bash
+      env:
+        TB_DECL_FILE: ${{ inputs.cache-declaration-file }}
+        TB_PRODUCER: ${{ inputs.dependency-cache-producer }}
+        TB_MATCHED: ${{ inputs.dependency-cache-matched-key }}
+        TB_HIT: ${{ inputs.dependency-cache-hit }}
+        # Producer A reads its OWN restore step's outputs, which is the whole
+        # difference between the two producers.
+        TB_ACTION_HIT: ${{ steps.dep-cache.outputs.cache-hit }}
+        TB_ACTION_MATCHED: ${{ steps.dep-cache.outputs.cache-matched-key }}
+      run: |
+        set -euo pipefail
+        # QC14a above already refused an unset MONGOMS_SYSTEM_BINARY, but this
+        # step reads it under `set -u` and so states its own precondition
+        # rather than relying on the order of two steps staying what it is.
+        if [ -z "${MONGOMS_SYSTEM_BINARY:-}" ]; then
+          echo "MONGOMS_SYSTEM_BINARY is unset or empty; §10.5.6's executed-binary leaves cannot be recorded" >&2
+          exit 1
+        fi
+        state="${RUNNER_TEMP}/cache-state-${GITHUB_JOB:-bucket}.json"
+        args=(
+          --declaration "$TB_DECL_FILE"
+          --out "$state"
+          --mongo-binary "${MONGOMS_SYSTEM_BINARY}"
+        )
+        # PASSED IFF A PRODUCER RAN. §10.5.3 makes ABSENCE meaningful: an empty
+        # matched key with hit false is a miss, and an empty matched key with
+        # no hit at all is absent producer data. Passing the flags with empty
+        # values under `none` would turn the second into the first.
+        case "$TB_PRODUCER" in
+          caller)
+            args+=(--hit "$TB_HIT" --matched-key "$TB_MATCHED") ;;
+          action)
+            # cache-hit is `true` only on an exact primary-key match, and the
+            # restore step above carries no restore-keys, so no other match is
+            # reachable. Anything that is not the literal `true` is a miss, and
+            # a `true` with an empty matched key is left to fail as §10.5.3's
+            # incoherent result rather than being repaired here.
+            hit=false
+            if [ "${TB_ACTION_HIT:-}" = "true" ]; then hit=true; fi
+            args+=(--hit "$hit" --matched-key "${TB_ACTION_MATCHED:-}") ;;
+        esac
+        testbucket wall cache-state "${args[@]}"
+        # Exported for the assemble step, which is where the document joins the
+        # observation.
+        echo "TB_CACHE_STATE_FILE=$state" >> "$GITHUB_ENV"
 
     # The Go runner needs the binary for `testbucket render`; a Vitest bucket's
     # script prints its own default-reporter log, so it needs no binary.

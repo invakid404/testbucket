@@ -38,6 +38,11 @@ usage:
                                    records, the plan it was fanned out from,
                                    and the cache outcome, so ingest has a
                                    document to qualify and append
+  testbucket wall cache-state [flags]
+                                   derive §10.5.0's cache state on the bucket
+                                   runner: the verified declaration's leaves
+                                   verbatim, plus the disposition its restore
+                                   step and executed binary actually produced
 
 Every endpoint is a fresh CLOCK_MONOTONIC read taken by the producer that
 records it.
@@ -439,6 +444,8 @@ func runWall(args []string) error {
 		return runWallVerify(args[1:])
 	case "assemble-observation":
 		return runWallAssemble(args[1:])
+	case "cache-state":
+		return runWallCacheState(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, wallUsage)
 		return nil
