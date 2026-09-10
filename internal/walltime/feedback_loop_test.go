@@ -61,7 +61,7 @@ func buildObservation(t *testing.T, scored bool, campaignID, workload, head stri
 		RunID: "run-1", RunAttempt: "1", JobID: "job-1",
 		BucketIndex: bucket, BucketName: fmt.Sprintf("bucket-%d", bucket),
 		PlanDigest: "sha256:p", Profile: blk,
-		AEtaNs: 20_000_000_000, EstSeconds: 20.0,
+		AEtaNs: NanosPtr(20_000_000_000), EstSeconds: 20.0,
 		UnitIDs: []string{"a.spec.ts"}, Terminal: "passed",
 		RuntimeProfile: rp, RuntimeProfileDigest: RuntimeProfileDigest(rp),
 		Limitations: CanonicalLimitations(),

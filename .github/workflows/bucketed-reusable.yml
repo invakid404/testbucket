@@ -497,6 +497,13 @@ jobs:
 
       - name: Run bucket ${{ matrix.bucket }}
         id: run-bucket
+        # WHAT THE BUCKET BANNER'S NUMBER MEANS. §16.4: under `reporter` the
+        # estimate is a reporter-work sum, under `wall` it is the model's
+        # predicted action interval. The component map gives run-bucket no
+        # `est-basis` input, and a composite step inherits the job environment,
+        # so the meaning travels here rather than the map being amended.
+        env:
+          TB_EST_BASIS: ${{ matrix.est_basis }}
         uses: $/.github/actions/run-bucket
         with:
           runner: ${{ inputs.runner }}

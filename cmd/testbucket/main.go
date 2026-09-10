@@ -1005,9 +1005,14 @@ func runPlan(args []string) error {
 	opt.Live = livePkgs
 	opt.Token = rnr.CanonicalToken()
 	opt.Basis = decision.Basis
-	if decision.Basis == core.BasisWall {
-		opt.WallModel = fitted
-	}
+	// THE MODEL TRAVELS UNDER BOTH BASES, and the basis decides what it is FOR.
+	//
+	// Under the wall basis it is the objective the allocator optimizes. Under
+	// the reporter basis it is §5.1's additive shadow and nothing else: it
+	// never reaches AllocationScore and never changes the partition. It used to
+	// be withheld outside the wall basis, which is why the shadow field was
+	// declared, copied to matrix rows, and permanently empty.
+	opt.WallModel = fitted
 
 	// §13.0's canonical profile: the shape this plan was built under, carried
 	// verbatim into every observation so QC13 compares one value rather than

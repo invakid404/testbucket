@@ -420,7 +420,44 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 		doc.Notes = append(doc.Notes,
 			"buckets were packed by the frozen pre-plan allocation score; est_seconds still reports the store's measured weights")
 	}
-	for _, b := range buckets {
+	// §5.1's ADDITIVE SHADOW. Under the reporter basis, and only when a fitted
+	// model with status ok exists, each bucket also carries what that model
+	// would have predicted. The field was declared and copied to matrix rows
+	// and NOTHING EVER ASSIGNED IT, so the B arm of a scored pair shipped the
+	// wall-only field permanently empty. It never reaches AllocationScore and
+	// never changes the partition: it is what the model says about a split the
+	// model did not make.
+	var shadow []int64
+	if basis == BasisReporter && opt.WallModel != nil {
+		shadow = make([]int64, len(buckets))
+		for i, b := range buckets {
+			members := make([]AllocUnit, 0, len(b.Units))
+			weights := make([]int64, 0, len(b.Units))
+			for _, u := range b.Units {
+				ns, err := reporterNsOf(u)
+				if err != nil {
+					return nil, fmt.Errorf("unit %s: %w", u.ID, err)
+				}
+				members = append(members, AllocUnit{
+					ID:      u.ID,
+					BaseNs:  ns,
+					IsSlice: u.Kind == runner.KindRunSlice || u.Kind == runner.KindCountShard,
+				})
+				weights = append(weights, ns)
+			}
+			sum, err := nsmath.SumNs("reporter_sum_ns", weights...)
+			if err != nil {
+				return nil, fmt.Errorf("bucket %d: %w", b.Index, err)
+			}
+			cost, err := AEtaNs(*opt.WallModel, sum, ShapeOf(members))
+			if err != nil {
+				return nil, fmt.Errorf("bucket %d wall shadow: %w", b.Index, err)
+			}
+			shadow[i] = cost
+		}
+	}
+
+	for i, b := range buckets {
 		pb := renderPlanBucket(b, rnr.Render(b))
 		if basis == BasisWall && b.Index < len(wallCosts) {
 			// §5.1: under the wall basis est_seconds is exactly
@@ -430,20 +467,47 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 			pb.AEtaNs = &ns
 			pb.Seconds = nsmath.Round1Seconds(wallCosts[b.Index])
 		}
+		if shadow != nil && i < len(shadow) {
+			sec := nsmath.Round1Seconds(shadow[i])
+			pb.WallEstSeconds = &sec
+		}
 		doc.Buckets = append(doc.Buckets, pb)
 	}
 
 	stale, staleOK := st.age(opt.Now)
 	added, removed := st.coverageDrift(opt.Live)
 	total := ex.MeasuredSeconds + ex.EstimatedSeconds
-	ideal := total / float64(opt.K)
-	maxSec, minSec := 0.0, 0.0
+	// THE BALANCE SUMMARY IS IN THE BASIS'S OWN QUANTITY.
+	//
+	// It read the reporter bucket sums under BOTH bases, so a wall plan whose
+	// buckets each cost 31.3 s reported ideal, makespan and lightest of 23.0 s:
+	// the split's balance was described in a quantity the split was not made
+	// from. `total_seconds`, `measured_seconds` and `estimated_seconds` stay
+	// reporter work, because that is what they name.
+	balance := make([]float64, len(buckets))
 	for i, b := range buckets {
-		if i == 0 || b.Seconds > maxSec {
-			maxSec = b.Seconds
+		balance[i] = b.Seconds
+	}
+	if basis == BasisWall && len(wallCosts) == len(buckets) {
+		for i := range buckets {
+			balance[i] = nsmath.Round1Seconds(wallCosts[i])
 		}
-		if i == 0 || b.Seconds < minSec {
-			minSec = b.Seconds
+	}
+	ideal := total / float64(opt.K)
+	if basis == BasisWall {
+		objective := 0.0
+		for _, v := range balance {
+			objective += v
+		}
+		ideal = objective / float64(opt.K)
+	}
+	maxSec, minSec := 0.0, 0.0
+	for i, v := range balance {
+		if i == 0 || v > maxSec {
+			maxSec = v
+		}
+		if i == 0 || v < minSec {
+			minSec = v
 		}
 	}
 	imbalance := 0.0
@@ -648,8 +712,17 @@ func (d *PlanDocument) WriteSummary(out io.Writer, shortenPrefix string) error {
 	// of the serial REPORTER-WORK sum. The basis is named, and the line is not
 	// emitted at all when file_parallelism > 1, because a bucket then finishes
 	// nearer its heaviest unit than its sum and the sentence would be false.
+	//
+	// It named the reporter sum under BOTH bases. A wall-basis estimate is the
+	// model's A_eta prediction for the bucket, which is not a sum of anything
+	// the store measured — describing it as one told a reader to compare it
+	// against a quantity it was never derived from.
 	if d.fileParallelism <= 1 {
-		_, _ = fmt.Fprintf(w, "execution model: -p=1, so a bucket's estimate is its serial reporter-work sum.\n")
+		if d.EstBasis == BasisWall {
+			_, _ = fmt.Fprintf(w, "execution model: -p=1; a bucket's estimate is the fitted model's predicted action interval (A_eta), not a reporter-work sum.\n")
+		} else {
+			_, _ = fmt.Fprintf(w, "execution model: -p=1, so a bucket's estimate is its serial reporter-work sum.\n")
+		}
 	}
 	return ew.err
 }

@@ -72,8 +72,16 @@ type Observation struct {
 	// (S-1). AEtaNs is the integer-nanosecond prediction the plan made for this
 	// bucket, echoed so calibration residuals are computed in the response's
 	// own units.
+	//
+	// A_eta IS THE WALL OBJECTIVE, so it exists only where the plan optimized
+	// one. §5.1 gives it to a wall-basis plan; a reporter-basis plan carries no
+	// objective at all. It was unconditional here and unconditionally
+	// validated, so the assembler manufactured one out of the reporter estimate
+	// to satisfy the schema — a reporter observation shipped
+	// `"a_eta_ns": "120000000000"` describing an objective nothing had computed.
+	// The pointer is what makes absence expressible.
 	EstSeconds float64 `json:"est_seconds"`
-	AEtaNs     Nanos   `json:"a_eta_ns"`
+	AEtaNs     *Nanos  `json:"a_eta_ns,omitempty"`
 
 	ProcessGroupID string `json:"process_group_id"`
 
@@ -124,6 +132,14 @@ type Observation struct {
 	Limitations []string `json:"limitations"`
 }
 
+// NanosPtr is the optional-objective constructor. a_eta_ns exists only where a
+// plan optimized an objective, so producers hold a pointer and this is how they
+// fill it without taking the address of a temporary at every call site.
+func NanosPtr(n int64) *Nanos {
+	v := Nanos(n)
+	return &v
+}
+
 // CanonicalLimitations is the limitation set contract §13 requires every
 // observation to carry. It is required and non-empty; §22 test 2 asserts it
 // names the Exec-envelope, topology, runner-label and cache-state limits.
@@ -165,9 +181,17 @@ func (o *Observation) Validate() error {
 	if !prof.Scored && o.CampaignID != "" {
 		return fmt.Errorf("unscored observation must omit campaign_id, got %q", o.CampaignID)
 	}
-	// §13: est_seconds is the display rounding of a_eta_ns, and nothing else.
-	if want := Round1Seconds(int64(o.AEtaNs)); o.EstSeconds != want {
-		return fmt.Errorf("est_seconds is %v, must be round1(a_eta_ns/1e9) = %v", o.EstSeconds, want)
+	// §5.1: est_seconds is the display rounding of a_eta_ns — WHERE THERE IS
+	// ONE. Under the wall basis the pair must agree exactly; under the reporter
+	// basis there is no objective, a_eta_ns is absent, and est_seconds is the
+	// reporter estimate the plan displayed. Requiring the pair unconditionally
+	// is what forced a reporter observation to invent an objective.
+	if o.AEtaNs != nil {
+		if want := Round1Seconds(int64(*o.AEtaNs)); o.EstSeconds != want {
+			return fmt.Errorf("est_seconds is %v, must be round1(a_eta_ns/1e9) = %v", o.EstSeconds, want)
+		}
+	} else if prof.EstBasis == BasisWall {
+		return fmt.Errorf("a wall-basis observation carries no a_eta_ns; the objective it was planned against is what §5.1 displays")
 	}
 	if got := RuntimeProfileDigest(o.RuntimeProfile); got != o.RuntimeProfileDigest {
 		return fmt.Errorf("runtime_profile_digest is %s, must be the digest of its own object (%s)",

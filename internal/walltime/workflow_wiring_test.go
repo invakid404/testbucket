@@ -677,3 +677,33 @@ func workflowInputDefault(t *testing.T, wf, name string) string {
 	}
 	return strings.Trim(strings.TrimSpace(m[1]), `"'`)
 }
+
+// TestTheBucketBannerNamesItsBasis is F4(d).
+//
+// The banner printed "estimated Ns" and N means two different quantities: the
+// bucket's reporter-work sum under `reporter`, and round1(A_eta/1e9) of the
+// fitted model's predicted action interval under `wall`. An operator reading
+// the job log could not tell which, and the action received nothing that said.
+func TestTheBucketBannerNamesItsBasis(t *testing.T) {
+	action := readRepoFile(t, ".github/actions/run-bucket/action.yml")
+	banner := regexp.MustCompile(`estimated \$\{BUCKET_EST[^"]*`)
+	found := banner.FindAllString(action, -1)
+	if len(found) == 0 {
+		t.Fatal("run-bucket prints no estimate banner")
+	}
+	for _, b := range found {
+		if !strings.Contains(b, "TB_EST_BASIS") {
+			t.Errorf("the banner %q states a number without saying what quantity it is", b)
+		}
+	}
+	if !strings.Contains(action, "TB_EST_BASIS: ${{ env.TB_EST_BASIS }}") {
+		t.Error("the banner's basis reaches no step environment, so it can only ever read unset")
+	}
+	// The caller supplies it. The component map gives run-bucket no
+	// `est-basis` input, so it travels through the job environment the way
+	// QC12's label reaches the record action.
+	wf := readRepoFile(t, ".github/workflows/bucketed-reusable.yml")
+	if !strings.Contains(wf, "TB_EST_BASIS: ${{ matrix.est_basis }}") {
+		t.Error("the reusable workflow does not pass the matrix entry's est_basis to the bucket step")
+	}
+}

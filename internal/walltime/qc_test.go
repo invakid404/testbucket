@@ -42,7 +42,7 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 		RunID: "run-1", RunAttempt: "1", JobID: "job-1",
 		BucketIndex: 0, BucketName: "bucket-0", PlanDigest: "sha256:plan",
 		Profile: blk,
-		AEtaNs:  20_000_000_000, EstSeconds: 20.0,
+		AEtaNs:  NanosPtr(20_000_000_000), EstSeconds: 20.0,
 		ProcessGroupID:      "4242",
 		ActualRunnerName:    "GitHub Actions 7",
 		ObservedRunsOnLabel: "ubuntu-24.04",

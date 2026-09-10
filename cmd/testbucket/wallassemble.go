@@ -145,17 +145,20 @@ func runWallAssemble(args []string) error {
 	// schema refuses — correctly, because a reader comparing the two would be
 	// comparing a number against something it was never derived from.
 	if bucket.AEtaNs != nil {
-		obs.AEtaNs = walltime.Nanos(*bucket.AEtaNs)
-		obs.EstSeconds = nsmath.Round1Seconds(int64(obs.AEtaNs))
+		a := walltime.Nanos(*bucket.AEtaNs)
+		obs.AEtaNs = &a
+		obs.EstSeconds = nsmath.Round1Seconds(int64(a))
 	} else {
-		// A reporter-basis plan carries no objective, so the objective is the
-		// estimate it does carry, converted the one checked way.
-		ns, err := core.ReporterNsFromSeconds(bucket.Seconds)
-		if err != nil {
-			return fmt.Errorf("bucket %s estimate: %w", bucket.Name, err)
-		}
-		obs.AEtaNs = walltime.Nanos(ns)
-		obs.EstSeconds = nsmath.Round1Seconds(ns)
+		// A REPORTER-BASIS PLAN CARRIES NO OBJECTIVE, and the observation says
+		// so by omitting a_eta_ns.
+		//
+		// This used to convert the reporter estimate into nanoseconds and store
+		// it AS the objective, because the field was unconditional and
+		// unconditionally validated. The row then reported an A_eta nothing had
+		// optimized — a number that looks like a wall prediction and is a
+		// reporter sum. The estimate the plan displayed is carried verbatim
+		// instead.
+		obs.EstSeconds = bucket.Seconds
 	}
 	for _, u := range bucket.Units {
 		obs.UnitIDs = append(obs.UnitIDs, u.ID)

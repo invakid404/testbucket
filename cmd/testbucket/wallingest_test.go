@@ -197,7 +197,7 @@ func observationFixture(bucket string, index int, runID string, planDigest wallt
 		PlanDigest:             planDigest,
 		Profile:                block,
 		EstSeconds:             10.0,
-		AEtaNs:                 10_000_000_000,
+		AEtaNs:                 walltime.NanosPtr(10_000_000_000),
 		ProcessGroupID:         "pg-1",
 		ActualRunnerName:       "runner-1",
 		ObservedRunsOnLabel:    "ubuntu-latest",

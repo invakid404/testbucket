@@ -500,6 +500,17 @@ runs:
         BUCKET_SCRIPT: ${{ inputs.script }}
         BUCKET_NAME: ${{ inputs.name }}
         BUCKET_EST: ${{ inputs.est-seconds }}
+        # WHAT THE NUMBER MEANS, FROM THE JOB ENVIRONMENT.
+        #
+        # The banner printed "estimated Ns" and N means two different things:
+        # under `reporter` it is the bucket's reporter-work sum, under `wall` it
+        # is round1(A_eta/1e9) of the fitted model's predicted action interval.
+        # An operator could not tell which. The component map does not give this
+        # action an `est-basis` input, and a composite step inherits the job's
+        # environment, so the caller sets it there and this reads it — the map
+        # decides the interface, the wiring adapts. Unset means unstated rather
+        # than guessed.
+        TB_EST_BASIS: ${{ env.TB_EST_BASIS }}
         TB_EVENTS_DIR: ${{ inputs.events-dir }}
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         # The account the MEASURED WORK runs under. The wrapper stays as this
@@ -588,7 +599,7 @@ runs:
               chgrp "$script_gid" "$TB_EVENTS_DIR"
               chmod 3770 "$TB_EVENTS_DIR"
             fi
-            echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
+            echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s (${TB_EST_BASIS:-basis unstated}) ==="
             printf "%s\n" "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
             echo "--- invocations ---"
             cat "$RUNNER_TEMP/testbucket-bucket.sh"
@@ -608,7 +619,7 @@ runs:
         else
           # Unmeasured: exactly what this step always did.
           mkdir -p "$TB_EVENTS_DIR"
-          echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s ==="
+          echo "=== ${BUCKET_NAME} — estimated ${BUCKET_EST:-?}s (${TB_EST_BASIS:-basis unstated}) ==="
           printf '%s\n' "$BUCKET_SCRIPT" > "$RUNNER_TEMP/testbucket-bucket.sh"
           echo "--- invocations ---"
           cat "$RUNNER_TEMP/testbucket-bucket.sh"
