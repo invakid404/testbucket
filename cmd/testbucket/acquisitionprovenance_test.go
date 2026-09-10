@@ -124,23 +124,3 @@ func TestTheDiscoveryArgvComesFromTheOperationThatRanIt(t *testing.T) {
 		t.Errorf("the retained executable %q is not the program that ran", seen.Path)
 	}
 }
-
-// TestDiscoveryFromFrozenBytesRetainsNoInvocation: there is no subprocess to
-// describe when the bytes came from a file, and inventing one would be worse
-// than reporting none.
-func TestDiscoveryFromFrozenBytesRetainsNoInvocation(t *testing.T) {
-	rnr, err := vitestrunner.New(vitestrunner.Options{
-		Root:          t.TempDir(),
-		DiscoveryMode: "glob",
-		Frozen:        &vitestrunner.FrozenInputs{Discovery: []byte(`[{"file":"a.test.ts"}]`)},
-	})
-	if err != nil {
-		t.Fatalf("vitestrunner.New: %v", err)
-	}
-	if _, err := rnr.Discover(context.Background()); err != nil {
-		t.Fatalf("Discover: %v", err)
-	}
-	if seen := rnr.Discovered(); seen != nil {
-		t.Errorf("a frozen discovery reported an invocation it never issued: %+v", seen)
-	}
-}

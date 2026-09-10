@@ -25,7 +25,7 @@ import (
 // script's time to a lifecycle that was not open when it ran.
 func TestTheActionEnvelopeSpansItsSteps(t *testing.T) {
 	dir := t.TempDir()
-	run := RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+	run := RunIdentity{BucketID: "b1", RunID: "run-1"}
 	if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
 		t.Fatalf("BeginAction: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestTheActionEnvelopeSpansItsSteps(t *testing.T) {
 // the produced records, which is the only way to see that.
 func TestTheComposedActionDerivesEverySpanFromItsOwnBytes(t *testing.T) {
 	dir := t.TempDir()
-	run := RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+	run := RunIdentity{BucketID: "b1", RunID: "run-1"}
 	if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
 		t.Fatalf("BeginAction: %v", err)
 	}

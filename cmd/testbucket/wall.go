@@ -104,8 +104,13 @@ func runWallBegin(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "testbucket wall: action envelope open (containment %s, %s)\n",
-		st.Containment.ID, st.Containment.Primitive)
+	// NAMES THE RUN, not a containment. This printed
+	// "action envelope open (containment , )" — two empty fields where a
+	// cgroup identity used to be — which told an operator a containment
+	// existed and could not say which.
+	fmt.Fprintf(os.Stderr, "testbucket wall: action envelope open (bucket %s, run %s attempt %s)\n",
+		firstNonEmpty(st.Run.BucketID, "-"), firstNonEmpty(st.Run.RunID, "-"),
+		firstNonEmpty(st.Run.AttemptID, "-"))
 	// THE SIGNER DELEGATE: EXACTLY ONE LINE ON STDOUT.
 	//
 	// The script and invocation producers — and the action-owned children —
@@ -143,7 +148,8 @@ func runWallEnd(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "testbucket wall: action envelope closed (containment %s)\n", st.Containment.ID)
+	fmt.Fprintf(os.Stderr, "testbucket wall: action envelope closed (bucket %s, terminal %s)\n",
+		firstNonEmpty(st.Run.BucketID, "-"), firstNonEmpty(*terminal, "-"))
 	return nil
 }
 
@@ -359,7 +365,7 @@ func runWallExec(args []string) error {
 	// admission model: Exec owns one process group and drains it, and there is
 	// no enclosing containment for an invocation to nest under.
 	if st, err := walltime.LoadActionState(*dir); err == nil {
-		if opt.Run.CampaignID == "" && opt.Run.Stage2 == "" {
+		if opt.Run.CampaignID == "" && opt.Run.BucketID == "" {
 			opt.Run = st.Run
 		}
 	}
@@ -513,4 +519,13 @@ func plannedInvocations(shardPlan string) walltime.InvocationsFunc {
 		// the records it is compared against.
 		return planbind.InvocationManifestFor(doc, index, "")
 	}
+}
+
+// firstNonEmpty names an absent identity rather than printing a blank where a
+// value belongs.
+func firstNonEmpty(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
 }

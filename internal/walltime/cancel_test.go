@@ -171,7 +171,7 @@ func TestATermIgnoringRootIsKilledAtTheGrace(t *testing.T) {
 		defer close(done)
 		_, err := Exec(ExecOptions{
 			Level: LevelInvocation, Dir: dir, Cwd: dir,
-			Run: RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
+			Run: RunIdentity{BucketID: "b1", RunID: "run-1"},
 			// trap '' TERM makes the shell ignore SIGTERM outright.
 			Argv:    []string{"sh", "-c", "trap '' TERM; while :; do sleep 0.05; done"},
 			Timeout: 30 * time.Second,
@@ -216,7 +216,7 @@ func TestTheDeadlineIsAnEndpointNotASuggestion(t *testing.T) {
 		defer close(done)
 		if _, err := Exec(ExecOptions{
 			Level: LevelInvocation, Dir: dir, Cwd: dir,
-			Run:     RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
+			Run:     RunIdentity{BucketID: "b1", RunID: "run-1"},
 			Argv:    []string{"sh", "-c", "trap '' TERM; while :; do sleep 0.05; done"},
 			Timeout: 700 * time.Millisecond,
 		}); err != nil {
@@ -255,7 +255,7 @@ func TestADetachedDescendantIsKilledAndReaped(t *testing.T) {
 	script := "( while :; do : > " + marker + "; sleep 0.05; done ) & exit 0"
 	if _, err := Exec(ExecOptions{
 		Level: LevelInvocation, Dir: dir, Cwd: dir,
-		Run:     RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
+		Run:     RunIdentity{BucketID: "b1", RunID: "run-1"},
 		Argv:    []string{"sh", "-c", script},
 		Timeout: 2 * time.Second,
 	}); err != nil {

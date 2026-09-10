@@ -76,10 +76,6 @@ type Runner struct {
 	discoveryCmd []string
 	root         string // absolute project dir, for subprocesses and id relativisation
 	render       renderConfig
-	// frozen, when set, replaces every discovery/listing subprocess with the
-	// byte-exact snapshots a Stage-1 planning-input bundle bound. See
-	// FrozenInputs.
-	frozen *FrozenInputs
 	// projectByFile maps a file id to its Vitest project name, resolved once
 	// (lazily) from the deadlock-safe glob so Runnables can scope its importing
 	// `vitest list` to a single project. nil until first resolved; "" for a file
@@ -154,28 +150,15 @@ type Options struct {
 	// a caller that is not binding a plan wants; `wall bundle` supplies the
 	// same set it retains, so the recorded environment is the one that ran.
 	Env []string
-	// Frozen, when set, makes discovery and runnable listing read BOUND BYTES
-	// instead of running Vitest. It is how a plan is replayed from a frozen
-	// input bundle: the same parsers run over the same bytes, so the plan is a
-	// function of its recorded inputs rather than of whatever the tree and the
-	// clock happened to say at the time.
-	Frozen *FrozenInputs
 }
 
-// FrozenInputs is the byte-exact discovery and runnable-listing evidence a
-// planning-input bundle carries.
+// STAGE-FROZEN REPLAY IS REMOVED.
 //
-// A missing entry is a LOUD ERROR, never a fall back to running Vitest: the
-// whole point of a frozen plan is that no unbound input can reach it, and a
-// silent live listing is exactly the unbound input that would.
-type FrozenInputs struct {
-	// Discovery is the raw discovery JSON, exactly as the recorded subprocess
-	// printed it.
-	Discovery []byte
-	// Runnables maps a file id to the raw `vitest list --json` bytes for that
-	// file. Only name-sliced targets need an entry.
-	Runnables map[string][]byte
-}
+// Options.Frozen and FrozenInputs let discovery and runnable listing read
+// BOUND BYTES from a Stage-1 planning-input bundle instead of running Vitest,
+// so a plan could be replayed as a function of recorded inputs. The component
+// map drops the Stage-frozen Vitest inputs with the rest of the
+// authority/replay model, and the practical product discovers live and says so.
 
 // New builds the Vitest adapter. The root is resolved to an absolute path but
 // not required to exist here: the offline methods (Render, ParseTimings,
@@ -216,7 +199,6 @@ func New(opt Options) (*Runner, error) {
 		tool:          nodetool{command: cmd, timeout: discTimeout, env: opt.Env},
 		discoveryMode: mode,
 		discoveryCmd:  append([]string(nil), opt.DiscoveryCommand...),
-		frozen:        opt.Frozen,
 		root:          abs,
 		render: renderConfig{
 			command:         cmd,
@@ -287,16 +269,6 @@ func (r *Runner) Discover(ctx context.Context) ([]runner.LivePackage, error) {
 // bare (`list <file> --json [--project p]`), which is also the form that actually
 // scopes; `list --json ... <file>` only survives when --project sits between them.
 func (r *Runner) Runnables(ctx context.Context, p runner.LivePackage) ([]string, error) {
-	if r.frozen != nil {
-		raw, ok := r.frozen.Runnables[p.ID]
-		if !ok {
-			// Refusing here is the point: falling back to a live listing would
-			// let an input the bundle never bound decide which tests a slice
-			// selects.
-			return nil, fmt.Errorf("vitest runnables: %s has no frozen listing in the planning-input bundle; a live listing is an unbound input", p.ID)
-		}
-		return runnableNames(r.root, p.ID, raw)
-	}
 	project, err := r.projectFor(ctx, p.ID)
 	if err != nil {
 		return nil, err
@@ -313,13 +285,7 @@ func (r *Runner) Runnables(ctx context.Context, p runner.LivePackage) ([]string,
 // rather than a parsed summary of it: the bundle's promise is that a replay
 // runs the same parser over the same bytes, and that is only checkable if the
 // bytes are what was kept.
-//
-// A runner already reading frozen inputs refuses: capturing from a capture
-// would record the snapshot as if it were a fresh observation.
 func (r *Runner) CaptureDiscovery(ctx context.Context) ([]byte, error) {
-	if r.frozen != nil {
-		return nil, fmt.Errorf("vitest: this runner is replaying a frozen bundle; there is nothing live to capture")
-	}
 	return r.runDiscovery(ctx)
 }
 
@@ -335,9 +301,6 @@ func (r *Runner) CaptureDiscovery(ctx context.Context) ([]byte, error) {
 // command nobody ran is worse than none: a replay would reproduce it, get
 // different bytes, and have no way to see why.
 func (r *Runner) CaptureRunnables(ctx context.Context, fileID string, discovery []byte) ([]byte, []string, error) {
-	if r.frozen != nil {
-		return nil, nil, fmt.Errorf("vitest: this runner is replaying a frozen bundle; there is nothing live to capture")
-	}
 	if r.projectByFile == nil && len(discovery) > 0 {
 		m, err := parseProjects(r.root, discovery)
 		if err != nil {
@@ -414,17 +377,6 @@ func filterPathArg(fileID string) string {
 // means a single-project config (no scoping needed).
 func (r *Runner) projectFor(ctx context.Context, fileID string) (string, error) {
 	if r.projectByFile == nil {
-		if r.frozen != nil {
-			// A frozen runner has bound discovery bytes; running a second
-			// listing to answer the same question would be exactly the
-			// unbound input the bundle exists to close.
-			m, err := parseProjects(r.root, r.frozen.Discovery)
-			if err != nil {
-				return "", err
-			}
-			r.projectByFile = m
-			return r.projectByFile[fileID], nil
-		}
 		out, err := r.tool.run(ctx, r.root, "list", "--filesOnly", "--json")
 		if err != nil {
 			return "", r.discoveryError(err)

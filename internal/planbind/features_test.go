@@ -1,32 +1,11 @@
 package planbind
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/invakid404/testbucket/internal/runner"
 	"github.com/invakid404/testbucket/internal/walltime"
 )
-
-// frozenScorer is a scorer with hand-written coefficients, which is what a
-// fitted wall model produces. It scores by runnable count, so it deliberately
-// disagrees with any measured store weight — that disagreement is what makes
-// the separation assertions below meaningful.
-//
-// It is built as a literal rather than trained: the sealed training lineage
-// went with the Stage receipts, and what the allocator adapter needs from a
-// scorer is the frozen coefficients, not the ceremony that produced them.
-func frozenScorer() walltime.Scorer {
-	return walltime.Scorer{
-		Kind: walltime.ScorerKind, ID: "test-scorer", Version: "1",
-		FeatureSchema: FeatureSchema,
-		Coefficients: map[string]float64{
-			"atom_size": 1, "file_count": 0, "is_slice": 0,
-			"path_depth": 0, "runnable_count": 2, "slice_share": 0,
-		},
-		Intercept: 5, Floor: 0.1,
-	}
-}
 
 // unitFixture is one scheduled unit, shaped like a name slice so every feature
 // in the schema takes a non-default value.
@@ -38,11 +17,10 @@ func unitFixture() runner.Unit {
 	}
 }
 
-// builderFixture is the frozen pre-plan evidence the builder reads: two names
-// listed for the sliced target, and one co-scheduling atom of size 2.
+// builderFixture is the pre-plan evidence the builder reads: two names listed
+// for the sliced target, and one co-scheduling atom of size 2.
 func builderFixture() *FeatureBuilder {
 	return &FeatureBuilder{
-		stage1:        "sha256:ef24c98b6f6843d9d586189733598c533de9fa109464aa1d7045c667a4621b0f",
 		runnableCount: map[string]int{"tests/alpha.spec.ts": 2},
 		atomSize:      map[string]int{},
 	}
@@ -76,7 +54,7 @@ func TestFeatureVectorsCarryOnlyPreplanProvenance(t *testing.T) {
 	}
 }
 
-// TestRunnableCountComesFromTheFrozenListing is the numeric half of the
+// TestRunnableCountComesFromTheRecordedListing is the numeric half of the
 // provenance check. Provenance says WHERE a feature came from; this says the
 // value is actually the one the pre-plan evidence carries.
 //
@@ -108,61 +86,5 @@ func TestRunnableCountComesFromTheFrozenListing(t *testing.T) {
 	}
 	if share, _ := v.Value("slice_share"); share != 0 {
 		t.Errorf("a slice of an unlisted target reported slice_share = %v, want 0", share)
-	}
-}
-
-// TestTheAllocatorScoresFromTheFrozenScorerAlone is the separation the
-// contract insists on: the frozen score decides the SPLIT, and it is a
-// function of the pre-plan vector and nothing else.
-func TestTheAllocatorScoresFromTheFrozenScorerAlone(t *testing.T) {
-	a := NewAllocator(frozenScorer(), builderFixture())
-	u := unitFixture()
-	// The unit carries a measured weight. It must not reach the score.
-	u.Seconds = 999
-
-	got, err := a.Score(u)
-	if err != nil {
-		t.Fatalf("Score: %v", err)
-	}
-	// intercept 5 + atom_size 1*1 + runnable_count 2*2 = 10.
-	if want := 10.0; got != want {
-		t.Errorf("Palloc = %v, want %v; the score is the frozen scorer's, not the store's", got, want)
-	}
-	if a.Values()[u.ID] != got {
-		t.Errorf("the allocator retained %v, having returned %v", a.Values()[u.ID], got)
-	}
-	// The vector it scored FROM is retained too, so the projection can be
-	// re-derived by running the frozen scorer again rather than only checked
-	// against the allocator's own arithmetic.
-	vecs := a.Vectors()
-	if len(vecs) != 1 || vecs[0].UnitID != u.ID {
-		t.Fatalf("the allocator retained %d vectors, want the one it scored", len(vecs))
-	}
-	again, err := frozenScorer().Score(vecs[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if again != got {
-		t.Errorf("re-running the frozen scorer over the retained vector gives %v, not %v", again, got)
-	}
-}
-
-// TestAllocationFailsClosed: a unit the frozen scorer cannot score fails the
-// plan. Falling back to the store weight would be the leak the two surfaces
-// exist to prevent, wearing the costume of robustness.
-func TestAllocationFailsClosed(t *testing.T) {
-	sc := frozenScorer()
-	sc.FeatureSchema = append(append([]string(nil), sc.FeatureSchema...), "previous_run_seconds")
-	a := NewAllocator(sc, builderFixture())
-
-	got, err := a.Score(unitFixture())
-	if err == nil {
-		t.Fatalf("a unit scored %v under a schema the builder cannot satisfy", got)
-	}
-	if !strings.Contains(err.Error(), "previous_run_seconds") {
-		t.Errorf("the error does not name the missing feature: %v", err)
-	}
-	if len(a.Values()) != 0 {
-		t.Errorf("a refused unit was still recorded: %v", a.Values())
 	}
 }

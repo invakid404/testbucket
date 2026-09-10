@@ -98,7 +98,7 @@ func TestACompleteRunIsCompleteButNotYetScorable(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := Exec(ExecOptions{
 		Level: LevelInvocation, Dir: dir, Cwd: dir, Timeout: 30 * time.Second,
-		Run:  RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
+		Run:  RunIdentity{BucketID: "b1", RunID: "run-1"},
 		Argv: []string{"sh", "-c", "true"},
 	}); err != nil {
 		t.Fatalf("Exec: %v", err)
@@ -134,7 +134,7 @@ func TestACompleteRunIsCompleteButNotYetScorable(t *testing.T) {
 // refusing everything.
 func TestARunThatMeetsEveryPrerequisiteIsScorable(t *testing.T) {
 	dir := t.TempDir()
-	run := RunIdentity{BucketID: "b1", Stage2: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+	run := RunIdentity{BucketID: "b1", RunID: "run-1"}
 	opt := ExecOptions{
 		Level: LevelInvocation, Dir: dir, Cwd: dir, Timeout: 30 * time.Second,
 		Run:        run,

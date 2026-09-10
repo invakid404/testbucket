@@ -2,50 +2,62 @@ package walltime
 
 import "testing"
 
-// TestTheScorerFloorKeepsUnitsSchedulable: a unit the model scores at or below
-// zero still has to be packed somewhere, and a zero-weight unit would make the
-// partition think it is free.
+// TestPreplanFeaturesRefuseOutcomeProvenance is what palloc.go still owes.
 //
-// The floor is applied inside Score rather than by each caller, because a
-// caller that forgot would not fail — it would quietly produce a partition
-// that schedules an unbounded number of "free" units into one bucket.
-func TestTheScorerFloorKeepsUnitsSchedulable(t *testing.T) {
-	scorer := Scorer{
-		Kind:          "linear",
-		ID:            "test-scorer",
-		FeatureSchema: []string{"runnable_count", "atom_size"},
-		Coefficients:  map[string]float64{"runnable_count": 0.5, "atom_size": 0.25},
-		Intercept:     1,
-		Floor:         0.05,
-	}
-	// A vector that drives the linear model far NEGATIVE: without a floor this
-	// unit would be scored at -498.5 seconds.
-	v := FeatureVector{UnitID: "u", Features: []Feature{
-		{Name: "runnable_count", Value: -1000, Provenance: ProvRunnableSnapshot},
-		{Name: "atom_size", Value: 0, Provenance: ProvPreplanAtom},
-	}}
-	got, err := scorer.Score(v)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got < scorer.Floor {
-		t.Errorf("Palloc = %v, below the %v floor", got, scorer.Floor)
-	}
-	if got != scorer.Floor {
-		t.Errorf("Palloc = %v, want exactly the floor %v: the floor replaces the score, it does not offset it", got, scorer.Floor)
+// This file used to hold TestTheScorerFloorKeepsUnitsSchedulable, which
+// exercised the sealed frozen scorer. The scorer, its training lineage and the
+// Pcheck re-derivation are REMOVE-classified — the component map replaces them
+// with the ordinary-history wall model — so the surface that test covered no
+// longer exists. What remains in palloc.go is the deterministic pre-plan
+// feature projection, and its one rule is the leakage rule: a feature derived
+// from an OUTCOME may not reach allocation.
+//
+// The file is reduced rather than deleted because a package that loses all its
+// tests still reports `ok`.
+func TestPreplanFeaturesRefuseOutcomeProvenance(t *testing.T) {
+	schema := []string{"atom_size"}
+
+	t.Run("an admissible pre-plan feature passes", func(t *testing.T) {
+		v := FeatureVector{UnitID: "a.test.ts", Features: []Feature{
+			{Name: "atom_size", Value: 2, Provenance: ProvPreplanAtom},
+		}}
+		if err := v.Validate(schema); err != nil {
+			t.Errorf("an immutable pre-plan feature was refused: %v", err)
+		}
+		if got, ok := v.Value("atom_size"); !ok || got != 2 {
+			t.Errorf("Value(atom_size) = %v, %v; the value is as much the contract as the provenance", got, ok)
+		}
+	})
+
+	// THE STORE'S OWN EWMA IS THE INTERESTING CASE. It is the most useful
+	// number available at plan time and it is built from reporter timings, so
+	// admitting it would leak an outcome into allocation through the side door.
+	for _, prov := range []string{"store_ewma", "reporter_timing", "observed_timing", "physical_envelope"} {
+		t.Run("outcome provenance "+prov+" is refused", func(t *testing.T) {
+			v := FeatureVector{UnitID: "a.test.ts", Features: []Feature{
+				{Name: "atom_size", Value: 2, Provenance: prov},
+			}}
+			if err := v.Validate(schema); err == nil {
+				t.Errorf("a feature with %q provenance reached allocation", prov)
+			}
+		})
 	}
 
-	// And it is a floor, not a clamp: a unit the model scores ABOVE it keeps
-	// its own value.
-	above := FeatureVector{UnitID: "u", Features: []Feature{
-		{Name: "runnable_count", Value: 4, Provenance: ProvRunnableSnapshot},
-		{Name: "atom_size", Value: 8, Provenance: ProvPreplanAtom},
-	}}
-	got, err = scorer.Score(above)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := 1 + 0.5*4 + 0.25*8; got != want {
-		t.Errorf("Palloc = %v, want %v", got, want)
-	}
+	t.Run("an unrecognised provenance is refused rather than allowed through", func(t *testing.T) {
+		v := FeatureVector{UnitID: "a.test.ts", Features: []Feature{
+			{Name: "atom_size", Value: 2, Provenance: "something_new"},
+		}}
+		if err := v.Validate(schema); err == nil {
+			t.Error("an unknown provenance class was admitted; the list is closed, not a denylist")
+		}
+	})
+
+	t.Run("a missing schema feature is refused", func(t *testing.T) {
+		v := FeatureVector{UnitID: "a.test.ts", Features: []Feature{
+			{Name: "file_count", Value: 1, Provenance: ProvDiscoverySnapshot},
+		}}
+		if err := v.Validate(schema); err == nil {
+			t.Error("a vector missing a schema feature was accepted")
+		}
+	})
 }

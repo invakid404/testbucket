@@ -3,6 +3,7 @@ package walltime
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"syscall"
 )
@@ -23,16 +24,13 @@ type processGroup struct {
 	ident  ContainmentIdentity
 }
 
-func newProcessGroupContainment(name, reason string) (Containment, error) {
+func newProcessGroupContainment(_, reason string) (Containment, error) {
 	self := os.Getpid()
 	return &processGroup{
 		reason: reason,
 		ident: ContainmentIdentity{
 			Primitive: PrimitiveProcessGroup,
-			ID:        name,
-			BootID:    bootIdentity(),
-			RootPID:   self,
-			RootStart: processStartID(self),
+			ID:        strconv.Itoa(self),
 		},
 	}, nil
 }
@@ -45,8 +43,7 @@ func (p *processGroup) Admit(pid int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.pgid = pid
-	p.ident.RootPID = pid
-	p.ident.RootStart = processStartID(pid)
+	p.ident.ID = strconv.Itoa(pid)
 	return nil
 }
 

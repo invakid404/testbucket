@@ -16,43 +16,20 @@ import (
 const actionStateFile = "action-state.json"
 
 // ActionState is the handoff between the two halves of the action envelope.
+//
+// It carried a ContainmentIdentity, peer/trace control paths, the two
+// observers' pids and start identities, and the process that opened the
+// envelope. Every one of them was serialized EMPTY at runtime once the
+// observers and the cgroup containment were removed — `action-state.json` read
+// `"containment":{"primitive":"","id":""}`, `"peer_control":""`,
+// `"trace_control":""`, `"root":{}` — so the file taught a reader that facts
+// were being recorded which nothing produced. A field that can only ever be
+// empty is not a field.
 type ActionState struct {
-	Schema       string              `json:"schema"`
-	Dir          string              `json:"dir"`
-	Run          RunIdentity         `json:"run"`
-	Containment  ContainmentIdentity `json:"containment"`
-	PeerControl  string              `json:"peer_control"`
-	TraceControl string              `json:"trace_control"`
-	// PeerPID and TracePID are the detached observers' process ids, and
-	// PeerStart and TraceStart are those processes' START IDENTITIES.
-	//
-	// `wall begin` and `wall end` are two different steps, so the handles the
-	// closing step reconstructs have no cmd. Without the pids, a lifecycle
-	// that could not be completed there had nothing to kill: the observers
-	// would outlive the action they were bracketing.
-	//
-	// The start identities are what make those numbers safe to use. A pid is
-	// reused, and between the two steps it may have come to name the runner's
-	// own work — so the closing step would signal a stranger, and would read
-	// "that pid is gone" as "the observer exited". Recording the identity the
-	// launching step read turns the pair into something that can be checked:
-	// either this is still our observer, or there is nothing of ours here.
-	PeerPID    int    `json:"peer_pid,omitempty"`
-	TracePID   int    `json:"trace_pid,omitempty"`
-	PeerStart  string `json:"peer_start,omitempty"`
-	TraceStart string `json:"trace_start,omitempty"`
-	// Root is the process that OPENED the envelope, retained as provenance
-	// rather than as the action's measured root.
-	//
-	// It was carried so the closing step could copy it into its own records,
-	// which made those records claim a process that had already exited as the
-	// thing they had just observed. `wall begin` returns after writing this
-	// handoff; the setup, bucket and closing steps are sibling step processes
-	// that join the same containment. No process spans an action, so no record
-	// may say one did — the containment spans it, and each record now names
-	// the wrapper that actually took its reading.
-	Root     ProcIdentity `json:"root"`
-	Deadline string       `json:"deadline"`
+	Schema   string      `json:"schema"`
+	Dir      string      `json:"dir"`
+	Run      RunIdentity `json:"run"`
+	Deadline string      `json:"deadline"`
 	// StartedAt is the AT_start reading, repeated here only so a human reading
 	// the file can find the record; the RECORD is the evidence.
 	StartedAt Instant `json:"started_at"`

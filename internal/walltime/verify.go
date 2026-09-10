@@ -88,38 +88,36 @@ func (i Interval) Duration() int64 {
 // empty — a report that shows a reader two blank quantities is telling them
 // something was measured and not reported.
 type Envelope struct {
-	Level       Level               `json:"level"`
-	Seq         int                 `json:"seq"`
-	Physical    Interval            `json:"physical"`
-	Containment ContainmentIdentity `json:"containment"`
-	Terminal    string              `json:"terminal"`
-	Reason      string              `json:"reason,omitempty"`
-	Spec        *SpecIdentity       `json:"spec,omitempty"`
-	Desc        string              `json:"desc,omitempty"`
+	Level    Level         `json:"level"`
+	Seq      int           `json:"seq"`
+	Physical Interval      `json:"physical"`
+	Terminal string        `json:"terminal"`
+	Reason   string        `json:"reason,omitempty"`
+	Spec     *SpecIdentity `json:"spec,omitempty"`
+	Desc     string        `json:"desc,omitempty"`
 }
 
 // InvocationsFunc resolves the invocation manifest for one bucket. A caller
 // that supplies none gets a finding, never a pass.
 type InvocationsFunc func(bucketID string) (*InvocationManifest, error)
 
-// VerifyOptions selects what to verify and against which frozen documents.
+// VerifyOptions selects what to verify.
+//
+// It used to carry Stage1Path, Stage2Path, AetaPath, PcheckPath,
+// RegistryPath, ReplayPath, AuthorityKeys, ScorerPath, TrainingSetPath,
+// Authority and SignerKeys. VerifyDir runs only the practical checks and read
+// NONE of them, so the interface accepted eleven controls it silently ignored
+// — a caller could pass a replay attestation and an authority key set and
+// believe something was being checked. They are gone with the model that
+// defined them.
 type VerifyOptions struct {
 	Dir string
 	// Records lets a caller supply an already-loaded stream (a test, or a
 	// verifier reading from an archive rather than a directory).
-	Records    []Record
-	Stage1Path string
-	Stage2Path string
-	AetaPath   string
-	PcheckPath string
-	// RegistryPath is the frozen Aeta component registry. Without it the
-	// ETA-completeness gate cannot pass — which is the correct answer, not a
-	// reason to skip the gate.
-	RegistryPath string
+	Records []Record
 	// StepAttemptPath is the GitHub step-attempt diagnostic (A_GH). It is
-	// never a gate — GitHub reports seconds — but the contract requires it for
-	// identity sanity, and it is what makes the unmeasurable binary-install
-	// prefix visible instead of merely absent.
+	// never a gate — GitHub reports seconds — but it is what makes the
+	// unmeasurable binary-install prefix visible instead of merely absent.
 	StepAttemptPath string
 	// Invocations resolves the per-bucket invocation manifest: what the
 	// authorised plan rendered. Without it a measured Spec is an assertion
@@ -130,42 +128,12 @@ type VerifyOptions struct {
 	// invocations, which belongs to the planner/adapter layer that this
 	// package deliberately does not import — the measurement code must not be
 	// able to reach the code it measures. And the bucket the manifest is for
-	// is a fact the RECORDS carry, so it cannot be known before they are
-	// read.
+	// is a fact the RECORDS carry, so it cannot be known before they are read.
 	Invocations InvocationsFunc
-	// ReplayPath is the independent Stage-2 replay attestation. Without it the
-	// records are bound to a receipt nobody re-derived, so the run cannot be
-	// scored: comparing the planner's account of its own output to itself
-	// proves nothing.
-	ReplayPath string
-	// AuthorityKeys are the PREDECLARED public keys of the protected campaign
-	// environment. An empty set is not "accept any key": it means no authority
-	// was declared, and the run is ineligible.
-	AuthorityKeys []string
-	// ScorerPath is the frozen scorer the Pcheck projection claims. Without it
-	// the projection is only checked against its own arithmetic, which a
-	// substituted allocation map satisfies.
-	ScorerPath string
-	// TrainingSetPath is the EXACT sealed training receipt set the scorer was
-	// fitted from. Without it the offline surface is checked only by its own
-	// digest — a string the scorer supplies about itself — so the run is
-	// ineligible rather than trusted. With it the verifier revalidates the
-	// set under the authority Stage 1 declared and REFITS the scorer, which is
-	// the only check that separates a model built from this evidence from one
-	// that merely cites it.
-	TrainingSetPath string
 	// Audit runs the exact-run coverage audit for the measured bucket. A nil
 	// Audit is not "no audit needed": it makes the row ineligible, because a
 	// row nobody audited cannot be shown to have run its plan.
 	Audit AuditFunc
-	// Authority, when set, is the protected environment name the manifest must
-	// name.
-	Authority string
-	// SignerKeys are the PREDECLARED public keys allowed to sign the roster
-	// and the closing seal — the run keys. They come from the Stage-1
-	// manifest, so a run whose signer set nobody declared is ineligible
-	// rather than trusted.
-	SignerKeys []string
 }
 
 // runIdentityDiff names the FIRST field two identities disagree about, or "".
@@ -186,10 +154,6 @@ func runIdentityDiff(want, got RunIdentity) string {
 		{"job", want.Job, got.Job},
 		{"step", want.Step, got.Step},
 		{"step_attempt", want.StepAttempt, got.StepAttempt},
-		{"stage1_digest", string(want.Stage1), string(got.Stage1)},
-		{"stage2_digest", string(want.Stage2), string(got.Stage2)},
-		{"component_registry_digest", string(want.ComponentRegistry), string(got.ComponentRegistry)},
-		{"verifier_id", want.VerifierID, got.VerifierID},
 	} {
 		if f.want != f.got {
 			return fmt.Sprintf("%s is %q, not %q", f.name, f.got, f.want)
@@ -318,32 +282,6 @@ func boundaryInterval(recs []Record) Interval {
 // evaluateGates runs every applicable frozen gate. A gate with no evidence
 // does not disappear: it is reported with an empty population and does not
 // pass.
-// boundIdentities are the verified plan identities the derived documents must
-// name. They come from the Stage-1/Stage-2 documents, not from the documents
-// being checked.
-type boundIdentities struct {
-	// signers are the run-key public keys Stage 1 declared: the only keys
-	// whose roster and seal this verifier will accept.
-	signers []string
-	// replaySigners are the keys allowed to attest an independent replay.
-	replaySigners []string
-	// planStage2 is the receipt's PLAN identity — its Stage-2 digest without
-	// the binding over the documents it derived. Derived documents cite it
-	// rather than the full receipt digest, because the full digest covers a
-	// binding taken over the documents themselves.
-	planStage2 Digest
-	stage1     Digest
-	stage2     Digest
-	membership Digest
-	scorer     Digest
-	registry   Digest
-	// lineage is the whole training lineage Stage 1 bound, and trainingKeys
-	// the authority that may have sealed the set it names. Both are needed to
-	// reprove the offline surface rather than read its own account of itself.
-	lineage      TrainingLineageID
-	trainingKeys []string
-}
-
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -409,16 +347,18 @@ type Verdict struct {
 	Terminal  string `json:"terminal,omitempty"`
 	// Complete means the records describe a well-formed measurement.
 	Complete bool `json:"complete"`
-	// Eligible means the measurement may be SCORED: complete, plus a scorable
-	// clock and containment, signed records, Stage-1/Stage-2 binding, and
-	// every applicable gate passing.
-	Eligible  bool             `json:"eligible"`
-	Envelopes []Envelope       `json:"envelopes"`
-	Phases    []Phase          `json:"phases"`
-	Recon     []Reconciliation `json:"reconciliation"`
-	Gates     []GateResult     `json:"gates"`
-	Findings  []Finding        `json:"findings"`
-	ActionNs  int64            `json:"action_ns"`
+	// Eligible means the measurement may be SCORED: complete, plus every
+	// applicable gate passing.
+	//
+	// `reconciliation` is gone from this document with the peer/trace ledgers:
+	// it reported like-for-like trace-minus-peer deltas, and nothing has
+	// produced a peer or a trace record since the observers were removed.
+	Eligible  bool         `json:"eligible"`
+	Envelopes []Envelope   `json:"envelopes"`
+	Phases    []Phase      `json:"phases"`
+	Gates     []GateResult `json:"gates"`
+	Findings  []Finding    `json:"findings"`
+	ActionNs  int64        `json:"action_ns"`
 	// ActionGHNs is A_GH: the GitHub step's own whole-second elapsed. It is a
 	// DIAGNOSTIC and never enters a gate, a balance or a prediction; it is
 	// recorded so a reader can see the action envelope against the step
@@ -645,7 +585,6 @@ func collectEnvelopes(v *Verdict, recs []Record) []Envelope {
 			}
 			if r.Boundary == "end" {
 				e.Terminal, e.Reason = r.Terminal, r.Reason
-				e.Containment = r.Containment
 			}
 		}
 		out = append(out, e)
@@ -713,7 +652,7 @@ func verifyRunIdentity(v *Verdict, recs []Record) {
 			continue
 		}
 		seen[r.Run] = true
-		if r.Run.BucketID != "" || r.Run.Stage2 != "" {
+		if r.Run.BucketID != "" || r.Run.RunID != "" {
 			v.Run = r.Run
 		}
 		if r.Boundary == "end" && r.Level == LevelAction {

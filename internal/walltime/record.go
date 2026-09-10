@@ -36,24 +36,12 @@ const (
 	LevelSetup Level = "setup"
 )
 
-// Role is the ledger a record belongs to. The three ledgers at each level are
-// deliberately distinct types rather than one interval with a flag: the
-// physical envelope is the product, the peer is its reconciliation partner,
-// and the trace is an independent reconstruction. Mixing them is the failure
-// mode the whole schema exists to prevent.
-type Role string
-
-const (
-	RolePhysicalAction     Role = "AT"
-	RolePhysicalScript     Role = "VB"
-	RolePhysicalInvocation Role = "V"
-	RolePeerAction         Role = "CPA"
-	RolePeerScript         Role = "CPB"
-	RolePeerInvocation     Role = "CPV"
-	RoleTraceAction        Role = "VTA"
-	RoleTraceScript        Role = "VTB"
-	RoleTraceInvocation    Role = "VT"
-)
+// THE THREE-LEDGER ROLE MODEL IS REMOVED.
+//
+// Role named which of nine ledgers a record belonged to — AT/VB/V for the
+// physical envelope, CPA/CPB/CPV for the containment peer, VTA/VTB/VT for the
+// trace collector. The peer and the trace are gone, so there is one ledger and
+// a level already names what it measures.
 
 // Producer is which of the three independent producers wrote a record. A peer
 // and a trace that share a producer are not independent, and the verifier says
@@ -101,15 +89,11 @@ type RunIdentity struct {
 	Job         string `json:"job,omitempty"`
 	Step        string `json:"step,omitempty"`
 	StepAttempt string `json:"step_attempt,omitempty"`
-	// Stage1 and Stage2 bind the record to the frozen planning inputs and the
-	// single derived plan. A record that names no Stage-2 receipt cannot be
-	// scored: it might have measured a plan nobody authorised.
-	Stage1 Digest `json:"stage1_digest,omitempty"`
-	Stage2 Digest `json:"stage2_digest,omitempty"`
-	// ComponentRegistry is the Aeta registry template digest in force.
-	ComponentRegistry Digest `json:"component_registry_digest,omitempty"`
-	// VerifierID is the delivery-bound verifier identity the run expects.
-	VerifierID string `json:"verifier_id,omitempty"`
+	// Stage1, Stage2, ComponentRegistry and VerifierID are gone with the
+	// authority model: they bound a record to frozen planning inputs, a
+	// single authorised derived plan, an Aeta registry template and a
+	// delivery-bound verifier identity, none of which exists. What identifies
+	// a record now is the run that produced it.
 	// RunnerName, RunnerOS and RunnerArch are the EXECUTING HOST as the job
 	// itself observes it — $RUNNER_NAME, $RUNNER_OS, $RUNNER_ARCH, read by the
 	// wrapper on the machine that runs the row.
@@ -126,38 +110,20 @@ type RunIdentity struct {
 	RunnerArch string `json:"runner_arch,omitempty"`
 }
 
-// ContainmentIdentity is the stable containment the physical wrapper, its peer
-// and the trace must all name. Inode and PID-start are strings: they are
-// identities, not quantities, and an inode can exceed the exact float64 range
-// that the canonical digest allows.
-type ContainmentIdentity struct {
-	// Primitive is the containment mechanism, e.g. "cgroup2". Anything other
-	// than a real containment primitive is unscorable by construction.
-	Primitive string `json:"primitive"`
-	// ID is the containment path/name.
-	ID string `json:"id"`
-	// Inode is the containment inode, which distinguishes a re-created
-	// containment that reused a path.
-	Inode string `json:"inode,omitempty"`
-	// BootID ties the identity to one boot.
-	BootID string `json:"boot_id,omitempty"`
-	// RootPID and RootStart are the process-start identity of the root the
-	// containment was created for: a PID alone is reusable, a PID plus its
-	// start time is not.
-	RootPID   int    `json:"root_pid,omitempty"`
-	RootStart string `json:"root_start,omitempty"`
-}
-
-// SameRoot reports whether two identities name the same root process.
+// ContainmentIdentity is the process group a record's measured tree belonged
+// to.
 //
-// It is separate from Same because the two answer different questions and
-// carry different consequences: Same asks whether this is the same stable
-// containment, while this asks whether the producers agree about the process
-// it was created for. Disagreement there means the observers watched
-// containments made for different processes, which is unscorable rather than
-// malformed.
-func (c ContainmentIdentity) SameRoot(o ContainmentIdentity) bool {
-	return c.RootPID == o.RootPID && c.RootStart == o.RootStart
+// It described a cgroup-v2 subtree — primitive, path, inode, boot id and the
+// root process's start identity — and every leaf serialized EMPTY once the
+// cgroup implementation was removed: records read
+// `"containment":{"primitive":"","id":""}`. What a record can still say
+// truthfully is which process group it signalled and drained, which the Proc
+// block already carries, so this type carries only what a reader can check.
+type ContainmentIdentity struct {
+	// Primitive is the containment mechanism. There is one.
+	Primitive string `json:"primitive,omitempty"`
+	// ID is the process-group id the measured tree ran under.
+	ID string `json:"id,omitempty"`
 }
 
 // ProcIdentity is the process-tree fact a record carries.
@@ -185,29 +151,30 @@ type ProcIdentity struct {
 	Signal    string `json:"signal,omitempty"`
 }
 
-// Record is one append-only JSONL line. Hash and Signature are excluded from
-// the hashed payload; everything else is in it, so a rewritten field breaks
-// the chain.
+// Record is one append-only JSONL line.
 type Record struct {
 	Schema   string   `json:"schema"`
 	Seq      int      `json:"seq"`
 	Kind     string   `json:"kind"`
-	Role     Role     `json:"role,omitempty"`
 	Level    Level    `json:"level,omitempty"`
 	Boundary string   `json:"boundary,omitempty"`
 	Producer Producer `json:"producer"`
 	// ProducerID is the execution context of the writer: which process, on
-	// which host. Peer and trace records that share it are not independent.
+	// which host.
 	ProducerID string `json:"producer_id"`
 	// Source is the taxonomy class of the underlying event.
 	Source string `json:"source"`
 	// Seqno is the stable ordinal of an invocation within its bucket script.
 	Seqno int `json:"invocation_seq,omitempty"`
 
-	Run         RunIdentity         `json:"run"`
-	Containment ContainmentIdentity `json:"containment"`
-	Proc        ProcIdentity        `json:"proc,omitzero"`
-	Instant     Instant             `json:"instant"`
+	Run  RunIdentity  `json:"run"`
+	Proc ProcIdentity `json:"proc,omitzero"`
+	// Containment is the process group the measured tree ran under. It is a
+	// POINTER so an absent one is absent: as a value it serialized `{}` on
+	// every record after the cgroup implementation was removed, which reads as
+	// "a containment exists and could not be described".
+	Containment *ContainmentIdentity `json:"containment,omitzero"`
+	Instant     Instant              `json:"instant"`
 
 	// Spec is the invocation identity: serialised argv, cwd and selector
 	// digests. It is what makes "this V measured that invocation" checkable
@@ -224,13 +191,8 @@ type Record struct {
 	// recorded rather than lost.
 	Note string `json:"note,omitempty"`
 
-	PrevHash  Digest `json:"prev_hash"`
-	Hash      Digest `json:"hash"`
-	SignerID  string `json:"signer_id,omitempty"`
-	Signature string `json:"signature,omitempty"`
-
 	// stream is the file this record was read from. It is stamped by the
-	// reader, is never serialized, and never enters a digest: a hash chain is
+	// reader and is never serialized: a per-file property is
 	// a property of one writer's FILE, and grouping by the identity a file
 	// CLAIMS merged two intact chains into one broken one.
 	stream string
