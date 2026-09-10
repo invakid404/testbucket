@@ -420,3 +420,168 @@ func actionInputNames(t *testing.T, rel string) map[string]bool {
 	}
 	return out
 }
+
+// TestNoCompositeShellReadsAnUnexportedVariable is the F3 regression.
+//
+// Every composite step runs `bash -euo pipefail`, so `set -u` terminates the
+// step the first time it dereferences a variable nothing exported. The
+// run-bucket action shipped with `"$TB_SCORED"` in its measured branch while
+// declaring no `scored` input and exporting no such variable: every measured
+// bucket died there, before the generated script ran, and no test noticed —
+// the workflow tests scan this file for step names and phrases rather than
+// checking what the shell actually reads.
+//
+// So this checks the invariant that broke: a variable the body dereferences
+// without a `:-` default must be exported by that step, provided by the
+// runner, or a shell builtin. It is a static check on purpose — the bodies
+// create directories and start processes, and a test that executed them would
+// be testing the runner rather than the wiring.
+func TestNoCompositeShellReadsAnUnexportedVariable(t *testing.T) {
+	// Provided by the Actions runner in every step's environment.
+	runnerProvided := map[string]bool{
+		"GITHUB_ENV": true, "GITHUB_OUTPUT": true, "GITHUB_PATH": true,
+		"GITHUB_STEP_SUMMARY": true, "GITHUB_WORKSPACE": true, "GITHUB_REPOSITORY": true,
+		"GITHUB_RUN_ID": true, "GITHUB_RUN_ATTEMPT": true, "GITHUB_JOB": true,
+		"GITHUB_SHA": true, "GITHUB_REF": true, "GITHUB_REF_NAME": true,
+		"GITHUB_ACTION_PATH": true, "GITHUB_EVENT_NAME": true, "GITHUB_TOKEN": true,
+		"RUNNER_TEMP": true, "RUNNER_OS": true, "RUNNER_ARCH": true, "RUNNER_TOOL_CACHE": true,
+		"HOME": true, "PATH": true, "PWD": true, "USER": true, "SHELL": true, "TMPDIR": true,
+	}
+	// Shell builtins and specials.
+	shellProvided := map[string]bool{
+		"PIPESTATUS": true, "BASH_SOURCE": true, "FUNCNAME": true, "LINENO": true,
+		"RANDOM": true, "SECONDS": true, "OSTYPE": true, "IFS": true, "REPLY": true,
+		"BASH_REMATCH": true, "PPID": true, "UID": true, "EUID": true, "HOSTNAME": true,
+	}
+
+	// A dereference of $NAME or ${NAME} that is NOT ${NAME:-...}, ${NAME:=...},
+	// ${NAME:?...} or ${NAME+...} — those supply or demand their own value.
+	deref := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+	guarded := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)[:+\-?=]`)
+
+	checked := 0
+	for _, action := range []string{"install", "plan", "record", "run-bucket", "verify-wall"} {
+		rel := filepath.Join(".github", "actions", action, "action.yml")
+		src := readRepoFile(t, rel)
+		for _, step := range compositeShellSteps(t, src) {
+			checked++
+			body := stripShellComments(step.run)
+			exported := map[string]bool{}
+			for name := range step.env {
+				exported[name] = true
+			}
+			// Assignments inside the body define their own names.
+			for _, m := range regexp.MustCompile(`(?m)^\s*(?:local\s+|export\s+)?([A-Za-z_][A-Za-z0-9_]*)=`).FindAllStringSubmatch(body, -1) {
+				exported[m[1]] = true
+			}
+			for _, m := range regexp.MustCompile(`(?m)for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in`).FindAllStringSubmatch(body, -1) {
+				exported[m[1]] = true
+			}
+			// `read` binds its own names, including in a `while read` loop.
+			for _, m := range regexp.MustCompile(`\bread\s+(?:-[A-Za-z]+\s+)*([A-Za-z_][A-Za-z0-9_ ]*)`).FindAllStringSubmatch(body, -1) {
+				for _, name := range strings.Fields(m[1]) {
+					exported[name] = true
+				}
+			}
+			for _, g := range guarded.FindAllStringSubmatch(body, -1) {
+				exported[g[1]] = true
+			}
+			for _, m := range deref.FindAllStringSubmatch(body, -1) {
+				name := m[1]
+				if name == "" {
+					name = m[2]
+				}
+				if exported[name] || runnerProvided[name] || shellProvided[name] {
+					continue
+				}
+				t.Errorf("%s step %q dereferences $%s under `set -u`, and the step exports no such variable: the step dies there before it runs anything",
+					rel, step.name, name)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no composite shell step was checked; the structure this test reads has moved")
+	}
+}
+
+// compositeShellStep is one `shell: bash` step of a composite action.
+type compositeShellStep struct {
+	name string
+	run  string
+	env  map[string]bool
+}
+
+// compositeShellSteps extracts each shell step's name, env keys and run body.
+//
+// It reads the YAML by structure rather than parsing it, because this package
+// has no YAML dependency. The shape is fixed: steps are `    - name:` entries,
+// `      env:` holds `        KEY: value` pairs, and `      run: |` opens a
+// block scalar that runs to the next key at its own indent.
+func compositeShellSteps(t *testing.T, src string) []compositeShellStep {
+	t.Helper()
+	var out []compositeShellStep
+	lines := strings.Split(src, "\n")
+	var cur *compositeShellStep
+	inEnv, inRun := false, false
+	var run []string
+	flush := func() {
+		if cur != nil && inRun {
+			cur.run = strings.Join(run, "\n")
+		}
+		if cur != nil && cur.run != "" {
+			out = append(out, *cur)
+		}
+		cur, inEnv, inRun, run = nil, false, false, nil
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "    - name:") || strings.HasPrefix(line, "    - uses:") {
+			flush()
+			name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- name:"))
+			cur = &compositeShellStep{name: name, env: map[string]bool{}}
+			continue
+		}
+		if cur == nil {
+			continue
+		}
+		if inRun {
+			// The run block ends at the next key at step-key indent.
+			if line != "" && !strings.HasPrefix(line, "        ") && strings.HasPrefix(line, "      ") {
+				inRun = false
+				cur.run = strings.Join(run, "\n")
+			} else {
+				run = append(run, line)
+				continue
+			}
+		}
+		switch {
+		case strings.HasPrefix(line, "      env:"):
+			inEnv = true
+		case strings.HasPrefix(line, "      run:"):
+			inEnv, inRun = false, true
+			run = nil
+		case inEnv && strings.HasPrefix(line, "        "):
+			if k, _, ok := strings.Cut(strings.TrimSpace(line), ":"); ok {
+				cur.env[strings.TrimSpace(k)] = true
+			}
+		case strings.HasPrefix(line, "      "):
+			inEnv = false
+		}
+	}
+	flush()
+	return out
+}
+
+// stripShellComments removes `#` comment text so a variable NAMED in a comment
+// is not read as a dereference. The removed TB_SCORED gate is described in a
+// comment that quotes it, and quoting a defect is not committing it.
+func stripShellComments(body string) string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
