@@ -360,7 +360,7 @@ bytes, not about which document is allowed to speak.
 
 | Symbol | Name | Definition |
 |---|---|---|
-| `V[j]` | **Exec-envelope interval** | one rendered invocation, from the wrapper's first clock read inside `Exec` — taken before it creates the signing key, writer, spec identity, containment, controller, or observers — through the root child's completion and reap, same-PGID signal and group drain, observer close, containment destroy, and the closing read |
+| `V[j]` | **Exec-envelope interval** | one rendered invocation, from the wrapper's first clock read inside `Exec` — taken before it starts the instrumented process group — through the root child's completion and reap, the same-PGID signal and group drain of §3.3, and the closing read |
 | `VB` | **Exec-envelope interval of the bucket script** | the complete generated script as one owned child, same bracketing |
 | `A` | **instrumented run-bucket interval** | the first clock read inside `wall begin` to the last clock read inside `wall end` |
 | `J` | whole-job wall time | **never measured, never estimated, never claimed** |
@@ -370,8 +370,8 @@ the `wall exec` process startup, its CLI dispatch and flag parsing, and the cloc
 construction all precede the first reading; the generated JSON spec-file write precedes the
 wrapper entirely. Inside it, and named: for Mandel, `pnpm` → `tsx` → the façade → the façade's
 offline preflight → `pnpm exec vitest` → Vitest initialization, import, transform, environment
-setup, workers, hooks, test bodies, reporters, shutdown → façade cleanup, plus wrapper, observer,
-and containment overhead.
+setup, workers, hooks, test bodies, reporters, shutdown → façade cleanup, plus wrapper and
+process-group overhead.
 
 `A` is **not** "the complete action" and not every nanosecond of a composite action. §3.2 names
 what sits outside the clock pair at both ends, inside the very same step.
@@ -595,9 +595,9 @@ startup and CLI dispatch; and the boot-identity read `NewSystemClock` performs b
 monotonic reading (`internal/walltime/action.go:176-177` → `internal/walltime/clock.go:70,109-112`).
 
 **After `A_end`, inside the same step:** the closing boundary record's own write, the writer close,
-the directory seal, the `wall end` process exit, and the step's shell tail
-(`internal/walltime/action.go:903-920`). Containment destroy and handoff removal deliberately
-precede the closing read and are inside `A`.
+the `wall end` process exit, and the step's shell tail. The action-state handoff removal
+deliberately precedes the closing read and is inside `A`; `A` ends when §3.3's process-group
+drain and reap have completed, and the closing read is taken after that and not before.
 
 **Outside the action entirely:** queue and scheduling; runner allocation and image boot;
 `actions/checkout`; `actions/setup-node` and `setup-go`; `pnpm install` / `npm ci`; fixture-binary

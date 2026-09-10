@@ -426,3 +426,85 @@ func TestTheShippedHelpDescribesThePracticalLifecycle(t *testing.T) {
 		}
 	}
 }
+
+// contractSection returns the text of one numbered acceptance-contract
+// section, from its own heading to the next heading at the same or a shallower
+// depth.
+func contractSection(t *testing.T, src, heading string) string {
+	t.Helper()
+	at := strings.Index(src, heading)
+	if at < 0 {
+		t.Fatalf("the contract has no %q heading", heading)
+	}
+	depth := len(heading) - len(strings.TrimLeft(heading, "#"))
+	rest := src[at+len(heading):]
+	for i := 0; i+depth+1 < len(rest); i++ {
+		if rest[i] != '\n' {
+			continue
+		}
+		line := rest[i+1:]
+		if !strings.HasPrefix(line, "#") {
+			continue
+		}
+		if d := len(line) - len(strings.TrimLeft(line, "#")); d <= depth {
+			return rest[:i]
+		}
+	}
+	return rest
+}
+
+// TestTheContractDefinesTheIntervalsItAlsoExcludes is the normative half of
+// the semantic boundary.
+//
+// The contract settled in §0.1 that multi-signer machinery, cgroup isolation,
+// hostile containment and observer chains are out of scope, gave the actual
+// three-step process-group teardown in §3.3, and repeated the exclusion in
+// §12 — and then defined the measured intervals around the very mechanisms it
+// had excluded. §1 began `V[j]` before creation of "the signing key, writer,
+// spec identity, containment, controller, or observers" and ended it after
+// "observer close, containment destroy"; §3.2 placed containment destroy
+// inside `A`.
+//
+// Two incompatible lifecycle designs in the sole normative root is worse than
+// either: a reader cannot tell whether the measured interval includes work
+// that does not exist. Every source walk in this file skips `docs`, so nothing
+// was looking.
+func TestTheContractDefinesTheIntervalsItAlsoExcludes(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "walltime", "acceptance-contract.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+
+	// The removed mechanisms, as the timing definitions used to name them.
+	removed := []string{"observer", "containment", "signing key", "controller"}
+
+	for _, sec := range []struct{ heading, why string }{
+		{"## 1. Vocabulary", "V[j] and A are defined here"},
+		{"### 3.2", "this section fixes what sits outside A at both ends"},
+	} {
+		text := strings.ToLower(contractSection(t, src, sec.heading))
+		if strings.TrimSpace(text) == "" {
+			t.Fatalf("%s is empty; this test is reading the contract wrong", sec.heading)
+		}
+		for _, word := range removed {
+			if strings.Contains(text, word) {
+				t.Errorf("%s still defines the interval in terms of %q — %s, and §0.1 excludes it",
+					sec.heading, word, sec.why)
+			}
+		}
+	}
+
+	// AND THE SETTLED SECTIONS ARE UNTOUCHED. §3.3 is the truth the two above
+	// were aligned to; if it stopped saying so, the alignment would be
+	// meaningless and this test would pass over an empty agreement.
+	three := strings.ToLower(contractSection(t, src, "### 3.3"))
+	for _, want := range []string{"process group", "drain", "reap"} {
+		if !strings.Contains(three, want) {
+			t.Errorf("§3.3 no longer states %q; it is the three-step contract §1 and §3.2 defer to", want)
+		}
+	}
+	if !strings.Contains(strings.ToLower(contractSection(t, src, "### 0.1")), "out of scope") {
+		t.Error("§0.1 no longer states what is out of scope")
+	}
+}
