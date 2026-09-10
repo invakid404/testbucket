@@ -55,18 +55,18 @@ inputs:
       ($GITHUB_OUTPUT, $GITHUB_ENV, $GITHUB_PATH, $GITHUB_STEP_SUMMARY,
       $GITHUB_STATE) from its environment. A setup command that sets step
       outputs or job-wide variables therefore has no effect on a measured
-      bucket: those channels are how the signer delegate reaches the measured
-      step, and consumer-supplied code must not be able to read or write them.
+      bucket: those channels are how a later step's outputs and the job
+      environment are written, and consumer-supplied code must not be able to
+      read or write them.
       Do that provisioning in a prior step of the caller's own job instead.
     default: ""
   wall-time-dir:
     description: >-
       Optional records directory for complete-action wall-time measurement
       (--runner vitest). When set, the whole action runs inside a physical
-      envelope with its own containment peer and independent trace: `wall begin`
-      opens it before setup, the setup command and the bucket script run inside
-      the action containment, and `wall end` closes it after verified-empty
-      containment. It MUST match the --wall-dir the plan baked into the script.
+      envelope: `wall begin` opens it before setup, the setup command and the
+      bucket script run inside it, and `wall end` closes it after the measured
+      process group has been drained. It MUST match the --wall-dir the plan baked into the script.
       Empty = no measurement ⇒ byte-identical behavior to before.
     default: ""
   campaign-id:
@@ -478,10 +478,10 @@ runs:
       run: |
         set -euo pipefail
         if [ -n "$TB_WALL_DIR" ]; then
-          # NO --wrapper-chain: this is the CONSUMER'S command. `wall run`
-          # strips every wall-time secret and account selector from its child,
-          # so caller-supplied code never runs holding the signer delegate or
-          # anything else that could decide whose evidence a run admits.
+          # NO --wrapper-chain: this is the CONSUMER'S command, so `wall run`
+          # strips the GitHub file-command channels from its child and records
+          # its own setup lifecycle. Caller-supplied code therefore cannot
+          # rewrite the measured step's outputs or the job environment.
           testbucket wall run --dir "$TB_WALL_DIR" -- bash -eo pipefail -c "$TB_SETUP_COMMAND"
         else
           bash -eo pipefail -c "$TB_SETUP_COMMAND"
@@ -518,17 +518,6 @@ runs:
         # command is executed as this account, which may not. Empty means no
         # boundary was established, and the row is recorded in full and
         # reported INELIGIBLE rather than scored.
-        # The bucket script's own account. The wrapper drops to it before
-        # starting the script, so the measured script is not the credential
-        # owning what contains it; the invocation containments beneath it are
-        # created by the wrapper's controller rather than by the script.
-        # THE SIGNER DELEGATE, NAMED BY THE ONE STEP THAT NEEDS IT.
-        #
-        # This is the only step that references the begin step's output, so it
-        # is the only step whose environment carries the capability. The
-        # consumer-supplied setup step above does not name it, and `wall run`
-        # strips it from that child's environment as well — two independent
-        # reasons caller-controlled code cannot hold it.
         TB_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
@@ -605,13 +594,11 @@ runs:
             cat "$RUNNER_TEMP/testbucket-bucket.sh"
             echo "--- output ---"
 
-            # VB: the complete generated script under its own physical
-            # envelope, containment peer and independent trace. The run
-            # identity is inherited from the action state `wall begin` wrote,
-            # so the script and its invocations bind the same Stage-1 and
-            # Stage-2 receipts the action does. The wrapper exits with the
-            # script status and `wall run` passes it on, so a red bucket stays
-            # red.
+            # VB: the complete generated script under its own measured
+            # envelope. The run identity is inherited from the action state
+            # `wall begin` wrote, so the script and its invocations belong to
+            # the same run the action does. The wrapper exits with the script
+            # status and `wall run` passes it on, so a red bucket stays red.
             testbucket wall exec --dir "$TB_WALL_DIR" --level script \
               --desc "$BUCKET_NAME" -- bash "$RUNNER_TEMP/testbucket-bucket.sh"
           '

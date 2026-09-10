@@ -183,35 +183,6 @@ func runWallRun(args []string) error {
 	return nil
 }
 
-// builderKeyEnv is where the builder's signing key is read from — an
-// environment variable rather than a flag, for the same reason the authority
-// key is: a key on a command line is a key in the process table.
-const builderKeyEnv = walltime.BuilderKeyEnv
-
-// verdictSigningIdentity is the identity a machine-readable verdict must be
-// signed under: the DELIVERY VERIFIER the measured records name.
-//
-// A signature covers `authority NUL digest`, and the retained authority is the
-// party the signature was made under. LoadCampaign requires that party to be
-// the delivery verifier the verdict's own body names, because a verdict signed
-// under some other identity attributes a row to somebody who did not verify
-// it.
-//
-// This used to be the --authority value, which in the scored workflow is the
-// protected Stage-1 environment `ewj2-campaign`, while the body's verifier
-// identity comes from the measured records and is `ewj2-verifier`. The
-// producer therefore emitted, by construction, exactly the verdict the
-// production campaign loader refuses — so no genuine population could ever
-// have been assembled from real runs. --authority keeps its own job: saying
-// which protected environment must have approved Stage 1.
-func verdictSigningIdentity(v *walltime.Verdict) (string, error) {
-	identity := strings.TrimSpace(v.Run.VerifierID)
-	if identity == "" {
-		return "", fmt.Errorf("these records name no delivery verifier identity, so there is nobody to sign this verdict as; signing it under any other name would attribute the row to a party that did not verify it")
-	}
-	return identity, nil
-}
-
 // coverageAudit builds the verifier's exact-run coverage check.
 //
 // It lives here rather than in internal/walltime because the audit belongs to

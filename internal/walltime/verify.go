@@ -80,14 +80,17 @@ func (i Interval) Duration() int64 {
 	return int64(i.EndNs - i.StartNs)
 }
 
-// Envelope is one measured thing: the physical ledger plus its independent
-// peer and trace.
+// Envelope is one measured thing: the physical ledger's start/end pair.
+//
+// It carried a `peer` and a `trace` interval beside the physical one, and the
+// report printed all three as columns. Nothing has produced a peer or a trace
+// record since the observers were removed, so both columns were structurally
+// empty — a report that shows a reader two blank quantities is telling them
+// something was measured and not reported.
 type Envelope struct {
 	Level       Level               `json:"level"`
 	Seq         int                 `json:"seq"`
 	Physical    Interval            `json:"physical"`
-	Peer        Interval            `json:"peer"`
-	Trace       Interval            `json:"trace"`
 	Containment ContainmentIdentity `json:"containment"`
 	Terminal    string              `json:"terminal"`
 	Reason      string              `json:"reason,omitempty"`
@@ -312,58 +315,6 @@ func boundaryInterval(recs []Record) Interval {
 	return iv
 }
 
-// containmentControlOrUnknown names an unset membership-control fact rather
-// than printing an empty string: a record written before this was established
-// says nothing about the model, which is itself the answer.
-func containmentControlOrUnknown(s string) string {
-	if strings.TrimSpace(s) == "" {
-		return MembershipUnknown + " (the record states none)"
-	}
-	return s
-}
-
-// comparableEndpoints reports whether an envelope's six readings can be
-// compared at all: same clock identity, same non-empty epoch identity.
-func comparableEndpoints(e Envelope) bool {
-	if !e.Physical.OK || !e.Peer.OK || !e.Trace.OK {
-		return false
-	}
-	recs := []Record{e.Physical.start, e.Physical.end, e.Peer.start, e.Peer.end, e.Trace.start, e.Trace.end}
-	clock, boot := recs[0].Instant.ClockID, recs[0].Instant.BootID
-	if boot == "" {
-		return false
-	}
-	for _, r := range recs[1:] {
-		if r.Instant.ClockID != clock || r.Instant.BootID != boot {
-			return false
-		}
-	}
-	return true
-}
-
-// reconcile computes the LIKE-FOR-LIKE trace-minus-peer deltas per level.
-func reconcile(envs []Envelope) []Reconciliation {
-	byLevel := map[Level]*Reconciliation{}
-	for _, e := range envs {
-		if !e.Peer.OK || !e.Trace.OK {
-			continue
-		}
-		r, ok := byLevel[e.Level]
-		if !ok {
-			r = &Reconciliation{Level: e.Level}
-			byLevel[e.Level] = r
-		}
-		r.Deltas = append(r.Deltas, e.Trace.Duration()-e.Peer.Duration())
-	}
-	out := make([]Reconciliation, 0, len(byLevel))
-	for _, l := range []Level{LevelAction, LevelScript, LevelInvocation} {
-		if r, ok := byLevel[l]; ok {
-			out = append(out, *r)
-		}
-	}
-	return out
-}
-
 // evaluateGates runs every applicable frozen gate. A gate with no evidence
 // does not disappear: it is reported with an empty population and does not
 // pass.
@@ -522,10 +473,10 @@ func (v *Verdict) has(severity string) bool {
 func (v *Verdict) Write(out io.Writer) error {
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "wall-time verification — %s\n\n", v.Dir)
-	fmt.Fprintf(w, "envelope\tphysical\tpeer\ttrace\tterminal\n")
+	fmt.Fprintf(w, "envelope\tphysical\tterminal\n")
 	for _, e := range v.Envelopes {
-		fmt.Fprintf(w, "%s[%d]\t%s\t%s\t%s\t%s\n", e.Level, e.Seq,
-			dur(e.Physical.Duration()), dur(e.Peer.Duration()), dur(e.Trace.Duration()), firstNonEmptyStr(e.Terminal, "-"))
+		fmt.Fprintf(w, "%s[%d]\t%s\t%s\n", e.Level, e.Seq,
+			dur(e.Physical.Duration()), firstNonEmptyStr(e.Terminal, "-"))
 	}
 	if len(v.Phases) > 0 {
 		fmt.Fprintf(w, "\nphysical partition\n")

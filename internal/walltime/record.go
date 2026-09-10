@@ -2,8 +2,6 @@ package walltime
 
 import (
 	"bufio"
-	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,18 +61,18 @@ const (
 type Producer string
 
 const (
+	// ProducerPhysical is the ONLY producer. The containment peer and the
+	// trace collector went with the multi-ledger model: they existed to
+	// reconcile the physical envelope against two independent observers, and
+	// nothing observes independently any more.
 	ProducerPhysical Producer = "physical_wrapper"
-	ProducerPeer     Producer = "containment_peer"
-	ProducerTrace    Producer = "trace_collector"
 )
 
-// Source taxonomy. Only an independently observed os_containment or
-// os_process_lifecycle event may DELIMIT a peer or trace lifecycle; a wrapper
-// or reporter event may annotate one but can never supply an endpoint.
+// Source taxonomy: what kind of event an endpoint was derived from. The
+// containment and reporter-annotation classes went with the observers that
+// produced them.
 const (
-	SourceContainment      = "os_containment"
 	SourceProcessLifecycle = "os_process_lifecycle"
-	SourceReporter         = "reporter_annotation"
 	SourceWrapper          = "wrapper_annotation"
 )
 
@@ -89,41 +87,6 @@ const (
 	TerminalWrapperError  = "wrapper_error"
 	TerminalCrashUnclosed = "crash_unclosed"
 )
-
-// RoleFor maps a producer and level to the ledger role, so the three producers
-// cannot disagree about what they are writing.
-func RoleFor(p Producer, l Level) (Role, error) {
-	switch p {
-	case ProducerPhysical:
-		switch l {
-		case LevelAction:
-			return RolePhysicalAction, nil
-		case LevelScript:
-			return RolePhysicalScript, nil
-		case LevelInvocation:
-			return RolePhysicalInvocation, nil
-		}
-	case ProducerPeer:
-		switch l {
-		case LevelAction:
-			return RolePeerAction, nil
-		case LevelScript:
-			return RolePeerScript, nil
-		case LevelInvocation:
-			return RolePeerInvocation, nil
-		}
-	case ProducerTrace:
-		switch l {
-		case LevelAction:
-			return RoleTraceAction, nil
-		case LevelScript:
-			return RoleTraceScript, nil
-		case LevelInvocation:
-			return RoleTraceInvocation, nil
-		}
-	}
-	return "", fmt.Errorf("walltime: no role for producer %q at level %q", p, l)
-}
 
 // RunIdentity is the campaign/delivery keying every record carries. It is
 // repeated on every line on purpose: a record must be independently
@@ -183,70 +146,6 @@ type ContainmentIdentity struct {
 	// start time is not.
 	RootPID   int    `json:"root_pid,omitempty"`
 	RootStart string `json:"root_start,omitempty"`
-	// OwnerUID is the credential that owns this containment's `cgroup.procs`.
-	// The verifier compares it against the measured process's own uid: they
-	// must differ, or the thing being measured could have rewritten its own
-	// membership.
-	OwnerUID int `json:"owner_uid,omitempty"`
-	// OwnerGID and Mode are the rest of the facts the membership decision was
-	// made from, retained so a VERIFIER CAN REDERIVE IT.
-	//
-	// The producer's MembershipControl string is a summary, and the cgroup is
-	// gone by the time anyone reads the records — so a verifier that trusted
-	// the string was trusting a non-reproducible producer conclusion about the
-	// one property eligibility turns on. These are the inputs; the rule is
-	// membershipModelFor, and it can be run again.
-	OwnerGID int    `json:"owner_gid,omitempty"`
-	Mode     uint32 `json:"mode,omitempty"`
-	// WorkloadUID and WorkloadGIDs are the credential the MEASURED WORKLOAD
-	// runs as, resolved once when the containment was created and retained
-	// here.
-	//
-	// The membership decision asks one question — can the workload rewrite
-	// this containment's `cgroup.procs`? — and the producer used to answer it
-	// by reading `/etc/passwd` and `/etc/group` at decision time and writing
-	// down the conclusion. Nobody could rerun that: the accounts file is not
-	// part of the evidence, the cgroup is gone, and at the action level there
-	// is no measured child whose own uid could stand in for the workload's.
-	// These are the inputs, retained beside the owner and the mode, so the
-	// rule runs again over the same facts the producer used.
-	//
-	// WorkloadUID is -1 when no workload account was declared, which is the
-	// single-credential host: the wrapper and the measured work share a
-	// credential, and no boundary exists to rederive.
-	WorkloadUID  int   `json:"workload_uid,omitempty"`
-	WorkloadGIDs []int `json:"workload_gids,omitempty"`
-	// MembershipControl is WHO may write this containment's `cgroup.procs` —
-	// the process-migration control on cgroup-v2 — established by reading the
-	// filesystem rather than asserted by Stage 1. See the Membership*
-	// constants. A containment the measured workload can migrate itself out
-	// of cannot prove the membership history the envelope is built on.
-	MembershipControl string `json:"membership_control,omitempty"`
-}
-
-// Scorable reports whether this containment can delimit a scored lifecycle.
-//
-// The ROOT PROCESS IDENTITY is required, not merely documented. RootPID plus
-// RootStart is what the schema says closes PID reuse, and a containment
-// identity that omits it cannot say which process the containment was made
-// for: the path and inode survive a reboot's worth of pid recycling, and
-// "some process with this number" is not an identity. It used to be checked
-// for none of that, so a run whose every record omitted the start identity
-// scored exactly as well as one that carried it.
-func (c ContainmentIdentity) Scorable() bool {
-	return c.Primitive == PrimitiveCgroup2 && c.ID != "" && c.Inode != "" && c.BootID != "" &&
-		c.RootPID > 0 && strings.TrimSpace(c.RootStart) != "" &&
-		c.MembershipControl == MembershipSupervisorOwned &&
-		// AND THE FACTS THE MEMBERSHIP DECISION WAS MADE FROM.
-		//
-		// MembershipControl is a producer's summary of the one property
-		// eligibility turns on. The verifier reruns the rule — but only over
-		// records that retained its inputs, and the mode was optional: a
-		// signed identity could omit it, assert supervisor ownership, skip
-		// the rederivation it gates and stay scorable. A conclusion whose
-		// inputs were not retained is not rederivable, and a property nobody
-		// can recheck is a claim.
-		c.OwnerUID >= 0 && c.OwnerGID >= 0 && c.Mode != 0
 }
 
 // SameRoot reports whether two identities name the same root process.
@@ -266,10 +165,6 @@ type ProcIdentity struct {
 	PID     int    `json:"pid,omitempty"`
 	PGID    int    `json:"pgid,omitempty"`
 	StartID string `json:"start_id,omitempty"`
-	// SessionID is the child's session, read while it is alive. The contract
-	// makes a session or PGID change terminal, and neither is decidable from a
-	// record that never carried the session.
-	SessionID int `json:"sid,omitempty"`
 	// UID is the credential the measured process actually ran under, read from
 	// the kernel rather than declared. It is what turns the workload account
 	// from a caller's assertion into a fact: a containment owned by one
@@ -304,45 +199,8 @@ type Record struct {
 	// ProducerID is the execution context of the writer: which process, on
 	// which host. Peer and trace records that share it are not independent.
 	ProducerID string `json:"producer_id"`
-	// ProducerBinary is the FULL SHA-256 of the executable that wrote this
-	// record. It is its own field rather than a fragment inside ProducerID
-	// because the verifier must compare it for exact equality against the
-	// binary Stage 1 approved: a substring match over a truncated digest is
-	// satisfiable by a prefix collision, and an identity that a collision can
-	// satisfy is not an identity.
-	ProducerBinary Digest `json:"producer_binary,omitempty"`
 	// Source is the taxonomy class of the underlying event.
 	Source string `json:"source"`
-	// RawEventID and RawEventDigest identify the raw event this endpoint was
-	// derived from. A peer and its trace observe the SAME lifecycle through
-	// DIFFERENT raw reads, so these must differ even though the containment
-	// identity matches.
-	RawEventID     string `json:"raw_event_id,omitempty"`
-	RawEventDigest Digest `json:"raw_event_digest,omitempty"`
-	// RawEventBytes is the exact kernel output the endpoint was derived from,
-	// retained so a later reader can re-derive the conclusion rather than
-	// trust it. RawProcs is the containment membership snapshot taken with the
-	// same read.
-	RawEventBytes []byte `json:"raw_event_bytes,omitempty"`
-	// RawProcs is the containment membership snapshot taken WITH that read.
-	//
-	// It deliberately carries no `omitempty`. A successful read of an empty
-	// containment and a read that never happened used to serialise
-	// identically — both absent — so a producer whose `cgroup.procs` read
-	// failed emitted evidence indistinguishable from one that proved the
-	// containment empty. Without omitempty a taken snapshot is `[]` and an
-	// absent one is `null`, and the verifier can tell them apart.
-	//
-	// RawProcsBytes and RawProcsDigest are that snapshot's own retained
-	// evidence, derived exactly as the event's are: the digest binds this
-	// observer's event id to the exact `cgroup.procs` bytes, so an empty read
-	// still has a digest nobody can produce without having taken it.
-	RawProcs       []int  `json:"raw_procs"`
-	RawProcsBytes  []byte `json:"raw_procs_bytes,omitempty"`
-	RawProcsDigest Digest `json:"raw_procs_digest,omitempty"`
-	// Phase names a trace phase (invocation lifecycle, inter-invocation gap,
-	// script epilogue).
-	Phase string `json:"phase,omitempty"`
 	// Seqno is the stable ordinal of an invocation within its bucket script.
 	Seqno int `json:"invocation_seq,omitempty"`
 
@@ -389,18 +247,6 @@ type SpecIdentity struct {
 	Desc           string `json:"desc,omitempty"`
 }
 
-// payload is the record minus the fields that authenticate it. Hashing this
-// (rather than the marshalled line) is what makes the chain independent of
-// field order and of encoding/json's future output choices.
-func (r Record) payload() Record {
-	c := r
-	c.Hash, c.Signature = "", ""
-	return c
-}
-
-// computeHash chains this record to its predecessor.
-func (r Record) computeHash() (Digest, error) { return DigestJSON(r.payload()) }
-
 // Writer appends hash-chained records to one producer's JSONL stream.
 //
 // Every Append fsyncs before returning. That is deliberately the slow choice:
@@ -410,22 +256,19 @@ type Writer struct {
 	mu       sync.Mutex
 	f        *os.File
 	seq      int
-	prev     Digest
 	producer Producer
 	id       string
-	// binary is the full digest of the executable writing this stream. Every
-	// record carries it so the verifier can tie the stream to the build Stage 1
-	// approved without parsing it out of a display string.
-	binary Digest
-	key    ed25519.PrivateKey
-	signer string
 }
 
-// NewWriter opens (creating) the append-only stream for one producer.
-// producerID is the writer's execution-context identity; signing key may be
-// nil, in which case records are hash-chained but unsigned and the verifier
-// will refuse to SCORE them (it still verifies their structure).
-func NewWriter(path string, p Producer, producerID string, key ed25519.PrivateKey) (*Writer, error) {
+// NewWriter opens (creating) the append-only stream.
+//
+// It used to take an ed25519 signing key and hash-chain every record. Both are
+// gone with the multi-ledger model: production always passed nil, and inside
+// the trusted-CI boundary §3 draws, a chain the writer recomputes and a
+// signature made with a key the writer holds establish nothing an editor of
+// the file could not reproduce. The producer-binary digest and the signer
+// identity went with them.
+func NewWriter(path string, p Producer, producerID string) (*Writer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("walltime: records dir: %w", err)
 	}
@@ -433,40 +276,23 @@ func NewWriter(path string, p Producer, producerID string, key ed25519.PrivateKe
 	if err != nil {
 		return nil, fmt.Errorf("walltime: open records %s: %w", path, err)
 	}
-	// No binary digest and no signer: salvage-map removes the signer identity
-	// with the rest of the multi-role ledger. What the writer still owes is
-	// one document per bucket, written atomically, with canonical JSON and a
-	// content digest — none of which needs a key.
 	w := &Writer{f: f, producer: p, id: producerID}
 	// Resume an existing stream rather than restarting its sequence: the
 	// action level writes its start and end from two different processes.
-	if seq, prev, err := tailChain(path); err == nil {
-		w.seq, w.prev = seq, prev
+	if seq, err := tailSeq(path); err == nil {
+		w.seq = seq
 	}
 	return w, nil
 }
 
-// Append stamps, chains, signs and durably writes one record.
+// Append stamps and durably writes one record.
 func (w *Writer) Append(r Record) (Record, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	r.Schema = SchemaVersion
 	r.Producer = w.producer
 	r.ProducerID = w.id
-	if r.ProducerBinary == "" {
-		r.ProducerBinary = w.binary
-	}
 	r.Seq = w.seq
-	r.PrevHash = w.prev
-	r.SignerID = w.signer
-	h, err := r.computeHash()
-	if err != nil {
-		return Record{}, err
-	}
-	r.Hash = h
-	if w.key != nil {
-		r.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(w.key, []byte(h)))
-	}
 	line, err := json.Marshal(r)
 	if err != nil {
 		return Record{}, fmt.Errorf("walltime: marshal record: %w", err)
@@ -478,7 +304,6 @@ func (w *Writer) Append(r Record) (Record, error) {
 		return Record{}, fmt.Errorf("walltime: sync record: %w", err)
 	}
 	w.seq++
-	w.prev = h
 	return r, nil
 }
 
@@ -489,14 +314,13 @@ func (w *Writer) Close() error {
 	return w.f.Close()
 }
 
-// tailChain reads an existing stream to recover its sequence and last hash.
-func tailChain(path string) (int, Digest, error) {
+// tailSeq reads an existing stream to recover its next sequence number.
+func tailSeq(path string) (int, error) {
 	recs, err := ReadRecords(path)
 	if err != nil || len(recs) == 0 {
-		return 0, "", err
+		return 0, err
 	}
-	last := recs[len(recs)-1]
-	return last.Seq + 1, last.Hash, nil
+	return recs[len(recs)-1].Seq + 1, nil
 }
 
 // ReadRecords parses one stream. It does NOT verify the chain — VerifyChain

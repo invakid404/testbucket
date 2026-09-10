@@ -41,7 +41,7 @@ func TestVerifierRefusesAnEmptyDirectory(t *testing.T) {
 func TestVerifierRefusesAnIncompleteStream(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "physical-invocation-00.jsonl")
-	w, err := NewWriter(path, ProducerPhysical, "physical", nil)
+	w, err := NewWriter(path, ProducerPhysical, "physical")
 	if err != nil {
 		t.Fatal(err)
 	}

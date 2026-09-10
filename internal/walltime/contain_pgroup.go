@@ -3,7 +3,6 @@ package walltime
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"sync"
 	"syscall"
 )
@@ -55,31 +54,6 @@ func (p *processGroup) Admit(pid int) error {
 // rather than guessing. The verifier treats an unenumerable membership as
 // unscorable.
 func (p *processGroup) Procs() ([]int, error) { return nil, nil }
-
-func (p *processGroup) Observe(observer string) (RawEvent, bool, error) {
-	p.mu.Lock()
-	pgid := p.pgid
-	p.mu.Unlock()
-	populated := false
-	if pgid != 0 {
-		// signal 0 probes for existence without delivering anything.
-		populated = syscall.Kill(-pgid, 0) == nil
-	}
-	id := newRawEventID(observer)
-	state := "populated=" + strconv.FormatBool(populated) + ";pgid=" + strconv.Itoa(pgid)
-	return RawEvent{
-		ID:    id,
-		Bytes: []byte(state),
-		// No membership snapshot: a process group cannot be enumerated
-		// portably, and Procs stays nil so the absence is visible rather than
-		// presented as an empty containment. Such a run is unscorable anyway.
-		Digest: DigestBytes([]byte(id + "\x00" + state)),
-		// A process-group probe is a process-lifecycle observation, not a
-		// containment event; naming it honestly is what lets the verifier see
-		// that no containment evidence exists.
-		Source: SourceProcessLifecycle,
-	}, populated, nil
-}
 
 // Freeze cannot be done to a process group: there is no kernel object to
 // suspend as a unit, and SIGSTOP to a group races the very fork it is meant to

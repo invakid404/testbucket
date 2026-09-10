@@ -94,7 +94,7 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	}
 	probe(atStartReading, dir)
 
-	w, err := NewWriter(filepath.Join(dir, "physical-action-00.jsonl"), ProducerPhysical, "physical", nil)
+	w, err := NewWriter(filepath.Join(dir, "physical-action-00.jsonl"), ProducerPhysical, "physical")
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +220,7 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 	clock := NewSystemClock()
 	var w *Writer
 	if writeLifecycle {
-		w, err = NewWriter(filepath.Join(dir, "physical-setup-00.jsonl"), ProducerPhysical, "physical", nil)
+		w, err = NewWriter(filepath.Join(dir, "physical-setup-00.jsonl"), ProducerPhysical, "physical")
 		if err != nil {
 			return 1, err
 		}
@@ -352,7 +352,7 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 		return nil, err
 	}
 	clock := NewSystemClock()
-	w, err := NewWriter(filepath.Join(dir, "physical-action-00.jsonl"), ProducerPhysical, "physical", nil)
+	w, err := NewWriter(filepath.Join(dir, "physical-action-00.jsonl"), ProducerPhysical, "physical")
 	if err != nil {
 		return st, err
 	}

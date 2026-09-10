@@ -78,8 +78,8 @@ inputs:
     description: >-
       Optional records directory for complete-action wall-time measurement
       (runner: vitest). When set, every rendered invocation in the generated
-      script runs under `testbucket wall exec`, so it gets a physical envelope,
-      a containment peer and an independent trace. It MUST match the
+      script runs under `testbucket wall exec`, so it gets its own measured
+      envelope. It MUST match the
       wall-time-dir the run-bucket action is given: the script names the
       directory, and a mismatch would write records nobody verifies. Empty = no
       measurement ⇒ byte-identical script to before.

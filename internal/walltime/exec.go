@@ -154,7 +154,7 @@ func Exec(opt ExecOptions) (int, error) {
 	start := clock.Now()
 	probe(atStartReading, opt.Dir)
 
-	w, err := NewWriter(filepath.Join(opt.Dir, execStreamName(opt)), ProducerPhysical, "physical", nil)
+	w, err := NewWriter(filepath.Join(opt.Dir, execStreamName(opt)), ProducerPhysical, "physical")
 	if err != nil {
 		return 1, err
 	}
@@ -544,131 +544,6 @@ var errUnreaped = fmt.Errorf("the root was not reaped after the whole containmen
 // membershipSnapshot returns the containment membership at close. The LIST is
 // retained, not a count: "0 members" and "these are the members" answer
 // different questions, and only the second one lets a reader check the first.
-// retainProcessTree writes one physical process-tree record with the
-// containment membership read AT THIS MOMENT.
-//
-// It is a best-effort retention: a read that fails still produces a record
-// saying so, because "the membership could not be read" is a fact about the
-// run and the verifier decides what it means. What it never does is present an
-// unread or absent snapshot as an observed one.
-// retainObservedTree writes the LAST OBSERVED state as its own record.
-//
-// It is a third boundary because it answers a third question. The admission
-// read says what was admitted; the drained read says the containment ended
-// empty; this one says what the measured process looked like the last time
-// anyone could see it, and which processes were in the containment then. A
-// descendant that lived and exited inside the interval appears here or
-// nowhere.
-func retainObservedTree(w *Writer, opt ExecOptions, clock Clock, cont Containment, proc ProcIdentity, ev *RawEvent) {
-	rec := Record{
-		Kind: "process_tree", Boundary: "observed",
-		Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
-		Source: SourceProcessLifecycle, Seqno: opt.Seq, Run: opt.Run,
-		Containment: cont.Identity(), Proc: proc, Instant: clock.Now(),
-	}
-	if ev == nil {
-		rec.Note = "the measured process was never observed alive after admission"
-	} else {
-		rec.RawEventID, rec.RawEventDigest, rec.RawEventBytes = ev.ID, ev.Digest, ev.Bytes
-		rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
-		rec.Note = fmt.Sprintf("cgroup.procs members last observed alive: %d", len(ev.Procs))
-	}
-	_, _ = w.Append(rec)
-}
-
-func retainProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment, proc ProcIdentity, boundary string) {
-	ev, _, err := cont.Observe(string(ProducerPhysical))
-	appendProcessTree(w, opt, clock, cont, proc, boundary, ev, err, "")
-}
-
-// appendProcessTree writes a process-tree record from a membership read that
-// was ALREADY TAKEN.
-//
-// The admission read and the identity read no longer happen at the same
-// instant, and they cannot: the membership must be read while the containment
-// is frozen, and the credential can only be read after the thaw lets the child
-// reach it. Splitting the write from the read is what lets one record carry
-// both, and the note says which instant each half came from rather than
-// leaving a reader to assume they were simultaneous.
-func appendProcessTree(w *Writer, opt ExecOptions, clock Clock, cont Containment, proc ProcIdentity, boundary string, ev RawEvent, err error, note string) {
-	rec := Record{
-		Kind: "process_tree", Boundary: boundary,
-		Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
-		Source: SourceProcessLifecycle, Seqno: opt.Seq, Run: opt.Run,
-		Containment: cont.Identity(), Proc: proc, Instant: clock.Now(),
-	}
-	if err != nil {
-		rec.Note = "cgroup.procs unreadable: " + err.Error()
-	} else {
-		rec.RawEventID, rec.RawEventDigest, rec.RawEventBytes = ev.ID, ev.Digest, ev.Bytes
-		rec.RawProcs, rec.RawProcsBytes, rec.RawProcsDigest = ev.Procs, ev.ProcsBytes, ev.ProcsDigest
-		rec.Note = fmt.Sprintf("cgroup.procs members at %s: %d", boundary, len(ev.Procs))
-	}
-	if note != "" {
-		rec.Note = joinReason(rec.Note, note)
-	}
-	_, _ = w.Append(rec)
-}
-
-// workloadArgv wraps the measured command so it runs under the MEASURED
-// PARTY'S OWN CREDENTIAL rather than the wrapper's.
-//
-// This is the privilege boundary, and it is the whole of it. The wrapper needs
-// to create containments, freeze them, admit into them and destroy them, so it
-// must be able to write the delegated subtree; the measured work must not,
-// because on cgroup-v2 `cgroup.procs` IS the process-migration control and a
-// process that can write it can move itself between containments and rewrite
-// the membership history the envelope records.
-//
-// Both cannot be one credential, and no arrangement of files or environment
-// changes that — so the measured command is executed as a different account.
-// The wrapper stays where it is; only the thing being measured drops.
-//
-// THERE ARE TWO MEASURED PARTIES, and they are not the same party.
-//
-// The invocation child runs somebody else's test code. The script child runs
-// the generated bucket body, which writes the invocation specs and starts the
-// nested wrappers — harness work, but work whose measured process was
-// nevertheless the credential OWNING its own containment when it did not drop,
-// which is exactly what the wrapper's own verifier refuses to score. Dropping
-// only the invocation therefore made an eligible script row unproducible: the
-// producer kept the wrapper credential at that level and the verifier made
-// that same credential unscorable there.
-//
-// So both drop, to two accounts:
-//
-//   - the script to ScriptUserEnv, whose subtree is delegated to it before it
-//     starts, so it can create and admit the invocation containments and can
-//     still not touch the enclosing action containment;
-//   - the invocation to WorkloadUserEnv, which is delegated nothing at all.
-//
-// Without a declared account a level runs as before: the run is recorded in
-// full and reported ineligible, because the measured process is then the
-// credential that owns its own containment.
-func workloadArgv(level Level, argv []string) []string {
-	user := workloadAccount(level)
-	if user == "" || len(argv) == 0 {
-		return argv
-	}
-	// `sudo -n` and never a password prompt: a measurement that stops to ask
-	// for one is a measurement that hangs. The runner grants the wrapper this;
-	// the measured accounts are deliberately granted no sudo back the other
-	// way.
-	return append([]string{"sudo", "-n", "-u", user, "--"}, argv...)
-}
-
-// workloadAccount is the account a level's measured process runs as. The
-// action level has no measured child — its containment is joined by the step
-// processes themselves — so it has no account and does not drop.
-func workloadAccount(level Level) string {
-	switch level {
-	case LevelInvocation:
-		return strings.TrimSpace(os.Getenv(WorkloadUserEnv))
-	case LevelScript:
-		return strings.TrimSpace(os.Getenv(ScriptUserEnv))
-	}
-	return ""
-}
 
 // credentialDropWait bounds how long the wrapper waits for the drop to become
 // observable. It is a spawn-and-exec of one program; a second is generous, and
@@ -683,75 +558,21 @@ func membershipSnapshot(cont Containment) ([]int, string) {
 	return pids, fmt.Sprintf("cgroup.procs members at close: %d", len(pids))
 }
 
-// ObserverLauncher builds the command that runs one independent observer. It
-// is a variable so a test can point it at a helper process; production always
-// re-executes THIS binary, which is what makes the observer's delivery
-// identity the same bytes Stage 1 bound.
-var ObserverLauncher = func(args []string) (*exec.Cmd, error) {
-	self, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
-	return exec.Command(self, append([]string{"wall", "observe"}, args...)...), nil
-}
-
-// reapStarted terminates and waits for an observer this function started but
-// is about to abandon, and folds the outcome into the error it returns.
+// THE PRIVATE SIGNING CAPABILITIES ARE GONE, and with them the observers.
 //
-// It KILLs rather than asking politely: the child is an observer whose launch
-// has already failed, there is nothing for it to finish, and the caller is
-// blocked until it is gone. The wait is what makes it a reap rather than a
-// signal — an unwaited child is a zombie, and the contract's rule is
-// terminate AND reap.
+// TB_WALL_AUTHORITY_KEY, _VERIFIER_KEY, _REPLAY_KEY, _BUILDER_KEY and
+// _RUNNER_KEY declared the keys that approved Stage-1 inputs, signed verdicts,
+// signed replay and build attestations, and let a fleet attest a host image.
+// ObserverLauncher re-executed this binary as an independent containment peer
+// and trace collector, handing each a signing key on descriptor 3. None of it
+// had a production caller, and all of it belongs to the threat model the
+// practical contract replaces with §3's trusted-CI boundary.
 //
-// A failure to reap is folded into the returned error rather than replacing
-// it: the original cause is why the launch was abandoned, and "we also could
-// not clean it up" is a second fact about the same event, not a substitute
-// for the first.
-func reapStarted(p Producer, cmd *exec.Cmd, cause error) error {
-	if cmd.Process == nil {
-		return cause
-	}
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return fmt.Errorf("%w; the already-started %s could not be killed: %v", cause, p, err)
-	}
-	if _, err := cmd.Process.Wait(); err != nil {
-		return fmt.Errorf("%w; the already-started %s was killed but not reaped: %v", cause, p, err)
-	}
-	return cause
-}
-
-// observerKeyFD is the descriptor an observer reads its signing key from. It
-// is 3 because Go places ExtraFiles immediately after stdin/stdout/stderr.
-const observerKeyFD = 3
-
-// The private signing capabilities this system reads from the environment.
-//
-// They are declared HERE, together, and every command that needs one refers to
-// the constant rather than writing the name out again. That is not tidiness:
-// the scrub list below is built from exactly these names, so a capability
-// cannot be introduced somewhere else and then be missing from it. The builder
-// key was introduced in another package and forgotten by the denylist, which
-// is precisely the failure this arrangement removes — and
-// TestEveryPrivateKeyEnvironmentVariableIsScrubbed scans the whole repository
-// for `TB_WALL_*_KEY` so a name declared anywhere else is still caught.
-const (
-	// AuthorityKeyEnv approves Stage-1 inputs.
-	AuthorityKeyEnv = "TB_WALL_AUTHORITY_KEY"
-	// VerifierKeyEnv signs a verifier verdict.
-	VerifierKeyEnv = "TB_WALL_VERIFIER_KEY"
-	// ReplayKeyEnv signs an independent replay attestation.
-	ReplayKeyEnv = "TB_WALL_REPLAY_KEY"
-	// BuilderKeyEnv signs a build attestation.
-	BuilderKeyEnv = "TB_WALL_BUILDER_KEY"
-
-	// RunnerKeyEnv is the FLEET'S key: it signs the statement that a host was
-	// booted from a named image. The fleet provisions runners; the job does
-	// not, and a measured process holding this key could attest the host it is
-	// running on — which is exactly the assertion the attestation exists to
-	// replace.
-	RunnerKeyEnv = "TB_WALL_RUNNER_KEY"
-)
+// The GitHub file-command scrubbing below STAYS, and it is not part of that
+// machinery: it is least privilege for consumer-supplied code. `wall run`
+// executes a setup command somebody else wrote, and a child that inherits
+// $GITHUB_OUTPUT or $GITHUB_ENV can rewrite the measured step's outputs and
+// the job's environment. That is true whether or not anything is signed.
 
 // GitHubFileCommandEnv names the writable file channels an Actions step is
 // handed. They are not secrets; they are something worse to inherit — paths to
@@ -851,7 +672,7 @@ func reapExitedChild(pid int) bool {
 // duration.
 func terminalExec(w *Writer, opt ExecOptions, spec *SpecIdentity, start Instant, clock Clock, state, reason string) error {
 	_, _ = w.Append(Record{
-		Kind: "terminal", Role: roleOrPanic(ProducerPhysical, opt.Level), Level: opt.Level,
+		Kind: "terminal", Level: opt.Level,
 		Source: SourceWrapper, Seqno: opt.Seq, Run: opt.Run, Instant: clock.Now(),
 		Spec: spec, Terminal: state, Reason: reason,
 	})
@@ -885,14 +706,6 @@ func sanitize(s string) string {
 			return '-'
 		}
 	}, s)
-}
-
-func roleOrPanic(p Producer, l Level) Role {
-	r, err := RoleFor(p, l)
-	if err != nil {
-		panic(err)
-	}
-	return r
 }
 
 func mustDigest(v any) Digest {

@@ -64,20 +64,3 @@ func findingsMentioning(v *Verdict, code, substr string) []string {
 	}
 	return out
 }
-
-// setMembership writes a coherent raw-procs snapshot onto a record: the bytes,
-// the parsed list and the digest together, so a case exercises the invariant it
-// names rather than tripping the digest check on the way there.
-//
-// A malformed tuple keeps an EMPTY NON-NIL list deliberately: leaving it nil
-// would trip the "no snapshot was taken" refusal first, and the case would pass
-// for the wrong reason. Ported from the deleted rawevidence_test.go.
-func setMembership(r *Record, procs string) {
-	r.RawProcsBytes = []byte(procs)
-	parsed, ok := parseCgroupProcs(r.RawProcsBytes)
-	if !ok {
-		parsed = []int{}
-	}
-	r.RawProcs = parsed
-	r.RawProcsDigest = DigestBytes(append([]byte(r.RawEventID+"\x00"), r.RawProcsBytes...))
-}

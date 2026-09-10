@@ -169,9 +169,12 @@ func TestTheArchiveEnumerationRefusesALeadingIrregularEntry(t *testing.T) {
 	t.Run("the successor refuses it and installs nothing", func(t *testing.T) {
 		root := t.TempDir()
 		artifact, digest := leadingIrregularArchive(t, root, leadingIrregularFiller)
-		code, out, bin := runInstaller(t,
-			filepath.Join("..", "..", ".github", "actions", "install-testbucket.sh"),
-			root, artifact, candidateVersion(t, digest), binDigest)
+		// THE SUCCESSOR RUNS ON THE RELEASE PATH, because the candidate
+		// delivery path it was written against is gone and the enumeration
+		// moved with the archive it protects, not with the delivery mode.
+		stage := stageLeadingIrregularRelease(t, root, "v9.9.9", leadingIrregularFiller)
+		code, out, bin := runReleaseInstaller(t, installerScript, root, stage, "v9.9.9")
+		_, _ = artifact, digest
 		if code == 0 {
 			t.Fatalf("an archive whose first entry is not a regular file installed (exit 0):\n%s", out)
 		}
@@ -188,8 +191,11 @@ func TestTheArchiveEnumerationRefusesALeadingIrregularEntry(t *testing.T) {
 		script := predecessorInstaller(t, predecessor)
 		root := t.TempDir()
 		artifact, digest := leadingIrregularArchive(t, root, leadingIrregularFiller)
+		// The predecessor is the OLD script, and the candidate pin is the
+		// only delivery it understands — the control is about those exact
+		// bytes, so it is driven the way they were driven.
 		code, out, bin := runInstaller(t, script, root, artifact,
-			candidateVersion(t, digest), binDigest)
+			legacyCandidateVersion(digest), binDigest)
 		if code != 0 {
 			t.Fatalf("the predecessor control did not reproduce: %s exited %d, so this test would pass for the wrong reason\n%s", predecessor, code, out)
 		}
@@ -202,16 +208,14 @@ func TestTheArchiveEnumerationRefusesALeadingIrregularEntry(t *testing.T) {
 	// refusing everything.
 	t.Run("a regular-file archive is unaffected", func(t *testing.T) {
 		root := t.TempDir()
-		artifact, digest := candidateArtifact(t, root, map[string]string{"testbucket": good}, nil, 1)
-		code, out, bin := runInstaller(t,
-			filepath.Join("..", "..", ".github", "actions", "install-testbucket.sh"),
-			root, artifact, candidateVersion(t, digest), binDigest)
+		stage := stageRelease(t, root, "v9.9.9", map[string]string{"testbucket": good})
+		code, out, bin := runReleaseInstaller(t, installerScript, root, stage, "v9.9.9")
 		if code != 0 {
-			t.Fatalf("a well-formed pinned archive was refused (exit %d):\n%s", code, out)
+			t.Fatalf("a well-formed release archive was refused (exit %d):\n%s", code, out)
 		}
 		ran, err := exec.Command(bin).Output()
 		if err != nil || strings.TrimSpace(string(ran)) != "PINNED" {
-			t.Errorf("the installed binary is not the pinned member: %q %v", string(ran), err)
+			t.Errorf("the installed binary is not the archive's member: %q %v", string(ran), err)
 		}
 	})
 }
@@ -226,16 +230,16 @@ func TestTheArchiveEnumerationUsesNoShortCircuitingPipeline(t *testing.T) {
 	}
 	sh := string(b)
 	for _, forbidden := range []string{
-		`tar -tzvf "$archive" | grep`,
-		`tar -tzf "$archive" | grep`,
+		`tar -tzvf "$work/$asset" | grep`,
+		`tar -tzf "$work/$asset" | grep`,
 	} {
 		if strings.Contains(sh, forbidden) {
 			t.Errorf("the archive enumeration decision is made through %q; under pipefail the pipeline reports the producer's SIGPIPE rather than the test's own answer", forbidden)
 		}
 	}
 	for _, want := range []string{
-		`entry_listing=$(tar -tzvf "$archive")`,
-		`name_listing=$(tar -tzf "$archive")`,
+		`entry_listing=$(tar -tzvf "$work/$asset")`,
+		`name_listing=$(tar -tzf "$work/$asset")`,
 		"irregular_count",
 		"unsafe_count",
 	} {
@@ -243,22 +247,29 @@ func TestTheArchiveEnumerationUsesNoShortCircuitingPipeline(t *testing.T) {
 			t.Errorf("the fully-evaluating enumeration is missing %q", want)
 		}
 	}
-	// The installed-byte checks that follow are untouched.
+	// The member checks that follow the enumeration are what remains of the
+	// installed-byte identity.
 	//
-	// "not the precommitted" is deliberately NOT in this list any more. It was
-	// the release-pin comparison against released-binary-digests.tsv — a
-	// second root of trust rooted in a later commit — and the pin file is
-	// gone, so an assertion naming it would demand the path back. The
-	// installed-byte identity it was grouped with is the re-digest of the
-	// EXTRACTED binary, which is retained and named here instead.
+	// The re-digest against TB_CANDIDATE_BINARY_DIGEST is deliberately NOT in
+	// this list any more: it named an ATTESTED pre-publication binary, and the
+	// candidate delivery it belonged to is REMOVE-classified. What survives is
+	// what the archive itself establishes — one binary, at a fixed name, that
+	// is a regular file.
 	for _, keep := range []string{
-		"TB_CANDIDATE_BINARY_DIGEST",
-		"the installed candidate binary digests to",
-		"a candidate archive carries one binary",
-		"not the attested",
+		"no testbucket member at its root",
+		"a release archive carries one binary",
+		"is a symlink",
 	} {
 		if !strings.Contains(sh, keep) {
 			t.Errorf("an installed-byte identity check was lost: %q", keep)
 		}
 	}
+}
+
+// legacyCandidateVersion spells the candidate pin the PREDECESSOR script
+// understood. It exists only for that control: the shipped installer no longer
+// has a candidate delivery path, and TestTheCandidateDeliveryPathIsGone is
+// what asserts so.
+func legacyCandidateVersion(digest string) string {
+	return fmt.Sprintf("candidate:123/candidate-build-%s_%s@sha256:%s", runtime.GOOS, runtime.GOARCH, digest)
 }
