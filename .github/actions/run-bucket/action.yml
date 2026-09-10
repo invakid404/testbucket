@@ -135,6 +135,72 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Install testbucket
+      if: inputs.runner == 'go' && inputs.wall-time-dir == ''
+      shell: bash
+      env:
+        TB_VERSION: ${{ inputs.version }}
+        TB_REPO: invakid404/testbucket
+        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/../install-testbucket.sh"
+
+    # AT_start. This is the FIRST action-owned operation, and it is first in
+    # the step list for that reason: the containment, the two observer
+    # processes and their admission handshakes are all real action time, and
+    # anything this action did before them would be action-owned work outside
+    # the interval that claims to contain it.
+    #
+    # The wrapper must therefore already be on PATH — a measured caller runs
+    # the `install` action first. A missing wrapper fails here, before the
+    # envelope opens, which is a precondition rather than unmeasured work.
+    - name: Open the wall-time action envelope
+      if: inputs.wall-time-dir != ''
+      shell: bash
+      env:
+        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
+        BUCKET_NAME: ${{ inputs.name }}
+        TB_CAMPAIGN_ID: ${{ inputs.campaign-id }}
+      run: |
+        set -euo pipefail
+        # The records directory is created by `wall begin` itself, INSIDE the
+        # envelope: creating it here would put action-owned work before
+        # AT_start and report an action shorter than the one that ran.
+        testbucket wall begin \
+          --dir "$TB_WALL_DIR" \
+          --bucket-id "$BUCKET_NAME" \
+          --campaign-id "$TB_CAMPAIGN_ID" \
+          --run-id "${GITHUB_RUN_ID:-}" \
+          --attempt-id "${GITHUB_RUN_ATTEMPT:-}" \
+          --repository "${GITHUB_REPOSITORY:-}" \
+          --workflow-run "${GITHUB_RUN_ID:-}" \
+          --job "${GITHUB_JOB:-}" \
+          --step "run-bucket" \
+          --step-attempt "${GITHUB_RUN_ATTEMPT:-}"
+
+    # A consumer's own per-runner provisioning, run once before the bucket's test
+    # command. Passed through the environment and executed as a bash block (never
+    # spliced into the command line): the command is consumer-supplied data, and
+    # splicing it into a run: line is how a workflow grows an injection. `-e` so a
+    # failed provisioning step fails the bucket instead of leaking into the tests.
+    #
+    # Under measurement it runs through `wall run`, which admits it to the ACTION
+    # containment first: setup is real action-owned work, and work outside the
+    # containment is work the trace cannot see.
+    # THE ACTION-OWNED PRECHECKS RUN INSIDE THE ENVELOPE.
+    #
+    # They used to run BEFORE `wall begin`. §3.2 lists what may sit outside A
+    # -- the wrapper install, the closing record write, the directory seal --
+    # and these are not on it: verifying the declaration, validating the
+    # producer and hashing the executed MongoDB binary are action-owned work,
+    # so an interval that excluded them was not the complete run-bucket action
+    # it reported.
+    #
+    # They still gate the bucket: a declaration that arrived altered fails
+    # here, before the setup command and the generated script, and now does so
+    # as a retained terminal record inside the envelope rather than as a step
+    # that vanished before the envelope existed.
+
     # --- §10.5.2 step 4: VERIFY the materialized declaration -----------------
     #
     # The bytes were published by the plan job and written to a job-local file
@@ -274,58 +340,6 @@ runs:
     # this action would put action-owned work before AT_start permanently. A
     # measured caller runs the `install` action first; the envelope step below
     # is then this action's first operation.
-    - name: Install testbucket
-      if: inputs.runner == 'go' && inputs.wall-time-dir == ''
-      shell: bash
-      env:
-        TB_VERSION: ${{ inputs.version }}
-        TB_REPO: invakid404/testbucket
-        TB_BINDIR: ${{ runner.temp }}/testbucket-bin
-        GH_TOKEN: ${{ github.token }}
-      run: bash "${{ github.action_path }}/../install-testbucket.sh"
-
-    # AT_start. This is the FIRST action-owned operation, and it is first in
-    # the step list for that reason: the containment, the two observer
-    # processes and their admission handshakes are all real action time, and
-    # anything this action did before them would be action-owned work outside
-    # the interval that claims to contain it.
-    #
-    # The wrapper must therefore already be on PATH — a measured caller runs
-    # the `install` action first. A missing wrapper fails here, before the
-    # envelope opens, which is a precondition rather than unmeasured work.
-    - name: Open the wall-time action envelope
-      if: inputs.wall-time-dir != ''
-      shell: bash
-      env:
-        TB_WALL_DIR: ${{ inputs.wall-time-dir }}
-        BUCKET_NAME: ${{ inputs.name }}
-        TB_CAMPAIGN_ID: ${{ inputs.campaign-id }}
-      run: |
-        set -euo pipefail
-        # The records directory is created by `wall begin` itself, INSIDE the
-        # envelope: creating it here would put action-owned work before
-        # AT_start and report an action shorter than the one that ran.
-        testbucket wall begin \
-          --dir "$TB_WALL_DIR" \
-          --bucket-id "$BUCKET_NAME" \
-          --campaign-id "$TB_CAMPAIGN_ID" \
-          --run-id "${GITHUB_RUN_ID:-}" \
-          --attempt-id "${GITHUB_RUN_ATTEMPT:-}" \
-          --repository "${GITHUB_REPOSITORY:-}" \
-          --workflow-run "${GITHUB_RUN_ID:-}" \
-          --job "${GITHUB_JOB:-}" \
-          --step "run-bucket" \
-          --step-attempt "${GITHUB_RUN_ATTEMPT:-}"
-
-    # A consumer's own per-runner provisioning, run once before the bucket's test
-    # command. Passed through the environment and executed as a bash block (never
-    # spliced into the command line): the command is consumer-supplied data, and
-    # splicing it into a run: line is how a workflow grows an injection. `-e` so a
-    # failed provisioning step fails the bucket instead of leaking into the tests.
-    #
-    # Under measurement it runs through `wall run`, which admits it to the ACTION
-    # containment first: setup is real action-owned work, and work outside the
-    # containment is work the trace cannot see.
     - name: Set up the bucket
       if: inputs.setup-command != ''
       shell: bash

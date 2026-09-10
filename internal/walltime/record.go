@@ -28,6 +28,14 @@ const (
 	// LevelInvocation is one exact rendered invocation and its waited process
 	// tree, V.
 	LevelInvocation Level = "invocation"
+	// LevelSetup is the action-owned per-bucket setup command.
+	//
+	// It has no envelope of its own -- it is not a measured product outcome --
+	// but §3.1's floor is `A >= setup_ns + script_ns`, and a term of that
+	// inequality has to come from somewhere. Without a recorded interval
+	// `setup_ns` was underivable from the produced bytes, so the floor could
+	// only ever be checked against a number supplied beside them.
+	LevelSetup Level = "setup"
 )
 
 // Role is the ledger a record belongs to. The three ledgers at each level are

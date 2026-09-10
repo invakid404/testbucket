@@ -489,6 +489,10 @@ type Verdict struct {
 	// it, not how it is enforced.
 	BootstrapGapNs int64   `json:"bootstrap_gap_ns,omitempty"`
 	ScriptNs       int64   `json:"script_ns"`
+	// SetupNs is the action-owned setup command's interval, derived from its
+	// own boundary pair. §3.1's floor is `A >= setup_ns + script_ns`, so the
+	// verdict carries the term rather than leaving it to be supplied.
+	SetupNs int64 `json:"setup_ns,omitempty"`
 	InvocationNs   []int64 `json:"invocation_ns,omitempty"`
 }
 
@@ -864,6 +868,8 @@ func summariseDurations(v *Verdict, envs []Envelope) {
 			v.ScriptNs = e.Physical.Duration()
 		case LevelInvocation:
 			v.InvocationNs = append(v.InvocationNs, e.Physical.Duration())
+		case LevelSetup:
+			v.SetupNs = e.Physical.Duration()
 		}
 	}
 }

@@ -237,7 +237,33 @@ func runOwnedChild(opt ExecOptions, deadline time.Time, clock Clock) (code int, 
 		return 1, nil, TerminalWrapperError, "start the child: " + err.Error()
 	}
 
+	// THE PROCESS IDENTITY IS RECORDED, not merely claimed.
+	//
+	// The closing record asserted in its note that the root had been reaped and
+	// the group drained, while carrying no `proc` object at all: the named
+	// result was declared and never assigned. QC7a requires a process-group
+	// identity, so a genuinely emitted record could not satisfy the very check
+	// it was written for.
+	//
+	// It is read HERE, while the child is alive, because that is the only time
+	// it exists: after cmd.Wait reaps it there is no process left to ask.
 	pgid, pgidErr := childProcessGroup(cmd)
+	identity := &ProcIdentity{
+		PID:       cmd.Process.Pid,
+		PGID:      pgid,
+		StartID:   processStartID(cmd.Process.Pid),
+		ParentPID: os.Getpid(),
+		UID:       os.Getuid(),
+		GID:       os.Getgid(),
+	}
+	if pgidErr != nil {
+		// A platform that cannot report the group is a stated limitation, not
+		// a reason to record nothing: the pid and start identity are still
+		// facts, and the absent pgid is what QC7a will read.
+		identity.PGID = 0
+	}
+	proc = identity
+
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- cmd.Wait() }()
 
@@ -267,6 +293,10 @@ func runOwnedChild(opt ExecOptions, deadline time.Time, clock Clock) (code int, 
 				reason = err.Error()
 			}
 		}
+		if ws, ok := exitStatusOf(cmd); ok && ws.Signaled() {
+			identity.Signal = ws.Signal().String()
+			termState, reason = TerminalSignalled, "child signalled with "+identity.Signal
+		}
 	case sig := <-sigs:
 		code, termState = 1, TerminalCancelled
 		reason = "cancelled by " + sig.String()
@@ -275,6 +305,35 @@ func runOwnedChild(opt ExecOptions, deadline time.Time, clock Clock) (code int, 
 		// never exits must not hang the wrapper with no record.
 		code, termState, reason = 1, TerminalCancelled, "the cancellation deadline passed"
 	}
+
+	// THE ROOT IS REAPED ON EVERY RETURN PATH.
+	//
+	// The teardown below is guarded on a usable PGID, and everything —
+	// including the root reap — used to sit inside that guard. So a platform
+	// or a moment where `childProcessGroup` failed, and every cancellation or
+	// deadline return, left the process this wrapper had parented unwaited:
+	// a zombie held by this process, while the record it then wrote said the
+	// root had been reaped. The claim in the note has to be true on the path
+	// that writes it.
+	//
+	// A kill is what makes the wait terminate on the cancelled paths: the
+	// child is not going to exit on its own, and waiting for it without one
+	// would hang the wrapper the deadline exists to protect.
+	defer func() {
+		if rootReaped {
+			return
+		}
+		_ = cmd.Process.Kill()
+		select {
+		case err := <-waitErr:
+			rootReaped, rootWait = true, err
+		case <-time.After(reapGrace):
+			// Reported, never silently absorbed: an unreaped root is exactly
+			// the state QC7a and the escape rule are looking for.
+			identity.ExitKind = TerminalCrashUnclosed
+			reason = joinReason(reason, "the root was not reaped within "+reapGrace.String()+" of the wrapper's own kill")
+		}
+	}()
 
 	// Teardown, and only then may the caller take the closing reading.
 	if pgidErr == nil && pgid > 1 {
@@ -337,6 +396,10 @@ func runOwnedChild(opt ExecOptions, deadline time.Time, clock Clock) (code int, 
 		if lim := out.Limitation(); lim != "" {
 			reason = joinReason(reason, lim)
 		}
+	}
+	identity.ExitCode = code
+	if identity.ExitKind == "" {
+		identity.ExitKind = termState
 	}
 	return code, proc, termState, reason
 }
@@ -902,4 +965,15 @@ func procOrZero(p *ProcIdentity) ProcIdentity {
 		return ProcIdentity{}
 	}
 	return *p
+}
+
+// exitStatusOf reads the child's wait status, once cmd.Wait has returned. It
+// is a helper rather than an inline type assertion so the caller cannot read
+// cmd.ProcessState on a path where the wait goroutine may still be writing it.
+func exitStatusOf(cmd *exec.Cmd) (syscall.WaitStatus, bool) {
+	if cmd.ProcessState == nil {
+		return 0, false
+	}
+	ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	return ws, ok
 }

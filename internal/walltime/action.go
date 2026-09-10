@@ -78,12 +78,20 @@ func BeginAction(dir string, run RunIdentity, timeout time.Duration) (*ActionSta
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
+	// THE OPENING READ IS THE FIRST OWNED OPERATION, and that is the whole
+	// point of §3.1: A must cover every cost this wrapper incurs, including
+	// its own setup. Creating the records directory first put a mkdir --
+	// wrapper-owned work, on a cold runner a filesystem round trip --
+	// OUTSIDE the interval that claims to contain it, so the recorded action
+	// was shorter than the action that ran. The comment below the call already
+	// said the read comes before the writer and the handoff; the directory was
+	// the one piece that had been left in front of it.
+	clock := NewSystemClock()
+	start := clock.Now()
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("walltime: create the records directory: %w", err)
 	}
-
-	clock := NewSystemClock()
-	start := clock.Now()
 	probe(atStartReading, dir)
 
 	w, err := NewWriter(filepath.Join(dir, "physical-action-00.jsonl"), ProducerPhysical, "physical", nil)
@@ -152,6 +160,10 @@ type RunInActionOptions struct {
 	// false by default, so a caller that does not think about it gets the
 	// scrubbed environment.
 	WrapperChain bool
+	// Timeout bounds the setup command. Zero means the action's own remaining
+	// deadline, which is the bound that matters: action-owned work may not
+	// outlive the action.
+	Timeout time.Duration
 }
 
 // RunInActionWith runs one action-owned child inside the envelope.
@@ -170,7 +182,33 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 	if len(argv) == 0 {
 		return 1, fmt.Errorf("walltime: no command to run")
 	}
-	if _, err := LoadActionState(dir); err != nil {
+	st, err := LoadActionState(dir)
+	if err != nil {
+		return 1, err
+	}
+
+	// THE SETUP INTERVAL IS RECORDED, and it has a DEADLINE.
+	//
+	// This used to start the command and wait, with no clock read, no process
+	// identity and no bound. Two things followed. `setup_ns` -- a term of
+	// §3.1's floor `A >= setup_ns + script_ns` -- was not derivable from the
+	// produced bytes at all, so the inequality could only be checked against a
+	// number supplied beside them. And a setup command that hung held the
+	// action open until the job timed out, producing no closing record: the
+	// one shape that cannot be reported as a terminal state, because nothing
+	// was ever written.
+	clock := NewSystemClock()
+	w, err := NewWriter(filepath.Join(dir, "physical-setup-00.jsonl"), ProducerPhysical, "physical", nil)
+	if err != nil {
+		return 1, err
+	}
+	defer w.Close()
+
+	start := clock.Now()
+	if _, err := w.Append(Record{
+		Kind: "boundary", Level: LevelSetup, Boundary: "start",
+		Source: SourceWrapper, Run: st.Run, Instant: start,
+	}); err != nil {
 		return 1, err
 	}
 
@@ -185,17 +223,73 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 		cmd.Stderr = os.Stderr
 	}
 	cmd.Env = os.Environ()
+	ownProcessGroup(cmd)
 
+	code, terminal, reason := 0, TerminalPassed, ""
+	proc := ProcIdentity{}
 	if err := cmd.Start(); err != nil {
-		return 1, err
-	}
-	if err := cmd.Wait(); err != nil {
-		if cmd.ProcessState != nil {
-			return cmd.ProcessState.ExitCode(), nil
+		code, terminal, reason = 1, TerminalWrapperError, "start the setup command: "+err.Error()
+	} else {
+		pgid, _ := childProcessGroup(cmd)
+		proc = ProcIdentity{
+			PID: cmd.Process.Pid, PGID: pgid, StartID: processStartID(cmd.Process.Pid),
+			ParentPID: os.Getpid(), UID: os.Getuid(), GID: os.Getgid(),
 		}
-		return 1, err
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case err := <-done:
+			code = exitCodeOf(err)
+			if code != 0 {
+				terminal = TerminalFailed
+				if err != nil {
+					reason = err.Error()
+				}
+			}
+		case <-time.After(time.Until(setupDeadline(st, o.Timeout))):
+			// The same bounded escalation the measured child gets: a setup
+			// command is action-owned work, so it may not outlive the action
+			// it belongs to.
+			code, terminal, reason = 1, TerminalCancelled, "the setup command passed its deadline"
+			if pgid > 1 {
+				_, _ = DrainGroup(DrainRequest{
+					PGID: pgid, TermGrace: cancellationGrace, KillGrace: reapGrace,
+					ReapRoot: func() error { return <-done },
+				})
+			} else {
+				_ = cmd.Process.Kill()
+				<-done
+			}
+		}
+		proc.ExitCode, proc.ExitKind = code, terminal
 	}
-	return 0, nil
+
+	if _, err := w.Append(Record{
+		Kind: "boundary", Level: LevelSetup, Boundary: "end",
+		Source: SourceWrapper, Run: st.Run, Instant: clock.Now(),
+		Proc: proc, Terminal: terminal, Reason: reason,
+	}); err != nil {
+		return code, err
+	}
+	if terminal == TerminalWrapperError {
+		return code, fmt.Errorf("walltime: %s", reason)
+	}
+	return code, nil
+}
+
+// setupDeadline bounds the setup command by the action's own remaining time,
+// or by an explicit override. A setup command may not outlive the action that
+// owns it: the closing read is what it would otherwise hold open.
+func setupDeadline(st *ActionState, override time.Duration) time.Time {
+	if override > 0 {
+		return time.Now().Add(override)
+	}
+	if st != nil && st.Deadline != "" {
+		if t, err := time.Parse(time.RFC3339Nano, st.Deadline); err == nil {
+			return t
+		}
+	}
+	return time.Now().Add(DefaultTimeout)
 }
 
 // LoadActionState reads the handoff `wall begin` left behind.
