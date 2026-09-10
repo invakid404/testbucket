@@ -138,11 +138,22 @@ func (p WallPartition) bucketCost(m WallModel, b int) (int64, error) {
 		members = append(members, p.Units[ui])
 		weights = append(weights, p.Units[ui].BaseNs)
 	}
-	if len(members) == 0 {
-		// An empty bucket runs nothing, so it costs nothing: fixed_ns is paid
-		// by every NON-EMPTY bucket (§6.5).
-		return 0, nil
-	}
+	// ONE OBJECTIVE, EVALUATED FOR EVERY BUCKET, empty ones included.
+	//
+	// This used to return 0 for an empty bucket while §17.3a's calibration
+	// emits its design row as `[1, 0, 0, 0]` — an intercept of 1, so the model
+	// predicts `fixed_ns` for exactly the bucket allocation valued at nothing.
+	// Empty buckets are permitted whenever `U < K`, so the two sides could
+	// disagree about the same bucket, and which answer you got depended on
+	// which one you asked.
+	//
+	// Evaluating the four-term objective here agrees with that row by
+	// construction: a bucket with no units has reporter_sum 0, no whole-file
+	// indicator and no slices, so its cost is `fixed_ns` — what the model says
+	// a job that starts and runs nothing takes. It cannot change the
+	// partition, because every non-empty bucket also pays `fixed_ns` and the
+	// makespan is a maximum; it changes only the reported number, into the one
+	// the model actually predicts.
 	sum, err := nsmath.SumNs("reporter_sum_ns", weights...)
 	if err != nil {
 		return 0, err
@@ -273,11 +284,14 @@ func WallSeed(m WallModel, units []AllocUnit, k int) (WallPartition, error) {
 		if err != nil {
 			return WallPartition{}, err
 		}
-		// Item weights are float64 in the v0.2.2 partitioner; the seed is an
-		// exact integer nanosecond count and stays exactly representable well
-		// past any realistic workload, so KK sees the same ordering the
-		// integer domain would give it.
-		items[i] = Item{ID: u.ID, Weight: float64(s)}
+		// The seed goes to KK as an EXACT integer. It used to be cast to
+		// float64 with a comment arguing that nanosecond counts stay
+		// representable "well past any realistic workload" — 2^53 ns is about
+		// 104 days, which a per-unit seed does not reach, but the argument was
+		// about the wrong quantity: KK accumulates these into part loads, and
+		// a bucket's load passes 2^53 ns after 104 days of summed work across
+		// a long history. Carrying the integer removes the question.
+		items[i] = Item{ID: u.ID, WeightNs: s, HasNs: true}
 	}
 	groups := karmarkarKarp(items, k)
 

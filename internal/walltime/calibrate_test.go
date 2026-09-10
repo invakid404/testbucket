@@ -85,12 +85,16 @@ func TestCalibrationModeTerminatesSufficientOrNotFoundWithinBudget(t *testing.T)
 					t.Errorf("L(%d) buckets = %v, want %v", c.i, got, c.want)
 				}
 			}
-			r, err := RankAdmission(designOfLayout(layout))
+			rows, derr := designOfLayout(layout)
+			if derr != nil {
+				t.Fatal(derr)
+			}
+			r, err := RankAdmission(rows)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if r.Rank != c.rank {
-				t.Errorf("L(%d) rank = %d, want %d (rows %v)", c.i, r.Rank, c.rank, designOfLayout(layout))
+				t.Errorf("L(%d) rank = %d, want %d (rows %v)", c.i, r.Rank, c.rank, rows)
 			}
 		}
 	})
@@ -286,7 +290,10 @@ func TestCalibrationModeTerminatesSufficientOrNotFoundWithinBudget(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		rows := designOfLayout(layout)
+		rows, derr := designOfLayout(layout)
+		if derr != nil {
+			t.Fatal(derr)
+		}
 		if len(rows) != 4 {
 			t.Fatalf("design has %d rows, want one per bucket", len(rows))
 		}

@@ -12,7 +12,10 @@
 // in internal/runner/gorunner.
 package core
 
-import "sort"
+import (
+	"math/big"
+	"sort"
+)
 
 // Item is one weighted thing to place into a bucket. The partitioners know
 // nothing about tests or CI — they take (items, k) and return k disjoint
@@ -21,6 +24,13 @@ import "sort"
 type Item struct {
 	ID     string
 	Weight float64
+	// WeightNs is the weight in EXACT integer nanoseconds, and HasNs says it
+	// is the one to use. The wall basis seeds KK with integer nanosecond
+	// weights, and casting those to float64 collapses distinct values above
+	// 2^53; carrying the integer means the partition stays an exact function
+	// of the seeds §6.5 defines it on.
+	WeightNs int64
+	HasNs    bool
 }
 
 // sortItems orders items heaviest-first, breaking ties by ID so the whole
@@ -30,8 +40,8 @@ type Item struct {
 func sortItems(items []Item) []Item {
 	out := append([]Item(nil), items...)
 	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Weight != out[j].Weight {
-			return out[i].Weight > out[j].Weight
+		if c := exactWeight(out[i]).Cmp(exactWeight(out[j])); c != 0 {
+			return c > 0
 		}
 		return out[i].ID < out[j].ID
 	})
@@ -45,7 +55,7 @@ func sortItems(items []Item) []Item {
 // between parts, not their absolute sums. The true loads are recomputed from
 // the item sets at the end.
 type kkPart struct {
-	load  float64
+	load  *big.Rat
 	items []Item
 }
 
@@ -73,11 +83,11 @@ type kkTuple struct {
 
 // diff is the tuple's spread — the quantity KK greedily attacks by always
 // combining the two most-spread tuples.
-func (t kkTuple) diff() float64 {
+func (t kkTuple) diff() *big.Rat {
 	if len(t.parts) == 0 {
-		return 0
+		return new(big.Rat)
 	}
-	return t.parts[0].load - t.parts[len(t.parts)-1].load
+	return new(big.Rat).Sub(t.parts[0].load, t.parts[len(t.parts)-1].load)
 }
 
 func (t kkTuple) tag() string {
@@ -101,8 +111,8 @@ func (t kkTuple) tag() string {
 // tie-break.
 func sortParts(parts []kkPart) {
 	sort.SliceStable(parts, func(i, j int) bool {
-		if parts[i].load != parts[j].load {
-			return parts[i].load > parts[j].load
+		if c := parts[i].load.Cmp(parts[j].load); c != 0 {
+			return c > 0
 		}
 		return parts[i].tag() < parts[j].tag()
 	})
@@ -133,7 +143,10 @@ func karmarkarKarp(items []Item, k int) [][]Item {
 	tuples := make([]kkTuple, 0, len(items))
 	for _, it := range sortItems(items) {
 		parts := make([]kkPart, k)
-		parts[0] = kkPart{load: it.Weight, items: []Item{it}}
+		parts[0] = kkPart{load: exactWeight(it), items: []Item{it}}
+		for e := 1; e < k; e++ {
+			parts[e].load = new(big.Rat)
+		}
 		tuples = append(tuples, kkTuple{parts: parts})
 	}
 
@@ -158,9 +171,9 @@ func karmarkarKarp(items []Item, k int) [][]Item {
 	// differences, not sums.
 	loaded := make([]kkPart, k)
 	for idx, p := range final.parts {
-		total := 0.0
+		total := new(big.Rat)
 		for _, it := range p.items {
-			total += it.Weight
+			total.Add(total, exactWeight(it))
 		}
 		loaded[idx] = kkPart{load: total, items: p.items}
 	}
@@ -180,8 +193,8 @@ func twoLargest(tuples []kkTuple) (int, int) {
 			return true
 		}
 		dc, dr := tuples[cand].diff(), tuples[cur].diff()
-		if dc != dr {
-			return dc > dr
+		if c := dc.Cmp(dr); c != 0 {
+			return c > 0
 		}
 		return tuples[cand].tag() < tuples[cur].tag()
 	}
@@ -212,13 +225,13 @@ func mergeTuples(a, b kkTuple, k int) kkTuple {
 		items := make([]Item, 0, len(ap[i].items)+len(other.items))
 		items = append(items, ap[i].items...)
 		items = append(items, other.items...)
-		parts[i] = kkPart{load: ap[i].load + other.load, items: items}
+		parts[i] = kkPart{load: new(big.Rat).Add(ap[i].load, other.load), items: items}
 	}
 	sortParts(parts)
 	// Normalise: only inter-part differences carry information from here on.
-	base := parts[k-1].load
+	base := new(big.Rat).Set(parts[k-1].load)
 	for i := range parts {
-		parts[i].load -= base
+		parts[i].load = new(big.Rat).Sub(parts[i].load, base)
 	}
 	return kkTuple{parts: parts}
 }
@@ -264,4 +277,29 @@ func makespan(buckets [][]Item) float64 {
 		}
 	}
 	return heaviest
+}
+
+// exactWeight is the item's weight in the EXACT rational domain.
+//
+// KK's loads used to be float64, and the wall seed handed it int64 nanosecond
+// weights cast to float64. Above 2^53 two distinct seeds collapse onto one
+// value, so the partition stopped being an exact function of the integer
+// seeds §6.5 requires — and the collapse is silent, changing deterministic
+// tie behaviour with nothing to observe.
+//
+// A rational is exact for both bases: an int64 nanosecond count is exact by
+// construction, and a float64 reporter weight converts exactly to the rational
+// it already is. The comparisons and the merge arithmetic are therefore exact
+// in both, which is what §6.5's "Stage-2 comparisons are integer comparisons"
+// asks for and what the seed feeding them has to be as well.
+func exactWeight(it Item) *big.Rat {
+	if it.HasNs {
+		return new(big.Rat).SetInt64(it.WeightNs)
+	}
+	if q := new(big.Rat).SetFloat64(it.Weight); q != nil {
+		return q
+	}
+	// A non-finite weight cannot order anything; it sorts as zero and the
+	// caller's own validation is what refuses it.
+	return new(big.Rat)
 }

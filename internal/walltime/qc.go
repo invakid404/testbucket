@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"fmt"
+	"github.com/invakid404/testbucket/internal/nsmath"
 	"time"
 )
 
@@ -245,11 +246,21 @@ func intervalInvariants(o Observation) error {
 			return fmt.Errorf("QC7: %s is %d; every interval value must be >= 0", name, v)
 		}
 	}
-	if int64(o.ElapsedNs) < int64(o.SetupNs)+int64(o.ScriptNs) {
+	// THE SUMS ARE CHECKED, because an overflow here turns an IMPOSSIBLE
+	// observation into one that passes. `setup_ns + script_ns` wrapping past
+	// MaxInt64 yields a negative left-hand side, and `A < negative` is false —
+	// so the row satisfies §3.1's floor by arithmetic accident. The whole
+	// point of the checked domain is that a value which cannot be represented
+	// is a named failure, never a smaller number.
+	floor, err := nsmath.SumNs("setup_ns_plus_script_ns", int64(o.SetupNs), int64(o.ScriptNs))
+	if err != nil {
+		return fmt.Errorf("QC7: %w", err)
+	}
+	if int64(o.ElapsedNs) < floor {
 		return fmt.Errorf("QC7: A (%d) < setup_ns (%d) + script_ns (%d)",
 			o.ElapsedNs, o.SetupNs, o.ScriptNs)
 	}
-	var sumV int64
+	terms := make([]int64, 0, len(o.Invocations))
 	for i, inv := range o.Invocations {
 		if int64(inv.ElapsedNs) < 0 {
 			return fmt.Errorf("QC7: invocation %d elapsed_ns is negative", i)
@@ -257,7 +268,11 @@ func intervalInvariants(o Observation) error {
 		if int64(inv.EndedMonoNs) < int64(inv.StartedMonoNs) {
 			return fmt.Errorf("QC7: invocation %d ends before it starts", i)
 		}
-		sumV += int64(inv.ElapsedNs)
+		terms = append(terms, int64(inv.ElapsedNs))
+	}
+	sumV, err := nsmath.SumNs("sum_invocation_elapsed_ns", terms...)
+	if err != nil {
+		return fmt.Errorf("QC7: %w", err)
 	}
 	if int64(o.ScriptNs) < sumV {
 		return fmt.Errorf("QC7: script_ns (%d) < the sum of invocation intervals (%d)", o.ScriptNs, sumV)

@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"fmt"
+	"github.com/invakid404/testbucket/internal/nsmath"
 	"sort"
 )
 
@@ -196,22 +197,36 @@ func Layout(u []CalibrationUnit, k, i int, pack Packer) ([][]CalibrationUnit, er
 // designOfLayout builds §0.9's four ordered columns for a layout. An empty
 // bucket is a LEGITIMATE design row contributing reporter_sum_ns = 0, I = 0 and
 // slice_count = 0.
-func designOfLayout(layout [][]CalibrationUnit) [][]float64 {
+func designOfLayout(layout [][]CalibrationUnit) ([][]float64, error) {
 	rows := make([][]float64, 0, len(layout))
 	for _, b := range layout {
-		var sum int64
+		terms := make([]int64, 0, len(b))
 		ind, sc := 0, 0
 		for _, u := range b {
-			sum += u.BaseNs
+			// CHECKED, not `sum += u.BaseNs`. A design row built from a wrapped
+			// sum describes a bucket that does not exist, and the fit that
+			// follows would identify parameters from it silently. §1.3 makes
+			// this a named failure with no artifact.
+			terms = append(terms, u.BaseNs)
 			if u.IsSlice {
 				sc++
 				continue
 			}
 			ind = 1
 		}
+		sum, err := nsmath.SumNs("calibration_design_reporter_sum_ns", terms...)
+		if err != nil {
+			return nil, err
+		}
+		// THE EMPTY BUCKET CHARGES THE INTERCEPT, and it must charge it in both
+		// places. Allocation evaluates the same four-term objective for every
+		// bucket, so an empty one is `[1,0,0,0]` here exactly as it is there:
+		// empty buckets are permitted when U < K, and calibration and
+		// validation disagreeing about the same bucket is the one thing that
+		// cannot be allowed to depend on which side is asked.
 		rows = append(rows, []float64{1, float64(sum), float64(ind), float64(sc)})
 	}
-	return rows
+	return rows, nil
 }
 
 // CalibrateProposer is the TOTAL proposer of contract §6.7 and §17.3a.
@@ -263,7 +278,11 @@ func CalibrateProposer(u []CalibrationUnit, k, n int, pack Packer) (CalibrationE
 			ev.Reason = fmt.Sprintf("the layout generator exhausted at i = %d: %v", i, err)
 			return ev, nil
 		}
-		rows := designOfLayout(layout)
+		rows, derr := designOfLayout(layout)
+		if derr != nil {
+			// Fail-closed with a named condition; NO evidence document.
+			return CalibrationEvidence{}, derr
+		}
 		rank, rerr := RankAdmission(rows)
 		if rerr != nil {
 			// Fail-closed with a named condition; NO evidence document.
