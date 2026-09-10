@@ -197,19 +197,41 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 	// action open until the job timed out, producing no closing record: the
 	// one shape that cannot be reported as a terminal state, because nothing
 	// was ever written.
-	clock := NewSystemClock()
-	w, err := NewWriter(filepath.Join(dir, "physical-setup-00.jsonl"), ProducerPhysical, "physical", nil)
-	if err != nil {
-		return 1, err
-	}
-	defer w.Close()
+	//
+	// IT IS RECORDED FOR THE CONSUMER SETUP COMMAND AND NOTHING ELSE.
+	//
+	// The wrapper chain runs through this same entry point, and it used to emit
+	// a setup lifecycle too — so the interval labelled `setup` CONTAINED the
+	// script it went on to start. Assembly then charged that span to A twice
+	// and refused the observation on §3.1's own floor:
+	//
+	//	§3.1: A (1234756000) < setup_ns + script_ns (1858303000)
+	//
+	// and when a consumer setup command ran as well, both calls appended to one
+	// stream and verification failed WT-020 on the second lifecycle. Neither
+	// branch of the shipped action could produce a usable measurement.
+	//
+	// A wrapper-chain child is not a level. It is this tool handing off to
+	// itself: the script it starts opens its own envelope, and the handoff's
+	// own duration belongs to the action prologue, which A already covers. So
+	// the records below are written only when this is the consumer's command.
+	writeLifecycle := !o.WrapperChain
 
-	start := clock.Now()
-	if _, err := w.Append(Record{
-		Kind: "boundary", Level: LevelSetup, Boundary: "start",
-		Source: SourceWrapper, Run: st.Run, Instant: start,
-	}); err != nil {
-		return 1, err
+	clock := NewSystemClock()
+	var w *Writer
+	if writeLifecycle {
+		w, err = NewWriter(filepath.Join(dir, "physical-setup-00.jsonl"), ProducerPhysical, "physical", nil)
+		if err != nil {
+			return 1, err
+		}
+		defer w.Close()
+
+		if _, err := w.Append(Record{
+			Kind: "boundary", Level: LevelSetup, Boundary: "start",
+			Source: SourceWrapper, Run: st.Run, Instant: clock.Now(),
+		}); err != nil {
+			return 1, err
+		}
 	}
 
 	cmd := exec.Command(argv[0], argv[1:]...)
@@ -264,12 +286,14 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 		proc.ExitCode, proc.ExitKind = code, terminal
 	}
 
-	if _, err := w.Append(Record{
-		Kind: "boundary", Level: LevelSetup, Boundary: "end",
-		Source: SourceWrapper, Run: st.Run, Instant: clock.Now(),
-		Proc: proc, Terminal: terminal, Reason: reason,
-	}); err != nil {
-		return code, err
+	if writeLifecycle {
+		if _, err := w.Append(Record{
+			Kind: "boundary", Level: LevelSetup, Boundary: "end",
+			Source: SourceWrapper, Run: st.Run, Instant: clock.Now(),
+			Proc: proc, Terminal: terminal, Reason: reason,
+		}); err != nil {
+			return code, err
+		}
 	}
 	if terminal == TerminalWrapperError {
 		return code, fmt.Errorf("walltime: %s", reason)
