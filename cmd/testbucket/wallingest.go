@@ -263,11 +263,13 @@ func rankSupportOf(r walltime.RankResult) []string {
 // canonical profile the plan carried, QC17 against the runtime profile it
 // declared. A context assembled from the rows would make every one of those
 // checks compare a row against itself and pass unconditionally.
-func planContextOf(planPath, runsOnLabel string, st *core.Store) (walltime.PlanContext, map[string]planFrozen, error) {
-	doc, err := core.ParseShardPlan(planPath)
-	if err != nil {
-		return walltime.PlanContext{}, nil, fmt.Errorf("--wall-shard-plan: %w", err)
-	}
+//
+// It takes the ALREADY-PARSED document rather than the path, for the reason
+// ParseShardPlan itself gives: a control that re-reads the artifact can have
+// each read see a different file, and the key ingest migrates under would then
+// be able to come from a plan other than the one the rows are qualified
+// against.
+func planContextOf(doc *core.PlanDocument, runsOnLabel string, st *core.Store) (walltime.PlanContext, map[string]planFrozen, error) {
 	frozen := map[string]planFrozen{}
 	ctx := walltime.PlanContext{
 		Buckets:             map[string]walltime.PlanBucketRef{},

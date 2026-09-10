@@ -287,7 +287,7 @@ func runIngest(args []string) error {
 	noGoList := fs.Bool("no-golist", false, "skip go list; record coverage from the observed events only (no row pruning)")
 	toolchainTimeout := fs.Duration("toolchain-timeout", 10*time.Minute, "deadline for each `go` subprocess; 0 disables")
 	runnerKind := fs.String("runner", "go", "test-runner adapter: go or vitest")
-	comparabilityKey := fs.String("comparability-key", "", "the §15.3 comparability-key digest this run's measurements belong to. REQUIRED when the restored store is schema 1: §15.2's forward migration initialises `wall` with the history its rows join, and a migration that cannot name one produces a population nothing can compare against")
+	comparabilityKey := fs.String("comparability-key", "", "the §15.3 comparability-key digest this run's measurements belong to. Needed whenever the restored store is schema 1 or carries no `wall` yet; when it is empty the key is read from --wall-shard-plan, which already carries it. A migration that cannot name a key produces a population nothing can compare against")
 	root := fs.String("root", "", "vitest project directory (--runner vitest); empty means the working directory")
 	vitestCommand := fs.String("vitest-command", "", "bare-vitest invocation (--runner vitest); empty means \"npx vitest\". testbucket appends the subcommand (discovery: \"list --filesOnly --json\"); see `plan -h`")
 	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly`, no import) or list (`vitest list --json`); see `plan -h`")
@@ -446,14 +446,52 @@ func runIngest(args []string) error {
 	// The key is required, not optional: `wall` records WHICH history its rows
 	// belong to, and a migration that could not say would create a population
 	// nothing can compare against.
-	if st.NeedsWallMigration() {
-		key := strings.TrimSpace(*comparabilityKey)
+	//
+	// THE PLAN IS PARSED ONCE, HERE, and the same document serves both the key
+	// and the qualification context below. Re-reading the artifact would let
+	// the key a store migrates under come from a different file than the one
+	// its rows are qualified against.
+	var planDoc *core.PlanDocument
+	if strings.TrimSpace(*wallShardPlan) != "" {
+		planDoc, err = core.ParseShardPlan(*wallShardPlan)
+		if err != nil {
+			return fmt.Errorf("--wall-shard-plan: %w", err)
+		}
+	}
+	// THE KEY TRAVELS WITH THE PLAN when it is not passed explicitly.
+	//
+	// The record action has no `comparability-key` input and the component map
+	// does not give it one, so nothing passed the flag and every schema-1 store
+	// failed the migration above — breaking the ordinary v0.2.2 upgrade even
+	// with no wall observations in sight. The plan already rides into the record
+	// job and already carries §15.3's key, so it is the transport.
+	key := strings.TrimSpace(*comparabilityKey)
+	if key == "" && planDoc != nil {
+		key = strings.TrimSpace(planDoc.ComparabilityKeyDigest)
+	}
+	switch {
+	case st.NeedsWallMigration():
 		if key == "" {
 			return fmt.Errorf("this store is schema 1 and ingest must migrate it (§15.2), " +
-				"but --comparability-key is empty: `wall` records which history its rows belong to, " +
-				"and a migration that cannot name one produces a population nothing can compare against")
+				"but no comparability key is available: pass --comparability-key, or " +
+				"--wall-shard-plan so the key travels with the plan. `wall` records which " +
+				"history its rows belong to, and a migration that cannot name one produces " +
+				"a population nothing can compare against")
 		}
 		st.MigrateWall(key)
+	case key != "":
+		// COLD START AND KEY CHANGE, in the one call that handles both.
+		//
+		// A store from core.NewStore has Wall == nil and is saved as schema 2,
+		// so NeedsWallMigration is false and the branch above never runs: every
+		// fresh store stayed wall-less and refused --wall-observations forever.
+		// ResetWallForKeyChange initialises the absent object and, per §15.3's
+		// second reset rule, clears the history when the key has moved — which
+		// is why it runs BEFORE any row can be appended below.
+		if n := st.ResetWallForKeyChange(key); n > 0 {
+			fmt.Fprintf(os.Stderr,
+				"wall: the comparability key changed; %d row(s) discarded and the model reset (§15.3)\n", n)
+		}
 	}
 
 	if *wallObservations != "" {
@@ -469,16 +507,17 @@ func runIngest(args []string) error {
 		// them, so no measured bucket could change a later plan. The hop below
 		// qualifies each row, appends the ones that pass, and refits IF AND
 		// ONLY IF the append changed the selected trainable population.
-		if st.Wall == nil {
-			return fmt.Errorf("--wall-observations needs a schema-2 store: §15.2's forward migration " +
-				"runs in this same ingest, so pass --comparability-key on the run that migrates")
-		}
-		if strings.TrimSpace(*wallShardPlan) == "" {
+		if planDoc == nil {
 			return fmt.Errorf("--wall-observations needs --wall-shard-plan: §7.1 compares each " +
 				"observation against the plan it was fanned out from, and a context built from the " +
 				"observations themselves would compare each row against itself")
 		}
-		planCtx, frozen, err := planContextOf(*wallShardPlan, *wallRunsOnLabel, st)
+		if st.Wall == nil {
+			return fmt.Errorf("--wall-observations needs a schema-2 store carrying `wall`, and " +
+				"neither --comparability-key nor the plan named a comparability key, so §15.2's " +
+				"initialisation had nothing to record the history under")
+		}
+		planCtx, frozen, err := planContextOf(planDoc, *wallRunsOnLabel, st)
 		if err != nil {
 			return err
 		}

@@ -585,3 +585,27 @@ func stripShellComments(body string) string {
 	}
 	return strings.Join(out, "\n")
 }
+
+// TestTheRecordActionCarriesTheComparabilityKeyOnEveryIngest guards the
+// v0.2.2 upgrade path.
+//
+// §15.3's key reaches ingest through the plan, because the component map gives
+// this action no `comparability-key` input. When --wall-shard-plan was passed
+// only inside the wall-observations branch, an ordinary reporter ingest over a
+// restored schema-1 store had no key, could not run §15.2's forward migration
+// and exited 1 — a break with no wall observations anywhere in the run.
+func TestTheRecordActionCarriesTheComparabilityKeyOnEveryIngest(t *testing.T) {
+	yml := readRepoFile(t, ".github/actions/record/action.yml")
+	wallBranch := strings.Index(yml, `if [ -n "${TB_WALL_OBSERVATIONS:-}" ]`)
+	if wallBranch < 0 {
+		t.Fatal("the record action no longer has a wall-observations branch")
+	}
+	plan := strings.Index(yml, "--wall-shard-plan")
+	if plan < 0 {
+		t.Fatal("the record action never passes --wall-shard-plan, so ingest gets no comparability key")
+	}
+	if plan > wallBranch {
+		t.Error("--wall-shard-plan is passed only inside the wall-observations branch; " +
+			"a reporter-only ingest over a schema-1 store then has no key and cannot migrate")
+	}
+}

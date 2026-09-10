@@ -506,8 +506,12 @@ func TestPlanFrozenRegressorsCountSlicesTheObservationCannotSee(t *testing.T) {
 			"script": "vitest run\n",
 		}},
 	})
+	parsed, err := core.ParseShardPlan(path)
+	if err != nil {
+		t.Fatalf("ParseShardPlan: %v", err)
+	}
 	st := core.NewStore("vitest")
-	_, frozen, err := planContextOf(path, "ubuntu-latest", st)
+	_, frozen, err := planContextOf(parsed, "ubuntu-latest", st)
 	if err != nil {
 		t.Fatalf("planContextOf: %v", err)
 	}

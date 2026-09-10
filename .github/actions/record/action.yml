@@ -189,6 +189,17 @@ runs:
         # same-run artifact download left; --campaign-config is the LOCAL path
         # the verify step above produced, never the caller's content, so an
         # unverified config cannot reach append.
+        # THE PLAN TRAVELS WITH EVERY INGEST, not only a wall one.
+        #
+        # It carries §15.3's comparability key, and this action has no
+        # `comparability-key` input -- the component map does not give it one.
+        # Without the key, ingest cannot run §15.2's forward migration, so an
+        # ORDINARY reporter ingest over a restored v0.2.2 store exited 1 and the
+        # store never upgraded. The audit step above already reads this same
+        # file, so it is present on every record.
+        if [ -f "$TB_SHARD_PLAN" ]; then
+          extra+=(--wall-shard-plan "$TB_SHARD_PLAN")
+        fi
         if [ -n "${TB_WALL_OBSERVATIONS:-}" ]; then
           # The plan and the label travel WITH the observations, because §7.1
           # compares each row against the plan it was fanned out from -- QC6
@@ -197,7 +208,6 @@ runs:
           # row against a context derived from the row itself would pass
           # unconditionally.
           extra+=(--wall-observations "$TB_WALL_OBSERVATIONS")
-          extra+=(--wall-shard-plan "$TB_SHARD_PLAN")
           # THE LABEL COMES FROM THE JOB ENVIRONMENT, not from an input.
           #
           # QC12 compares the label the run was DISPATCHED under against the
