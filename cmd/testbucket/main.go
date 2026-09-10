@@ -786,6 +786,7 @@ func runPlan(args []string) error {
 	estBasis := fs.String("est-basis", string(core.BasisReporter), "which weight the partition is built from: reporter (default) or wall. Mode selection is contract §16.1; an explicit `wall` request with no fitted `ok` model is a hard error with no matrix (§0.8 outcome c), never a silent fallback")
 	scored := fs.Bool("scored", false, "this plan belongs to a scored campaign run. Nothing else can derive it — basis does not imply it, since a scored B arm runs `reporter` — so it is explicit, and it gates §0.8's phase-2 veto plus AD-8…AD-10")
 	runnerClass := fs.String("runner-class", "", "the stable execution-class leaf of the comparability key (§15.3). Required non-empty for a scored plan (AD-8); it replaces the former runner_name leaf, whose per-instance value had no cross-run stability contract")
+	setupCommand := fs.String("setup-command", "", "the per-job provisioning command the caller runs before this plan, verbatim. It is §15.3's setup_command key leaf: the plan action executes arbitrary consumer provisioning, and an environment built by a different command is a different population. Empty means no provisioning ran")
 	runsOnLabel := fs.String("runs-on-label", "", "the caller's resolved runs-on label, the producer for the runner_image_label key leaf. No context yields it inside a composite action, so the caller passes it; run-bucket echoes it and QC12 compares them (AD-8)")
 	candidateSHA := fs.String("candidate-sha", "", "the testbucket commit the executing binary was built from, recorded as the observation's candidate_sha (AD-10, QC15)")
 	workloadCommit := fs.String("workload-commit", "", "the consumer checkout this run executes against, recorded as the observation's workload_commit (AD-10, QC15)")
@@ -893,6 +894,47 @@ func runPlan(args []string) error {
 		return err
 	}
 
+	// THE RUNTIME PROFILE IS OBSERVED, not asserted: §15.3a's leaves come from
+	// the toolchain this process can actually see, so a declaration and the
+	// execution that follows it can be compared rather than assumed equal.
+	rtProfile := buildRuntimeProfile(runtimeProfileInputs{
+		runnerKind:    *runnerKind,
+		root:          *root,
+		workingDir:    *root,
+		vitestCommand: *vitestCommand,
+		cacheDecl:     cacheDecl,
+	})
+	opt.RuntimeProfileDeclared = runtimeProfileMap(rtProfile)
+	opt.RuntimeProfileDeclaredDigest = string(walltime.RuntimeProfileDigest(rtProfile))
+
+	// §15.3's comparability key: which wall history these measurements may
+	// join. It is derived from the DECLARED leaves, never from a per-job
+	// outcome, so ordinary cache behaviour cannot reset the population.
+	keyProfile := walltime.ComparabilityProfile{
+		RunnerClass:      *runnerClass,
+		RunnerImageLabel: *runsOnLabel,
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		NodeVersion:      rtProfile.NodeVersion,
+		PnpmVersion:      rtProfile.PnpmVersion,
+		VitestVersion:    rtProfile.VitestVersion,
+		TestbucketSHA256: rtProfile.TestbucketSHA256,
+		WorkingDir:       *root,
+		FacadeCommand:    rtProfile.FacadeCommand,
+		SetupCommand:     strings.TrimSpace(*setupCommand),
+		LockSHA256:       rtProfile.LockSHA256,
+		DiscoveryMode:    *vitestDiscovery,
+		Exclusions:       []string(excludes),
+	}
+	if cacheDecl != nil {
+		keyProfile.CacheDeclarationDigest = string(cacheDecl.Digest())
+	}
+	keyDigest, err := walltime.ComparabilityKeyDigest(keyProfile)
+	if err != nil {
+		return fmt.Errorf("comparability key: %w", err)
+	}
+	opt.ComparabilityKeyDigest = string(keyDigest)
+
 	// THE STORE IS READ BEFORE DISCOVERY, because the basis decision depends on
 	// it and an unusable one must refuse before an expensive `go list` or
 	// `vitest list` sweep — not after.
@@ -907,13 +949,32 @@ func runPlan(args []string) error {
 	status := core.WallStatusAbsent
 	var fitted *core.WallModel
 	if st != nil && st.Wall != nil {
-		status = st.Wall.Status
-		if f := st.Wall.Fit; f != nil {
-			fitted = &core.WallModel{
-				FixedNs:                   f.FixedNs,
-				Scale:                     f.Scale,
-				WholeInvocationOverheadNs: f.WholeInvocationOverheadNs,
-				PerSliceOverheadNs:        f.PerSliceOverheadNs,
+		// §15.3's KEY IS EVALUATED BEFORE THE FIT IS EXPOSED, not after.
+		//
+		// The key was constructed further down, and the reset lived only in
+		// ingest — so a store fitted under a different runner, toolchain, cache
+		// declaration or setup command drove THIS allocation once, and was only
+		// cleared on the next ingest. `--est-basis wall` exited 0 and emitted a
+		// wall plan from a foreign fit. Measurements from another population
+		// are not a warm start; they are the thing the key exists to keep out.
+		//
+		// An empty stored key is treated as incompatible for the same reason: a
+		// history that cannot say which population it belongs to cannot be
+		// shown to belong to this one.
+		if st.Wall.ComparabilityKeyDigest != string(keyDigest) {
+			fmt.Fprintf(os.Stderr,
+				"testbucket plan: the stored wall history was measured under comparability key %s and this run's key is %s; "+
+					"the model is not used and the history rewarms under the new key (§15.3)\n",
+				emptyAsNone(st.Wall.ComparabilityKeyDigest), keyDigest)
+		} else {
+			status = st.Wall.Status
+			if f := st.Wall.Fit; f != nil {
+				fitted = &core.WallModel{
+					FixedNs:                   f.FixedNs,
+					Scale:                     f.Scale,
+					WholeInvocationOverheadNs: f.WholeInvocationOverheadNs,
+					PerSliceOverheadNs:        f.PerSliceOverheadNs,
+				}
 			}
 		}
 	}
@@ -947,47 +1008,6 @@ func runPlan(args []string) error {
 	if decision.Basis == core.BasisWall {
 		opt.WallModel = fitted
 	}
-
-	// THE RUNTIME PROFILE IS OBSERVED, not asserted: §15.3a's leaves come from
-	// the toolchain this process can actually see, so a declaration and the
-	// execution that follows it can be compared rather than assumed equal.
-	rtProfile := buildRuntimeProfile(runtimeProfileInputs{
-		runnerKind:    *runnerKind,
-		root:          *root,
-		workingDir:    *root,
-		vitestCommand: *vitestCommand,
-		cacheDecl:     cacheDecl,
-	})
-	opt.RuntimeProfileDeclared = runtimeProfileMap(rtProfile)
-	opt.RuntimeProfileDeclaredDigest = string(walltime.RuntimeProfileDigest(rtProfile))
-
-	// §15.3's comparability key: which wall history these measurements may
-	// join. It is derived from the DECLARED leaves, never from a per-job
-	// outcome, so ordinary cache behaviour cannot reset the population.
-	keyProfile := walltime.ComparabilityProfile{
-		RunnerClass:      *runnerClass,
-		RunnerImageLabel: *runsOnLabel,
-		OS:               runtime.GOOS,
-		Arch:             runtime.GOARCH,
-		NodeVersion:      rtProfile.NodeVersion,
-		PnpmVersion:      rtProfile.PnpmVersion,
-		VitestVersion:    rtProfile.VitestVersion,
-		TestbucketSHA256: rtProfile.TestbucketSHA256,
-		WorkingDir:       *root,
-		FacadeCommand:    rtProfile.FacadeCommand,
-		SetupCommand:     "",
-		LockSHA256:       rtProfile.LockSHA256,
-		DiscoveryMode:    *vitestDiscovery,
-		Exclusions:       []string(excludes),
-	}
-	if cacheDecl != nil {
-		keyProfile.CacheDeclarationDigest = string(cacheDecl.Digest())
-	}
-	keyDigest, err := walltime.ComparabilityKeyDigest(keyProfile)
-	if err != nil {
-		return fmt.Errorf("comparability key: %w", err)
-	}
-	opt.ComparabilityKeyDigest = string(keyDigest)
 
 	// §13.0's canonical profile: the shape this plan was built under, carried
 	// verbatim into every observation so QC13 compares one value rather than
@@ -1099,4 +1119,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "testbucket: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// emptyAsNone names an absent digest so a diagnostic does not print a bare
+// "key  and". A history with no key is not a history with an empty key.
+func emptyAsNone(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(none recorded)"
+	}
+	return s
 }

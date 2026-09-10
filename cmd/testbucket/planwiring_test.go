@@ -240,6 +240,13 @@ func TestTheWallBasisPacksAndDisplaysOneObjective(t *testing.T) {
 
 	st := warmStore(8)
 	st["schema"] = 2
+	writeFixture(t, store, st)
+	// WARMED UNDER THIS RUN'S OWN KEY. The fixture used to name a constant
+	// `sha256:aaaa…`, which the planner now correctly refuses as a foreign
+	// population — so the key is derived from a reporter plan over the same
+	// configuration rather than asserted. This test is about the objective,
+	// not about the key.
+	key := planComparabilityKey(t, bin, dir, live, store)
 	// The REGISTERED wire format: the fit's leaves are flat under `wall`, and
 	// `scale` is a string. This fixture used to nest them under `wall.fit`
 	// with a numeric scale, which is the shape the field registry does not
@@ -247,7 +254,7 @@ func TestTheWallBasisPacksAndDisplaysOneObjective(t *testing.T) {
 	// registered paths can find.
 	st["wall"] = map[string]any{
 		"model_version":                1,
-		"comparability_key_digest":     "sha256:" + strings.Repeat("a", 64),
+		"comparability_key_digest":     key,
 		"status":                       "ok",
 		"observations":                 []any{},
 		"fixed_ns":                     "2000000000",
@@ -358,5 +365,151 @@ func TestThePlanArtifactCarriesTheCanonicalProfileVerbatim(t *testing.T) {
 	if !bytes.Equal([]byte(doc.Profile), want.Raw()) {
 		t.Errorf("the plan artifact's profile block is not canonical, so no observation can copy it verbatim:\n  on disk: %s\n  canonical: %s",
 			doc.Profile, want.Raw())
+	}
+}
+
+// TestAForeignWallModelIsRefusedBeforeItCanAllocate is F3.
+//
+// The planner loaded the store's status and fit, called SelectBasis and
+// installed that fit — and only afterwards constructed the current §15.3
+// comparability key, which it then never compared against the store's. The
+// key-change reset existed only in ingest, so a store fitted under a different
+// runner, toolchain, cache declaration or setup command drove THIS allocation
+// once and was cleared on the NEXT ingest. Explicit `--est-basis wall` exited 0
+// and emitted a wall-basis plan from a foreign fit.
+//
+// Measurements from another population are not a warm start.
+func TestAForeignWallModelIsRefusedBeforeItCanAllocate(t *testing.T) {
+	bin := planBinary(t)
+	dir := t.TempDir()
+	live := filepath.Join(dir, "live.json")
+	store := filepath.Join(dir, "store.json")
+	plan := filepath.Join(dir, "plan.json")
+	writeFixture(t, live, liveSet(8))
+
+	warm := warmStore(8)
+	warm["wall"] = map[string]any{
+		"model_version":            1,
+		"comparability_key_digest": "sha256:" + strings.Repeat("a", 64),
+		"status":                   "ok",
+		"observations":             []any{},
+	}
+	// THE REGISTERED WIRE FORMAT IS FLAT: the registry declares fixed_ns,
+	// scale and fitted_at directly under `wall`, with scale as a STRING. A
+	// nested `fit` object unmarshals to no fit at all, which would make this
+	// test pass for the wrong reason.
+	for k, v := range fittedWallLeaves() {
+		warm["wall"].(map[string]any)[k] = v
+	}
+	writeFixture(t, store, warm)
+
+	// EXPLICIT wall basis. §0.8 outcome (c) is a hard error with no matrix when
+	// no usable model exists — and a model measured under another key is not a
+	// usable model, so this must fail rather than silently allocating from it.
+	cmd := exec.Command(bin, "plan", "--runner", "vitest", "--count", "1", "--k", "8",
+		"--live", live, "--store", store, "--json", "--shard-plan", plan,
+		"--est-basis", "wall", "--runs-on-label", "ubuntu-latest")
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("a foreign fit produced a wall-basis plan and exited 0:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "comparability key") {
+		t.Errorf("the refusal does not name the key that made the model foreign:\n%s", stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "" {
+		t.Errorf("a refused plan emitted matrix bytes:\n%s", stdout.String())
+	}
+	if _, statErr := os.Stat(plan); statErr == nil {
+		t.Error("a refused plan wrote a shard-plan artifact")
+	}
+}
+
+// TestAMatchingComparabilityKeyStillWarms is the control: the fix must refuse
+// a FOREIGN population, not every stored model.
+func TestAMatchingComparabilityKeyStillWarms(t *testing.T) {
+	bin := planBinary(t)
+	dir := t.TempDir()
+	live := filepath.Join(dir, "live.json")
+	store := filepath.Join(dir, "store.json")
+	writeFixture(t, live, liveSet(8))
+	writeFixture(t, store, warmStore(8))
+
+	// The key this configuration computes is not knowable to the test without
+	// re-deriving it, so the store is warmed in two steps: plan once under the
+	// reporter basis to learn the key the run reports, then write it back.
+	key := planComparabilityKey(t, bin, dir, live, store, "--runs-on-label", "ubuntu-latest")
+	warm := warmStore(8)
+	warm["wall"] = map[string]any{
+		"model_version":            1,
+		"comparability_key_digest": key,
+		"status":                   "ok",
+		"observations":             []any{},
+	}
+	// THE REGISTERED WIRE FORMAT IS FLAT: the registry declares fixed_ns,
+	// scale and fitted_at directly under `wall`, with scale as a STRING. A
+	// nested `fit` object unmarshals to no fit at all, which would make this
+	// test pass for the wrong reason.
+	for k, v := range fittedWallLeaves() {
+		warm["wall"].(map[string]any)[k] = v
+	}
+	writeFixture(t, store, warm)
+
+	plan := filepath.Join(dir, "plan-warm.json")
+	cmd := exec.Command(bin, "plan", "--runner", "vitest", "--count", "1", "--k", "8",
+		"--live", live, "--store", store, "--json", "--shard-plan", plan,
+		"--est-basis", "wall", "--runs-on-label", "ubuntu-latest")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("a model measured under THIS key was refused: %v\n%s", err, stderr.String())
+	}
+	doc, err := core.ParseShardPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.EstBasis != core.BasisWall {
+		t.Errorf("the plan's basis is %q, want wall", doc.EstBasis)
+	}
+}
+
+// planComparabilityKey runs the planner once and reads back the key it
+// computed for this exact configuration.
+func planComparabilityKey(t *testing.T, bin, dir, live, store string, extra ...string) string {
+	t.Helper()
+	plan := filepath.Join(dir, "plan-key.json")
+	args := append([]string{"plan", "--runner", "vitest", "--count", "1", "--k", "8",
+		"--live", live, "--store", store, "--json", "--shard-plan", plan}, extra...)
+	cmd := exec.Command(bin, args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("reporter plan failed: %v\n%s", err, stderr.String())
+	}
+	doc, err := core.ParseShardPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.ComparabilityKeyDigest == "" {
+		t.Fatal("the plan carries no comparability key")
+	}
+	return doc.ComparabilityKeyDigest
+}
+
+// fittedWallLeaves is an accepted §15.1c fit on the registered flat surface.
+func fittedWallLeaves() map[string]any {
+	return map[string]any{
+		"fitted_at":                    "2026-09-01T00:00:00Z",
+		"rows_used":                    24,
+		"runs_used":                    6,
+		"fixed_ns":                     "1000000000",
+		"scale":                        "1",
+		"whole_invocation_overhead_ns": "0",
+		"per_slice_overhead_ns":        "0",
+		"residual_mae_ns":              "0",
+		"residual_p90_ns":              "0",
+		"rank_support":                 []string{"fixed", "scale"},
 	}
 }

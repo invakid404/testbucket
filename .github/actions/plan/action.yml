@@ -202,6 +202,11 @@ runs:
         TB_SCORED: ${{ inputs.scored }}
         TB_RUNNER_CLASS: ${{ inputs.runner-class }}
         TB_RUNS_ON_LABEL: ${{ inputs.runs-on-label }}
+        # THE SAME COMMAND THE STEP ABOVE EXECUTED. §15.3 makes setup_command a
+        # key leaf: this action runs arbitrary consumer provisioning before
+        # discovery, and an environment built by a different command is a
+        # different population. The key hard-coded it empty, so it could not.
+        TB_SETUP_COMMAND: ${{ inputs.setup-command }}
         TB_CACHE_DECLARATION_FILE: ${{ inputs.cache-declaration-file }}
         TB_CANDIDATE_SHA: ${{ inputs.candidate-sha }}
         TB_WORKLOAD_COMMIT: ${{ inputs.workload-commit }}
@@ -329,6 +334,7 @@ runs:
           --store "$TB_STORE" \
           --events-dir "$TB_EVENTS_DIR" \
           --shard-plan "$TB_SHARD_PLAN" \
+          --setup-command "$TB_SETUP_COMMAND" \
           "${extra[@]}" \
           --json)
 
