@@ -1,0 +1,326 @@
+package main
+
+import (
+	"encoding/json"
+
+	"github.com/invakid404/testbucket/internal/core"
+	"github.com/invakid404/testbucket/internal/walltime"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// TestProductionObservationIngestCycle is the F2 regression, and it is BLACK
+// BOX on purpose.
+//
+// `ingest --wall-observations` used to read the rows, print the accept/reject
+// table, and stop. The §7.1 qualification, the ring append and the conditional
+// refit all existed and all had passing tests; nothing in production called
+// any of them, so no measured bucket could change a later plan. A test that
+// invokes those helpers cannot see that. This one runs the shipped binary and
+// reads the store back off disk.
+func TestProductionObservationIngestCycle(t *testing.T) {
+	bin := planBinary(t)
+	dir := t.TempDir()
+	store := filepath.Join(dir, "store.json")
+	obsDir := filepath.Join(dir, "obs")
+	if err := os.MkdirAll(obsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A schema-2 store with an empty ring: the migration has already happened,
+	// which is the state a second run is in.
+	writeFixture(t, store, map[string]any{
+		"schema": 2, "flags": "vitest", "updated_at": "2026-09-01T00:00:00Z",
+		"units": map[string]any{"f0.test.ts": map[string]any{"seconds": 10.0, "samples": 4}},
+		"wall": map[string]any{
+			"model_version":            1,
+			"comparability_key_digest": sharedComparabilityKey,
+			"status":                   "insufficient",
+			"failure_subtype":          "migrated_no_history",
+			"observations":             []any{},
+		},
+	})
+	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0)
+	writeFixture(t, filepath.Join(obsDir, "b0.json"), observationFixture("bucket-0", 0, "run-1", planDigest))
+
+	events := filepath.Join(dir, "ev.ndjson")
+	if err := os.WriteFile(events, []byte(
+		`{"Action":"run","Package":"f0.test.ts","Test":"T"}`+"\n"+
+			`{"Action":"pass","Package":"f0.test.ts","Test":"T","Elapsed":1}`+"\n"+
+			`{"Action":"pass","Package":"f0.test.ts","Elapsed":1}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "ingest", "--store", store, "--no-golist",
+		"--wall-observations", obsDir, "--wall-shard-plan", plan,
+		"--runs-on-label", "ubuntu-latest", events)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("ingest failed: %v\n%s", err, stderr.String())
+	}
+
+	// The loop must have RUN, not merely reported.
+	if !strings.Contains(stderr.String(), "observation(s) appended") {
+		t.Errorf("ingest printed no append summary; the loop did not run:\n%s", stderr.String())
+	}
+
+	var got struct {
+		Wall struct {
+			Observations []map[string]any `json:"observations"`
+			Status       string           `json:"status"`
+		} `json:"wall"`
+	}
+	b, err := os.ReadFile(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Wall.Observations) != 1 {
+		t.Fatalf("the ring holds %d row(s) after ingesting one qualifying observation, want 1:\n%s",
+			len(got.Wall.Observations), stderr.String())
+	}
+	row := got.Wall.Observations[0]
+	if row["run_id"] != "run-1" {
+		t.Errorf("the appended row names run %v, want run-1", row["run_id"])
+	}
+	if row["trainable"] != true {
+		t.Errorf("an ordinary unscored row was appended non-trainable: %v", row["trainable"])
+	}
+}
+
+// TestAnUnqualifiedObservationNeverReachesTheRing: qualification is the gate,
+// so a row that fails it must leave the ring exactly as it was. Reporting the
+// rejection and appending anyway would be worse than not checking.
+func TestAnUnqualifiedObservationNeverReachesTheRing(t *testing.T) {
+	bin := planBinary(t)
+	dir := t.TempDir()
+	store := filepath.Join(dir, "store.json")
+	obsDir := filepath.Join(dir, "obs")
+	if err := os.MkdirAll(obsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, store, map[string]any{
+		"schema": 2, "flags": "vitest", "updated_at": "2026-09-01T00:00:00Z",
+		"units": map[string]any{"f0.test.ts": map[string]any{"seconds": 10.0, "samples": 4}},
+		"wall": map[string]any{
+			"model_version":            1,
+			"comparability_key_digest": sharedComparabilityKey,
+			"status":                   "insufficient",
+			"failure_subtype":          "migrated_no_history",
+			"observations":             []any{},
+		},
+	})
+
+	// §3.1's floor is A >= setup_ns + script_ns. This row breaks it, so QC7
+	// must refuse it.
+	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0)
+	bad := observationFixture("bucket-0", 0, "run-2", planDigest)
+	bad.ElapsedNs = 1
+	bad.SetupNs = 1_000_000_000
+	bad.ScriptNs = 1_000_000_000
+	writeFixture(t, filepath.Join(obsDir, "b0.json"), bad)
+
+	events := filepath.Join(dir, "ev.ndjson")
+	if err := os.WriteFile(events, []byte(
+		`{"Action":"pass","Package":"f0.test.ts","Elapsed":1}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "ingest", "--store", store, "--no-golist",
+		"--wall-observations", obsDir, "--wall-shard-plan", plan,
+		"--runs-on-label", "ubuntu-latest", events)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("ingest failed: %v\n%s", err, stderr.String())
+	}
+
+	var got struct {
+		Wall struct {
+			Observations []map[string]any `json:"observations"`
+		} `json:"wall"`
+	}
+	b, err := os.ReadFile(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Wall.Observations) != 0 {
+		t.Errorf("an observation that fails §3.1's floor reached the ring: %v", got.Wall.Observations)
+	}
+	if !strings.Contains(stderr.String(), "REJECT") {
+		t.Errorf("the rejection was not reported:\n%s", stderr.String())
+	}
+}
+
+// observationFixture is a schema-valid unscored observation for one bucket.
+//
+// It is built through the PRODUCTION constructors — the profile block and the
+// runtime-profile digest — rather than hand-written JSON, because several of
+// §7.1's checks compare a document against a digest of its own contents. A
+// hand-written fixture either has to restate those digests (and then agrees
+// with itself while disagreeing with the code) or fails qualification for a
+// reason that has nothing to do with what is being tested.
+func observationFixture(bucket string, index int, runID string, planDigest walltime.Digest) walltime.Observation {
+	block, err := walltime.NewProfileBlock(sharedProfile())
+	if err != nil {
+		panic(err)
+	}
+	rp := sharedRuntimeProfile()
+	decl := walltime.CacheDeclaration{
+		DependencyCacheMode: "disabled", TransformCacheMode: "disabled",
+		DependencyCacheProducer:   "none",
+		ExpectedMongoBinarySHA256: strings.Repeat("a", 64),
+	}
+	return walltime.Observation{
+		Schema:                 walltime.ObservationSchema,
+		ComparabilityKeyDigest: walltime.Digest(sharedComparabilityKey),
+		Repository:             "owner/name",
+		HeadSHA:                strings.Repeat("1", 40),
+		CandidateSHA:           strings.Repeat("2", 40),
+		WorkloadCommit:         strings.Repeat("3", 40),
+		RunID:                  runID,
+		RunAttempt:             "1",
+		JobID:                  "job-1",
+		BucketIndex:            index,
+		BucketName:             bucket,
+		PlanDigest:             planDigest,
+		Profile:                block,
+		EstSeconds:             10.0,
+		AEtaNs:                 10_000_000_000,
+		ProcessGroupID:         "pg-1",
+		ActualRunnerName:       "runner-1",
+		ObservedRunsOnLabel:    "ubuntu-latest",
+		UnitIDs:                []string{"f0.test.ts"},
+		Invocations: []walltime.Invocation{{
+			Seq: 0, Units: []string{"f0.test.ts"},
+			// Derived from the SAME argv and cwd the plan declares, through
+			// the production digester. QC6 then compares two independently
+			// derived values instead of a placeholder against itself.
+			ArgvDigest: walltime.DigestJSONOrEmpty([]string{"run", "f0.test.ts"}),
+			CwdDigest:  walltime.DigestJSONOrEmpty("."),
+			Selector:   []string{"./f0.test.ts"}, Atoms: []string{},
+			ProcessGroupID: "pg-1",
+			StartedMonoNs:  1000, EndedMonoNs: 2_000_000_000,
+			ElapsedNs: 1_999_999_000,
+		}},
+		StartedMonoNs:    0,
+		EndedMonoNs:      10_000_000_000,
+		ElapsedNs:        10_000_000_000,
+		SetupNs:          1_000_000_000,
+		ScriptNs:         8_000_000_000,
+		ScriptOverheadNs: 1_000_000,
+		WrapperNs:        1_000_000_000,
+		RealtimeStart:    "2026-09-01T00:00:00Z",
+		RealtimeEnd:      "2026-09-01T00:00:10Z",
+		CacheState: walltime.CacheState{
+			DependencyCacheMode: "disabled", TransformCacheMode: "disabled",
+			DependencyCacheProducer:     "none",
+			MongoBinarySHA256:           strings.Repeat("a", 64),
+			ExpectedMongoBinarySHA256:   strings.Repeat("a", 64),
+			MongoBinaryPath:             "/opt/mongodb/bin/mongod",
+			MongoBinaryVerifiedOnRunner: true,
+			DependencyCacheDisposition:  "disabled",
+		},
+		CacheDeclarationDigest: decl.Digest(),
+		RuntimeProfile:         rp,
+		RuntimeProfileDigest:   walltime.RuntimeProfileDigest(rp),
+		Terminal:               "passed",
+		Limitations:            walltime.CanonicalLimitations(),
+	}
+}
+
+// sharedProfile is the canonical profile BOTH the plan and the observation
+// carry. §13.0 has the observation copy the plan's profile verbatim, and QC13
+// compares the two — so the test builds one value and hands it to both, which
+// is what the production path does.
+func sharedProfile() walltime.CanonicalProfile {
+	return walltime.CanonicalProfile{
+		Scored: false, RunnerToken: "vitest", K: 8, Count: 1, FileParallelism: 1,
+		BucketIndices:         []int{0, 1, 2, 3, 4, 5, 6, 7},
+		EstBasis:              walltime.EstBasis("reporter"),
+		StoreSHA256:           "sha256:" + strings.Repeat("b", 64),
+		ExpandedUnitSetDigest: "sha256:" + strings.Repeat("c", 64),
+	}
+}
+
+// sharedProfileBlock is that profile in its CANONICAL serialization, which is
+// what the plan carries and the observation copies verbatim.
+func sharedProfileBlock(t *testing.T) walltime.ProfileBlock {
+	t.Helper()
+	b, err := walltime.NewProfileBlock(sharedProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// sharedRuntimeProfile is the runtime profile the plan DECLARES and the
+// observation reports as EXECUTED. QC17 compares them field by field.
+func sharedRuntimeProfile() walltime.RuntimeProfile {
+	return walltime.RuntimeProfile{
+		NodeVersion: "26.8.1", PnpmVersion: "10.29.3", VitestVersion: "4.1.11",
+		TestbucketSHA256:    "sha256:" + strings.Repeat("8", 64),
+		FacadeCommand:       "pnpm exec tsx scripts/tb-vitest.ts",
+		LockSHA256:          "sha256:" + strings.Repeat("7", 64),
+		DependencyCacheMode: "disabled",
+	}
+}
+
+const sharedComparabilityKey = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// writePlanFor writes the plan document the observation fixture claims to have
+// been fanned out from, with the one invocation the fixture records. The
+// argv/cwd digests are computed the way the planner computes them, so QC6
+// compares two independently derived values rather than one value with itself.
+func writePlanFor(t *testing.T, dir, bucket string, index int) (string, walltime.Digest) {
+	t.Helper()
+	path := filepath.Join(dir, "shard-plan.json")
+	rp := sharedRuntimeProfile()
+	var rpMap map[string]string
+	if err := json.Unmarshal(rp.OrderedJSON(), &rpMap); err != nil {
+		t.Fatal(err)
+	}
+	doc := map[string]any{
+		"k": 8, "flags": "vitest", "algorithm": "karmarkar-karp",
+		"store":                           "test-timings.json",
+		"est_basis":                       "reporter",
+		"comparability_key_digest":        sharedComparabilityKey,
+		"expanded_unit_set_digest":        "sha256:" + strings.Repeat("c", 64),
+		"profile":                         json.RawMessage(sharedProfileBlock(t).Raw()),
+		"runtime_profile_declared":        rpMap,
+		"runtime_profile_declared_digest": string(walltime.RuntimeProfileDigest(rp)),
+		"buckets": []map[string]any{{
+			"bucket": index, "name": bucket, "est_seconds": 10.0, "needs_node": true,
+			"units": []map[string]any{{"id": "f0.test.ts", "kind": "package",
+				"packages": []string{"f0.test.ts"}, "est_seconds": 10.0}},
+			"invocations": []map[string]any{{
+				"dir": ".", "args": []string{"run", "f0.test.ts"},
+				"desc": "f0.test.ts", "units": []string{"f0.test.ts"},
+				"selector": []string{"./f0.test.ts"},
+			}},
+			"script": "vitest run f0.test.ts\n",
+		}},
+	}
+	writeFixture(t, path, doc)
+	// The digest QC3 compares against is the one the record job derives by
+	// PARSING the plan, so the test derives it the same way rather than
+	// hashing the bytes it just wrote.
+	parsed, err := core.ParseShardPlan(path)
+	if err != nil {
+		t.Fatalf("ParseShardPlan: %v", err)
+	}
+	d, err := walltime.DigestJSON(parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path, d
+}

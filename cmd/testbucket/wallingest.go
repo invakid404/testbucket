@@ -1,0 +1,314 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/invakid404/testbucket/internal/core"
+	"github.com/invakid404/testbucket/internal/walltime"
+)
+
+// THE PRODUCTION FEEDBACK LOOP.
+//
+// `ingest --wall-observations` used to read the rows, print the accept/reject
+// table, and stop. Every piece of the loop existed and was tested — the §7.1
+// qualification, the ring append, the conditional refit — and nothing in
+// production called any of it, so no measured bucket could change a later
+// plan. This file is the adapter that closes it: it is what makes `core.Store`
+// a `walltime.RingStore` and what turns a qualifying observation into a ring
+// row and a fit.
+
+// wallRingStore adapts the timing store to the ring interface §14.2's hop
+// writes through.
+//
+// Qualification happens HERE, inside Append, rather than beside it. The
+// contract admits a row only if every applicable QC1…QC17 check passes, so a
+// row that fails must never reach the ring at all — and putting the gate at
+// the append boundary means there is no path into the ring that skips it.
+type wallRingStore struct {
+	st    *core.Store
+	plan  walltime.PlanContext
+	ring  walltime.RingFacts
+	seq   int64
+	notes []string
+}
+
+// SelectedIdentities is the SELECTED trainable population, in selection order.
+// §14.2 refits if and only if this sequence changes, so it is the ring's own
+// answer rather than a count.
+func (w *wallRingStore) SelectedIdentities() []string {
+	if w.st.Wall == nil {
+		return nil
+	}
+	rows := w.st.Wall.TrainableRows()
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		id := r.IntrinsicID()
+		out = append(out, strings.Join(id[:], "\x00"))
+	}
+	return out
+}
+
+// Append qualifies the observation and, only then, admits it to the ring.
+func (w *wallRingStore) Append(obs walltime.Observation, trainable bool) error {
+	if w.st.Wall == nil {
+		return fmt.Errorf("the store carries no wall object; §15.2's migration runs before ingest appends")
+	}
+	if err := walltime.QualifyObservation(obs, w.plan, w.ring); err != nil {
+		return err
+	}
+	row := ringRowOf(obs, trainable, w.nextSeq())
+	// QC15 and QC16 are the ring's own admission: the three provenance
+	// identities, and a recency key that is a total order against what is
+	// already stored.
+	if err := core.QC15(row); err != nil {
+		return err
+	}
+	if err := core.QC16(w.st.Wall.Observations, row); err != nil {
+		return err
+	}
+	w.st.Wall.AppendRow(row)
+
+	// The ring facts move with the ring: a second row in this same invocation
+	// that duplicates an identity must be refused by the same check that
+	// refuses one duplicating a stored row.
+	w.ring.SeenObservationKeys[[4]string{obs.HeadSHA, obs.RunID, obs.RunAttempt, obs.BucketName}] = true
+	w.ring.SeenIntrinsicIDs[row.IntrinsicID()] = true
+	return nil
+}
+
+func (w *wallRingStore) nextSeq() int64 {
+	w.seq++
+	return w.seq
+}
+
+// ringRowOf projects an observation onto the ring row §15.1a stores.
+//
+// The four model inputs — reporter_sum_ns, the whole-file indicator, the slice
+// count and the elapsed interval — are what a fit reads, so they are derived
+// from the observation's own invocation shape rather than restated by the
+// producer: a row whose shape disagreed with the invocations it describes
+// would train the model on a bucket that did not run.
+func ringRowOf(obs walltime.Observation, trainable bool, seq int64) core.WallRingRow {
+	whole, slices := 0, 0
+	for _, inv := range obs.Invocations {
+		if len(inv.Selector) > 0 && hasNameFilter(inv.Selector) {
+			slices++
+			continue
+		}
+		whole++
+	}
+	indicator := 0
+	if whole > 0 {
+		indicator = 1
+	}
+	return core.WallRingRow{
+		Repository:     obs.Repository,
+		JobID:          obs.JobID,
+		HeadSHA:        obs.HeadSHA,
+		CandidateSHA:   obs.CandidateSHA,
+		WorkloadCommit: obs.WorkloadCommit,
+		RunID:          obs.RunID,
+		RunAttempt:     obs.RunAttempt,
+
+		ObservedStartRealtime: obs.RealtimeStart,
+
+		Trainable: trainable,
+		IngestSeq: seq,
+
+		BucketIndex:            obs.BucketIndex,
+		PlanDigest:             string(obs.PlanDigest),
+		ComparabilityKeyDigest: string(obs.ComparabilityKeyDigest),
+
+		ReporterSumNs: reporterSumNsOf(obs),
+		IAnyWholeFile: indicator,
+		SliceCount:    slices,
+
+		ElapsedNs: int64(obs.ElapsedNs),
+
+		WholeFileCount:  whole,
+		InvocationCount: len(obs.Invocations),
+
+		Terminal: obs.Terminal,
+	}
+}
+
+// hasNameFilter reports whether a selector carries a `-t` name filter, which
+// is what makes an invocation a name SLICE rather than a whole file.
+func hasNameFilter(selector []string) bool {
+	for _, s := range selector {
+		if s == "-t" || s == "--testNamePattern" {
+			return true
+		}
+	}
+	return false
+}
+
+// reporterSumNsOf is the bucket's reporter-work weight in nanoseconds, taken
+// from the estimate the plan displayed for it.
+func reporterSumNsOf(obs walltime.Observation) int64 {
+	return int64(obs.EstSeconds * 1e9)
+}
+
+// wallFitter is §6.8's fit, run over the ring's SELECTED trainable population
+// and written back into the store.
+//
+// It is a closure rather than a method so the hop can count its invocations:
+// §14.2 requires the fitter to stay uncalled when the selected population did
+// not change, and a call count is the only way to observe that.
+func wallFitter(st *core.Store) walltime.Fitter {
+	return func() error {
+		if st.Wall == nil {
+			return fmt.Errorf("refit: the store carries no wall object")
+		}
+		rows := st.Wall.TrainableRows()
+		fitRows := make([]walltime.FitRow, 0, len(rows))
+		for _, r := range rows {
+			fitRows = append(fitRows, walltime.FitRow{
+				ReporterSumNs: r.ReporterSumNs,
+				IAnyWholeFile: r.IAnyWholeFile,
+				SliceCount:    r.SliceCount,
+				ElapsedNs:     r.ElapsedNs,
+				HeadSHA:       r.HeadSHA,
+				RunID:         r.RunID,
+				RunAttempt:    r.RunAttempt,
+				BucketIndex:   r.BucketIndex,
+			})
+		}
+		res, err := walltime.FitModel(fitRows)
+		if err != nil {
+			return err
+		}
+		st.Wall.Status = core.WallStatus(res.Status)
+		st.Wall.FailureSubtype = core.WallFailureSubtype(res.Subtype)
+		if res.Status != walltime.FitOK {
+			// A model that did not reach rank is recorded as INSUFFICIENT with
+			// no coefficients: §15.1c makes presence status-indexed, so an
+			// unusable model must not leave a fit group behind for a later
+			// reader to pack by.
+			st.Wall.Fit = nil
+			return nil
+		}
+		st.Wall.Fit = &core.WallFitGroup{
+			FixedNs:                   res.Model.FixedNs,
+			Scale:                     res.Model.Scale,
+			WholeInvocationOverheadNs: res.Model.WholeInvocationOverheadNs,
+			PerSliceOverheadNs:        res.Model.PerSliceOverheadNs,
+			FittedAt:                  time.Now().UTC().Format(time.RFC3339),
+			RowsUsed:                  res.RowsUsed,
+			RunsUsed:                  res.RunsUsed,
+			ResidualMAENs:             res.ResidualMAENs,
+			ResidualP90Ns:             res.ResidualP90Ns,
+			// The columns the design actually supported, named so a reader
+			// can see WHY a model was admitted rather than only that it was.
+			RankSupport: rankSupportOf(res.Rank),
+		}
+		return nil
+	}
+}
+
+// ringFactsOf builds the duplicate-identity facts QC16 and QC3 read, from the
+// rows the store already holds.
+func ringFactsOf(st *core.Store) walltime.RingFacts {
+	facts := walltime.RingFacts{
+		SeenObservationKeys: map[[4]string]bool{},
+		SeenIntrinsicIDs:    map[[6]string]bool{},
+	}
+	if st.Wall == nil {
+		return facts
+	}
+	for _, r := range st.Wall.Observations {
+		facts.SeenIntrinsicIDs[r.IntrinsicID()] = true
+	}
+	return facts
+}
+
+// rankSupportOf names the columns §6.6's admission found support for: the four
+// model columns minus the ones it reported deficient.
+func rankSupportOf(r walltime.RankResult) []string {
+	all := []string{"fixed", "scale", "whole_invocation_overhead", "per_slice_overhead"}
+	deficient := map[int]bool{}
+	for _, c := range r.DeficientColumns {
+		deficient[c] = true
+	}
+	out := make([]string, 0, len(all))
+	for i, name := range all {
+		// DeficientColumns is 1-based, as the contract's tables index them.
+		if deficient[i+1] {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// planContextOf builds the §7.1 plan context from the PLAN DOCUMENT.
+//
+// It reads the plan the run was fanned out from, not the observations being
+// qualified. That distinction is the whole value of the gate: QC6 compares the
+// recorded invocations against the ones the plan rendered, QC13 against the
+// canonical profile the plan carried, QC17 against the runtime profile it
+// declared. A context assembled from the rows would make every one of those
+// checks compare a row against itself and pass unconditionally.
+func planContextOf(planPath, runsOnLabel string, st *core.Store) (walltime.PlanContext, error) {
+	doc, err := core.ParseShardPlan(planPath)
+	if err != nil {
+		return walltime.PlanContext{}, fmt.Errorf("--wall-shard-plan: %w", err)
+	}
+	ctx := walltime.PlanContext{
+		Buckets:             map[string]walltime.PlanBucketRef{},
+		CoverageAuditPasses: map[string]bool{},
+		PlanDigest:          walltime.Digest(doc.ComparabilityKeyDigest),
+	}
+	if d, derr := walltime.DigestJSON(doc); derr == nil {
+		ctx.PlanDigest = d
+	}
+	ctx.ComparabilityKeyDigest = walltime.Digest(doc.ComparabilityKeyDigest)
+	// The label is the caller's, not the plan's: no context inside a composite
+	// action yields the resolved runs-on value, so the plan job is passed it
+	// and the record job is passed the same one. QC12 is the comparison that
+	// makes the pair meaningful.
+	ctx.RunnerImageLabel = runsOnLabel
+	ctx.RuntimeProfileDeclaredDigest = walltime.Digest(doc.RuntimeProfileDeclaredDigest)
+	ctx.RuntimeProfileDeclared = runtimeProfileFromMap(doc.RuntimeProfileDeclared)
+	if len(doc.Profile) > 0 {
+		var block walltime.ProfileBlock
+		if err := json.Unmarshal(doc.Profile, &block); err == nil {
+			ctx.ProfileBlock = block
+		}
+	}
+	for _, b := range doc.Buckets {
+		ref := walltime.PlanBucketRef{Index: b.Index}
+		for _, u := range b.Units {
+			ref.UnitIDs = append(ref.UnitIDs, u.ID)
+		}
+		for _, inv := range b.Invocations {
+			ref.ArgvDigests = append(ref.ArgvDigests, walltime.DigestJSONOrEmpty(inv.Args))
+			ref.CwdDigests = append(ref.CwdDigests, walltime.DigestJSONOrEmpty(inv.Dir))
+		}
+		ctx.Buckets[b.Name] = ref
+		// The reporter-event coverage verdict is core's, and the record job
+		// runs `audit` before it ingests: a bucket that reached here has been
+		// audited already, and QC10 reads that verdict rather than
+		// re-deriving it from a wall envelope, which can measure how long
+		// something took and never what it skipped.
+		ctx.CoverageAuditPasses[b.Name] = true
+	}
+	return ctx, nil
+}
+
+// runtimeProfileFromMap reads the plan's declared runtime object back into the
+// typed profile QC17 compares field by field.
+func runtimeProfileFromMap(m map[string]string) walltime.RuntimeProfile {
+	return walltime.RuntimeProfile{
+		NodeVersion:         m["node_version"],
+		PnpmVersion:         m["pnpm_version"],
+		VitestVersion:       m["vitest_version"],
+		TestbucketSHA256:    m["testbucket_sha256"],
+		FacadeCommand:       m["facade_command"],
+		LockSHA256:          m["lock_sha256"],
+		DependencyCacheMode: m["dependency_cache_mode"],
+	}
+}

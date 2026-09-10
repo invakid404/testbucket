@@ -300,6 +300,8 @@ func runIngest(args []string) error {
 
 	// --- contract §14.2 added ingest inputs ----------------------------------
 	wallObservations := fs.String("wall-observations", "", "directory of wall observations to ingest (§14.2): each document is parsed, the §7.1 qualification checks are applied, qualifying rows are appended to the store's bounded ring under §15.1b, and the model is refit under §6.8 IF AND ONLY IF the append changed the selected trainable population. R54 uploaded a wall artifact that nothing downloaded; this is the reader that closes the loop")
+	wallRunsOnLabel := fs.String("runs-on-label", "", "the caller's resolved runs-on label the plan was dispatched under. QC12 compares it against the label each bucket OBSERVED, and no context inside a composite action yields it, so the record job passes the same value the plan job did")
+	wallShardPlan := fs.String("wall-shard-plan", "", "the plan artifact the measured run was fanned out from. REQUIRED with --wall-observations: §7.1's checks compare each observation against the PLAN — QC6 against the rendered invocations, QC13 against the canonical profile, QC17 against the declared runtime profile — and a context derived from the observations themselves would compare a row against itself")
 	campaignConfig := fs.String("campaign-config", "", "job-local path to the frozen campaign config (§19.9a), already materialized and verified against its expected digest by the record job (§19.9c-1). Supplying it makes every matching row `trainable: false` AT APPEND, so no fit at any later time can consume a campaign or pilot row")
 
 	if err := fs.Parse(args); err != nil {
@@ -320,23 +322,6 @@ func runIngest(args []string) error {
 			return err
 		}
 		verifiedConfig = &cfg
-	}
-	if *wallObservations != "" {
-		sources, err := walltime.ReadWallObservations(*wallObservations)
-		if err != nil {
-			return err
-		}
-		// The per-observation accept/reject table §14.2 requires, with the
-		// exact reason for each rejection.
-		for _, src := range sources {
-			trainable, accept, reason := walltime.TrainableAtAppend(src.Obs, verifiedConfig)
-			verdict := "REJECT"
-			if accept {
-				verdict = "accept"
-			}
-			fmt.Fprintf(os.Stderr, "%-8s %-12s trainable=%-5v %s\n",
-				verdict, src.Obs.BucketName, trainable, reason)
-		}
 	}
 
 	// Resolve the adapter-aware sweep count (Go 100, Vitest 1) up front. For
@@ -469,6 +454,52 @@ func runIngest(args []string) error {
 				"and a migration that cannot name one produces a population nothing can compare against")
 		}
 		st.MigrateWall(key)
+	}
+
+	if *wallObservations != "" {
+		sources, err := walltime.ReadWallObservations(*wallObservations)
+		if err != nil {
+			return err
+		}
+		// THE LOOP, not a report of it.
+		//
+		// This used to print the accept/reject table and stop: every piece —
+		// the §7.1 qualification, the ring append, the conditional refit —
+		// existed and was tested, and nothing in production called any of
+		// them, so no measured bucket could change a later plan. The hop below
+		// qualifies each row, appends the ones that pass, and refits IF AND
+		// ONLY IF the append changed the selected trainable population.
+		if st.Wall == nil {
+			return fmt.Errorf("--wall-observations needs a schema-2 store: §15.2's forward migration " +
+				"runs in this same ingest, so pass --comparability-key on the run that migrates")
+		}
+		if strings.TrimSpace(*wallShardPlan) == "" {
+			return fmt.Errorf("--wall-observations needs --wall-shard-plan: §7.1 compares each " +
+				"observation against the plan it was fanned out from, and a context built from the " +
+				"observations themselves would compare each row against itself")
+		}
+		planCtx, err := planContextOf(*wallShardPlan, *wallRunsOnLabel, st)
+		if err != nil {
+			return err
+		}
+		ring := &wallRingStore{st: st, plan: planCtx, ring: ringFactsOf(st)}
+		res, err := walltime.IngestWallObservations(sources, ring, verifiedConfig, wallFitter(st))
+		if err != nil {
+			return err
+		}
+		for _, d := range res.Decisions {
+			verdict := "REJECT"
+			if d.Accepted {
+				verdict = "accept"
+			}
+			fmt.Fprintf(os.Stderr, "%-8s %-12s trainable=%-5v %s\n",
+				verdict, d.BucketName, d.Trainable, d.Reason)
+		}
+		fmt.Fprintf(os.Stderr,
+			"wall: %d of %d observation(s) appended; selected population %s; fitter called %d time(s)\n",
+			res.Appended, len(sources),
+			map[bool]string{true: "CHANGED", false: "unchanged"}[res.SelectionChanged],
+			res.FitterCalls)
 	}
 
 	if err := st.Save(*store); err != nil {
@@ -931,11 +962,16 @@ func runPlan(args []string) error {
 			return fmt.Errorf("%w; no matrix is emitted", err)
 		}
 	}
-	profileJSON, err := json.Marshal(profile)
+	// THE CANONICAL BYTES, not json.Marshal's. §13.0 has the observation copy
+	// this block VERBATIM and QC13 compares it byte for byte, so the plan has
+	// to carry the same serialization the observation will: an ordinary
+	// marshal differs in key order and would fail the comparison it exists to
+	// make meaningful.
+	profileBlock, err := walltime.NewProfileBlock(profile)
 	if err != nil {
 		return fmt.Errorf("canonical profile: %w", err)
 	}
-	opt.Profile = profileJSON
+	opt.Profile = profileBlock.Raw()
 	opt.ExpandedUnitSetDigest = expandedDigest
 
 	if *calibrate {
