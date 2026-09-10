@@ -287,6 +287,7 @@ func runIngest(args []string) error {
 	noGoList := fs.Bool("no-golist", false, "skip go list; record coverage from the observed events only (no row pruning)")
 	toolchainTimeout := fs.Duration("toolchain-timeout", 10*time.Minute, "deadline for each `go` subprocess; 0 disables")
 	runnerKind := fs.String("runner", "go", "test-runner adapter: go or vitest")
+	comparabilityKey := fs.String("comparability-key", "", "the §15.3 comparability-key digest this run's measurements belong to. REQUIRED when the restored store is schema 1: §15.2's forward migration initialises `wall` with the history its rows join, and a migration that cannot name one produces a population nothing can compare against")
 	root := fs.String("root", "", "vitest project directory (--runner vitest); empty means the working directory")
 	vitestCommand := fs.String("vitest-command", "", "bare-vitest invocation (--runner vitest); empty means \"npx vitest\". testbucket appends the subcommand (discovery: \"list --filesOnly --json\"); see `plan -h`")
 	vitestDiscovery := fs.String("vitest-discovery", "glob", "vitest discovery mode (--runner vitest): glob (`vitest list --filesOnly`, no import) or list (`vitest list --json`); see `plan -h`")
@@ -447,6 +448,29 @@ func runIngest(args []string) error {
 		// Nothing has been written; the restored store is left as it was.
 		return err
 	}
+
+	// §15.2's FORWARD MIGRATION, inside this transaction and before the save.
+	//
+	// It used to be reachable only by calling MigrateWall directly, which
+	// nothing in production did, while Save stamped `schema: 2`
+	// unconditionally. So an ordinary reporter ingest over an existing
+	// schema-1 store rewrote it as schema 2 with no `wall` object and no
+	// marker: a later reader saw a nominally current store carrying no
+	// evidence of the migration that never happened.
+	//
+	// The key is required, not optional: `wall` records WHICH history its rows
+	// belong to, and a migration that could not say would create a population
+	// nothing can compare against.
+	if st.NeedsWallMigration() {
+		key := strings.TrimSpace(*comparabilityKey)
+		if key == "" {
+			return fmt.Errorf("this store is schema 1 and ingest must migrate it (§15.2), " +
+				"but --comparability-key is empty: `wall` records which history its rows belong to, " +
+				"and a migration that cannot name one produces a population nothing can compare against")
+		}
+		st.MigrateWall(key)
+	}
+
 	if err := st.Save(*store); err != nil {
 		return err
 	}

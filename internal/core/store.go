@@ -70,9 +70,13 @@ type Store struct {
 	// the bump additive for a consumer that never opts into wall basis.
 	Wall *WallObject `json:"wall,omitempty"`
 
-	// migratedFromLegacy records that this store was read at schema 1, so
-	// ingest can perform §15.2's forward migration. It is not serialized: the
-	// on-disk marker is `wall.migrated_from`.
+	// MigratedFrom is §15.2's on-disk migration marker, at the store ROOT
+	// where the field registry declares it. A reader that finds schema 2 with
+	// no marker cannot tell a migrated store from one born at 2.
+	MigratedFrom *int `json:"migrated_from,omitempty"`
+
+	// migratedFromLegacy records that this store was READ at schema 1, so
+	// ingest can perform the forward migration inside its own transaction.
 	migratedFromLegacy bool `json:"-"`
 }
 
@@ -89,6 +93,8 @@ func (s *Store) MigrateWall(comparabilityKeyDigest string) {
 		return
 	}
 	s.Wall = NewMigratedWall(comparabilityKeyDigest)
+	from := 1
+	s.MigratedFrom = &from
 	s.migratedFromLegacy = false
 }
 
@@ -247,6 +253,17 @@ func storeName(path string) string {
 // concurrent CI step can never leave a half-written store behind for the next
 // run to restore.
 func (s *Store) Save(path string) error {
+	// A SAVE MAY NOT INVENT A SCHEMA IT DID NOT PERFORM.
+	//
+	// Save stamped `schema: 2` unconditionally, so a reporter ingest over an
+	// existing schema-1 store rewrote it as schema 2 with no `wall` object and
+	// no migration marker: the migration was silently skipped and a later
+	// reader saw a nominally current store with no evidence of how it got
+	// there. §15.2's forward step belongs to ingest, and this is the check
+	// that it actually ran.
+	if s.NeedsWallMigration() {
+		return fmt.Errorf("store: refusing to write schema %d over a schema-1 store that has not been migrated; §15.2's forward step runs in ingest before the save", storeSchema)
+	}
 	s.Schema = storeSchema
 	sort.Strings(s.Coverage)
 	data, err := json.MarshalIndent(s, "", "  ")

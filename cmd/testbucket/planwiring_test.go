@@ -236,20 +236,26 @@ func TestTheWallBasisPacksAndDisplaysOneObjective(t *testing.T) {
 
 	st := warmStore(8)
 	st["schema"] = 2
+	// The REGISTERED wire format: the fit's leaves are flat under `wall`, and
+	// `scale` is a string. This fixture used to nest them under `wall.fit`
+	// with a numeric scale, which is the shape the field registry does not
+	// declare — a store written that way is one no consumer reading the
+	// registered paths can find.
 	st["wall"] = map[string]any{
-		"model_version":            1,
-		"comparability_key_digest": "sha256:" + strings.Repeat("a", 64),
-		"status":                   "ok",
-		"observations":             []any{},
-		"fit": map[string]any{
-			"fixed_ns": "2000000000", "scale": 1.25,
-			"whole_invocation_overhead_ns": "500000000",
-			"per_slice_overhead_ns":        "100000000",
-			"fitted_at":                    "2026-09-01T00:00:00Z",
-			"rows_used":                    40, "runs_used": 5,
-			"residual_mae_ns": "1000000", "residual_p90_ns": "2000000",
-			"rank_support": []string{"fixed", "scale", "whole", "slice"},
-		},
+		"model_version":                1,
+		"comparability_key_digest":     "sha256:" + strings.Repeat("a", 64),
+		"status":                       "ok",
+		"observations":                 []any{},
+		"fixed_ns":                     "2000000000",
+		"scale":                        "1.25",
+		"whole_invocation_overhead_ns": "500000000",
+		"per_slice_overhead_ns":        "100000000",
+		"fitted_at":                    "2026-09-01T00:00:00Z",
+		"rows_used":                    40,
+		"runs_used":                    5,
+		"residual_mae_ns":              "1000000",
+		"residual_p90_ns":              "2000000",
+		"rank_support":                 []string{"fixed", "scale", "whole", "slice"},
 	}
 	writeFixture(t, store, st)
 

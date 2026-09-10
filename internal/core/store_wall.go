@@ -1,8 +1,10 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -212,8 +214,10 @@ type WallObject struct {
 	// Observations is the bounded ring (W = 240). Always present once `wall`
 	// exists, and empty rather than absent on a fresh migration.
 	Observations []WallRingRow `json:"observations"`
-	// MigratedFrom is present iff the store was migrated.
-	MigratedFrom *int `json:"migrated_from,omitempty"`
+	// MigratedFrom is present iff the store was migrated. It is NOT serialized
+	// here: the registry puts `migrated_from` at the store ROOT, and this
+	// field is where the migration is recorded on the way there.
+	MigratedFrom *int `json:"-"`
 }
 
 // Validate enforces contract §15.1c's presence matrix. It is the store-side
@@ -262,8 +266,21 @@ func (w *WallObject) Validate() error {
 	// §15.1d: a bump never silently reuses a fit. A different model_version
 	// together with a fit group is forbidden — that case is unreachable here
 	// because the version check above already refused it, which is the point.
-	if len(w.Observations) > W {
-		return fmt.Errorf("observations ring holds %d rows, above W = %d", len(w.Observations), W)
+	trainableRows, diagnosticRows := 0, 0
+	for _, row := range w.Observations {
+		if row.Trainable {
+			trainableRows++
+		} else {
+			diagnosticRows++
+		}
+	}
+	// PER CLASS, not combined: §15.1a bounds each `trainable` class at W
+	// independently, so the two together may legitimately reach 2W.
+	if trainableRows > W {
+		return fmt.Errorf("observations ring holds %d trainable rows, above W = %d", trainableRows, W)
+	}
+	if diagnosticRows > W {
+		return fmt.Errorf("observations ring holds %d non-trainable rows, above W = %d", diagnosticRows, W)
 	}
 	return nil
 }
@@ -312,27 +329,34 @@ func (w *WallObject) AppendRow(r WallRingRow) {
 	w.evict()
 }
 
+// evict applies §15.1a's retention, which is PER CLASS.
+//
+// Each `trainable` class holds up to W rows INDEPENDENTLY, and appending to one
+// trims only that one. The combined cap this used to apply had two consequences
+// the contract does not permit: 240 trainable rows and one diagnostic row could
+// not coexist, so the accepted total could never reach 480; and a diagnostic
+// append pushed the population over W and evicted from a class it has nothing
+// to do with, so an untrainable row could displace the corpus a fit reads.
 func (w *WallObject) evict() {
-	if len(w.Observations) <= W {
-		w.sortByRecency()
-		return
-	}
 	w.sortByRecency()
-	over := len(w.Observations) - W
-	// Drop the oldest non-trainable rows first, then the oldest trainable
-	// ones, so the diagnostic class is bounded without displacing the corpus.
-	for pass := 0; pass < 2 && over > 0; pass++ {
-		wantTrainable := pass == 1
-		kept := make([]WallRingRow, 0, len(w.Observations))
-		for _, row := range w.Observations {
-			if over > 0 && row.Trainable == wantTrainable {
-				over--
-				continue
-			}
-			kept = append(kept, row)
+	trainable := make([]WallRingRow, 0, len(w.Observations))
+	diagnostic := make([]WallRingRow, 0, len(w.Observations))
+	for _, row := range w.Observations {
+		if row.Trainable {
+			trainable = append(trainable, row)
+		} else {
+			diagnostic = append(diagnostic, row)
 		}
-		w.Observations = kept
 	}
+	// Oldest first within a class, so dropping the head drops the oldest.
+	if len(trainable) > W {
+		trainable = trainable[len(trainable)-W:]
+	}
+	if len(diagnostic) > W {
+		diagnostic = diagnostic[len(diagnostic)-W:]
+	}
+	w.Observations = append(trainable, diagnostic...)
+	w.sortByRecency()
 }
 
 func (w *WallObject) sortByRecency() {
@@ -427,5 +451,128 @@ func QC15(r WallRingRow) error {
 	if r.Repository == "" || r.RunID == "" || r.RunAttempt == "" || r.JobID == "" {
 		return fmt.Errorf("QC15: the intrinsic identity is incomplete, so the recency key would not be reconstructible from the row")
 	}
+	return nil
+}
+
+// THE REGISTERED WIRE FORMAT IS FLAT, and this is where the Go shape and the
+// registry meet.
+//
+// The field registry declares `wall.fixed_ns`, `wall.scale`, `wall.fitted_at`
+// and their peers directly under `wall`, with `migrated_from` at the store
+// ROOT and `scale` as a STRING. The Go struct groups the fit into `Fit` for
+// the same reason the contract groups it in prose — presence is all-or-nothing
+// and a group makes that a single nil check — but the group is an internal
+// convenience and must not reach the wire.
+//
+// It did. The store serialized `wall.fit.{...}`, wrote `wall.migrated_from`,
+// and emitted `scale` as a JSON number. A consumer reading the registered
+// paths found none of them, and `scale` as a number reintroduces exactly the
+// float ambiguity the string form exists to remove: the shortest round-trip
+// decimal is what makes two readers agree on the value they read.
+type wallWire struct {
+	ModelVersion           *int               `json:"model_version"`
+	ComparabilityKeyDigest string             `json:"comparability_key_digest"`
+	Status                 WallStatus         `json:"status"`
+	FailureSubtype         WallFailureSubtype `json:"failure_subtype,omitempty"`
+
+	FittedAt                  string   `json:"fitted_at,omitempty"`
+	RowsUsed                  *int     `json:"rows_used,omitempty"`
+	RunsUsed                  *int     `json:"runs_used,omitempty"`
+	FixedNs                   string   `json:"fixed_ns,omitempty"`
+	Scale                     string   `json:"scale,omitempty"`
+	WholeInvocationOverheadNs string   `json:"whole_invocation_overhead_ns,omitempty"`
+	PerSliceOverheadNs        string   `json:"per_slice_overhead_ns,omitempty"`
+	ResidualMAENs             string   `json:"residual_mae_ns,omitempty"`
+	ResidualP90Ns             string   `json:"residual_p90_ns,omitempty"`
+	RankSupport               []string `json:"rank_support,omitempty"`
+
+	Observations []WallRingRow `json:"observations"`
+}
+
+// MarshalJSON writes the registered flat surface.
+func (w WallObject) MarshalJSON() ([]byte, error) {
+	out := wallWire{
+		ModelVersion:           w.ModelVersion,
+		ComparabilityKeyDigest: w.ComparabilityKeyDigest,
+		Status:                 w.Status,
+		FailureSubtype:         w.FailureSubtype,
+		Observations:           w.Observations,
+	}
+	if out.Observations == nil {
+		// Always present once `wall` exists, and EMPTY rather than absent on a
+		// fresh migration: the registry gives it cardinality one.
+		out.Observations = []WallRingRow{}
+	}
+	if f := w.Fit; f != nil {
+		rows, runs := f.RowsUsed, f.RunsUsed
+		out.FittedAt = f.FittedAt
+		out.RowsUsed, out.RunsUsed = &rows, &runs
+		out.FixedNs = strconv.FormatInt(f.FixedNs, 10)
+		out.Scale = strconv.FormatFloat(f.Scale, 'g', -1, 64)
+		out.WholeInvocationOverheadNs = strconv.FormatInt(f.WholeInvocationOverheadNs, 10)
+		out.PerSliceOverheadNs = strconv.FormatInt(f.PerSliceOverheadNs, 10)
+		out.ResidualMAENs = strconv.FormatInt(f.ResidualMAENs, 10)
+		out.ResidualP90Ns = strconv.FormatInt(f.ResidualP90Ns, 10)
+		out.RankSupport = f.RankSupport
+	}
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON reads the registered flat surface back into the grouped Go
+// shape. The fit group is present exactly when the wire carries a fitted_at,
+// which is the leaf whose presence the contract ties the group's to.
+func (w *WallObject) UnmarshalJSON(b []byte) error {
+	var in wallWire
+	if err := json.Unmarshal(b, &in); err != nil {
+		return err
+	}
+	*w = WallObject{
+		ModelVersion:           in.ModelVersion,
+		ComparabilityKeyDigest: in.ComparabilityKeyDigest,
+		Status:                 in.Status,
+		FailureSubtype:         in.FailureSubtype,
+		Observations:           in.Observations,
+	}
+	if w.Observations == nil {
+		w.Observations = []WallRingRow{}
+	}
+	if in.FittedAt == "" {
+		return nil
+	}
+	fit := &WallFitGroup{FittedAt: in.FittedAt, RankSupport: in.RankSupport}
+	if in.RowsUsed != nil {
+		fit.RowsUsed = *in.RowsUsed
+	}
+	if in.RunsUsed != nil {
+		fit.RunsUsed = *in.RunsUsed
+	}
+	for _, f := range []struct {
+		name string
+		src  string
+		dst  *int64
+	}{
+		{"fixed_ns", in.FixedNs, &fit.FixedNs},
+		{"whole_invocation_overhead_ns", in.WholeInvocationOverheadNs, &fit.WholeInvocationOverheadNs},
+		{"per_slice_overhead_ns", in.PerSliceOverheadNs, &fit.PerSliceOverheadNs},
+		{"residual_mae_ns", in.ResidualMAENs, &fit.ResidualMAENs},
+		{"residual_p90_ns", in.ResidualP90Ns, &fit.ResidualP90Ns},
+	} {
+		if f.src == "" {
+			continue
+		}
+		v, err := strconv.ParseInt(f.src, 10, 64)
+		if err != nil {
+			return fmt.Errorf("wall.%s: %w", f.name, err)
+		}
+		*f.dst = v
+	}
+	if in.Scale != "" {
+		v, err := strconv.ParseFloat(in.Scale, 64)
+		if err != nil {
+			return fmt.Errorf("wall.scale: %w", err)
+		}
+		fit.Scale = v
+	}
+	w.Fit = fit
 	return nil
 }

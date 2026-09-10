@@ -202,26 +202,52 @@ func TestWallHistoryRecencyEvictionAndThreeIdentities(t *testing.T) {
 		}
 	})
 
-	t.Run("the diagnostic class is bounded and never evicts a trainable row", func(t *testing.T) {
+	t.Run("each trainable class is bounded independently at W", func(t *testing.T) {
+		// §15.1a bounds each `trainable` class at W INDEPENDENTLY. The ring
+		// used to apply one combined cap, which had two consequences the
+		// contract does not permit: W trainable rows and a single diagnostic
+		// row could not coexist, so the accepted total could never reach 2W;
+		// and a diagnostic append pushed the population over the cap and
+		// evicted from the other class, letting an untrainable row displace
+		// the corpus a fit reads.
 		w := newWall()
-		// Fill the ring exactly with trainable rows.
 		for i := 0; i < W; i++ {
 			w.AppendRow(ringRow(fmt.Sprintf("t-%04d", i), 0, "2026-09-01T00:00:00Z"))
 		}
-		before := retainedIDs(w)
+		before := trainableIDs(w)
 
-		// Then append many non-trainable rows.
 		for i := 0; i < 50; i++ {
 			r := ringRow(fmt.Sprintf("d-%04d", i), 0, "2026-09-02T00:00:00Z")
 			r.Trainable = false
 			w.AppendRow(r)
 		}
-		after := retainedIDs(w)
-		if !reflect.DeepEqual(before, after) {
+		if after := trainableIDs(w); !reflect.DeepEqual(before, after) {
 			t.Fatal("appending non-trainable rows evicted trainable rows; the corpus must not be displaceable")
 		}
-		if len(w.Observations) != W {
-			t.Fatalf("ring holds %d rows, want it bounded at %d", len(w.Observations), W)
+		if got, want := len(w.Observations), W+50; got != want {
+			t.Fatalf("ring holds %d rows, want %d: the two classes are bounded separately", got, want)
+		}
+
+		// And the diagnostic class has its own W, reached without touching the
+		// corpus.
+		for i := 50; i < W+25; i++ {
+			r := ringRow(fmt.Sprintf("d-%04d", i), 0, "2026-09-03T00:00:00Z")
+			r.Trainable = false
+			w.AppendRow(r)
+		}
+		if after := trainableIDs(w); !reflect.DeepEqual(before, after) {
+			t.Fatal("overflowing the diagnostic class evicted trainable rows")
+		}
+		trainable, diagnostic := 0, 0
+		for _, r := range w.Observations {
+			if r.Trainable {
+				trainable++
+			} else {
+				diagnostic++
+			}
+		}
+		if trainable != W || diagnostic != W {
+			t.Fatalf("classes hold %d trainable and %d diagnostic rows, want %d each", trainable, diagnostic, W)
 		}
 	})
 
@@ -242,6 +268,18 @@ func retainedRunIDs(rows []WallRingRow) []string {
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, r.RunID)
+	}
+	return out
+}
+
+// trainableIDs is the fit population's run ids, which is the sequence a
+// diagnostic append must never disturb.
+func trainableIDs(w *WallObject) []string {
+	out := make([]string, 0, len(w.Observations))
+	for _, r := range w.Observations {
+		if r.Trainable {
+			out = append(out, r.RunID)
+		}
 	}
 	return out
 }
