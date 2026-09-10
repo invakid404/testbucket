@@ -252,6 +252,13 @@ func wallLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string {
 // verifier compares against. One function builds it, so the plan's expectation
 // and the wrapper's record cannot disagree about what the identity of an
 // invocation is.
+//
+// Cwd stays RELATIVE here on purpose. This spec is baked into the script at
+// plan time and read back on the bucket runner, so an absolute path resolved
+// in the planning process would be the planning machine's. §13.1's absolute
+// identity is produced where the command actually runs: walltime.RunExec
+// resolves this string against the bucket runner's own root before recording
+// it, and the plan-side digests resolve it the same way.
 func MeasuredSpec(inv runner.Invocation, seq int) walltime.InvocationSpec {
 	return walltime.InvocationSpec{
 		Seq: seq, Argv: append([]string(nil), inv.Args...), Cwd: inv.Dir,

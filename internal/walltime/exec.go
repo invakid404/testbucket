@@ -160,6 +160,11 @@ func Exec(opt ExecOptions) (int, error) {
 	}
 	defer w.Close()
 
+	// THE EXECUTED ABSOLUTE DIRECTORY, not the relative string the plan
+	// rendered: §13.1's cwd identity is the directory the command ran in, and
+	// the child below is given the same resolved value so the record and the
+	// execution cannot describe different directories.
+	opt.Cwd = AbsCwd(opt.Cwd)
 	spec := &SpecIdentity{
 		ArgvDigest:     mustDigest(opt.Argv),
 		Cwd:            opt.Cwd,
@@ -976,4 +981,29 @@ func exitStatusOf(cmd *exec.Cmd) (syscall.WaitStatus, bool) {
 	}
 	ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
 	return ws, ok
+}
+
+// AbsCwd resolves a working directory to the ABSOLUTE, cleaned path §13.1
+// makes the invocation's cwd identity.
+//
+// The plan renders `dir` relative to the repo root, and every side used to
+// hash that relative string: the plan job, the bucket runner and the record
+// job could each resolve "." under a different absolute root and QC7a would
+// still pass, because it was comparing two copies of the same relative text.
+// Resolving here means the digest is of the directory a command actually ran
+// in — the jobs share a workspace path, so agreeing on it is a real check
+// rather than a tautology, and disagreeing is now visible.
+//
+// An unresolvable path yields the cleaned input rather than an error: a cwd
+// that cannot be made absolute is a finding for the checks downstream, not a
+// reason for this helper to have no answer.
+func AbsCwd(dir string) string {
+	if strings.TrimSpace(dir) == "" {
+		dir = "."
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return filepath.Clean(dir)
+	}
+	return filepath.Clean(abs)
 }

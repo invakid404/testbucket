@@ -133,3 +133,69 @@ func TestRunInActionRunsTheAdmittedCommand(t *testing.T) {
 		t.Errorf("exit code = %d, want 7", code)
 	}
 }
+
+// TestTheRecordedCwdIsTheExecutedAbsoluteDirectory is §13.1's cwd identity.
+//
+// The plan renders a repo-root-relative directory and every side used to hash
+// that string. QC7a therefore compared two copies of the same relative text
+// and passed no matter which absolute root each job resolved it under — the
+// check existed and could not fail for the reason it was written for.
+func TestTheRecordedCwdIsTheExecutedAbsoluteDirectory(t *testing.T) {
+	target := t.TempDir()
+	records := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(wd, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.IsAbs(rel) {
+		t.Skipf("no relative path from %s to %s", wd, target)
+	}
+
+	if _, err := Exec(ExecOptions{
+		Level: LevelInvocation, Dir: records, Argv: []string{"sh", "-c", "true"},
+		Cwd: rel, Timeout: 30 * time.Second,
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+
+	recs, err := ReadDir(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen int
+	for _, r := range recs {
+		if r.Spec == nil {
+			continue
+		}
+		seen++
+		if !filepath.IsAbs(r.Spec.Cwd) {
+			t.Errorf("the record carries cwd %q, which is the relative string the plan rendered", r.Spec.Cwd)
+		}
+		if r.Spec.Cwd != filepath.Clean(target) {
+			t.Errorf("the record carries cwd %q, want the directory the command ran in, %q",
+				r.Spec.Cwd, filepath.Clean(target))
+		}
+	}
+	if seen == 0 {
+		t.Fatal("the run recorded no spec identity at all")
+	}
+}
+
+// TestAbsCwdNormalizes covers the two forms a rendered dir arrives in: the
+// empty string the repo root is spelled as, and a path with traversal in it.
+// Both have to reduce to one value, because the digest is of the text.
+func TestAbsCwdNormalizes(t *testing.T) {
+	if AbsCwd("") != AbsCwd(".") {
+		t.Errorf("AbsCwd(%q) = %q but AbsCwd(%q) = %q", "", AbsCwd(""), ".", AbsCwd("."))
+	}
+	if got, want := AbsCwd("a/../b"), AbsCwd("b"); got != want {
+		t.Errorf("AbsCwd(%q) = %q, want %q", "a/../b", got, want)
+	}
+	if !filepath.IsAbs(AbsCwd("b")) {
+		t.Errorf("AbsCwd(%q) = %q, which is not absolute", "b", AbsCwd("b"))
+	}
+}

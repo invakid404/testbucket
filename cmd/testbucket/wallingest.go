@@ -332,7 +332,10 @@ func planContextOf(doc *core.PlanDocument, runsOnLabel string, st *core.Store) (
 		}
 		for _, inv := range b.Invocations {
 			ref.ArgvDigests = append(ref.ArgvDigests, walltime.DigestJSONOrEmpty(inv.Args))
-			ref.CwdDigests = append(ref.CwdDigests, walltime.DigestJSONOrEmpty(inv.Dir))
+			// §13.1's cwd identity is the ABSOLUTE executed directory. Hashing
+			// the plan's relative string let QC7a pass while the measuring job
+			// and this one resolved it under different roots.
+			ref.CwdDigests = append(ref.CwdDigests, walltime.DigestJSONOrEmpty(walltime.AbsCwd(inv.Dir)))
 		}
 		ctx.Buckets[b.Name] = ref
 		// The reporter-event coverage verdict is core's, and the record job

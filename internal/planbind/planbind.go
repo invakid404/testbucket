@@ -135,9 +135,12 @@ func InvocationManifestFor(doc *core.PlanDocument, bucket int, stage2 walltime.D
 			atoms := append([]string(nil), inv.Atoms...)
 			sort.Strings(atoms)
 			m.Invocations = append(m.Invocations, walltime.InvocationIdentity{
-				Seq:            i,
-				ArgvDigest:     walltime.DigestJSONOrEmpty(inv.Args),
-				Cwd:            inv.Dir,
+				Seq:        i,
+				ArgvDigest: walltime.DigestJSONOrEmpty(inv.Args),
+				// Resolved, because the record it is compared against carries
+				// the ABSOLUTE directory the invocation ran in. Comparing two
+				// copies of the plan's relative string proved nothing.
+				Cwd:            walltime.AbsCwd(inv.Dir),
 				SelectorDigest: walltime.DigestJSONOrEmpty(inv.Selector),
 				UnitDigest:     walltime.DigestJSONOrEmpty(units),
 				AtomDigest:     walltime.DigestJSONOrEmpty(atoms),

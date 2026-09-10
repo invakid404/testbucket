@@ -204,9 +204,11 @@ func observationFixture(bucket string, index int, runID string, planDigest wallt
 			Seq: 0, Units: []string{"f0.test.ts"},
 			// Derived from the SAME argv and cwd the plan declares, through
 			// the production digester. QC6 then compares two independently
-			// derived values instead of a placeholder against itself.
+			// derived values instead of a placeholder against itself. The cwd
+			// is RESOLVED, because §13.1's identity is the absolute directory
+			// the invocation ran in and both sides resolve before hashing.
 			ArgvDigest: walltime.DigestJSONOrEmpty([]string{"run", "f0.test.ts"}),
-			CwdDigest:  walltime.DigestJSONOrEmpty("."),
+			CwdDigest:  walltime.DigestJSONOrEmpty(walltime.AbsCwd(".")),
 			Selector:   []string{"./f0.test.ts"}, Atoms: []string{},
 			ProcessGroupID: "pg-1",
 			StartedMonoNs:  1000, EndedMonoNs: 2_000_000_000,
