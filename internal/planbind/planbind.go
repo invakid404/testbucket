@@ -120,14 +120,15 @@ func membershipProjection(doc *core.PlanDocument) map[string][]string {
 // rather than a claim checked against it: the verifier could confirm that a
 // record names SOME argv and selector, but not that they are the ones the
 // authorised plan rendered.
-func InvocationManifestFor(doc *core.PlanDocument, bucket int, stage2 walltime.Digest) (*walltime.InvocationManifest, error) {
+func InvocationManifestFor(doc *core.PlanDocument, bucket int) (*walltime.InvocationManifest, error) {
 	for _, b := range doc.Buckets {
 		if b.Index != bucket {
 			continue
 		}
 		m := &walltime.InvocationManifest{
-			Kind: walltime.InvocationManifestKind, Stage2: stage2,
-			BucketIndex: b.Index, BucketName: b.Name,
+			Kind:        walltime.InvocationManifestKind,
+			BucketIndex: b.Index,
+			BucketName:  b.Name,
 		}
 		for i, inv := range b.Invocations {
 			units := append([]string(nil), inv.Units...)

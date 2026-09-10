@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/invakid404/testbucket/internal/core"
+	"github.com/invakid404/testbucket/internal/planbind"
 )
 
 // TestNoProhibitedProofSymbolSurvives is the SEMANTIC half of the governed
@@ -33,6 +36,45 @@ func TestNoProhibitedProofSymbolSurvives(t *testing.T) {
 		{"func EvaluateCampaign(", "the retired campaign decision rule"},
 		{"type Role string", "the three-ledger role model"},
 		{"type Allocator struct", "the frozen-scorer allocation adapter"},
+		// The Aeta registry proof. These were dead AND exported: nothing
+		// referenced them, so an internal caller could still construct a
+		// registry-shaped document from a package that had "removed" it.
+		{"type ComponentClass ", "the Aeta registry's component classes"},
+		{"type Component struct", "the Aeta registry's component template"},
+		{"type AetaInputs struct", "the Aeta registry's frozen inputs"},
+		{"type InstantiatedComponent struct", "the per-bucket Aeta instantiation"},
+		{"type AetaInstance struct", "the per-bucket Aeta instance"},
+		// The frozen planner's option struct and its claim-store channels,
+		// which outlived the planner they configured.
+		{"type frozenPlanOptions struct", "the frozen planner's options"},
+		{"func machineClaimStore(", "the one-shot planner claim store"},
+	}
+	// PROHIBITED TEXT, not prohibited tags.
+	//
+	// This list checked for `json:"stage2_digest,omitempty"` exactly, and the
+	// three surviving Stage-2 fields were spelled `json:"stage2_digest"` —
+	// so the control passed over the field it existed to catch, and the
+	// practical path went on emitting a live empty proof slot. A serialized
+	// name is prohibited however its options are spelled, so the tag name is
+	// matched without them.
+	prohibitedTags := []struct{ name, why string }{
+		{"stage2_digest", "the Stage-2 binding"},
+		{"stage1_digest", "the Stage-1 binding"},
+		{"registry_digest", "the Aeta component registry"},
+		{"verifier_id", "the delivery-bound verifier identity"},
+		{"component_registry_digest", "the Aeta component registry"},
+		{"producer_binary", "the producer-binary digest"},
+		{"prev_hash", "the record hash chain"},
+		{"hash", "the record hash chain"},
+		{"signature", "record signatures"},
+		{"signer_id", "the signer identity"},
+		{"peer_control", "the observer handshake"},
+		{"trace_control", "the observer handshake"},
+	}
+	prohibitedEnv := []struct{ name, why string }{
+		{"TB_WALL_PLANNER_CLAIM_STORE", "the one-shot planner claim store"},
+		{"TB_WALL_CAMPAIGN_AUTHORITY_KEYS", "the predeclared campaign authority keys"},
+		{"TB_CANDIDATE_BINARY_DIGEST", "the attested candidate delivery"},
 	}
 	prohibitedFields := []struct{ field, why string }{
 		{"`json:\"prev_hash\"`", "the record hash chain"},
@@ -76,6 +118,25 @@ func TestNoProhibitedProofSymbolSurvives(t *testing.T) {
 		for _, f := range prohibitedFields {
 			if strings.Contains(src, f.field) {
 				t.Errorf("%s serializes %s — %s is REMOVE-classified", path, f.field, f.why)
+			}
+		}
+		for _, tag := range prohibitedTags {
+			// Any option spelling: `json:"x"`, `json:"x,omitempty"`,
+			// `json:"x,string"`. Only the struct-tag form is matched, so a
+			// comment naming the removed field stays legal — a removal has to
+			// be explainable in the source.
+			for _, form := range []string{
+				`json:"` + tag.name + `"`,
+				`json:"` + tag.name + `,`,
+			} {
+				if strings.Contains(src, form) {
+					t.Errorf("%s serializes %s — %s is REMOVE-classified", path, form, tag.why)
+				}
+			}
+		}
+		for _, e := range prohibitedEnv {
+			if strings.Contains(src, `"`+e.name+`"`) {
+				t.Errorf("%s declares the %s environment channel — %s is REMOVE-classified", path, e.name, e.why)
 			}
 		}
 		return nil
@@ -195,4 +256,127 @@ func TestTheLifecycleEmitsNoEmptyProofFields(t *testing.T) {
 			t.Error("action-state.json no longer carries the run identity it exists to hand off")
 		}
 	})
+}
+
+// TestTheInvocationManifestEmitsNoProofSlot is the output half of the same
+// boundary, taken over the document the previous control never looked at.
+//
+// InvocationManifest.Stage2 was serialized as `json:"stage2_digest"` with no
+// `omitempty`, and the live caller passed "" because the receipt it named was
+// already gone — so every manifest the practical path rendered carried
+// `"stage2_digest":""`. The lifecycle control inspected records and action
+// state; the manifest is a third document, and nothing was reading it.
+func TestTheInvocationManifestEmitsNoProofSlot(t *testing.T) {
+	bin := planBinary(t)
+	dir := t.TempDir()
+	records := filepath.Join(dir, "records")
+	if err := os.MkdirAll(records, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		var out strings.Builder
+		cmd.Stderr, cmd.Stdout = &out, &out
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out.String())
+		}
+	}
+	// A complete lifecycle with one rendered invocation, exactly as the action
+	// nests it.
+	run("wall", "begin", "--dir", records, "--bucket-id", "bucket-0", "--run-id", "run-1")
+	inner := bin + " wall exec --dir " + records + " --level invocation" +
+		" --bucket-id bucket-0 --cwd " + dir + " -- sh -c true"
+	run("wall", "run", "--dir", records, "--wrapper-chain", "--", "bash", "-euo", "pipefail", "-c",
+		bin+" wall exec --dir "+records+" --level script --bucket-id bucket-0 --cwd "+dir+" -- sh -c '"+inner+"'")
+	run("wall", "end", "--dir", records, "--terminal", "passed")
+
+	plan, _ := writePlanDeclaring(t, dir, "bucket-0", 0, []string{"sh", "-c", "true"}, dir,
+		observedProfileOf(t, bin))
+
+	// `wall verify` renders the manifest from the plan and reports it. The
+	// JSON form is what a consumer reads.
+	cmd := exec.Command(bin, "wall", "verify", "--dir", records, "--shard-plan", plan, "--json")
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("wall verify: %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "stage2_digest") {
+		t.Errorf("the verifier's own output carries a stage2_digest slot:\n%s", out.String())
+	}
+
+	// And the manifest the builder produces, serialized directly: the verifier
+	// may not print every field it holds.
+	doc, err := core.ParseShardPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := planbind.InvocationManifestFor(doc, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"stage2_digest", "stage1_digest", "registry_digest"} {
+		if _, present := raw[key]; present {
+			t.Errorf("the invocation manifest emits %q: %s", key, b)
+		}
+	}
+	if len(m.Invocations) != 1 {
+		t.Errorf("the manifest renders %d invocations, want the one the plan declares", len(m.Invocations))
+	}
+}
+
+// TestTheShippedHelpDescribesThePracticalLifecycle reads what a user is told.
+//
+// The no-argument help said `wall` runs a command "under a physical envelope
+// with its own containment peer and independent trace" and verifies records
+// "against every frozen gate". None of those exist. Documentation that
+// describes a removed design is the removal's last hiding place: nothing
+// compiles it, so nothing catches it.
+func TestTheShippedHelpDescribesThePracticalLifecycle(t *testing.T) {
+	bin := planBinary(t)
+	prohibited := []string{
+		"physical envelope", "containment peer", "independent trace",
+		"frozen gate", "stage-1", "stage-2", "signer delegate",
+	}
+	for _, argv := range [][]string{{}, {"wall"}, {"--help"}} {
+		name := "no arguments"
+		if len(argv) > 0 {
+			name = strings.Join(argv, " ")
+		}
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command(bin, argv...)
+			var out strings.Builder
+			cmd.Stdout, cmd.Stderr = &out, &out
+			// These exit 2 by design; the TEXT is the subject.
+			_ = cmd.Run()
+			text := strings.ToLower(out.String())
+			if strings.TrimSpace(text) == "" {
+				t.Fatal("printed no help at all")
+			}
+			for _, p := range prohibited {
+				if strings.Contains(text, p) {
+					t.Errorf("the shipped help describes %q, which does not exist:\n%s", p, out.String())
+				}
+			}
+		})
+	}
+	// And it still says what the command DOES; silence is not the fix.
+	cmd := exec.Command(bin, "wall")
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	_ = cmd.Run()
+	for _, want := range []string{"begin", "end", "exec", "verify", "assemble-observation"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the wall usage no longer names %q", want)
+		}
+	}
 }

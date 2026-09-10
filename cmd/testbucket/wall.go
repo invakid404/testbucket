@@ -17,12 +17,12 @@ import (
 const wallUsage = `testbucket wall — run-bucket wall-time measurement
 
 usage:
-  testbucket wall begin   [flags]  open the physical action envelope (AT_start)
+  testbucket wall begin   [flags]  open the measured action interval (AT_start)
                                    and leave state for ` + "`wall end`" + `
   testbucket wall end     [flags]  close that envelope after the process group
                                    is drained (AT_end)
   testbucket wall exec    [flags] -- cmd...
-                                   run one command under a physical envelope
+                                   run one command under a measured envelope
                                    (VB or V)
   testbucket wall run     [flags] -- cmd...
                                    run an action-owned command inside the
@@ -513,11 +513,11 @@ func plannedInvocations(shardPlan string) walltime.InvocationsFunc {
 		if err != nil {
 			return nil, err
 		}
-		// The Stage-2 receipt this used to be bound to is gone, so the
-		// manifest carries no receipt digest. What makes it a control is that
-		// it is rendered from the authorised plan rather than read back from
-		// the records it is compared against.
-		return planbind.InvocationManifestFor(doc, index, "")
+		// What makes this a control is that it is rendered from the authorised
+		// plan rather than read back from the records it is compared against.
+		// The Stage-2 receipt it used to be bound to is gone, and so is the
+		// empty digest this call used to pass in its place.
+		return planbind.InvocationManifestFor(doc, index)
 	}
 }
 

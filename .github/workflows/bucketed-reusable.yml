@@ -121,7 +121,7 @@ on:
         description: >-
           Forwarded to plan + test (runner: vitest): records directory for
           run-bucket wall-time measurement. When set, the whole Run-bucket
-          action runs inside a physical envelope, and each invocation gets one
+          action runs inside a measured envelope, and each invocation gets one
           of its own. Empty = no measurement ⇒ unchanged behavior.
         type: string
         default: ""
@@ -296,9 +296,6 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
-      # Derived ONCE, here, from the signed Stage-1 manifest, and consumed by
-      # every downstream job that installs the candidate. One derivation is the
-      # point: a value each job resolved for itself could differ between them.
       # §10.5.2 step 2: the declaration crosses the job boundary as CONTENT
       # plus a digest, because two jobs on two runners share no filesystem and
       # a pathname would transport nothing.
@@ -336,12 +333,11 @@ jobs:
           restore-keys: |
             testbucket-timings-${{ inputs.cache-scope }}-v1-
 
-      # The attested-candidate-digest resolution that stood here is removed with
-      # the protected-authority model: it derived a candidate binary digest from
-      # a signed Stage-1 manifest through its own reviewed resolver action, and
-      # §21 deletes that action. The install step still enforces
-      # TB_CANDIDATE_BINARY_DIGEST when a caller supplies one; what is gone is
-      # deriving it from a signature.
+      # The attested-candidate-digest resolution that stood here is removed
+      # with the authority model, together with the candidate delivery path it
+      # fed: the installer now takes a released binary or builds from the
+      # checked-out source, and names nothing it cannot verify against the
+      # release's own checksums.
 
       - name: Materialize and verify the cache declaration
         id: cache-declaration
@@ -393,26 +389,11 @@ jobs:
           exclude-module: ${{ inputs.exclude-module }}
           setup-command: ${{ inputs.setup-command }}
           wall-time-dir: ${{ inputs.wall-time-dir }}
-          # With a bundle the matrix is derived by the frozen planner over
-          # those exact bytes, and every per-bucket document is derived and
-          # bound into the Stage-2 receipt in the same step. Empty leaves the
-          # ordinary path byte-identical.
-          # The one-shot planner claim. Taken BEFORE the planner runs and keyed
-          # by the Stage-1 and bundle digests, so a second invocation is
-          # refused rather than performed and rejected afterwards.
-          #
-          # planner-claim-dir must name storage that OUTLIVES one runner for
-          # the guard to reach a job rerun, which gets a fresh filesystem. Left
-          # empty it falls back to the runner-local derived directory, which
-          # guards a second invocation within one runner and cannot see an
-          # earlier attempt; the command says so on stderr. A cross-runner
-          # claim needs the same durable external channel the campaign
-          # evidence handoff needs.
-          # The authority's signed statement that the store outlives a runner,
-          # and the predeclared keys it verifies against. Without both, a
-          # SCORED derivation refuses to plan: a configured pathname is
-          # something the planner can choose for itself, and the planner is the
-          # party whose one-shot behaviour is being constrained.
+          # The frozen-bundle planner is removed, and its one-shot claim with
+          # it: the matrix is derived by the ordinary planner from the live
+          # discovery and the store, which is the only path there is. The
+          # claim store, its authority attestation and the predeclared keys
+          # that verified it constrained a planner that no longer exists.
 
       - name: Upload the shard plan
         if: always()
@@ -456,9 +437,8 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         run: npm ci
 
-      # The Stage-2 receipt and per-bucket documents the frozen planner
-      # derived, and the plan itself. The plan is what the coverage audit
-      # compares this bucket's events against: a wall-time envelope records how
+      # The plan this bucket was fanned out from. It is what the coverage
+      # audit compares this bucket's events against: a wall-time envelope records how
       # long something took and can never record what it skipped.
       # §10.5.2 step 3. Each matrix job writes the plan job's published bytes
       # to its OWN job-local file; run-bucket then re-verifies the digest and

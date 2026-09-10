@@ -58,11 +58,11 @@ usage:
                               the plan it was fanned out from: every target
                               covered exactly as scheduled, shards and slices
                               accounted for
-  testbucket wall    <sub>    run-bucket wall-time measurement: open and
-                              close the physical action envelope, run a command
-                              under a physical envelope with its own containment
-                              peer and independent trace, and verify a records
-                              directory against every frozen gate
+  testbucket wall    <sub>    run-bucket wall-time measurement: open and close
+                              the action interval, measure the generated script
+                              and each rendered invocation, verify the records
+                              are a complete measurement, and assemble the one
+                              observation per bucket that ingest learns from
   testbucket render           replay a "go test -json" stream from stdin as the
                               plain log it would have printed; a pure filter that
                               never changes an exit status

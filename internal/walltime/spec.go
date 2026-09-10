@@ -62,9 +62,15 @@ type InvocationIdentity struct {
 // and some selector, but not that they are the ones the authorised plan
 // rendered — and for two legal name slices of one file, "some selector" is
 // exactly the difference that matters.
+//
+// It carried a Stage2 digest binding it to the authorised plan's receipt. The
+// receipt is gone, and the field went on being serialized — without
+// `omitempty`, so every manifest the practical path produced emitted a live
+// `"stage2_digest":""`. What makes this document a control is that it is
+// RENDERED from the plan rather than read back from the records it is compared
+// against; a receipt digest was never what did that work.
 type InvocationManifest struct {
 	Kind        string               `json:"kind"`
-	Stage2      Digest               `json:"stage2_digest"`
 	BucketIndex int                  `json:"bucket"`
 	BucketName  string               `json:"bucket_name"`
 	Invocations []InvocationIdentity `json:"invocations"`

@@ -203,75 +203,20 @@ func dedupe(in []string) []string {
 	return out
 }
 
-// planFromBundle is `plan`'s frozen path: instead of discovering and reading
-// the clock, it replays a bundle and writes the Stage-2 receipt.
+// THE FROZEN PLANNER PATH IS REMOVED.
 //
-// The receipt is written with O_EXCL. That is the exactly-once rule made
-// mechanical: the bound planner runs once, and a second run that quietly
-// replaced the first receipt would be indistinguishable from the first.
-// frozenPlanOptions is what the frozen `plan` path needs beyond the bundle.
-type frozenPlanOptions struct {
-	// claimStore overrides where the one-shot planner claim is taken. It is a
-	// STORE rather than an output directory: keying the claim to the place the
-	// derivation writes meant a fresh working directory saw no claim, which is
-	// exactly what a job rerun looks like. Anything set here is treated as a
-	// store the deployment provides and every attempt of the job resolves.
-	claimStore string
-	// scored says this derivation is for an eligible/scored arm, where a
-	// durable claim is mandatory rather than advisory.
-	scored     bool
-	bundlePath string
-	stage1Path string
-	stage2Path string
-	shardPlan  string
-	asJSON     bool
-	// scorerPath, when set, makes the frozen pre-plan score the ALLOCATION
-	// input. Without it the partition uses the store's measured weights, which
-	// is a perfectly good split and is not campaign eligible.
-	scorerPath string
-	// registryPath is the frozen Aeta component template; outDir is where the
-	// per-bucket derived documents (Palloc, Pcheck, Aeta) are written.
-	registryPath string
-	outDir       string
-	// authorityKeys are the PREDECLARED public keys allowed to approve the
-	// Stage-1 inputs, and authority the protected environment they must name.
-	// Both are required: the frozen path plans only from authorised inputs.
-	authorityKeys []string
-	authority     string
-}
-
-// plannerClaimStoreEnv names the DURABLE claim store.
+// `plan`'s frozen path replayed a Stage-1 input bundle, wrote a Stage-2 receipt
+// with O_EXCL to make the exactly-once rule mechanical, and took a durable
+// one-shot claim from a store named by TB_WALL_PLANNER_CLAIM_STORE, attested by
+// TB_WALL_PLANNER_CLAIM_STORE_ATTESTATION and verified against
+// TB_WALL_CAMPAIGN_AUTHORITY_KEYS. frozenPlanOptions carried the bundle, the
+// two receipts, the frozen scorer, the Aeta registry template, the predeclared
+// authority keys and the protected environment they had to name.
 //
-// It is an environment variable rather than only a flag because the store is a
-// property of the deployment, not of one invocation: every attempt of a job
-// must resolve the same store, or the claim proves nothing about the attempts
-// it was supposed to exclude.
-const plannerClaimStoreEnv = "TB_WALL_PLANNER_CLAIM_STORE"
-
-// plannerClaimAttestationEnv carries the campaign authority's signature over
-// the claim store's identity. Without it a store is not durable, whatever its
-// pathname suggests.
-const plannerClaimAttestationEnv = "TB_WALL_PLANNER_CLAIM_STORE_ATTESTATION"
-
-// plannerClaimAuthorityKeysEnv carries the predeclared campaign-authority
-// public keys the store attestation is verified against. A signature checked
-// against whatever signed it is one anybody can mint.
-const plannerClaimAuthorityKeysEnv = "TB_WALL_CAMPAIGN_AUTHORITY_KEYS"
-
-// machineClaimStore is a stable location that does not move with the working
-// directory. It is still one machine's disk, which is why holding a claim
-// there is not durable across runners.
-func machineClaimStore() (string, error) {
-	base := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("resolve the machine planner claim store: %w", err)
-		}
-		base = filepath.Join(home, ".local", "state")
-	}
-	return filepath.Join(base, "testbucket", "planner-claims"), nil
-}
+// The planner itself was removed with the authority model; this options
+// struct, the three environment channels and machineClaimStore outlived it
+// with no caller in any Go source. A dead interface that names a capability is
+// still an interface that names a capability.
 
 // firstErr returns the first non-nil error, so a caller can fold several
 // close-shaped failures into one without losing the first one that happened.

@@ -330,7 +330,7 @@ every action step is exactly what it was.
 
 ### What it records
 
-One physical envelope at each of three levels:
+One measured envelope at each of three levels:
 
 | Level | Envelope |
 | --- | --- |
