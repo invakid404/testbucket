@@ -32,6 +32,12 @@ usage:
                                    state, positive monotonic duration,
                                    plan/bucket identity, exact invocation
                                    membership and event coverage
+  testbucket wall assemble-observation [flags]
+                                   build the canonical observation from what a
+                                   measured bucket produced -- the verified
+                                   records, the plan it was fanned out from,
+                                   and the cache outcome, so ingest has a
+                                   document to qualify and append
 
 Every endpoint is a fresh CLOCK_MONOTONIC read taken by the producer that
 records it.
@@ -431,6 +437,8 @@ func runWall(args []string) error {
 		return runWallRun(args[1:])
 	case "verify":
 		return runWallVerify(args[1:])
+	case "assemble-observation":
+		return runWallAssemble(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, wallUsage)
 		return nil

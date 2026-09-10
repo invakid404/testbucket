@@ -707,3 +707,11 @@ func ExpandUnitsFor(ctx context.Context, rnr runner.Runner, st *Store, opt PlanO
 // the design matrix a calibration proposal is built from must be in the exact
 // integer domain the objective is evaluated in, converted the one way.
 func ReporterNs(u runner.Unit) (int64, error) { return reporterNsOf(u) }
+
+// ReporterNsFromSeconds converts a stored one-decimal seconds weight to exact
+// integer nanoseconds, through the same checked rational path reporterNsOf
+// uses. It is exported for the observation assembler, which needs the identical
+// conversion so a plan and the observation of it cannot disagree by rounding.
+func ReporterNsFromSeconds(sec float64) (int64, error) {
+	return reporterNsOf(runner.Unit{Seconds: sec})
+}

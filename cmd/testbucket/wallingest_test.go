@@ -324,3 +324,84 @@ func writePlanFor(t *testing.T, dir, bucket string, index int) (string, walltime
 	}
 	return path, d
 }
+
+// TestAssembledObservationSurvivesIngest closes the loop on itself.
+//
+// The two halves were separately absent: nothing produced an observation
+// document, and nothing consumed one. Testing them apart would leave the
+// interesting failure — a producer whose output the consumer refuses —
+// invisible. So this measures a real command with `wall exec`, assembles the
+// observation from those records and the plan, and ingests it, all through the
+// shipped binary.
+func TestAssembledObservationSurvivesIngest(t *testing.T) {
+	bin := planBinary(t)
+	dir := t.TempDir()
+	records := filepath.Join(dir, "records")
+	obsDir := filepath.Join(dir, "obs")
+	for _, d := range []string{records, obsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A real measured action: begin, a setup command, the script, one
+	// invocation, end. These are the records the assembler reads.
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, stderr.String())
+		}
+	}
+	run("wall", "begin", "--dir", records, "--bucket-id", "bucket-0")
+	run("wall", "run", "--dir", records, "--", "sh", "-c", "true")
+	// The invocation runs INSIDE the script, as the generated bucket script
+	// runs it. Measuring them as siblings would put V outside VB and break
+	// §3.1's `script_ns >= Σ V[j]` — which the assembler correctly refuses,
+	// and which is a property of the composition rather than of the tooling.
+	inner := bin + " wall exec --dir " + records + " --level invocation" +
+		" --bucket-id bucket-0 --cwd " + dir + " -- sh -c true"
+	run("wall", "exec", "--dir", records, "--level", "script", "--bucket-id", "bucket-0",
+		"--cwd", dir, "--", "sh", "-c", inner)
+	run("wall", "end", "--dir", records, "--terminal", "passed")
+
+	plan, _ := writePlanFor(t, dir, "bucket-0", 0)
+	obsFile := filepath.Join(obsDir, "bucket-0.json")
+	cmd := exec.Command(bin, "wall", "assemble-observation",
+		"--dir", records, "--shard-plan", plan, "--bucket-name", "bucket-0",
+		"--out", obsFile, "--runs-on-label", "ubuntu-latest",
+		"--repository", "owner/name", "--run-id", "run-9", "--attempt-id", "1",
+		"--job", "job-1", "--head-sha", strings.Repeat("1", 40),
+		"--candidate-sha", strings.Repeat("2", 40),
+		"--workload-commit", strings.Repeat("3", 40))
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("assemble-observation failed: %v\n%s", err, stderr.String())
+	}
+
+	// The assembled document must be the shape the loop consumes.
+	b, err := os.ReadFile(obsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obs map[string]any
+	if err := json.Unmarshal(b, &obs); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"schema", "plan_digest", "profile", "elapsed_ns", "setup_ns", "script_ns"} {
+		if obs[field] == nil {
+			t.Errorf("the assembled observation carries no %s", field)
+		}
+	}
+	// setup_ns is the term §3.1's floor needs and the one that was previously
+	// underivable: `wall run` recorded no interval at all.
+	if s, _ := obs["setup_ns"].(string); s == "" || s == "0" {
+		t.Errorf("setup_ns is %q; the setup command's interval did not reach the observation", s)
+	}
+	if len(obs["invocations"].([]any)) != 1 {
+		t.Errorf("the observation records %v invocations, want the one that ran", obs["invocations"])
+	}
+}
