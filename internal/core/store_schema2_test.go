@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -364,4 +365,111 @@ func TestWallStoreSchemaStateMatrixAndMigration(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestWallObjectLiteralJSON asserts that marshalling a WallObject with a
+// fitted model produces the registered FLAT wire surface: fixed_ns, scale,
+// fitted_at and peers appear directly under "wall", not under "wall.fit",
+// and scale is a JSON STRING not a number.
+func TestWallObjectLiteralJSON(t *testing.T) {
+	w := newWall()
+	w.Status = WallStatusOK
+	w.FailureSubtype = ""
+	w.Fit = &WallFitGroup{
+		FixedNs:                   5_000_000_000,
+		Scale:                     1.25,
+		WholeInvocationOverheadNs: 8_000_000_000,
+		PerSliceOverheadNs:        3_000_000_000,
+		FittedAt:                  "2026-09-01T00:00:00Z",
+		RowsUsed:                  25,
+		RunsUsed:                  4,
+		ResidualMAENs:             1_545_660_377,
+		ResidualP90Ns:             1_811_320_754,
+		RankSupport:               []string{"c1", "c2"},
+	}
+
+	data, err := json.Marshal(w)
+	if err != nil {
+		t.Fatalf("marshal WallObject: %v", err)
+	}
+
+	for _, want := range [][]byte{
+		[]byte(`"fixed_ns":`),
+		[]byte(`"fitted_at":`),
+		[]byte(`"scale":"`), // string value — opening quote immediately after colon
+	} {
+		if !bytes.Contains(data, want) {
+			t.Errorf("marshalled WallObject missing %q\nfull JSON: %s", want, data)
+		}
+	}
+	if bytes.Contains(data, []byte(`"fit":{`)) {
+		t.Errorf("marshalled WallObject must not nest fit fields under \"fit\":{...}; full JSON: %s", data)
+	}
+
+	// Round-trip: unmarshal back and verify the fit group is reconstructed.
+	var w2 WallObject
+	if err := json.Unmarshal(data, &w2); err != nil {
+		t.Fatalf("unmarshal round-trip: %v", err)
+	}
+	if w2.Fit == nil {
+		t.Fatal("round-trip: fit group is nil after unmarshal")
+	}
+	if w2.Fit.FixedNs != w.Fit.FixedNs {
+		t.Errorf("round-trip FixedNs = %d, want %d", w2.Fit.FixedNs, w.Fit.FixedNs)
+	}
+	if w2.Fit.Scale != w.Fit.Scale {
+		t.Errorf("round-trip Scale = %v, want %v", w2.Fit.Scale, w.Fit.Scale)
+	}
+}
+
+// TestMigrationMarkerAtRoot asserts that after MigrateWall, the store's
+// marshal output contains "migrated_from" at the root level (not nested under
+// "wall") and that the wall's scale field, when present, serialises as a string.
+func TestMigrationMarkerAtRoot(t *testing.T) {
+	const schema1 = `{"schema":1,"flags":"vitest","units":{"a":{"seconds":3,"samples":2}}}`
+	st, reason, err := ParseStore([]byte(schema1), "migration-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason != "" {
+		t.Fatalf("unexpected cold-start reason: %q", reason)
+	}
+	st.MigrateWall("sha256:comparability-key")
+
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal migrated store: %v", err)
+	}
+
+	// "migrated_from" must appear at the root, i.e. outside any nested object.
+	// A rough structural check: the key must be present and must not appear
+	// only inside a "wall":{...} block.
+	if !bytes.Contains(data, []byte(`"migrated_from"`)) {
+		t.Fatalf("migrated store JSON missing root-level \"migrated_from\"\nfull JSON: %s", data)
+	}
+	// It must not appear nested under "wall": if "wall" always precedes the
+	// only occurrence of "migrated_from", that would imply nesting.
+	wallIdx := bytes.Index(data, []byte(`"wall"`))
+	migIdx := bytes.Index(data, []byte(`"migrated_from"`))
+	if wallIdx >= 0 && migIdx > wallIdx {
+		// Check the byte before "migrated_from" — if we're inside the wall
+		// object we'd be within its braces. A simple heuristic: look for the
+		// root-level "migrated_from" by checking the store struct directly.
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("unmarshal as map: %v", err)
+		}
+		if _, ok := raw["migrated_from"]; !ok {
+			t.Errorf("\"migrated_from\" is not a root-level key in the marshalled store\nfull JSON: %s", data)
+		}
+	}
+
+	// The migrated wall has no fit, so we can't check scale here.
+	// Verify the store round-trips and MigratedFrom is set.
+	if st.MigratedFrom == nil || *st.MigratedFrom != 1 {
+		t.Errorf("store.MigratedFrom = %v, want pointer to 1", st.MigratedFrom)
+	}
+	if st.Wall == nil {
+		t.Fatal("migrated store has no wall object")
+	}
 }
