@@ -39,6 +39,8 @@ func runWallAssemble(args []string) error {
 	actualRunner := fs.String("actual-runner-name", "", "the runner instance name, a diagnostic that is never part of the comparability key")
 	cacheStateFile := fs.String("cache-state", "", "the cache outcome this bucket's own restore step reported, as JSON")
 	cacheDeclFile := fs.String("cache-declaration-file", "", "the verified cache declaration, for its digest")
+	runnerKind := fs.String("runner", "", "the adapter this bucket ran (go or vitest); it selects which §15.3a leaves are observable here")
+	root := fs.String("root", "", "the directory this bucket ran in; the runtime profile's toolchain and lockfile leaves are observed from it")
 	headSHA := fs.String("head-sha", "", "the consumer commit this run measured; one of QC15's three provenance identities")
 	candidateSHA := fs.String("candidate-sha", "", "the testbucket commit the measuring binary was built from (QC15)")
 	workloadCommit := fs.String("workload-commit", "", "the workload checkout this run executed against (QC15)")
@@ -99,7 +101,32 @@ func runWallAssemble(args []string) error {
 			return fmt.Errorf("plan profile: %w", err)
 		}
 	}
-	obs.RuntimeProfile = runtimeProfileFromMap(doc.RuntimeProfileDeclared)
+	// THE RUNTIME PROFILE IS OBSERVED HERE, ON THE BUCKET RUNNER.
+	//
+	// It used to be `runtimeProfileFromMap(doc.RuntimeProfileDeclared)` — the
+	// plan's declaration copied into the observation and hashed again — so
+	// QC17 compared the declaration against itself and could not fail. The
+	// leaves come from the toolchain THIS process can reach instead, through
+	// the same observer the plan job uses, so the two sides are independent
+	// derivations of the same facts and a runner whose Node, pnpm, Vitest,
+	// lockfile or binary has drifted from the plan is now a rejected row.
+	//
+	// facade_command is the one leaf that is a configuration rather than a
+	// measurement: it is the command the rendered script runs, so it is taken
+	// from the plan — and it is what vitest_version is observed BY INVOKING,
+	// which is where a façade the runner cannot execute shows up.
+	declared := runtimeProfileFromMap(doc.RuntimeProfileDeclared)
+	obsRoot := strings.TrimSpace(*root)
+	if obsRoot == "" {
+		obsRoot = "."
+	}
+	obs.RuntimeProfile = buildRuntimeProfile(runtimeProfileInputs{
+		runnerKind:    strings.TrimSpace(*runnerKind),
+		root:          obsRoot,
+		workingDir:    obsRoot,
+		vitestCommand: declared.FacadeCommand,
+		cacheDecl:     observedCacheDeclaration(*cacheDeclFile),
+	})
 	obs.RuntimeProfileDigest = walltime.RuntimeProfileDigest(obs.RuntimeProfile)
 
 	id := ids.identity()
@@ -148,13 +175,9 @@ func runWallAssemble(args []string) error {
 		}
 	}
 	if strings.TrimSpace(*cacheDeclFile) != "" {
-		b, err := os.ReadFile(*cacheDeclFile)
-		if err != nil {
-			return fmt.Errorf("--cache-declaration-file: %w", err)
-		}
-		var decl walltime.CacheDeclaration
-		if err := json.Unmarshal(b, &decl); err != nil {
-			return fmt.Errorf("--cache-declaration-file: %w", err)
+		decl := observedCacheDeclaration(*cacheDeclFile)
+		if decl == nil {
+			return fmt.Errorf("--cache-declaration-file %s: not a readable cache declaration", *cacheDeclFile)
 		}
 		obs.CacheDeclarationDigest = decl.Digest()
 	}
@@ -329,4 +352,26 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 	obs.ScriptOverheadNs = walltime.Nanos(spans.ScriptOverheadNs)
 	obs.WrapperNs = walltime.Nanos(spans.WrapperNs)
 	return nil
+}
+
+// observedCacheDeclaration reads the declaration the runner materialized and
+// verified, which is where dependency_cache_mode is observed from.
+//
+// It returns nil rather than an error for an absent or unreadable file: the
+// runtime profile leaves an unobservable leaf EMPTY, and QC17 is what decides
+// whether that is enough for the run in question. The caller that requires the
+// declaration checks for nil itself.
+func observedCacheDeclaration(path string) *walltime.CacheDeclaration {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var decl walltime.CacheDeclaration
+	if err := json.Unmarshal(b, &decl); err != nil {
+		return nil
+	}
+	return &decl
 }

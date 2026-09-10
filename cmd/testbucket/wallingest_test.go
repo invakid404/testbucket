@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 
 	"github.com/invakid404/testbucket/internal/core"
@@ -285,8 +287,19 @@ const sharedComparabilityKey = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 // compares two independently derived values rather than one value with itself.
 func writePlanFor(t *testing.T, dir, bucket string, index int, argv []string, cwd string) (string, walltime.Digest) {
 	t.Helper()
+	return writePlanDeclaring(t, dir, bucket, index, argv, cwd, sharedRuntimeProfile())
+}
+
+// writePlanDeclaring is writePlanFor with the runtime profile the plan
+// DECLARES spelled out.
+//
+// A test that ingests the real assembler's output has to declare what that
+// assembler will OBSERVE on this machine, because QC17 now compares the two
+// independently. Tests that ingest a fixture observation keep using the shared
+// profile on both sides.
+func writePlanDeclaring(t *testing.T, dir, bucket string, index int, argv []string, cwd string, rp walltime.RuntimeProfile) (string, walltime.Digest) {
+	t.Helper()
 	path := filepath.Join(dir, "shard-plan.json")
-	rp := sharedRuntimeProfile()
 	var rpMap map[string]string
 	if err := json.Unmarshal(rp.OrderedJSON(), &rpMap); err != nil {
 		t.Fatal(err)
@@ -369,7 +382,15 @@ func TestAssembledObservationSurvivesIngest(t *testing.T) {
 		"--cwd", dir, "--", "sh", "-c", inner)
 	run("wall", "end", "--dir", records, "--terminal", "passed")
 
-	plan, _ := writePlanFor(t, dir, "bucket-0", 0, []string{"sh", "-c", "true"}, dir)
+	// THE PLAN DECLARES WHAT THE ASSEMBLER WILL OBSERVE.
+	//
+	// §15.3a's leaves are read off the machine now, not copied out of the
+	// plan, so this test states them the way the plan job would have and lets
+	// QC17 do the comparison it exists for. Nothing here is a placeholder: the
+	// binary digest is of the binary that assembles, and the façade is the one
+	// vitest_version would be observed by invoking.
+	plan, _ := writePlanDeclaring(t, dir, "bucket-0", 0, []string{"sh", "-c", "true"}, dir,
+		observedProfileOf(t, bin))
 	obsFile := filepath.Join(obsDir, "bucket-0.json")
 	cmd := exec.Command(bin, "wall", "assemble-observation",
 		"--dir", records, "--shard-plan", plan, "--bucket-name", "bucket-0",
@@ -531,5 +552,125 @@ func TestPlanFrozenRegressorsCountSlicesTheObservationCannotSee(t *testing.T) {
 	}
 	if got.StoreSHA256 == "" {
 		t.Error("store_sha256 did not come off the plan's canonical profile")
+	}
+}
+
+// observedProfileOf is the runtime profile `wall assemble-observation` will
+// observe when it is run as `bin` with no --runner and no cache declaration:
+// the executing binary's digest and the façade it was told to use, with the
+// Node-toolchain leaves absent because the adapter was not named.
+//
+// It is built through the production observer rather than restated, so a
+// change to what "observed" means fails here rather than drifting.
+func observedProfileOf(t *testing.T, bin string) walltime.RuntimeProfile {
+	t.Helper()
+	b, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	return walltime.RuntimeProfile{
+		TestbucketSHA256: "sha256:" + hex.EncodeToString(sum[:]),
+		FacadeCommand:    sharedRuntimeProfile().FacadeCommand,
+	}
+}
+
+// TestQC17RejectsARunnerThatDriftedFromThePlan is the check with teeth.
+//
+// The assembler used to copy doc.runtime_profile_declared into the observation
+// and hash the copy, so QC17 compared the plan declaration against itself and
+// could not fail for any runner, ever. One declared leaf is moved here; the
+// executed runtime has not, and the row must be refused.
+func TestQC17RejectsARunnerThatDriftedFromThePlan(t *testing.T) {
+	bin := planBinary(t)
+	dir := t.TempDir()
+	records := filepath.Join(dir, "records")
+	obsDir := filepath.Join(dir, "obs")
+	for _, d := range []string{records, obsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, stderr.String())
+		}
+	}
+	run("wall", "begin", "--dir", records, "--bucket-id", "bucket-0")
+	run("wall", "run", "--dir", records, "--", "sh", "-c", "true")
+	inner := bin + " wall exec --dir " + records + " --level invocation" +
+		" --bucket-id bucket-0 --cwd " + dir + " -- sh -c true"
+	run("wall", "exec", "--dir", records, "--level", "script", "--bucket-id", "bucket-0",
+		"--cwd", dir, "--", "sh", "-c", inner)
+	run("wall", "end", "--dir", records, "--terminal", "passed")
+
+	// The plan declares a NODE VERSION. The bucket observed none, because it
+	// was not told it was running the Node adapter.
+	drifted := observedProfileOf(t, bin)
+	drifted.NodeVersion = "26.8.1"
+	plan, _ := writePlanDeclaring(t, dir, "bucket-0", 0, []string{"sh", "-c", "true"}, dir, drifted)
+
+	obsFile := filepath.Join(obsDir, "bucket-0.json")
+	cmd := exec.Command(bin, "wall", "assemble-observation",
+		"--dir", records, "--shard-plan", plan, "--bucket-name", "bucket-0",
+		"--out", obsFile, "--runs-on-label", "ubuntu-latest",
+		"--repository", "owner/name", "--run-id", "run-9", "--attempt-id", "1",
+		"--job", "job-1", "--head-sha", strings.Repeat("1", 40),
+		"--candidate-sha", strings.Repeat("2", 40),
+		"--workload-commit", strings.Repeat("3", 40))
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("assemble-observation failed: %v\n%s", err, stderr.String())
+	}
+
+	store := filepath.Join(dir, "store.json")
+	writeFixture(t, store, map[string]any{
+		"schema": 2, "flags": "vitest", "updated_at": "2026-09-01T00:00:00Z",
+		"units": map[string]any{"f0.test.ts": map[string]any{"seconds": 10.0, "samples": 4}},
+		"wall": map[string]any{
+			"model_version":            1,
+			"comparability_key_digest": sharedComparabilityKey,
+			"status":                   "insufficient",
+			"failure_subtype":          "migrated_no_history",
+			"observations":             []any{},
+		},
+	})
+	events := filepath.Join(dir, "ev.ndjson")
+	if err := os.WriteFile(events, []byte(
+		`{"Action":"pass","Package":"f0.test.ts","Elapsed":1}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ing := exec.Command(bin, "ingest", "--store", store, "--no-golist",
+		"--wall-observations", obsDir, "--wall-shard-plan", plan,
+		"--runs-on-label", "ubuntu-latest", events)
+	var ingErr strings.Builder
+	ing.Stderr = &ingErr
+	if err := ing.Run(); err != nil {
+		t.Fatalf("ingest failed: %v\n%s", err, ingErr.String())
+	}
+	if !strings.Contains(ingErr.String(), "QC17") {
+		t.Fatalf("a runner whose node_version disagrees with the plan was not refused by QC17:\n%s",
+			ingErr.String())
+	}
+
+	var saved struct {
+		Wall struct {
+			Observations []map[string]any `json:"observations"`
+		} `json:"wall"`
+	}
+	sb, err := os.ReadFile(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(sb, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Wall.Observations) != 0 {
+		t.Errorf("the drifted row reached the ring anyway (%d row(s))", len(saved.Wall.Observations))
 	}
 }

@@ -561,6 +561,8 @@ runs:
         TB_WORKLOAD_COMMIT: ${{ inputs.workload-commit }}
         TB_CAMPAIGN_ID: ${{ inputs.campaign-id }}
         TB_CACHE_DECLARATION_FILE: ${{ inputs.cache-declaration-file }}
+        TB_RUNNER: ${{ inputs.runner }}
+        TB_WORKING_DIRECTORY: ${{ inputs.working-directory }}
       run: |
         set -euo pipefail
         # NAMED FOR ITS BUCKET. The record job merges every bucket's artifact
@@ -581,6 +583,11 @@ runs:
           --head-sha "${GITHUB_SHA:-}"
           --candidate-sha "$TB_CANDIDATE_SHA"
           --workload-commit "$TB_WORKLOAD_COMMIT"
+          # §15.3a's runtime profile is OBSERVED here rather than copied from
+          # the plan, so the assembler needs the two things that say where to
+          # look: which adapter ran, and the directory it ran in.
+          --runner "$TB_RUNNER"
+          --root "$TB_WORKING_DIRECTORY"
         )
         if [ -n "$TB_CAMPAIGN_ID" ]; then args+=(--campaign-id "$TB_CAMPAIGN_ID"); fi
         if [ -n "$TB_CACHE_DECLARATION_FILE" ]; then
