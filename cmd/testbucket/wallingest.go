@@ -3,6 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -453,9 +458,24 @@ func wallFitRows(st *core.Store) []walltime.FitRow {
 // It is the same comparison `wall verify`'s audit makes — core.AuditCoverage over
 // core.PlannedCoverageForBucket — applied at the ingest boundary, so the verdict
 // QC10 reads is derived from evidence this command holds rather than inherited
-// from a command that may not have run. A nil summary yields no verdicts at all,
-// which QC10 treats as a refusal.
-func coverageVerdicts(doc *core.PlanDocument, sum *runner.RunSummary) (map[string]bool, error) {
+// from a command that may not have run.
+//
+// IT NEEDS PER-BUCKET EVIDENCE, AND THE EVENT FILES CARRY IT.
+//
+// The record job downloads every bucket's artifact, and the Vitest renderer named
+// each reporter output `bucket-<index>-<seq>.json` — so which bucket produced
+// which results is already in the input paths. Two earlier attempts at this
+// verdict both lost that: the first audited each bucket against the whole merged
+// summary, and the second filtered the merged summary by PACKAGE, which is not a
+// per-bucket partition. Two name slices of one file legitimately live in
+// different buckets, and both attempts then charged each bucket with the other's
+// run and the other's name.
+//
+// Nothing here divides an aggregate count or narrows observed names to the
+// expected set. Either the evidence says which bucket produced a result or the
+// verdict cannot be made, and a verdict that cannot be made is a refusal.
+func coverageVerdicts(doc *core.PlanDocument, sum *runner.RunSummary,
+	perBucket map[int]*runner.RunSummary) (map[string]bool, error) {
 	out := map[string]bool{}
 	if doc == nil || sum == nil {
 		return out, nil
@@ -463,11 +483,9 @@ func coverageVerdicts(doc *core.PlanDocument, sum *runner.RunSummary) (map[strin
 
 	// THE WHOLE PLAN FIRST, against the whole merged evidence.
 	//
-	// The record job downloads every bucket's event artifact and parses ONE
-	// combined summary, so this is the scope at which "an event belonging to no
-	// bucket" is even a question — and it is the only scope at which it is. A
-	// failure here is not attributable to one bucket, so it fails them all:
-	// evidence that does not match the plan is not evidence for any row of it.
+	// This is the only scope at which "an event belonging to no bucket" is a
+	// question. A failure here is not attributable to one bucket, so it fails them
+	// all: evidence that does not match the plan is not evidence for any row of it.
 	var planReport strings.Builder
 	planOK := core.AuditCoverage(&planReport, core.PlannedCoverageForPlan(doc), sum) == nil
 
@@ -476,18 +494,79 @@ func coverageVerdicts(doc *core.PlanDocument, sum *runner.RunSummary) (map[strin
 		if err != nil {
 			return nil, fmt.Errorf("bucket %s: %w", b.Name, err)
 		}
-		// PER-BUCKET EVIDENCE FOR A PER-BUCKET VERDICT.
-		//
-		// Auditing one bucket against the merged summary reports every other
-		// bucket's packages as unplanned for it — correctly, by AuditCoverage's own
-		// rule — so a valid two-bucket fan-in failed both buckets. The projection
-		// keeps every per-bucket direction: a planned target with no events, a
-		// short invocation count, a slice that did not run its names. The direction
-		// it cannot see belongs to the whole plan, which is audited above.
+		evidence, have := perBucket[b.Index]
+		if !have {
+			// No attributable evidence for this bucket. An empty design row is
+			// still a pass — §17.3a admits it and it renders no invocation, so it
+			// emits no event file — and anything else is the missing-evidence
+			// refusal, whether the artifact is absent or the input set simply
+			// cannot say which bucket produced what.
+			out[b.Name] = planOK && planned.Units == 0
+			continue
+		}
 		var report strings.Builder
-		bucketOK := core.AuditCoverage(&report, planned,
-			core.SummaryForPackages(sum, planned.Invocations)) == nil
-		out[b.Name] = planOK && bucketOK
+		out[b.Name] = planOK && core.AuditCoverage(&report, planned, evidence) == nil
 	}
 	return out, nil
+}
+
+// bucketEventPath is the reporter output name the Vitest renderer writes:
+// `bucket-<index>-<seq>.json`. It is the route per-bucket evidence travels, and
+// it exists because the plan renders it — see vitestrunner's eventsFileFor.
+var bucketEventPath = regexp.MustCompile(`^bucket-([0-9]+)-([0-9]+)\.(?:json|ndjson)$`)
+
+// eventPathsByBucket groups event input paths by the bucket index their names
+// carry, and returns the paths that carry none.
+//
+// A path with no bucket in its name is not evidence about any single bucket. It
+// still belongs to the merged set — the whole-plan audit reads that — but it
+// cannot support a per-bucket verdict, and inventing one from it is exactly what
+// the two previous attempts did.
+func eventPathsByBucket(paths []string) (byBucket map[int][]string, unattributed []string) {
+	byBucket = map[int][]string{}
+	for _, p := range paths {
+		m := bucketEventPath.FindStringSubmatch(filepath.Base(p))
+		if m == nil {
+			unattributed = append(unattributed, p)
+			continue
+		}
+		idx, err := strconv.Atoi(m[1])
+		if err != nil {
+			unattributed = append(unattributed, p)
+			continue
+		}
+		byBucket[idx] = append(byBucket[idx], p)
+	}
+	return byBucket, unattributed
+}
+
+// perBucketSummaries parses one RunSummary per bucket from the bucket-scoped
+// event files, through the SAME adapter parser the merged summary uses.
+func perBucketSummaries(rnr runner.Runner, paths []string) (map[int]*runner.RunSummary, []string, error) {
+	byBucket, unattributed := eventPathsByBucket(paths)
+	out := map[int]*runner.RunSummary{}
+	for idx, group := range byBucket {
+		var readers []io.Reader
+		var closers []io.Closer
+		for _, p := range group {
+			f, err := os.Open(p)
+			if err != nil {
+				for _, c := range closers {
+					c.Close()
+				}
+				return nil, nil, fmt.Errorf("open bucket %d events %s: %w", idx, p, err)
+			}
+			closers = append(closers, f)
+			readers = append(readers, f)
+		}
+		sum, err := rnr.ParseTimings(readers...)
+		for _, c := range closers {
+			c.Close()
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse bucket %d events: %w", idx, err)
+		}
+		out[idx] = sum
+	}
+	return out, unattributed, nil
 }

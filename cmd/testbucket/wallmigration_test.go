@@ -49,10 +49,17 @@ func runIngestBinary(t *testing.T, bin string, args ...string) string {
 	return stderr.String()
 }
 
-// writeEvents writes the one reporter event the ingests below consume.
+// writeEvents writes the one reporter event the ingests below consume, UNDER THE
+// NAME THE RENDERER GIVES IT.
+//
+// The Vitest renderer writes each invocation's reporter output to
+// `bucket-<index>-<seq>.json`, and §7.1 QC10's per-bucket verdict is derived from
+// exactly that: which bucket produced which results is carried by the path. A
+// fixture that hands ingest an unattributable blob is handing it an input the
+// shipped action never produces.
 func writeEvents(t *testing.T, dir string) string {
 	t.Helper()
-	path := filepath.Join(dir, "ev.ndjson")
+	path := filepath.Join(dir, "bucket-0-00.json")
 	if err := os.WriteFile(path, []byte(
 		`{"Action":"pass","Package":"f0.test.ts","Elapsed":1}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -196,18 +203,47 @@ func TestAChangedComparabilityKeyDiscardsTheOldHistory(t *testing.T) {
 	}
 }
 
-// writeEventsForUnits writes one passing reporter event per named target, which
-// is what a MERGED multi-bucket artifact set looks like after the record job
-// downloads every bucket's events.
-func writeEventsForUnits(t *testing.T, dir string, units ...string) string {
+// writeEventsForUnits writes one bucket's reporter output per named target, in
+// bucket order — target i to bucket i — which is what the downloaded artifact set
+// looks like after the record job collects every bucket's events.
+//
+// One FILE PER BUCKET, because that is how the renderer writes them and how QC10
+// recovers which bucket produced which results.
+func writeEventsForUnits(t *testing.T, dir string, units ...string) []string {
 	t.Helper()
-	path := filepath.Join(dir, "ev-merged.ndjson")
-	var b strings.Builder
-	for _, u := range units {
-		fmt.Fprintf(&b, `{"Action":"pass","Package":%q,"Elapsed":1}`+"\n", u)
+	perBucket := make([][]string, len(units))
+	for i, u := range units {
+		perBucket[i] = []string{u}
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-		t.Fatal(err)
+	return writeBucketEvents(t, dir, perBucket...)
+}
+
+// writeBucketEvents writes one reporter output file per bucket, each holding that
+// bucket's own events, and returns the paths in bucket order.
+//
+// A nil entry writes no file at all, which is what a bucket that produced no
+// artifact looks like.
+func writeBucketEvents(t *testing.T, dir string, perBucket ...[]string) []string {
+	t.Helper()
+	var paths []string
+	for i, lines := range perBucket {
+		if lines == nil {
+			continue
+		}
+		path := filepath.Join(dir, fmt.Sprintf("bucket-%d-00.json", i))
+		var b strings.Builder
+		for _, l := range lines {
+			if strings.HasPrefix(strings.TrimSpace(l), "{") {
+				// A raw event line, for a fixture that needs a name slice.
+				b.WriteString(l + "\n")
+				continue
+			}
+			fmt.Fprintf(&b, `{"Action":"pass","Package":%q,"Elapsed":1}`+"\n", l)
+		}
+		if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, path)
 	}
-	return path
+	return paths
 }

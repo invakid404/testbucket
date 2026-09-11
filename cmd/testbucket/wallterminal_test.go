@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
 // TestAFailedActionReportsItsExitCodeAndReason is §13's "how it ended".
@@ -62,8 +64,16 @@ func TestAFailedActionReportsItsExitCodeAndReason(t *testing.T) {
 	// The planned invocation SUCCEEDS; the script around it then fails. This
 	// is the shape that made the loss visible: a green invocation inside a red
 	// script, so nothing but the script's own record carries the status.
+	// THE SELECTION IDENTITIES THE RENDERER PASSES, which the assembler needs to
+	// produce a consistent document: it takes the LISTS from the plan and the
+	// DIGESTS from the record, so a spec with no unit digest yields an invocation
+	// whose units contradict the digest naming them. The real renderer always
+	// writes both through its spec file.
 	inner := bin + " wall exec --dir " + records + " --level invocation" +
-		" --bucket-id bucket-0 --cwd " + dir + " -- sh -c true"
+		" --bucket-id bucket-0 --cwd " + dir +
+		" --selector ./f0.test.ts --unit-digest " +
+		string(walltime.DigestJSONOrEmpty([]string{"f0.test.ts"})) +
+		" -- sh -c true"
 	runExpectingFailure(7, "wall", "exec", "--dir", records, "--level", "script",
 		"--bucket-id", "bucket-0", "--cwd", dir, "--", "sh", "-c", inner+"; exit 7")
 	run("wall", "end", "--dir", records, "--terminal", "failed", "--reason", "the bucket script failed")

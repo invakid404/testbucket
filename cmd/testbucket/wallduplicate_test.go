@@ -50,11 +50,12 @@ func duplicateFixtureStore(t *testing.T, path string) {
 // ingestObservations runs the shipped ingest over one directory and returns its
 // stderr. A non-zero exit fails the test: QC11 rejects a ROW, it does not fail
 // the command.
-func ingestObservations(t *testing.T, bin, store, obsDir, plan, events string) string {
+func ingestObservations(t *testing.T, bin, store, obsDir, plan string, events ...string) string {
 	t.Helper()
-	cmd := exec.Command(bin, "ingest", "--store", store, "--no-golist",
+	args := append([]string{"ingest", "--store", store, "--no-golist",
 		"--wall-observations", obsDir, "--wall-shard-plan", plan,
-		"--runs-on-label", "ubuntu-latest", events)
+		"--runs-on-label", "ubuntu-latest"}, events...)
+	cmd := exec.Command(bin, args...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -77,7 +78,7 @@ func TestQC11SurvivesTheStoreBeingSavedAndReloaded(t *testing.T) {
 	store := filepath.Join(dir, "store.json")
 	duplicateFixtureStore(t, store)
 	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0, []string{"run", "f0.test.ts"}, ".")
-	events := writeEvents(t, dir)
+	events := []string{writeEvents(t, dir)}
 
 	first := filepath.Join(dir, "obs-1")
 	second := filepath.Join(dir, "obs-2")
@@ -94,10 +95,10 @@ func TestQC11SurvivesTheStoreBeingSavedAndReloaded(t *testing.T) {
 	writeFixture(t, filepath.Join(first, "b0.json"), a)
 	writeFixture(t, filepath.Join(second, "b0.json"), b)
 
-	if out := ingestObservations(t, bin, store, first, plan, events); !strings.Contains(out, "accept") {
+	if out := ingestObservations(t, bin, store, first, plan, events...); !strings.Contains(out, "accept") {
 		t.Fatalf("the first observation was not accepted:\n%s", out)
 	}
-	out := ingestObservations(t, bin, store, second, plan, events)
+	out := ingestObservations(t, bin, store, second, plan, events...)
 
 	if !strings.Contains(out, "QC11") {
 		t.Errorf("the duplicate execution key was not refused by QC11 after a reload:\n%s", out)
@@ -125,7 +126,7 @@ func TestQC11RejectsEveryRowOfADuplicatedKeyInOneBatch(t *testing.T) {
 	store := filepath.Join(dir, "store.json")
 	duplicateFixtureStore(t, store)
 	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0, []string{"run", "f0.test.ts"}, ".")
-	events := writeEvents(t, dir)
+	events := []string{writeEvents(t, dir)}
 
 	obsDir := filepath.Join(dir, "obs")
 	if err := os.MkdirAll(obsDir, 0o755); err != nil {
@@ -137,7 +138,7 @@ func TestQC11RejectsEveryRowOfADuplicatedKeyInOneBatch(t *testing.T) {
 	writeFixture(t, filepath.Join(obsDir, "a.json"), a)
 	writeFixture(t, filepath.Join(obsDir, "b.json"), b)
 
-	out := ingestObservations(t, bin, store, obsDir, plan, events)
+	out := ingestObservations(t, bin, store, obsDir, plan, events...)
 
 	if strings.Contains(out, "accept ") {
 		t.Errorf("a row of a duplicated execution key was accepted; the rule is all-reject:\n%s", out)
@@ -182,7 +183,7 @@ func TestQC11LeavesDistinctExecutionKeysAlone(t *testing.T) {
 		writeFixture(t, filepath.Join(obsDir, c.name+".json"), o)
 	}
 
-	out := ingestObservations(t, bin, store, obsDir, plan, events)
+	out := ingestObservations(t, bin, store, obsDir, plan, events...)
 	if rows := ringRows(t, store); len(rows) != 2 {
 		t.Fatalf("the ring holds %d rows; two distinct execution keys are two rows:\n%s", len(rows), out)
 	}

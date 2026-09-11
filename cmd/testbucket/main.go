@@ -532,7 +532,23 @@ func runIngest(args []string) error {
 		// QC10's verdicts are computed from the events THIS command read, over
 		// the plan it qualifies against. Without this, planContextOf asserted a
 		// pass for every bucket.
-		verdicts, err := coverageVerdicts(planDoc, sum)
+		//
+		// PER-BUCKET EVIDENCE COMES FROM THE INPUT PATHS, which the renderer names
+		// `bucket-<index>-<seq>.json`. A per-bucket verdict taken over the merged
+		// summary charges each bucket with every other bucket's results, which is
+		// wrong for any file whose slices live in different buckets.
+		perBucket, unattributed, err := perBucketSummaries(rnr, inputs)
+		if err != nil {
+			return err
+		}
+		if len(perBucket) == 0 && len(unattributed) > 0 {
+			fmt.Fprintf(os.Stderr,
+				"wall: none of the %d event input(s) names a bucket, so §7.1 QC10 has no per-bucket "+
+					"evidence and every non-empty bucket is refused. The reporter writes "+
+					"`bucket-<index>-<seq>.json` per invocation; pass those files rather than a merged stream\n",
+				len(unattributed))
+		}
+		verdicts, err := coverageVerdicts(planDoc, sum, perBucket)
 		if err != nil {
 			return err
 		}

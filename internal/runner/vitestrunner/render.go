@@ -329,3 +329,15 @@ func dedupe(sorted []string) []string {
 	}
 	return out
 }
+
+// EventsFilePathForTest exposes the reporter output path this renderer writes, so
+// a consumer of that NAME can be checked against the producer of it rather than
+// against a restatement.
+//
+// §7.1 QC10's per-bucket coverage verdict recovers which bucket produced which
+// results from these file names, and the two ends live in different packages. A
+// rename on either side would send every bucket to "no attributable evidence" —
+// fail-closed, but indistinguishable from a missing artifact.
+func EventsFilePathForTest(eventsDir string, bucket, seq int) string {
+	return eventsFileFor(renderConfig{eventsDir: eventsDir}, bucket, seq)
+}

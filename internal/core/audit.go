@@ -77,51 +77,6 @@ func PlannedCoverageForPlan(doc *PlanDocument) *PlannedCoverage {
 	return out
 }
 
-// SummaryForPackages projects a merged RunSummary onto one bucket's own targets.
-//
-// The record job downloads every bucket's event artifact and parses ONE combined
-// summary. Auditing an individual bucket against all of it reports the other
-// buckets' packages as unplanned for that bucket — correctly, by AuditCoverage's
-// own rule — so a perfectly valid two-bucket fan-in failed both buckets. The
-// per-bucket verdict QC10 reads has to be bound to the per-bucket evidence.
-//
-// It is not a tautology. Filtering by the bucket's planned targets keeps every
-// direction that matters per bucket: a planned target with NO events, a short
-// invocation count, and a name slice that did not run its names. What filtering
-// drops — an event for a target this bucket did not plan — is not a per-bucket
-// fact at all; the plan's coverage gate assigns each target to exactly one
-// bucket, so an event belonging to no bucket is a WHOLE-PLAN defect, and the
-// whole-plan audit is what catches it.
-func SummaryForPackages(sum *runner.RunSummary, pkgs map[string]int) *runner.RunSummary {
-	out := runner.NewRunSummary()
-	if sum == nil {
-		return out
-	}
-	out.Lines, out.Events = sum.Lines, sum.Events
-	out.Subtests, out.Implausible, out.Malformed = sum.Subtests, sum.Implausible, sum.Malformed
-	for pkg := range pkgs {
-		if v, ok := sum.PackageSeconds[pkg]; ok {
-			out.PackageSeconds[pkg] = v
-		}
-		if v, ok := sum.PackageRuns[pkg]; ok {
-			out.PackageRuns[pkg] = v
-		}
-		if v, ok := sum.TestSeconds[pkg]; ok {
-			out.TestSeconds[pkg] = v
-		}
-		if sum.Failed[pkg] {
-			out.Failed[pkg] = true
-		}
-		if sum.Unsliceable[pkg] {
-			out.Unsliceable[pkg] = true
-		}
-		if sum.NoTests[pkg] {
-			out.NoTests[pkg] = true
-		}
-	}
-	return out
-}
-
 // AuditCoverage compares the plan against what the events show actually ran.
 //
 // The coverage gate inside `plan` proves the MATRIX is complete before anything

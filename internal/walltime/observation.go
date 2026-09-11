@@ -191,6 +191,34 @@ func (o *Observation) Validate() error {
 	if len(o.Limitations) == 0 {
 		return fmt.Errorf("observation limitations is required and non-empty")
 	}
+	// EACH INVOCATION'S CARRIED LISTS AGREE WITH THE DIGESTS THAT NAME THEM.
+	//
+	// This is a rule about the document ITSELF — it needs no plan and no measured
+	// side — so it belongs here as well as in QC6. A row whose `units` are absent
+	// while its `unit_digest` names a set, or whose `selector` names another file,
+	// is internally inconsistent before anything compares it to anything: §18.0's
+	// audit surface reads those lists, and they described a selection the row's own
+	// digests contradict.
+	//
+	// The recomputation is DigestJSONOrEmpty's, the same function the wrapper and
+	// the plan side use, so the empty-list convention is one convention.
+	for i, inv := range o.Invocations {
+		for _, l := range []struct {
+			what   string
+			list   []string
+			digest Digest
+		}{
+			{"units", inv.Units, inv.UnitDigest},
+			{"selector", inv.Selector, inv.SelectorDigest},
+			{"atoms", inv.Atoms, inv.AtomDigest},
+		} {
+			if got := DigestJSONOrEmpty(l.list); got != l.digest {
+				return fmt.Errorf("invocation %d carries %s %v, which digests to %q, and its %s_digest is %q; "+
+					"the list and the digest that names it are one value",
+					i, l.what, l.list, got, l.what, l.digest)
+			}
+		}
+	}
 	prof, err := o.Profile.Parse()
 	if err != nil {
 		return err

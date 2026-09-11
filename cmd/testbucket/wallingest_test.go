@@ -48,7 +48,7 @@ func TestProductionObservationIngestCycle(t *testing.T) {
 	plan, planDigest := writePlanFor(t, dir, "bucket-0", 0, []string{"run", "f0.test.ts"}, ".")
 	writeFixture(t, filepath.Join(obsDir, "b0.json"), observationFixture("bucket-0", 0, "run-1", planDigest))
 
-	events := filepath.Join(dir, "ev.ndjson")
+	events := filepath.Join(dir, "bucket-0-00.json")
 	if err := os.WriteFile(events, []byte(
 		`{"Action":"run","Package":"f0.test.ts","Test":"T"}`+"\n"+
 			`{"Action":"pass","Package":"f0.test.ts","Test":"T","Elapsed":1}`+"\n"+
@@ -128,7 +128,7 @@ func TestAnUnqualifiedObservationNeverReachesTheRing(t *testing.T) {
 	bad.ScriptNs = 1_000_000_000
 	writeFixture(t, filepath.Join(obsDir, "b0.json"), bad)
 
-	events := filepath.Join(dir, "ev.ndjson")
+	events := filepath.Join(dir, "bucket-0-00.json")
 	if err := os.WriteFile(events, []byte(
 		`{"Action":"pass","Package":"f0.test.ts","Elapsed":1}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -472,7 +472,7 @@ func TestAssembledObservationSurvivesIngest(t *testing.T) {
 			"observations":             []any{},
 		},
 	})
-	events := filepath.Join(dir, "ev.ndjson")
+	events := filepath.Join(dir, "bucket-0-00.json")
 	if err := os.WriteFile(events, []byte(
 		`{"Action":"pass","Package":"f0.test.ts","Elapsed":1}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -679,7 +679,7 @@ func TestQC17RejectsARunnerThatDriftedFromThePlan(t *testing.T) {
 			"observations":             []any{},
 		},
 	})
-	events := filepath.Join(dir, "ev.ndjson")
+	events := filepath.Join(dir, "bucket-0-00.json")
 	if err := os.WriteFile(events, []byte(
 		`{"Action":"pass","Package":"f0.test.ts","Elapsed":1}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)

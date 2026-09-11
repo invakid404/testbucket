@@ -179,6 +179,41 @@ func QualifyObservation(o Observation, plan PlanContext, ring RingFacts) error {
 					i, d.what, emptyDigestName(d.observed), emptyDigestName(d.wanted))
 			}
 		}
+
+		// AND THE CARRIED LISTS ARE THE VALUES THOSE DIGESTS NAME.
+		//
+		// The three digests above are now compared against the plan, which proves
+		// what the invocation SELECTED. The row also carries the lists themselves
+		// — `units`, `selector`, `atoms` — and nothing proved they are the lists
+		// the digests stand for. An imported document could set `units: null`,
+		// `selector: ["wrong.test.ts"]` or `atoms: ["wrong-atom"]` with every
+		// digest intact and be admitted: the audit surface §18.0 names would then
+		// attribute the interval to a selection the row itself contradicts.
+		//
+		// Copying the lists from the plan in the assembler is not a check. It
+		// makes the shipped path consistent and says nothing about bytes that
+		// arrive from anywhere else, which is the whole reason ingest has a
+		// qualifier rather than a trust boundary.
+		//
+		// The digest is recomputed with DigestJSONOrEmpty — the SAME function both
+		// the wrapper and the plan side use, including its empty-list convention —
+		// so a legitimately empty list and its empty digest agree, and a nil list
+		// under a non-empty digest does not.
+		for _, l := range []struct {
+			what   string
+			list   []string
+			digest Digest
+		}{
+			{"units", inv.Units, inv.UnitDigest},
+			{"selector", inv.Selector, inv.SelectorDigest},
+			{"atoms", inv.Atoms, inv.AtomDigest},
+		} {
+			if got := DigestJSONOrEmpty(l.list); got != l.digest {
+				return fmt.Errorf("QC6: invocation %d carries %s %v, which digests to %s, and its %s_digest is %s; "+
+					"the list and the digest that names it must be one value",
+					i, l.what, l.list, emptyDigestName(got), l.what, emptyDigestName(l.digest))
+			}
+		}
 	}
 
 	// QC7 — §3.1's interval invariants; no endpoint copied between records.

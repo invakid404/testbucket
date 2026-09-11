@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,17 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 		t.Fatal(err)
 	}
 	rp := planRuntimeProfile()
+	// THE FIXTURE'S SELECTION IS ONE SET OF VALUES, digested once and used on both
+	// sides. The placeholder digests it carried ("sha256:units0" and friends) named
+	// nothing: the row's lists and the digests that claim to describe them were
+	// unrelated strings, which is a shape no run produces — and it is exactly what
+	// QC6 now refuses.
+	invUnits := []string{"a.spec.ts", "b.spec.ts"}
+	invSelector := []string{"./a.spec.ts", "./b.spec.ts"}
+	invAtoms := []string{"suffix:spec.ts"}
+	unitDigest := DigestJSONOrEmpty(invUnits)
+	selectorDigest := DigestJSONOrEmpty(invSelector)
+	atomDigest := DigestJSONOrEmpty(invAtoms)
 	plan := PlanContext{
 		PlanDigest: "sha256:plan",
 		Buckets: map[string]PlanBucketRef{
@@ -30,9 +42,9 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 				// The per-invocation SELECTION identities QC6 compares. Without
 				// them the check could see only the count, the sequence and the
 				// argv digest — and "membership" is what it is named for.
-				SelectorDigests: []Digest{"sha256:sel0"},
-				UnitDigests:     []Digest{"sha256:units0"},
-				AtomDigests:     []Digest{"sha256:atoms0"},
+				SelectorDigests: []Digest{selectorDigest},
+				UnitDigests:     []Digest{unitDigest},
+				AtomDigests:     []Digest{atomDigest},
 				// What the PLAN decided. QC18 compares the row's echo against
 				// these; without them the fixture's observation agreed only
 				// with itself.
@@ -62,9 +74,11 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 		ObservedRunsOnLabel: "ubuntu-24.04",
 		UnitIDs:             []string{"a.spec.ts", "b.spec.ts"},
 		Invocations: []Invocation{{
-			Seq: 0, Units: []string{"a.spec.ts", "b.spec.ts"},
+			Seq: 0, Units: invUnits, Selector: invSelector, Atoms: invAtoms,
 			ArgvDigest: "sha256:argv0", CwdDigest: "sha256:cwd0",
-			SelectorDigest: "sha256:sel0", UnitDigest: "sha256:units0", AtomDigest: "sha256:atoms0",
+			// EACH DIGEST IS THE DIGEST OF THE LIST BESIDE IT, through the one
+			// function both the wrapper and the plan side use.
+			SelectorDigest: selectorDigest, UnitDigest: unitDigest, AtomDigest: atomDigest,
 			ProcessGroupID: "4243",
 			StartedMonoNs:  1_000, EndedMonoNs: 9_000_001_000, ElapsedNs: 9_000_000_000,
 			ExitCode: 0,
@@ -137,6 +151,28 @@ func TestQualificationChecks(t *testing.T) {
 		}},
 		{check: "QC6", sub: "QC6 an atom set that is not the plan's", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			o.Invocations[0].AtomDigest = "sha256:other-atoms"
+		}},
+		// THE CARRIED LISTS, tested INDEPENDENTLY of the digests. Each of these
+		// changes exactly one list and leaves every digest — the row's and the
+		// plan's — intact, which is the shape the digest comparison alone admits:
+		// an internally inconsistent audit record whose membership contradicts the
+		// identity it claims.
+		{check: "QC6", sub: "QC6 an absent units list under an intact digest", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].Units = nil
+		}},
+		{check: "QC6", sub: "QC6 a wrong selector list under an intact digest", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].Selector = []string{"wrong.test.ts"}
+		}},
+		{check: "QC6", sub: "QC6 a wrong atoms list under an intact digest", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].Atoms = []string{"wrong-atom"}
+		}},
+		{check: "QC6", sub: "QC6 an absent atoms list under a non-empty digest", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].Atoms = nil
+		}},
+		{check: "QC6", sub: "QC6 a reordered units list under an intact digest", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			// Order is part of the identity: the digest is over the list as
+			// rendered, not over its set.
+			o.Invocations[0].Units = []string{"b.spec.ts", "a.spec.ts"}
 		}},
 		{check: "QC6", sub: "QC6 a plan context carrying no membership identities", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			ref := p.Buckets["bucket-0"]
@@ -441,9 +477,9 @@ func TestDuplicateObservationRejectsAllRows(t *testing.T) {
 	plan.Buckets["bucket-1"] = PlanBucketRef{
 		Index: 1, UnitIDs: obs.UnitIDs,
 		ArgvDigests: []Digest{"sha256:argv0"}, CwdDigests: []Digest{"sha256:cwd0"},
-		SelectorDigests: []Digest{"sha256:sel0"},
-		UnitDigests:     []Digest{"sha256:units0"},
-		AtomDigests:     []Digest{"sha256:atoms0"},
+		SelectorDigests: []Digest{obs.Invocations[0].SelectorDigest},
+		UnitDigests:     []Digest{obs.Invocations[0].UnitDigest},
+		AtomDigests:     []Digest{obs.Invocations[0].AtomDigest},
 	}
 	plan.CoverageAuditPasses["bucket-1"] = true
 	if got := RejectDuplicateKeys([]Observation{a, c}); len(got) != 0 {
@@ -678,4 +714,157 @@ func profileBlockWithScoredForm(t *testing.T, in ProfileBlock, scoredJSON string
 		t.Fatal(err)
 	}
 	return out
+}
+
+// TestQC6BindsTheCarriedListsToTheirDigests is F09's residual control.
+//
+// The digest comparison proves what the invocation SELECTED. The row also carries
+// the lists — `units`, `selector`, `atoms` — which §18.0's audit surface reads,
+// and nothing proved they are the values the digests name. An imported document
+// could set `units: null`, `selector: ["wrong.test.ts"]` or `atoms:
+// ["wrong-atom"]` with every digest intact, survive `Observation.Validate` and
+// the whole qualifier, and have its interval attributed to a selection the row
+// itself contradicts.
+//
+// Copying the lists from the plan in the assembler is not a check: it makes the
+// shipped path consistent and says nothing about bytes from anywhere else, which
+// is why ingest has a qualifier rather than a trust boundary.
+//
+// The changed lists are tested INDEPENDENTLY of the digests, and the empty-list
+// convention is the digest function's own.
+func TestQC6BindsTheCarriedListsToTheirDigests(t *testing.T) {
+	t.Run("POSITIVE: a wholly consistent row passes, through a JSON round trip", func(t *testing.T) {
+		plan, obs := qcFixture(t)
+		// Serialize and read back, so the control is over the WIRE bytes an
+		// imported document would arrive as.
+		b, err := json.Marshal(obs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var back Observation
+		if err := json.Unmarshal(b, &back); err != nil {
+			t.Fatal(err)
+		}
+		if err := back.Validate(); err != nil {
+			t.Fatalf("the round-tripped fixture does not satisfy its own structural rules: %v", err)
+		}
+		if err := QualifyObservation(back, plan, emptyRing()); err != nil {
+			t.Fatalf("a consistent row was rejected after a round trip: %v", err)
+		}
+	})
+
+	// ONE LIST CHANGED, EVERY DIGEST INTACT — the probe's exact three shapes,
+	// plus the two the same defect also admits.
+	for _, c := range []struct {
+		name   string
+		mutate func(*Invocation)
+	}{
+		{"units = null", func(inv *Invocation) { inv.Units = nil }},
+		{`selector = ["wrong.test.ts"]`, func(inv *Invocation) { inv.Selector = []string{"wrong.test.ts"} }},
+		{`atoms = ["wrong-atom"]`, func(inv *Invocation) { inv.Atoms = []string{"wrong-atom"} }},
+		{"atoms = null under a non-empty digest", func(inv *Invocation) { inv.Atoms = nil }},
+		{"units reordered", func(inv *Invocation) {
+			inv.Units = []string{inv.Units[1], inv.Units[0]}
+		}},
+		{"an extra selector token", func(inv *Invocation) {
+			inv.Selector = append(append([]string(nil), inv.Selector...), "./extra.spec.ts")
+		}},
+	} {
+		t.Run("NEGATIVE: "+c.name, func(t *testing.T) {
+			plan, obs := qcFixture(t)
+			before := obs.Invocations[0]
+			c.mutate(&obs.Invocations[0])
+
+			// Every digest is untouched: the row's three and the plan's three.
+			inv := obs.Invocations[0]
+			if inv.UnitDigest != before.UnitDigest ||
+				inv.SelectorDigest != before.SelectorDigest ||
+				inv.AtomDigest != before.AtomDigest {
+				t.Fatalf("the case changed a digest; this control is about the LISTS")
+			}
+
+			b, err := json.Marshal(obs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var back Observation
+			if err := json.Unmarshal(b, &back); err != nil {
+				t.Fatal(err)
+			}
+			err = QualifyObservation(back, plan, emptyRing())
+			if err == nil {
+				t.Fatalf("a row whose %s contradicts its own digest was admitted", c.name)
+			}
+			if !strings.HasPrefix(err.Error(), "QC6:") {
+				t.Fatalf("expected QC6 to fire, got: %v", err)
+			}
+		})
+	}
+
+	t.Run("a legitimately empty list agrees with its empty digest", func(t *testing.T) {
+		// The convention is DigestJSONOrEmpty's: an empty or nil list digests to
+		// the empty digest. A plan with no atoms for an invocation and a row that
+		// carries none must agree — the rule binds the two, it does not demand a
+		// non-empty list.
+		plan, obs := qcFixture(t)
+		ref := plan.Buckets["bucket-0"]
+		ref.AtomDigests = []Digest{""}
+		plan.Buckets["bucket-0"] = ref
+		obs.Invocations[0].Atoms = nil
+		obs.Invocations[0].AtomDigest = ""
+		if err := QualifyObservation(obs, plan, emptyRing()); err != nil {
+			t.Fatalf("an invocation with no atoms and no atom digest was rejected: %v", err)
+		}
+
+		t.Run("and an empty slice agrees with it too", func(t *testing.T) {
+			plan, obs := qcFixture(t)
+			ref := plan.Buckets["bucket-0"]
+			ref.AtomDigests = []Digest{""}
+			plan.Buckets["bucket-0"] = ref
+			obs.Invocations[0].Atoms = []string{}
+			obs.Invocations[0].AtomDigest = ""
+			if err := QualifyObservation(obs, plan, emptyRing()); err != nil {
+				t.Fatalf("an empty atoms slice was rejected: %v", err)
+			}
+		})
+	})
+
+	t.Run("Observation.Validate refuses the same inconsistency on its own", func(t *testing.T) {
+		// The self-consistency half needs no plan and no measured side, so it is a
+		// rule about the DOCUMENT and belongs to Validate as well. The probe found
+		// both layers accepting; both refuse now.
+		for _, c := range []struct {
+			name   string
+			mutate func(*Invocation)
+		}{
+			{"units = null", func(inv *Invocation) { inv.Units = nil }},
+			{`selector = ["wrong.test.ts"]`, func(inv *Invocation) { inv.Selector = []string{"wrong.test.ts"} }},
+			{`atoms = ["wrong-atom"]`, func(inv *Invocation) { inv.Atoms = []string{"wrong-atom"} }},
+		} {
+			_, obs := qcFixture(t)
+			c.mutate(&obs.Invocations[0])
+			b, err := json.Marshal(obs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var back Observation
+			if err := json.Unmarshal(b, &back); err != nil {
+				t.Fatal(err)
+			}
+			if err := back.Validate(); err == nil {
+				t.Errorf("Validate accepted a document whose %s contradicts its own digest", c.name)
+			}
+		}
+	})
+
+	t.Run("a changed DIGEST is still a digest failure", func(t *testing.T) {
+		// The two halves stay separable: mutating the digest while leaving the
+		// list alone must still fail against the PLAN, not merely against itself.
+		plan, obs := qcFixture(t)
+		obs.Invocations[0].UnitDigest = Digest("sha256:" + strings.Repeat("e", 64))
+		err := QualifyObservation(obs, plan, emptyRing())
+		if err == nil || !strings.HasPrefix(err.Error(), "QC6:") {
+			t.Fatalf("a mutated unit digest was admitted: %v", err)
+		}
+	})
 }
