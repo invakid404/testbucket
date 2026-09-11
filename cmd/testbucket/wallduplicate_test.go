@@ -162,16 +162,24 @@ func TestQC11LeavesDistinctExecutionKeysAlone(t *testing.T) {
 	store := filepath.Join(dir, "store.json")
 	duplicateFixtureStore(t, store)
 	plan, planDigest := writePlanTwoBuckets(t, dir)
-	events := writeEvents(t, dir)
+	// EACH BUCKET'S OWN TARGET, and events for both — which is what a real
+	// two-bucket fan-in is. The plan's coverage gate puts every target in exactly
+	// one bucket, so the old fixture's two buckets holding the SAME unit was a
+	// plan no planner emits, and auditing the whole plan against the merged
+	// evidence now says so.
+	events := writeEventsForUnits(t, dir, "f0.test.ts", "g0.test.ts")
 
 	obsDir := filepath.Join(dir, "obs")
 	if err := os.MkdirAll(obsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for i, name := range []string{"bucket-0", "bucket-1"} {
-		o := observationFixture(name, i, "run-1", planDigest)
-		o.JobID = "job-" + name
-		writeFixture(t, filepath.Join(obsDir, name+".json"), o)
+	for i, c := range []struct{ name, unit string }{
+		{"bucket-0", "f0.test.ts"},
+		{"bucket-1", "g0.test.ts"},
+	} {
+		o := observationFixtureForUnit(c.name, i, "run-1", planDigest, c.unit)
+		o.JobID = "job-" + c.name
+		writeFixture(t, filepath.Join(obsDir, c.name+".json"), o)
 	}
 
 	out := ingestObservations(t, bin, store, obsDir, plan, events)
@@ -180,8 +188,9 @@ func TestQC11LeavesDistinctExecutionKeysAlone(t *testing.T) {
 	}
 }
 
-// writePlanTwoBuckets renders a plan whose two buckets run the same command,
-// so two observations of one run differ only in the bucket they name.
+// writePlanTwoBuckets renders a LEGAL two-bucket plan: each bucket holds its own
+// target, as the coverage gate guarantees, so two observations of one run differ
+// in the bucket they name and in the unit that bucket ran.
 func writePlanTwoBuckets(t *testing.T, dir string) (string, walltime.Digest) {
 	t.Helper()
 	path := filepath.Join(dir, "shard-plan-2.json")
@@ -190,17 +199,17 @@ func writePlanTwoBuckets(t *testing.T, dir string) (string, walltime.Digest) {
 	if err := json.Unmarshal(rp.OrderedJSON(), &rpMap); err != nil {
 		t.Fatal(err)
 	}
-	bucket := func(index int, name string) map[string]any {
+	bucket := func(index int, name, unit string) map[string]any {
 		return map[string]any{
 			"bucket": index, "name": name, "est_seconds": 10.0, "needs_node": true,
-			"units": []map[string]any{{"id": "f0.test.ts", "kind": "package",
-				"packages": []string{"f0.test.ts"}, "est_seconds": 10.0}},
+			"units": []map[string]any{{"id": unit, "kind": "package",
+				"packages": []string{unit}, "est_seconds": 10.0}},
 			"invocations": []map[string]any{{
-				"dir": ".", "args": []string{"run", "f0.test.ts"},
-				"desc": "f0.test.ts", "units": []string{"f0.test.ts"},
-				"selector": []string{"./f0.test.ts"},
+				"dir": ".", "args": []string{"run", unit},
+				"desc": unit, "units": []string{unit},
+				"selector": []string{"./" + unit},
 			}},
-			"script": "vitest run f0.test.ts\n",
+			"script": "vitest run " + unit + "\n",
 		}
 	}
 	doc := map[string]any{
@@ -212,7 +221,10 @@ func writePlanTwoBuckets(t *testing.T, dir string) (string, walltime.Digest) {
 		"profile":                         json.RawMessage(sharedProfileBlock(t).Raw()),
 		"runtime_profile_declared":        rpMap,
 		"runtime_profile_declared_digest": string(walltime.RuntimeProfileDigest(rp)),
-		"buckets":                         []map[string]any{bucket(0, "bucket-0"), bucket(1, "bucket-1")},
+		"buckets": []map[string]any{
+			bucket(0, "bucket-0", "f0.test.ts"),
+			bucket(1, "bucket-1", "g0.test.ts"),
+		},
 	}
 	if err := writeJSONFile(path, doc); err != nil {
 		t.Fatal(err)

@@ -32,30 +32,94 @@ func LoadPlannedCoverage(path string) (*PlannedCoverage, error) {
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse shard plan %s: %w", path, err)
 	}
-	out := &PlannedCoverage{Invocations: map[string]int{}, Runnables: map[string][]string{}}
-	for _, b := range doc.Buckets {
-		for _, u := range b.Units {
-			out.Units++
-			for _, p := range u.Packages {
-				out.Invocations[p]++
-			}
-			if u.Kind == runner.KindRunSlice && len(u.Packages) == 1 {
-				// Prefer the structural Run field: a runnable name can contain the
-				// '|' the ID joins on (a Vitest title), so parsing it out of the ID
-				// would split one name into two. The ID parse stays as a fallback
-				// for a plan artifact written before the field existed — its names
-				// are Go identifiers, where '|' cannot occur.
-				names := u.Run
-				if len(names) == 0 {
-					if open := strings.Index(u.ID, "["); open >= 0 && strings.HasSuffix(u.ID, "]") {
-						names = strings.Split(u.ID[open+1:len(u.ID)-1], "|")
-					}
+	return PlannedCoverageForPlan(&doc), nil
+}
+
+// mergePlannedUnits folds one bucket's units into an expected-coverage map. It is
+// shared so the whole-plan and per-bucket derivations cannot drift apart.
+func mergePlannedUnits(out *PlannedCoverage, units []PlanUnit) {
+	for _, u := range units {
+		out.Units++
+		for _, p := range u.Packages {
+			out.Invocations[p]++
+		}
+		if u.Kind == runner.KindRunSlice && len(u.Packages) == 1 {
+			// Prefer the structural Run field: a runnable name can contain the
+			// '|' the ID joins on (a Vitest title), so parsing it out of the ID
+			// would split one name into two. The ID parse stays as a fallback
+			// for a plan artifact written before the field existed — its names
+			// are Go identifiers, where '|' cannot occur.
+			names := u.Run
+			if len(names) == 0 {
+				if open := strings.Index(u.ID, "["); open >= 0 && strings.HasSuffix(u.ID, "]") {
+					names = strings.Split(u.ID[open+1:len(u.ID)-1], "|")
 				}
-				out.Runnables[u.Packages[0]] = append(out.Runnables[u.Packages[0]], names...)
 			}
+			out.Runnables[u.Packages[0]] = append(out.Runnables[u.Packages[0]], names...)
 		}
 	}
-	return out, nil
+}
+
+// PlannedCoverageForPlan derives the WHOLE plan's expected coverage from an
+// already-parsed document.
+//
+// It is LoadPlannedCoverage's derivation without the file read, so the ingest
+// boundary can audit the complete merged evidence against the complete plan using
+// the same code path the verifier uses — one derivation, two callers.
+func PlannedCoverageForPlan(doc *PlanDocument) *PlannedCoverage {
+	out := &PlannedCoverage{Invocations: map[string]int{}, Runnables: map[string][]string{}}
+	if doc == nil {
+		return out
+	}
+	for _, b := range doc.Buckets {
+		mergePlannedUnits(out, b.Units)
+	}
+	return out
+}
+
+// SummaryForPackages projects a merged RunSummary onto one bucket's own targets.
+//
+// The record job downloads every bucket's event artifact and parses ONE combined
+// summary. Auditing an individual bucket against all of it reports the other
+// buckets' packages as unplanned for that bucket — correctly, by AuditCoverage's
+// own rule — so a perfectly valid two-bucket fan-in failed both buckets. The
+// per-bucket verdict QC10 reads has to be bound to the per-bucket evidence.
+//
+// It is not a tautology. Filtering by the bucket's planned targets keeps every
+// direction that matters per bucket: a planned target with NO events, a short
+// invocation count, and a name slice that did not run its names. What filtering
+// drops — an event for a target this bucket did not plan — is not a per-bucket
+// fact at all; the plan's coverage gate assigns each target to exactly one
+// bucket, so an event belonging to no bucket is a WHOLE-PLAN defect, and the
+// whole-plan audit is what catches it.
+func SummaryForPackages(sum *runner.RunSummary, pkgs map[string]int) *runner.RunSummary {
+	out := runner.NewRunSummary()
+	if sum == nil {
+		return out
+	}
+	out.Lines, out.Events = sum.Lines, sum.Events
+	out.Subtests, out.Implausible, out.Malformed = sum.Subtests, sum.Implausible, sum.Malformed
+	for pkg := range pkgs {
+		if v, ok := sum.PackageSeconds[pkg]; ok {
+			out.PackageSeconds[pkg] = v
+		}
+		if v, ok := sum.PackageRuns[pkg]; ok {
+			out.PackageRuns[pkg] = v
+		}
+		if v, ok := sum.TestSeconds[pkg]; ok {
+			out.TestSeconds[pkg] = v
+		}
+		if sum.Failed[pkg] {
+			out.Failed[pkg] = true
+		}
+		if sum.Unsliceable[pkg] {
+			out.Unsliceable[pkg] = true
+		}
+		if sum.NoTests[pkg] {
+			out.NoTests[pkg] = true
+		}
+	}
+	return out
 }
 
 // AuditCoverage compares the plan against what the events show actually ran.

@@ -519,6 +519,19 @@ func qc15Observation(o Observation, prof CanonicalProfile) error {
 		return fmt.Errorf("QC15: all three provenance identities carry %q and the plan declares no same-repository workload; "+
 			"a row that collapses them is rejected rather than silently overloaded",
 			o.HeadSHA)
+	case !prof.ScoredIsExplicit():
+		// EXPLICITLY UNSCORED, which is what the carve-out is for.
+		//
+		// Go decodes an absent `scored` and a `scored: null` into the same `false`
+		// a present `false` produces, so a block that simply does not say would
+		// have collected an exception reserved for a declared shape — and QC13's
+		// byte-identity cannot close that, because it only makes the plan and the
+		// row agree, and two blocks agree trivially on a field neither contains.
+		// "Not scored" and "does not say" are different facts.
+		return fmt.Errorf("QC15: all three provenance identities carry %q under a same-repository declaration, "+
+			"but profile.scored is absent or null rather than an explicit JSON false; the carve-out is for an "+
+			"explicitly unscored row and a block that does not say is not one",
+			o.HeadSHA)
 	}
 	return nil
 }

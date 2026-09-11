@@ -56,7 +56,26 @@ type CanonicalProfile struct {
 	// AdmitScoredProfile — and an external-consumer run has no reason to, which
 	// is what keeps the carve-out narrow.
 	SameRepositoryWorkload bool `json:"same_repository_workload"`
+
+	// scoredExplicit records that the wire carried `scored` as a JSON boolean —
+	// not absent, not null. It is set by Parse and never serialized: it is a fact
+	// about the BYTES, and a block constructed in Go always has the key because
+	// `scored` carries no omitempty.
+	//
+	// ScoredIsExplicit is the only reader, and §13.0's QC15 carve-out is the only
+	// rule that needs it.
+	scoredExplicit bool
 }
+
+// ScoredIsExplicit reports whether the parsed block stated `scored` as a JSON
+// boolean, rather than omitting it or setting it to null.
+//
+// It exists because the carve-out of §13.0 is for an EXPLICITLY unscored row.
+// Absent and null both decode to Go's `false`, so "this run is not scored" and
+// "this block does not say" were the same value — and the second is not a
+// declaration. A block NewProfileBlock produced always satisfies this; one that
+// does not came from somewhere else.
+func (p CanonicalProfile) ScoredIsExplicit() bool { return p.scoredExplicit }
 
 // runtimeProfileFieldOrder is the canonical order contract §15.3a's table
 // gives, and the digest is defined over exactly this sequence.
@@ -209,6 +228,16 @@ func (b ProfileBlock) Raw() json.RawMessage { return b.raw }
 // Parse decodes the block. It rejects unknown keys: the block's membership is
 // the field registry's `profile` projection, so a key outside it is drift and
 // not something to tolerate.
+//
+// IT ALSO RECORDS WHETHER `scored` WAS AN EXPLICIT JSON BOOLEAN.
+//
+// Go decodes an absent key and a `null` value into the same `false` a present
+// `false` produces, and §13.0's QC15 carve-out is available only to a row that is
+// EXPLICITLY unscored. Without the distinction, a block that simply omits
+// `scored` — or sets it to null — reads as "not scored" and collects an exception
+// meant for a declared, deliberate shape. QC13's byte-identity cannot help: it
+// makes the plan and the row agree, and two blocks can agree on a field neither
+// of them contains.
 func (b ProfileBlock) Parse() (CanonicalProfile, error) {
 	var p CanonicalProfile
 	dec := json.NewDecoder(bytes.NewReader(b.raw))
@@ -216,6 +245,12 @@ func (b ProfileBlock) Parse() (CanonicalProfile, error) {
 	if err := dec.Decode(&p); err != nil {
 		return CanonicalProfile{}, fmt.Errorf("parse canonical profile: %w", err)
 	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(b.raw, &probe); err != nil {
+		return CanonicalProfile{}, fmt.Errorf("parse canonical profile presence: %w", err)
+	}
+	raw, ok := probe["scored"]
+	p.scoredExplicit = ok && (string(bytes.TrimSpace(raw)) == "true" || string(bytes.TrimSpace(raw)) == "false")
 	return p, nil
 }
 

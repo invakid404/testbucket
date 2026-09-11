@@ -370,6 +370,7 @@ func TestCalibrationEvidenceMatchesItsRegistryEntries(t *testing.T) {
 	// EVERY field populated, because the comparison is over what the document
 	// CAN serialize and most fields are omitempty. A half-filled value would
 	// make an absent field look unregistered.
+	rank := DesignColumns
 	ev := CalibrationEvidence{
 		Schema:                 CalibrationEvidenceSchema,
 		Outcome:                CalibrationSufficient,
@@ -377,7 +378,7 @@ func TestCalibrationEvidenceMatchesItsRegistryEntries(t *testing.T) {
 		ProposedPlanDigests:    []Digest{"sha256:plan"},
 		LayoutsTried:           1,
 		LayoutBudget:           DefaultCalibrationMaxPlans,
-		Rank:                   DesignColumns,
+		Rank:                   &rank,
 		SigmaMax:               "1",
 		Tolerance:              "2",
 		MinPivot:               "3",

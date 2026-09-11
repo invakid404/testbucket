@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -193,4 +194,20 @@ func TestAChangedComparabilityKeyDiscardsTheOldHistory(t *testing.T) {
 	if _, ok := reporter.Units["f0.test.ts"]; !ok {
 		t.Error("the key change cleared reporter rows; §15.3's rules are independent")
 	}
+}
+
+// writeEventsForUnits writes one passing reporter event per named target, which
+// is what a MERGED multi-bucket artifact set looks like after the record job
+// downloads every bucket's events.
+func writeEventsForUnits(t *testing.T, dir string, units ...string) string {
+	t.Helper()
+	path := filepath.Join(dir, "ev-merged.ndjson")
+	var b strings.Builder
+	for _, u := range units {
+		fmt.Fprintf(&b, `{"Action":"pass","Package":%q,"Elapsed":1}`+"\n", u)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

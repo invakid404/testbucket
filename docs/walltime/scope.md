@@ -451,8 +451,11 @@ wire_paths:
   - {path: "calib.proposed_plan_digests",   artifact: calibration_evidence, type: array_of_string, cardinality: one}
   - {path: "calib.layouts_tried",           artifact: calibration_evidence, type: integer, cardinality: one}
   - {path: "calib.layout_budget",           artifact: calibration_evidence, type: integer, cardinality: one}
-  - {path: "calib.rank",                    artifact: calibration_evidence, type: integer, cardinality: one}
-  - {path: "calib.sigma_max",               artifact: calibration_evidence, type: string, cardinality: one}
+  # the six rank diagnostics are present iff a design matrix was formed — acceptance-contract.md 17.3a
+  - {path: "calib.rank",                    artifact: calibration_evidence, type: integer, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
+  - {path: "calib.sigma_max",               artifact: calibration_evidence, type: string, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
 
   # ---- store — acceptance-contract.md 15.1 ----
   # presence by status — acceptance-contract.md 15.1c.
@@ -479,11 +482,15 @@ wire_paths:
   - {path: "wall.rank_support",             artifact: store, type: array_of_string, cardinality: optional}
   - {path: "wall.observations",             artifact: store, type: array_of_object, cardinality: one, opaque: true,
      provenance: {tags: [R22-F2], see: ["acceptance-contract.md 15.1a"]}}
-  - {path: "calib.tolerance",               artifact: calibration_evidence, type: string, cardinality: one}
-  - {path: "calib.min_pivot",               artifact: calibration_evidence, type: string, cardinality: one}
+  - {path: "calib.tolerance",               artifact: calibration_evidence, type: string, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
+  - {path: "calib.min_pivot",               artifact: calibration_evidence, type: string, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
   - {path: "calib.deficient_columns",       artifact: calibration_evidence, type: array_of_integer, cardinality: one}
-  - {path: "calib.indicator_values_present", artifact: calibration_evidence, type: array_of_integer, cardinality: one}
-  - {path: "calib.distinct_slice_counts",   artifact: calibration_evidence, type: array_of_integer, cardinality: one}
+  - {path: "calib.indicator_values_present", artifact: calibration_evidence, type: array_of_integer, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
+  - {path: "calib.distinct_slice_counts",   artifact: calibration_evidence, type: array_of_integer, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
   - {path: "calib.generated_at",            artifact: calibration_evidence, type: string, cardinality: one}
   # also serialized — acceptance-contract.md 6.7, acceptance-contract.md 17.3a
   - {path: "calib.generator_exhausted",     artifact: calibration_evidence, type: boolean, cardinality: optional,

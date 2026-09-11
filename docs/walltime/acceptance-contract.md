@@ -2718,6 +2718,19 @@ answers, and under both, explicit wall mode stays a hard error (§0.8 outcome (c
 }
 ```
 
+**Which leaves are always there, and which follow the outcome (R31-F04).** Every leaf above is
+required on every outcome — `proposed_plan_digests` and `deficient_columns` as **arrays, empty when
+the proposer proposed nothing and when no column was deficient**, which is exactly what the example
+shows — **except** the six rank diagnostics `rank`, `sigma_max`, `tolerance`, `min_pivot`,
+`indicator_values_present` and `distinct_slice_counts`. Those are present **iff the proposer formed a
+design matrix**, and a `structurally_infeasible` proof forms none: it rules out every partition from
+the universe's own shape, so there is no matrix to have a rank. A structural document reports the
+proven-constant column in whichever of the two column summaries the proof establishes, and states no
+rank at all.
+
+Absence there is deliberate and is not a defaulted zero. A bounded miss **does** have a decisive
+matrix — that is why it missed — and so reports all six.
+
 **What subsequent explicit wall mode does with it.** The document is **evidence, not authority**: a
 later `--est-basis wall` plan still re-runs the §6.6 rank check against the **actual** ring
 contents, and still requires `MIN_ROWS` and `MIN_RUNS`. The evidence records that a sufficient

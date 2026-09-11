@@ -58,14 +58,23 @@ type CalibrationEvidence struct {
 	// ComparabilityKeyDigest is which wall population this proposal was made
 	// for. Without it a persisted document cannot be matched to the history a
 	// later plan is allowed to join (§15.3).
-	ComparabilityKeyDigest string `json:"comparability_key_digest,omitempty"`
+	ComparabilityKeyDigest string `json:"comparability_key_digest"`
 	// ProposedPlanDigests identifies the layouts this document proposes, one
 	// digest per proposed plan, so W-2's non-scored executions can be bound to
 	// the proposal that asked for them rather than to its outcome word.
-	ProposedPlanDigests []Digest `json:"proposed_plan_digests,omitempty"`
+	// It is ALWAYS SERIALIZED, empty when the proposer accepted no layout. The
+	// registry gives it cardinality one, and `omitempty` made a bounded miss emit
+	// no key at all — so a reader could not tell "this proposal proposes nothing"
+	// from "this producer does not write the field".
+	ProposedPlanDigests []Digest `json:"proposed_plan_digests"`
 	LayoutsTried        int      `json:"layouts_tried"`
 	LayoutBudget        int      `json:"layout_budget"`
-	Rank                int      `json:"rank,omitempty"`
+	// Rank is a POINTER because absence is a real outcome: a structural proof
+	// evaluates no design matrix, so there is no rank to report and `0` would be a
+	// number nobody computed. `omitempty` on an int could not express that — it
+	// also swallowed a legitimately computed rank of 0 — and it omitted the rank of
+	// the decisive matrix on a bounded miss, which §6.6 does produce.
+	Rank *int `json:"rank,omitempty"`
 	// SigmaMax, Tolerance and MinPivot are §6.6's own numbers for the DECISIVE
 	// design matrix — the admitted layout's, or the last one evaluated on a
 	// bounded miss. They are the rank verdict's evidence: a reader can see how
@@ -83,13 +92,22 @@ type CalibrationEvidence struct {
 	// reported from the universe and the other is absent rather than invented.
 	IndicatorValuesPresent []int `json:"indicator_values_present,omitempty"`
 	DistinctSliceCounts    []int `json:"distinct_slice_counts,omitempty"`
+	// rankEvaluated records that a design matrix was actually formed, which is
+	// what §17.3a ties the six rank diagnostics' presence to. It is not
+	// serialized: the document says which outcome it is, and the presence of the
+	// diagnostics follows from that.
+	rankEvaluated bool `json:"-"`
 	// GeneratorExhausted records that L(i) became undefined before the budget
 	// was reached, which §6.7 requires to be reported rather than folded into
 	// an ordinary bounded miss.
 	GeneratorExhausted bool `json:"generator_exhausted,omitempty"`
 	// DeficientColumns names what was missing on a bounded miss, and
 	// ZeroColumn names the actually-zero column on a structural proof.
-	DeficientColumns []int  `json:"deficient_columns,omitempty"`
+	// DeficientColumns is ALWAYS SERIALIZED, empty when nothing was deficient —
+	// which is exactly how §17.3a's published example represents a sufficient
+	// result. `omitempty` omitted the key on success, so the one outcome that
+	// proves no column is missing said nothing about columns at all.
+	DeficientColumns []int  `json:"deficient_columns"`
 	ZeroColumn       int    `json:"zero_column,omitempty"`
 	Reason           string `json:"reason,omitempty"`
 	// Buckets and DesignRows are the accepted layout, present iff SUFFICIENT.
@@ -98,8 +116,13 @@ type CalibrationEvidence struct {
 	// GeneratedAt is the plan run's own instant, RFC 3339 UTC. It is the
 	// planner's `now` rather than a second clock read, so the document a test
 	// writes is the document the test can compare.
-	GeneratedAt string `json:"generated_at,omitempty"`
+	GeneratedAt string `json:"generated_at"`
 }
+
+// RankEvaluated reports whether the proposer formed a design matrix, which is
+// what §17.3a ties the presence of the six rank diagnostics to. A structural
+// proof forms none.
+func (ev CalibrationEvidence) RankEvaluated() bool { return ev.rankEvaluated }
 
 // columnValues returns the deduplicated ascending integer values of one design
 // column, which is how §17.3a reports columns 3 and 4.
@@ -124,6 +147,12 @@ func (ev *CalibrationEvidence) withDesign(rows [][]float64, rank RankResult) {
 	ev.SigmaMax, ev.Tolerance, ev.MinPivot = rank.SigmaMax, rank.Tolerance, rank.MinPivot
 	ev.IndicatorValuesPresent = columnValues(rows, 2)
 	ev.DistinctSliceCounts = columnValues(rows, 3)
+	// THE DECISIVE MATRIX'S RANK, on every outcome that has one. A bounded miss
+	// has a rank — that is WHY it missed — and omitting it left the outcome word
+	// as the only evidence for a verdict §6.6 computes from numbers.
+	r := rank.Rank
+	ev.Rank = &r
+	ev.rankEvaluated = true
 }
 
 const CalibrationEvidenceSchema = "testbucket.calibration-evidence/v1"
@@ -311,7 +340,13 @@ func CalibrateProposer(u []CalibrationUnit, k, n int, pack Packer) (CalibrationE
 	if n < 1 {
 		return CalibrationEvidence{}, fmt.Errorf("calibration: --calibration-max-plans is %d, must be >= 1", n)
 	}
-	ev := CalibrationEvidence{Schema: CalibrationEvidenceSchema, LayoutBudget: n}
+	// EVERY CARDINALITY-ONE CONTAINER STARTS EMPTY RATHER THAN NIL, so the
+	// document always carries the key and a nil slice never serializes as `null`.
+	ev := CalibrationEvidence{
+		Schema: CalibrationEvidenceSchema, LayoutBudget: n,
+		ProposedPlanDigests: []Digest{},
+		DeficientColumns:    []int{},
+	}
 
 	whole, slices := splitUniverse(u)
 
@@ -348,7 +383,7 @@ func CalibrateProposer(u []CalibrationUnit, k, n int, pack Packer) (CalibrationE
 			ev.Outcome = CalibrationNotFoundWithinBudget
 			ev.LayoutsTried = i - 1
 			ev.GeneratorExhausted = true
-			ev.DeficientColumns = lastDeficient
+			ev.DeficientColumns = orEmptyInts(lastDeficient)
 			if lastRows != nil {
 				ev.withDesign(lastRows, lastRank)
 			}
@@ -368,9 +403,10 @@ func CalibrateProposer(u []CalibrationUnit, k, n int, pack Packer) (CalibrationE
 		if rank.Admitted {
 			ev.Outcome = CalibrationSufficient
 			ev.LayoutsTried = i
-			ev.Rank = rank.Rank
 			ev.DesignRows = rows
 			ev.Buckets = bucketIDs(layout)
+			// withDesign carries the rank and the three diagnostics, so the rank is
+			// written in exactly one place for every outcome that has one.
 			ev.withDesign(rows, rank)
 			return ev, nil
 		}
@@ -380,7 +416,7 @@ func CalibrateProposer(u []CalibrationUnit, k, n int, pack Packer) (CalibrationE
 
 	ev.Outcome = CalibrationNotFoundWithinBudget
 	ev.LayoutsTried = n
-	ev.DeficientColumns = lastDeficient
+	ev.DeficientColumns = orEmptyInts(lastDeficient)
 	if lastRows != nil {
 		ev.withDesign(lastRows, lastRank)
 	}
@@ -396,4 +432,14 @@ func bucketIDs(layout [][]CalibrationUnit) [][]string {
 		}
 	}
 	return out
+}
+
+// orEmptyInts renders a nil column list as an empty array, because the registry
+// gives `deficient_columns` cardinality one and a JSON `null` is neither a list
+// nor an absence.
+func orEmptyInts(in []int) []int {
+	if in == nil {
+		return []int{}
+	}
+	return in
 }

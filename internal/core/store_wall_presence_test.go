@@ -91,9 +91,13 @@ func TestWallDecoderPreservesWirePresence(t *testing.T) {
 		for k, v := range fit {
 			m[k] = v
 		}
+		// REFUSED AT EITHER LAYER. The decoder now rejects a null leaf outright —
+		// null is neither a value nor an absence — so this no longer has to reach
+		// Validate to be caught. What must hold is that it never becomes an empty
+		// ring.
 		w, err := decode(t, m)
 		if err != nil {
-			t.Fatalf("decode: %v", err)
+			return
 		}
 		if err := w.Validate(); err == nil {
 			t.Fatal("`observations: null` must be refused; null is not an empty container")
@@ -170,6 +174,145 @@ func TestWallDecoderPreservesWirePresence(t *testing.T) {
 		}
 		if w.Fit != nil {
 			t.Error("an insufficient record materialized a fit group")
+		}
+		if err := w.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	})
+}
+
+// TestWallDecoderRejectsNullAndForbiddenEmptyLeaves is F06's residual half.
+//
+// The all-present-or-all-absent check reads KEY EXISTENCE, and a key whose value
+// is `null` exists — so null slipped between present and absent and then decoded
+// into Go's zero. `"rows_used": null` became a fit over zero rows, `"rank_support":
+// null` became a nil support list, and Validate saw a complete record. The same
+// rule the partial-group check states — an omitted quantity is not a measured zero
+// — applies to the one wire form that satisfied neither branch.
+//
+// And §15.1c makes `failure_subtype` ABSENT for `ok`. Validate can only refuse a
+// non-empty one, which is all a Go-built object can express, so a wire
+// `"failure_subtype": ""` read as absence.
+func TestWallDecoderRejectsNullAndForbiddenEmptyLeaves(t *testing.T) {
+	const key = "sha256:key"
+	fit := map[string]any{
+		"fitted_at":                    "2026-09-01T00:00:00Z",
+		"rows_used":                    24,
+		"runs_used":                    3,
+		"fixed_ns":                     "1000000000",
+		"scale":                        "1",
+		"whole_invocation_overhead_ns": "0",
+		"per_slice_overhead_ns":        "0",
+		"residual_mae_ns":              "0",
+		"residual_p90_ns":              "0",
+		"rank_support":                 []string{"fixed", "scale", "whole_invocation_overhead", "per_slice_overhead"},
+	}
+	withFit := func() map[string]any {
+		m := map[string]any{
+			"model_version":            1,
+			"comparability_key_digest": key,
+			"status":                   "ok",
+			"observations":             []any{},
+		}
+		for k, v := range fit {
+			m[k] = v
+		}
+		return m
+	}
+	decode := func(t *testing.T, m map[string]any) (*WallObject, error) {
+		t.Helper()
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var w WallObject
+		if err := json.Unmarshal(b, &w); err != nil {
+			return nil, err
+		}
+		return &w, nil
+	}
+
+	t.Run("the positive still holds", func(t *testing.T) {
+		w, err := decode(t, withFit())
+		if err != nil {
+			t.Fatalf("a complete ok record must decode: %v", err)
+		}
+		if w.Fit == nil || w.Fit.RowsUsed != 24 || w.Fit.RunsUsed != 3 {
+			t.Fatalf("the fit decoded as %+v", w.Fit)
+		}
+		if len(w.Fit.RankSupport) != 4 {
+			t.Errorf("rank_support decoded as %v", w.Fit.RankSupport)
+		}
+		if err := w.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	})
+
+	// THE THREE NULL COUNTS AND THE NULL SUPPORT LIST.
+	for _, leaf := range []string{"rows_used", "runs_used", "rank_support"} {
+		t.Run("null "+leaf+" is neither present nor absent", func(t *testing.T) {
+			m := withFit()
+			m[leaf] = nil
+			w, err := decode(t, m)
+			if err != nil {
+				if !strings.Contains(err.Error(), leaf) {
+					t.Errorf("the refusal does not name %s: %v", leaf, err)
+				}
+				return
+			}
+			if err := w.Validate(); err == nil {
+				t.Fatalf("`%s: null` decoded to %+v and validated; null must not become a zero or a nil list",
+					leaf, w.Fit)
+			}
+		})
+	}
+
+	t.Run("every other null leaf is refused too", func(t *testing.T) {
+		for _, leaf := range []string{
+			"fitted_at", "fixed_ns", "scale", "whole_invocation_overhead_ns",
+			"per_slice_overhead_ns", "residual_mae_ns", "residual_p90_ns",
+			"model_version", "comparability_key_digest", "status", "observations",
+		} {
+			m := withFit()
+			m[leaf] = nil
+			w, err := decode(t, m)
+			if err != nil {
+				continue
+			}
+			if err := w.Validate(); err == nil {
+				t.Errorf("`%s: null` was accepted", leaf)
+			}
+		}
+	})
+
+	t.Run("an ok record may not carry an empty failure_subtype", func(t *testing.T) {
+		m := withFit()
+		m["failure_subtype"] = ""
+		w, err := decode(t, m)
+		if err != nil {
+			if !strings.Contains(err.Error(), "failure_subtype") {
+				t.Errorf("the refusal does not name failure_subtype: %v", err)
+			}
+			return
+		}
+		if err := w.Validate(); err == nil {
+			t.Fatal(`"failure_subtype": "" on an ok record validated; §15.1c makes the leaf ABSENT for ok, and an empty string is present`)
+		}
+	})
+
+	t.Run("a non-ok record still requires its subtype", func(t *testing.T) {
+		// The other direction, so the new presence rule cannot be satisfied by
+		// refusing the leaf everywhere.
+		m := map[string]any{
+			"model_version":            1,
+			"comparability_key_digest": key,
+			"status":                   "insufficient",
+			"failure_subtype":          "rows_below_minimum",
+			"observations":             []any{},
+		}
+		w, err := decode(t, m)
+		if err != nil {
+			t.Fatalf("an insufficient record with its subtype must decode: %v", err)
 		}
 		if err := w.Validate(); err != nil {
 			t.Fatalf("validate: %v", err)

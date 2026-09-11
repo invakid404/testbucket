@@ -460,13 +460,34 @@ func coverageVerdicts(doc *core.PlanDocument, sum *runner.RunSummary) (map[strin
 	if doc == nil || sum == nil {
 		return out, nil
 	}
+
+	// THE WHOLE PLAN FIRST, against the whole merged evidence.
+	//
+	// The record job downloads every bucket's event artifact and parses ONE
+	// combined summary, so this is the scope at which "an event belonging to no
+	// bucket" is even a question — and it is the only scope at which it is. A
+	// failure here is not attributable to one bucket, so it fails them all:
+	// evidence that does not match the plan is not evidence for any row of it.
+	var planReport strings.Builder
+	planOK := core.AuditCoverage(&planReport, core.PlannedCoverageForPlan(doc), sum) == nil
+
 	for _, b := range doc.Buckets {
 		planned, err := core.PlannedCoverageForBucket(doc, b.Index)
 		if err != nil {
 			return nil, fmt.Errorf("bucket %s: %w", b.Name, err)
 		}
+		// PER-BUCKET EVIDENCE FOR A PER-BUCKET VERDICT.
+		//
+		// Auditing one bucket against the merged summary reports every other
+		// bucket's packages as unplanned for it — correctly, by AuditCoverage's own
+		// rule — so a valid two-bucket fan-in failed both buckets. The projection
+		// keeps every per-bucket direction: a planned target with no events, a
+		// short invocation count, a slice that did not run its names. The direction
+		// it cannot see belongs to the whole plan, which is audited above.
 		var report strings.Builder
-		out[b.Name] = core.AuditCoverage(&report, planned, sum) == nil
+		bucketOK := core.AuditCoverage(&report, planned,
+			core.SummaryForPackages(sum, planned.Invocations)) == nil
+		out[b.Name] = planOK && bucketOK
 	}
 	return out, nil
 }

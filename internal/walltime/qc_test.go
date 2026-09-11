@@ -588,6 +588,52 @@ func TestQC15AdmitsADeclaredSameRepositoryDogfoodAndNothingElse(t *testing.T) {
 		}
 	})
 
+	// THE CARVE-OUT IS FOR AN *EXPLICITLY* UNSCORED ROW. Go decodes an absent
+	// `scored` and a `scored: null` into the same `false` a present `false`
+	// produces, so without a presence check a block that does not say collected an
+	// exception meant for a declared shape. Both blocks are mutated together,
+	// because QC13 compares them byte for byte — and that is the point: QC13
+	// cannot establish a field neither block contains.
+	for _, c := range []struct {
+		name, scoredJSON string
+	}{
+		{"absent scored", ""},
+		{"null scored", `"scored":null,`},
+	} {
+		t.Run("NEGATIVE: "+c.name+" is not an explicit false", func(t *testing.T) {
+			plan, obs := qcFixture(t)
+			sameRepoProfile(t, &plan, &obs, true, false)
+			blk := profileBlockWithScoredForm(t, plan.ProfileBlock, c.scoredJSON)
+			plan.ProfileBlock, obs.Profile = blk, blk
+			obs.HeadSHA, obs.CandidateSHA, obs.WorkloadCommit = one, one, one
+
+			err := QualifyObservation(obs, plan, emptyRing())
+			if err == nil {
+				t.Fatalf("%s was accepted under the same-repository carve-out", c.name)
+			}
+			if !strings.HasPrefix(err.Error(), "QC15:") {
+				t.Fatalf("expected QC15 to fire for %s, got: %v", c.name, err)
+			}
+			if !strings.Contains(err.Error(), "explicit") {
+				t.Errorf("the refusal must say the declaration needs an explicit JSON false, got %q", err)
+			}
+		})
+	}
+
+	t.Run("an explicit false still passes after the presence check", func(t *testing.T) {
+		// The positive above goes through NewProfileBlock, which always writes
+		// `scored`. This re-states it against the byte form, so the control is
+		// about the BYTES rather than about the constructor.
+		plan, obs := qcFixture(t)
+		sameRepoProfile(t, &plan, &obs, true, false)
+		blk := profileBlockWithScoredForm(t, plan.ProfileBlock, `"scored":false,`)
+		plan.ProfileBlock, obs.Profile = blk, blk
+		obs.HeadSHA, obs.CandidateSHA, obs.WorkloadCommit = one, one, one
+		if err := QualifyObservation(obs, plan, emptyRing()); err != nil {
+			t.Fatalf("an explicit `\"scored\": false` was rejected: %v", err)
+		}
+	})
+
 	t.Run("partial equality needs no declaration", func(t *testing.T) {
 		// A `local` build's source can equal the orchestration head while the
 		// workload is somewhere else. That was always legal and still is.
@@ -599,4 +645,37 @@ func TestQC15AdmitsADeclaredSameRepositoryDogfoodAndNothingElse(t *testing.T) {
 			t.Fatalf("two equal identities and one distinct was rejected: %v", err)
 		}
 	})
+}
+
+// profileBlockWithScoredForm rewrites a block's `scored` member into a chosen
+// JSON form — an empty form removes the key entirely.
+//
+// It edits BYTES on purpose. NewProfileBlock always writes `scored`, so a
+// constructor cannot produce the absent and null shapes the carve-out must
+// refuse, and those shapes are exactly what a foreign or hand-made block can
+// carry. The rest of the block is left untouched so the only difference under
+// test is the one being tested.
+func profileBlockWithScoredForm(t *testing.T, in ProfileBlock, scoredJSON string) ProfileBlock {
+	t.Helper()
+	raw := string(in.Raw())
+	// Canonical JSON sorts keys, so `scored` is a plain member somewhere in the
+	// object; find and replace its exact `"scored":<value>,` or `,"scored":<value>`
+	// span rather than re-serializing.
+	i := strings.Index(raw, `"scored":`)
+	if i < 0 {
+		t.Fatalf("the fixture block carries no scored member: %s", raw)
+	}
+	j := i + len(`"scored":`)
+	for j < len(raw) && raw[j] != ',' && raw[j] != '}' {
+		j++
+	}
+	rest := raw[j:]
+	if strings.HasPrefix(rest, ",") {
+		rest = rest[1:]
+	}
+	var out ProfileBlock
+	if err := out.UnmarshalJSON([]byte(raw[:i] + scoredJSON + rest)); err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

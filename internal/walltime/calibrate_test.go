@@ -1,6 +1,8 @@
 package walltime
 
 import (
+	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -147,8 +149,8 @@ func TestCalibrationModeTerminatesSufficientOrNotFoundWithinBudget(t *testing.T)
 		if ev4.Outcome != CalibrationSufficient {
 			t.Fatalf("N = 4 outcome = %q, want %q", ev4.Outcome, CalibrationSufficient)
 		}
-		if ev4.Rank != 4 {
-			t.Fatalf("N = 4 rank = %d, want 4", ev4.Rank)
+		if ev4.Rank == nil || *ev4.Rank != 4 {
+			t.Fatalf("N = 4 rank = %v, want 4", ev4.Rank)
 		}
 		if ev4.LayoutsTried != 4 {
 			t.Fatalf("N = 4 layouts_tried = %d, want 4", ev4.LayoutsTried)
@@ -316,6 +318,165 @@ func TestCalibrationModeTerminatesSufficientOrNotFoundWithinBudget(t *testing.T)
 		// L(6) isolates 3 whole units but only 2 exist.
 		if _, err := Layout(twoWhole, 8, 6, corePacker); err == nil {
 			t.Fatal("L(6) must be undefined when the universe has fewer whole units than it isolates")
+		}
+	})
+}
+
+// TestCalibrationProducerSerializesRequiredFieldsOnRealOutcomes is F04's control.
+//
+// `TestCalibrationEvidenceMatchesItsRegistryEntries` populates every field of a
+// SYNTHETIC object, so its bidirectional key-set comparison proves what the type
+// CAN serialize and nothing about what the producer DOES. The real proposer, run
+// on §17.3a's own published universe, omitted `proposed_plan_digests` and `rank`
+// at budget 3 and `deficient_columns` at budget 4 — every one of them because
+// `omitempty` turned "this outcome has nothing to report here" into "this
+// producer writes no such key".
+//
+// This runs the actual CalibrateProposer at both budgets, applies the same
+// identity additions runCalibration applies, and asserts presence in the
+// SERIALIZED bytes.
+func TestCalibrationProducerSerializesRequiredFieldsOnRealOutcomes(t *testing.T) {
+	u := calibrationUniverse()
+	const k = 4
+
+	// Always present on every real outcome, per §17.3a.
+	always := []string{
+		"schema", "outcome", "comparability_key_digest", "proposed_plan_digests",
+		"layouts_tried", "layout_budget", "deficient_columns", "generated_at",
+	}
+	// Present iff the proposer formed a design matrix. Both budgets below do.
+	whenMatrix := []string{
+		"rank", "sigma_max", "tolerance", "min_pivot",
+		"indicator_values_present", "distinct_slice_counts",
+	}
+
+	for _, budget := range []int{3, 4} {
+		t.Run(fmt.Sprintf("budget %d", budget), func(t *testing.T) {
+			ev, err := CalibrateProposer(u, k, budget, corePacker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The caller's identity additions, exactly as runCalibration makes
+			// them — the proposer cannot know either value.
+			ev.ComparabilityKeyDigest = "sha256:key"
+			ev.GeneratedAt = "2026-09-11T00:00:00Z"
+			if ev.ProposedPlanDigests == nil {
+				ev.ProposedPlanDigests = []Digest{}
+			}
+			if len(ev.Buckets) > 0 {
+				d, derr := DigestJSON(ev.Buckets)
+				if derr != nil {
+					t.Fatal(derr)
+				}
+				ev.ProposedPlanDigests = []Digest{d}
+			}
+
+			b, err := json.Marshal(ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire map[string]json.RawMessage
+			if err := json.Unmarshal(b, &wire); err != nil {
+				t.Fatal(err)
+			}
+
+			if !ev.RankEvaluated() {
+				t.Fatalf("budget %d evaluated no design matrix; the fixture no longer exercises the case", budget)
+			}
+			for _, key := range append(append([]string{}, always...), whenMatrix...) {
+				raw, ok := wire[key]
+				if !ok {
+					t.Errorf("outcome %q at budget %d omits required key %q:\n%s", ev.Outcome, budget, key, b)
+					continue
+				}
+				if string(raw) == "null" {
+					t.Errorf("outcome %q at budget %d writes %q as null; null is neither a value nor an absence",
+						ev.Outcome, budget, key)
+				}
+			}
+			// The two arrays are ARRAYS even when they hold nothing, which is how
+			// §17.3a's example represents them.
+			for _, key := range []string{"proposed_plan_digests", "deficient_columns"} {
+				if raw := string(wire[key]); len(raw) == 0 || raw[0] != '[' {
+					t.Errorf("outcome %q at budget %d writes %q as %s, want a JSON array",
+						ev.Outcome, budget, key, raw)
+				}
+			}
+		})
+	}
+
+	t.Run("budget 3 is the bounded miss and reports its decisive rank", func(t *testing.T) {
+		ev, err := CalibrateProposer(u, k, 3, corePacker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev.Outcome != CalibrationNotFoundWithinBudget {
+			t.Fatalf("outcome = %q, want %q", ev.Outcome, CalibrationNotFoundWithinBudget)
+		}
+		if ev.Rank == nil {
+			t.Fatal("a bounded miss has a decisive matrix and therefore a rank; it reported none")
+		}
+		if *ev.Rank >= DesignColumns {
+			t.Errorf("a miss reported rank %d; a rank of %d would have been admitted", *ev.Rank, DesignColumns)
+		}
+		if len(ev.DeficientColumns) == 0 {
+			t.Error("a bounded miss must name the deficient columns")
+		}
+	})
+
+	t.Run("budget 4 is sufficient and reports an empty deficient set", func(t *testing.T) {
+		ev, err := CalibrateProposer(u, k, 4, corePacker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev.Outcome != CalibrationSufficient {
+			t.Fatalf("outcome = %q, want %q", ev.Outcome, CalibrationSufficient)
+		}
+		if ev.DeficientColumns == nil {
+			t.Fatal("a sufficient result must state that no column is deficient, as an empty array")
+		}
+		if len(ev.DeficientColumns) != 0 {
+			t.Errorf("a sufficient result named deficient columns %v", ev.DeficientColumns)
+		}
+	})
+
+	t.Run("a structural proof reports no rank rather than a zero", func(t *testing.T) {
+		// §17.3a ties the six diagnostics to a matrix having been formed, and a
+		// structural proof forms none. The alternative — serializing rank 0 —
+		// would be a number nobody computed.
+		whole := []CalibrationUnit{{ID: "w1", BaseNs: 1e9}, {ID: "w2", BaseNs: 2e9}}
+		ev, err := CalibrateProposer(whole, k, 4, corePacker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev.Outcome != CalibrationStructurallyInfeasible {
+			t.Fatalf("an all-whole universe is structurally infeasible, got %q", ev.Outcome)
+		}
+		if ev.RankEvaluated() {
+			t.Fatal("a structural proof reports that it evaluated a design matrix")
+		}
+		if ev.Rank != nil {
+			t.Errorf("a structural proof reported rank %d", *ev.Rank)
+		}
+		b, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire map[string]json.RawMessage
+		if err := json.Unmarshal(b, &wire); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range whenMatrix {
+			if _, ok := wire[key]; ok && key == "rank" {
+				t.Errorf("a structural proof serializes %q", key)
+			}
+		}
+		// The always-present set still holds, minus the caller's two identities.
+		for _, key := range []string{"schema", "outcome", "proposed_plan_digests",
+			"layouts_tried", "layout_budget", "deficient_columns"} {
+			if _, ok := wire[key]; !ok {
+				t.Errorf("a structural proof omits required key %q:\n%s", key, b)
+			}
 		}
 	})
 }

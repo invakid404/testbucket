@@ -172,6 +172,13 @@ func TestAnUnqualifiedObservationNeverReachesTheRing(t *testing.T) {
 // with itself while disagreeing with the code) or fails qualification for a
 // reason that has nothing to do with what is being tested.
 func observationFixture(bucket string, index int, runID string, planDigest walltime.Digest) walltime.Observation {
+	return observationFixtureForUnit(bucket, index, runID, planDigest, "f0.test.ts")
+}
+
+// observationFixtureForUnit is observationFixture over a NAMED unit, so a
+// multi-bucket fixture can give each bucket its own target — which is what a real
+// plan does, since the coverage gate puts every target in exactly one bucket.
+func observationFixtureForUnit(bucket string, index int, runID string, planDigest walltime.Digest, unit string) walltime.Observation {
 	block, err := walltime.NewProfileBlock(sharedProfile())
 	if err != nil {
 		panic(err)
@@ -208,21 +215,21 @@ func observationFixture(bucket string, index int, runID string, planDigest wallt
 		ProcessGroupID:      "4242",
 		ActualRunnerName:    "runner-1",
 		ObservedRunsOnLabel: "ubuntu-latest",
-		UnitIDs:             []string{"f0.test.ts"},
+		UnitIDs:             []string{unit},
 		Invocations: []walltime.Invocation{{
-			Seq: 0, Units: []string{"f0.test.ts"},
+			Seq: 0, Units: []string{unit},
 			// Derived from the SAME argv and cwd the plan declares, through
 			// the production digester. QC6 then compares two independently
 			// derived values instead of a placeholder against itself. The cwd
 			// is RESOLVED, because §13.1's identity is the absolute directory
 			// the invocation ran in and both sides resolve before hashing.
-			ArgvDigest: walltime.DigestJSONOrEmpty([]string{"run", "f0.test.ts"}),
+			ArgvDigest: walltime.DigestJSONOrEmpty([]string{"run", unit}),
 			CwdDigest:  walltime.DigestJSONOrEmpty(walltime.AbsCwd(".")),
-			Selector:   []string{"./f0.test.ts"}, Atoms: []string{},
+			Selector:   []string{"./" + unit}, Atoms: []string{},
 			// The OBSERVED selection identities, derived the same way the plan
 			// side derives them. QC6 compares membership now, not only the argv.
-			SelectorDigest: walltime.DigestJSONOrEmpty([]string{"./f0.test.ts"}),
-			UnitDigest:     walltime.DigestJSONOrEmpty([]string{"f0.test.ts"}),
+			SelectorDigest: walltime.DigestJSONOrEmpty([]string{"./" + unit}),
+			UnitDigest:     walltime.DigestJSONOrEmpty([]string{unit}),
 			AtomDigest:     walltime.DigestJSONOrEmpty([]string{}),
 			ProcessGroupID: "4243",
 			StartedMonoNs:  1000, EndedMonoNs: 2_000_000_000,

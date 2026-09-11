@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -569,7 +570,37 @@ func (w *WallObject) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	has := func(k string) bool { _, ok := wire[k]; return ok }
+	// NULL IS NEITHER PRESENT NOR ABSENT, and it must not become a value.
+	//
+	// A key whose value is `null` satisfies `has` — so the all-present-or-all-absent
+	// check passed — and then decodes into Go's zero: `"rows_used": null` became a
+	// fit over zero rows, `"rank_support": null` became a nil support list, and
+	// Validate saw a complete record. That is the same "an omitted quantity is not
+	// a measured zero" rule as the partial-group check above, applied to the one
+	// wire form that slipped between present and absent.
+	isNull := func(k string) bool {
+		raw, ok := wire[k]
+		return ok && string(bytes.TrimSpace(raw)) == "null"
+	}
+	for _, k := range append(append([]string{}, wallFitLeaves...),
+		"model_version", "comparability_key_digest", "status", "failure_subtype", "observations") {
+		if isNull(k) {
+			return fmt.Errorf("wall.%s is present and null; null is not a value and not an absence, "+
+				"and §15.1c decides presence rather than reading a zero", k)
+		}
+	}
 
+	// §15.1c MAKES `failure_subtype` ABSENT FOR `ok`, and absent is not the same
+	// as present-and-empty.
+	//
+	// Validate refuses a NON-EMPTY subtype under `ok`, which is what a Go-built
+	// object can express — so `"failure_subtype": ""` on the wire decoded to the
+	// empty string and read as absence. The matrix says the leaf is not there, and
+	// the only place that difference still exists is here.
+	if in.Status == WallStatusOK && has("failure_subtype") {
+		return fmt.Errorf("wall.failure_subtype is present under status ok; §15.1c makes it absent for ok, " +
+			"and an empty string is a present leaf rather than a missing one")
+	}
 	*w = WallObject{
 		ModelVersion:           in.ModelVersion,
 		ComparabilityKeyDigest: in.ComparabilityKeyDigest,
@@ -602,11 +633,17 @@ func (w *WallObject) UnmarshalJSON(b []byte) error {
 	}
 
 	fit := &WallFitGroup{FittedAt: in.FittedAt, RankSupport: in.RankSupport}
-	if in.RowsUsed != nil {
-		fit.RowsUsed = *in.RowsUsed
+	// The pointers can no longer be nil while the key is present — a null was
+	// refused above — so an absent pointer here would be a decoder inconsistency
+	// rather than a wire fact, and it is named as one.
+	if in.RowsUsed == nil || in.RunsUsed == nil {
+		return fmt.Errorf("wall.rows_used/runs_used are present but did not decode as integers; " +
+			"§15.1c's counts are the population a fit was taken over, not a default")
 	}
-	if in.RunsUsed != nil {
-		fit.RunsUsed = *in.RunsUsed
+	fit.RowsUsed, fit.RunsUsed = *in.RowsUsed, *in.RunsUsed
+	if in.RankSupport == nil {
+		return fmt.Errorf("wall.rank_support is present but decoded as no list; it names which " +
+			"coefficients the design supported, and an empty support is not the same as none recorded")
 	}
 	if in.FittedAt == "" {
 		return fmt.Errorf("wall.fitted_at is present and empty; it is the instant a fit was accepted, not a placeholder")

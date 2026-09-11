@@ -233,10 +233,17 @@ func runCalibration(rnr runner.Runner, st *core.Store, opt core.PlanOptions, out
 	// read an outcome word and nothing that binds it to a history or a layout.
 	ev.ComparabilityKeyDigest = opt.ComparabilityKeyDigest
 	ev.GeneratedAt = opt.Now.UTC().Format(time.RFC3339)
+	// ONE DIGEST PER PROPOSED PLAN, and an EMPTY LIST when nothing was proposed.
+	//
+	// The proposer accepts one layout, so a sufficient document carries one. A
+	// miss proposes nothing — and it must still carry the key, because the
+	// registry gives it cardinality one and "proposes nothing" is a fact the
+	// document has to state. It used to leave the field nil, which `omitempty`
+	// turned into no key at all.
+	if ev.ProposedPlanDigests == nil {
+		ev.ProposedPlanDigests = []walltime.Digest{}
+	}
 	if len(ev.Buckets) > 0 {
-		// One digest per PROPOSED plan. The proposer accepts one layout, so a
-		// sufficient document carries one; a miss proposes nothing and carries
-		// none rather than an empty-string placeholder.
 		d, derr := walltime.DigestJSON(ev.Buckets)
 		if derr != nil {
 			return fmt.Errorf("calibration proposed-plan digest: %w", derr)
