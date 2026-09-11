@@ -284,24 +284,3 @@ func (d Digest) Valid() bool {
 	}
 	return true
 }
-
-// requireDigests refuses any field that is not a well-formed digest, naming
-// every offender rather than the first, so a caller fixes one document instead
-// of discovering its problems one at a time.
-func requireDigests(fields map[string]Digest) error {
-	names := make([]string, 0, len(fields))
-	for name := range fields {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	var bad []string
-	for _, name := range names {
-		if !fields[name].Valid() {
-			bad = append(bad, fmt.Sprintf("%s (%q)", name, fields[name]))
-		}
-	}
-	if len(bad) > 0 {
-		return fmt.Errorf("does not carry a sha256:<64 lowercase hex> identity for %s", strings.Join(bad, ", "))
-	}
-	return nil
-}

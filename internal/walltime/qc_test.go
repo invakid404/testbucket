@@ -183,6 +183,22 @@ func TestQualificationChecks(t *testing.T) {
 			// A < setup_ns + script_ns.
 			o.ElapsedNs = 1_000_000_000
 		}},
+		// THE DERIVED SPANS AND RESIDUALS, one at a time with the endpoints
+		// fixed. Every case below satisfies every bound the earlier checks
+		// impose — nonnegative, A >= setup+script, script >= ΣV, ordered
+		// endpoints — and is still arithmetically impossible.
+		{check: "QC7", sub: "QC7 elapsed_ns is not the envelope's span", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.ElapsedNs, o.WrapperNs = o.ElapsedNs-1, o.WrapperNs-1
+		}},
+		{check: "QC7", sub: "QC7 an invocation's elapsed_ns is not its span", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].ElapsedNs--
+		}},
+		{check: "QC7", sub: "QC7 wrapper_ns is not the envelope residual", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.WrapperNs--
+		}},
+		{check: "QC7", sub: "QC7 script_overhead_ns is not the script residual", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.ScriptOverheadNs--
+		}},
 		{check: "QC7a", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.ProcessGroupID = "" }},
 		{check: "QC8", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.BootIDEnd = "boot-b" }},
 		// THE CLOCK DOMAIN, for a SCORED row. §13.1 admits CLOCK_MONOTONIC only;

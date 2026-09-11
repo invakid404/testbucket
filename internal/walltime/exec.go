@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -393,6 +392,18 @@ func runOwnedChild(opt ExecOptions, deadline time.Time, clock Clock) (code int, 
 			// because "it escaped" and "it escaped and is still running" call
 			// for different responses from whoever reads the receipt.
 			termState = TerminalCrashUnclosed
+			// AND THE STATUS MOVES WITH THE TERMINAL.
+			//
+			// The root's own exit code stayed 0, so Exec returned (0, nil), the
+			// shell around it saw success, the action envelope closed `passed`,
+			// and QC9 — which reads the terminal and the exit codes — saw a clean
+			// row. A measurement that recorded `crash_unclosed` was ingested as a
+			// pass. The terminal is the finding; the exit code is how every caller
+			// between here and the action learns of it, and they must not
+			// disagree.
+			if code == 0 {
+				code = 1
+			}
 			reason = joinReason(reason, "a descendant outlived its root: the process group was still populated after the root was reaped, and was then killed")
 			if !out.GroupEmpty {
 				reason = joinReason(reason, "the killed group was STILL not confirmed empty after "+reapGrace.String())
@@ -426,16 +437,6 @@ func exitCodeOf(err error) int {
 	return 1
 }
 
-// abandonReason renders a refusal to signal as text for the record. An
-// observer that could not be ended safely is part of what happened, so it
-// travels with the terminal reason rather than being dropped on the floor.
-func abandonReason(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
 func joinReason(a, b string) string {
 	switch {
 	case a == "":
@@ -461,27 +462,12 @@ func joinReason(a, b string) string {
 var (
 	atStartReading func(dir string)
 	atEndReading   func(dir string)
-	// atRecordsDir fires after the records directory exists and before the
-	// signing key, so a test can INJECT a failure into the window between
-	// AT_start and the first writer. That window is the one place a bootstrap
-	// failure could previously return with nothing in the ledger, and its
-	// retention cannot be proved by any real error a test can provoke there.
-	atRecordsDir func(dir string) error
 )
 
 func probe(hook func(string), dir string) {
 	if hook != nil {
 		hook(dir)
 	}
-}
-
-// probeErr is probe for a hook that can fail, used to inject a pre-writer
-// bootstrap failure. It returns nil in production, where the hook is nil.
-func probeErr(hook func(string) error, dir string) error {
-	if hook == nil {
-		return nil
-	}
-	return hook(dir)
 }
 
 // THE PRIVATE SIGNING CAPABILITIES ARE GONE, and with them the observers.
@@ -499,92 +485,6 @@ func probeErr(hook func(string) error, dir string) error {
 // executes a setup command somebody else wrote, and a child that inherits
 // $GITHUB_OUTPUT or $GITHUB_ENV can rewrite the measured step's outputs and
 // the job's environment. That is true whether or not anything is signed.
-
-// GitHubFileCommandEnv names the writable file channels an Actions step is
-// handed. They are not secrets; they are something worse to inherit — paths to
-// files a later step's capability is DELIVERED THROUGH.
-//
-// `wall begin` mints the signer delegate, returns it on stdout, and the
-// composite step then appends it to $GITHUB_OUTPUT so exactly the measured
-// step can name it. The two action observers are started BEFORE that append
-// and are deliberately detached, so they outlive the step — and they were
-// inheriting $GITHUB_OUTPUT. Scrubbing the delegate VALUE out of their
-// environment while leaving them holding the path of the file it is about to
-// be written to secures nothing: each observer kept same-uid read access to
-// the exact channel, and an observer that can obtain the delegate can
-// authorize a lower signer and vouch for itself, which is the one thing the
-// delegation scope exists to prevent.
-//
-// So the channels go too. The handoff itself is untouched: the append happens
-// in the composite step's OWN shell, which is not a scrubbed child, so the
-// step output still reaches the measured step by the same narrow route.
-// It is the CURRENT official set, not a plausible one. actions/runner v2.337.0
-// (commit 397b032cbf865e9c3ddfab89d533ec19325e1273) exports `artifacts` and
-// `artifacts_list` as GITHUB_ARTIFACTS and GITHUB_ARTIFACTS_LIST, and its
-// FileCommandManager gives EVERY extension one shared GUID suffix — including
-// `set_output_`. So an observer holding either artifacts path holds the suffix
-// that names the output file, whether or not artifact processing is enabled.
-// Listing the five obvious names and stopping was a defence against the
-// channel one happens to think of.
-var GitHubFileCommandEnv = []string{
-	"GITHUB_OUTPUT",
-	"GITHUB_ENV",
-	"GITHUB_PATH",
-	"GITHUB_STEP_SUMMARY",
-	"GITHUB_STATE",
-	"GITHUB_ARTIFACTS",
-	"GITHUB_ARTIFACTS_LIST",
-}
-
-// scrubFileCommandSiblings removes any OTHER variable whose value is a file in
-// the same directory as one of the named channels.
-//
-// The runner puts every file command in one directory and gives them one
-// shared suffix, so a sibling path is the whole channel: from
-// `.../_runner_file_commands/artifacts_<suffix>` the output file is
-// `set_output_<suffix>` in the same directory. Enumerating names cannot keep
-// up with a runner that adds an extension — v2.337.0 added two since this
-// denylist was written — so the SHAPE is refused as well as the names.
-//
-// It is deliberately narrow: only variables whose value is a path in a
-// directory some named channel also lives in. GITHUB_WORKSPACE,
-// GITHUB_EVENT_PATH and the rest of the run identity live elsewhere and are
-// untouched, and with no channel present it removes nothing at all.
-func scrubFileCommandSiblings(env []string) []string {
-	dirs := map[string]bool{}
-	for _, kv := range env {
-		name, value, _ := strings.Cut(kv, "=")
-		if !slices.Contains(GitHubFileCommandEnv, name) {
-			continue
-		}
-		if d := filepath.Dir(value); filepath.IsAbs(value) && d != "." && d != string(filepath.Separator) {
-			dirs[d] = true
-		}
-	}
-	if len(dirs) == 0 {
-		return env
-	}
-	out := make([]string, 0, len(env))
-	for _, kv := range env {
-		name, value, _ := strings.Cut(kv, "=")
-		if !slices.Contains(GitHubFileCommandEnv, name) && filepath.IsAbs(value) && dirs[filepath.Dir(value)] {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return out
-}
-
-// terminalExec retains a wrapper-level failure with its reason and no
-// duration.
-func terminalExec(w *Writer, opt ExecOptions, spec *SpecIdentity, start Instant, clock Clock, state, reason string) error {
-	_, _ = w.Append(Record{
-		Kind: "terminal", Level: opt.Level,
-		Source: SourceWrapper, Seqno: opt.Seq, Run: opt.Run, Instant: clock.Now(),
-		Spec: spec, Terminal: state, Reason: reason,
-	})
-	return fmt.Errorf("walltime: %s", reason)
-}
 
 func sanitize(s string) string {
 	return strings.Map(func(r rune) rune {

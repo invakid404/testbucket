@@ -96,13 +96,13 @@ func TestVerifierRefusesAMalformedRecord(t *testing.T) {
 // absent prerequisites are findings rather than skips.
 func TestACompleteRunIsCompleteButNotYetScorable(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := Exec(ExecOptions{
-		Level: LevelInvocation, Dir: dir, Cwd: dir, Timeout: 30 * time.Second,
-		Run:  RunIdentity{BucketID: "b1", RunID: "run-1"},
+	// COMPOSED, not a lone invocation. This fixture used to write one
+	// invocation envelope and call the result a complete run, which is exactly
+	// the hole the verifier had: a fragment that named every property the
+	// checks looked at verified as a whole measurement.
+	measuredRun(t, dir, RunIdentity{BucketID: "b1", RunID: "run-1"}, "", ExecOptions{
 		Argv: []string{"sh", "-c", "true"},
-	}); err != nil {
-		t.Fatalf("Exec: %v", err)
-	}
+	})
 	v, err := VerifyDir(VerifyOptions{Dir: dir})
 	if err != nil {
 		t.Fatalf("VerifyDir: %v", err)
@@ -143,9 +143,7 @@ func TestARunThatMeetsEveryPrerequisiteIsScorable(t *testing.T) {
 		UnitDigest: mustDigest([]string{"a.test.ts"}),
 		AtomDigest: mustDigest([]string{"suffix:test.ts"}),
 	}
-	if _, err := Exec(opt); err != nil {
-		t.Fatalf("Exec: %v", err)
-	}
+	measuredRun(t, dir, run, "", opt)
 
 	// The manifest is built from the SAME identities the plan would have
 	// rendered, which is what the comparison is for: a manifest written from
@@ -272,4 +270,178 @@ func TestTheSchemaIsAnEpochNotAMigration(t *testing.T) {
 	if v.Complete {
 		t.Error("records from a schema this binary does not implement verified as complete")
 	}
+}
+
+// measuredRun composes one measured bucket through the PRODUCTION entry
+// points: the action envelope, the script envelope inside it, and one
+// invocation inside that — the three streams the run-bucket action actually
+// produces, in the order it produces them.
+//
+// `omit` leaves one level out, which is what the negative controls need: a
+// record set missing exactly one mandatory stream and well-formed in every
+// other respect. Omitting the action omits its closing record too, because
+// `EndAction` closes an envelope `BeginAction` opened and a closing record
+// without an opening one is a different defect.
+//
+// The invocation's ExecOptions are the caller's, so a test that compares
+// against a manifest supplies the same argv, selector and digests the plan
+// would have rendered; Level, Dir, Cwd, Run and Timeout are filled here
+// because they are properties of the composition rather than of the claim.
+func measuredRun(t *testing.T, dir string, run RunIdentity, omit Level, inv ExecOptions) {
+	t.Helper()
+	if omit != LevelAction {
+		if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
+			t.Fatalf("BeginAction: %v", err)
+		}
+	}
+	if omit != LevelScript {
+		if _, err := Exec(ExecOptions{
+			Level: LevelScript, Dir: dir, Cwd: dir, Run: run, Timeout: 30 * time.Second,
+			Argv: []string{"sh", "-c", "true"},
+		}); err != nil {
+			t.Fatalf("Exec(script): %v", err)
+		}
+	}
+	if omit != LevelInvocation {
+		inv.Level, inv.Dir, inv.Run = LevelInvocation, dir, run
+		if inv.Cwd == "" {
+			inv.Cwd = dir
+		}
+		if inv.Timeout == 0 {
+			inv.Timeout = 30 * time.Second
+		}
+		if _, err := Exec(inv); err != nil {
+			t.Fatalf("Exec(invocation): %v", err)
+		}
+	}
+	if omit != LevelAction {
+		if _, err := EndAction(dir, TerminalPassed, ""); err != nil {
+			t.Fatalf("EndAction: %v", err)
+		}
+	}
+}
+
+// TestEveryMandatoryStreamIsRequired is R07.
+//
+// The verifier required that SOME envelope opened and that SOME interval
+// closed, and then validated the envelopes that happened to exist. Identity
+// was taken from any boundary record including an invocation's, and membership
+// compared only invocation envelopes — so a record set holding one clean
+// invocation pair and nothing else satisfied every check and verified as a
+// COMPLETE measurement, without the action interval A the whole measurement
+// reports or the script interval VB §3.1's floor is written in terms of. The
+// no-records case did not close this: an absent stream inside a populated
+// record set is not an absent measurement, and the two took different paths.
+//
+// Each mandatory stream is therefore omitted from an otherwise qualifying
+// record set, one at a time, and the optional ones are exercised on both
+// sides so the requirement cannot be satisfied by requiring everything.
+func TestEveryMandatoryStreamIsRequired(t *testing.T) {
+	run := RunIdentity{BucketID: "b1", RunID: "run-1"}
+
+	// The positive control first: with every stream present the same
+	// composition is complete. Without it the omissions below would pass
+	// against a verifier that refused everything.
+	t.Run("the whole composition is complete", func(t *testing.T) {
+		dir := t.TempDir()
+		measuredRun(t, dir, run, "", ExecOptions{Argv: []string{"sh", "-c", "true"}})
+		v, err := VerifyDir(VerifyOptions{Dir: dir})
+		if err != nil {
+			t.Fatalf("VerifyDir: %v", err)
+		}
+		if !v.Complete {
+			t.Errorf("a complete composition verified as incomplete; findings = %+v", v.Findings)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		omit  Level
+		field string
+	}{
+		{"without the action envelope", LevelAction, "A"},
+		{"without the script envelope", LevelScript, "VB"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			measuredRun(t, dir, run, tc.omit, ExecOptions{Argv: []string{"sh", "-c", "true"}})
+			v, err := VerifyDir(VerifyOptions{Dir: dir})
+			if err != nil {
+				t.Fatalf("VerifyDir: %v", err)
+			}
+			if v.Complete || v.Eligible {
+				t.Errorf("a record set with no %s stream (%s) verified as complete=%v eligible=%v; findings = %+v",
+					tc.omit, tc.field, v.Complete, v.Eligible, v.Findings)
+			}
+			if !hasFinding(v, "WT-004") {
+				t.Errorf("no WT-004 finding names the absent %s stream; findings = %+v", tc.omit, v.Findings)
+			}
+		})
+	}
+
+	// A BUCKET THE PLAN GAVE NO WORK IS STILL A MEASUREMENT. The requirement
+	// is on the levels that measure the action and its script, not on there
+	// being something to run: an empty bucket has a real A and a real VB.
+	t.Run("with no invocation at all", func(t *testing.T) {
+		dir := t.TempDir()
+		measuredRun(t, dir, run, LevelInvocation, ExecOptions{})
+		v, err := VerifyDir(VerifyOptions{Dir: dir})
+		if err != nil {
+			t.Fatalf("VerifyDir: %v", err)
+		}
+		if !v.Complete {
+			t.Errorf("an empty bucket verified as incomplete; findings = %+v", v.Findings)
+		}
+	})
+
+	// SETUP IS OPTIONAL ON BOTH SIDES: absent above, present here, and neither
+	// is a finding. §3.1 admits a bucket with no setup command.
+	t.Run("with a setup command", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := BeginAction(dir, run, 30*time.Second); err != nil {
+			t.Fatalf("BeginAction: %v", err)
+		}
+		if code, err := RunInAction(dir, []string{"sh", "-c", "true"}, dir, nil, nil); err != nil || code != 0 {
+			t.Fatalf("RunInAction: code=%d err=%v", code, err)
+		}
+		if _, err := Exec(ExecOptions{
+			Level: LevelScript, Dir: dir, Cwd: dir, Run: run, Timeout: 30 * time.Second,
+			Argv: []string{"sh", "-c", "true"},
+		}); err != nil {
+			t.Fatalf("Exec(script): %v", err)
+		}
+		if _, err := EndAction(dir, TerminalPassed, ""); err != nil {
+			t.Fatalf("EndAction: %v", err)
+		}
+		v, err := VerifyDir(VerifyOptions{Dir: dir})
+		if err != nil {
+			t.Fatalf("VerifyDir: %v", err)
+		}
+		if !v.Complete {
+			t.Errorf("a run with a setup command verified as incomplete; findings = %+v", v.Findings)
+		}
+	})
+
+	// CARDINALITY, not just presence. Two script envelopes is two measurements
+	// wearing one bucket's name, and nothing downstream picks between them.
+	t.Run("with two script envelopes", func(t *testing.T) {
+		dir := t.TempDir()
+		measuredRun(t, dir, run, "", ExecOptions{Argv: []string{"sh", "-c", "true"}})
+		if _, err := Exec(ExecOptions{
+			Level: LevelScript, Seq: 1, Dir: dir, Cwd: dir, Run: run, Timeout: 30 * time.Second,
+			Argv: []string{"sh", "-c", "true"},
+		}); err != nil {
+			t.Fatalf("Exec(second script): %v", err)
+		}
+		v, err := VerifyDir(VerifyOptions{Dir: dir})
+		if err != nil {
+			t.Fatalf("VerifyDir: %v", err)
+		}
+		if v.Complete || v.Eligible {
+			t.Errorf("two script envelopes verified as complete=%v eligible=%v", v.Complete, v.Eligible)
+		}
+		if !hasFinding(v, "WT-020") {
+			t.Errorf("no WT-020 finding names the duplicate script envelope; findings = %+v", v.Findings)
+		}
+	})
 }

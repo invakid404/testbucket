@@ -77,19 +77,38 @@ func TestWallHistoryRecencyEvictionAndThreeIdentities(t *testing.T) {
 		if r.HeadSHA == r.CandidateSHA || r.CandidateSHA == r.WorkloadCommit || r.HeadSHA == r.WorkloadCommit {
 			t.Fatal("the fixture collapses two identities; they must be independently addressable")
 		}
-		// A row that collapses them is rejected by QC15.
+		// A row that collapses them is rejected by QC15, with the plan declaring
+		// no same-repository workload.
 		bad := r
 		bad.CandidateSHA = ""
-		if err := QC15(bad); err == nil {
+		if err := QC15(bad, false); err == nil {
 			t.Fatal("QC15 accepted a row missing candidate_sha")
 		}
 		bad = r
 		bad.WorkloadCommit = ""
-		if err := QC15(bad); err == nil {
+		if err := QC15(bad, false); err == nil {
 			t.Fatal("QC15 accepted a row missing workload_commit")
 		}
-		if err := QC15(r); err != nil {
+		if err := QC15(r, false); err != nil {
 			t.Fatalf("QC15 rejected a well-formed row: %v", err)
+		}
+
+		// THE PLAN-BOUND EXCEPTION, at the ring gate as at the qualifier. The
+		// declaration is the plan's, so it arrives as an argument; a row cannot
+		// grant it to itself here any more than it can there.
+		collapsed := r
+		collapsed.CandidateSHA, collapsed.WorkloadCommit = r.HeadSHA, r.HeadSHA
+		if err := QC15(collapsed, false); err == nil {
+			t.Fatal("QC15 accepted a collapsed row with no declaration")
+		}
+		if err := QC15(collapsed, true); err != nil {
+			t.Fatalf("QC15 rejected a declared same-repository row, so the dogfood can never reach the ring: %v", err)
+		}
+		// The exception admits EQUALITY only, never an absent identity.
+		missing := collapsed
+		missing.CandidateSHA = ""
+		if err := QC15(missing, true); err == nil {
+			t.Fatal("the carve-out excused an absent candidate_sha")
 		}
 	})
 
@@ -282,4 +301,102 @@ func trainableIDs(w *WallObject) []string {
 		}
 	}
 	return out
+}
+
+// TestRecencyOrdersInstantsNotText is R05's control.
+//
+// §15.1b orders the recency key's first element as an RFC 3339 UTC INSTANT, and
+// `Less` compared the text. Assembly writes the stamp with time.RFC3339Nano,
+// whose fraction is VARIABLE WIDTH — trailing zeros are dropped — so two stamps
+// 10ms apart can sort in the opposite order, and two spellings of the same
+// instant can sort as different ones. At W the ring evicts on this order, so the
+// wrong measurement was discarded.
+func TestRecencyOrdersInstantsNotText(t *testing.T) {
+	key := func(stamp, job string) RingRecencyKey {
+		return RingRecencyKey{
+			ObservedStartRealtime: stamp,
+			Intrinsic:             [6]string{"owner/name", "run-1", "1", job, "0", "sha256:plan"},
+		}
+	}
+
+	t.Run("differing fractional precision orders by time", func(t *testing.T) {
+		// THE REPORT'S OWN EXAMPLE. `.1` is 100ms and `.11` is 110ms, so the
+		// first is older — but as text `.11Z` sorts before `.1Z`, because '1'
+		// precedes 'Z'.
+		older := key("2026-09-11T12:00:00.1Z", "job-a")
+		newer := key("2026-09-11T12:00:00.11Z", "job-b")
+		if !older.Less(newer) {
+			t.Error("100ms did not sort before 110ms; the key is comparing text")
+		}
+		if newer.Less(older) {
+			t.Error("110ms sorted before 100ms")
+		}
+	})
+
+	t.Run("more precision on the older instant still orders by time", func(t *testing.T) {
+		older := key("2026-09-11T12:00:00.000001Z", "job-a")
+		newer := key("2026-09-11T12:00:00.1Z", "job-b")
+		if !older.Less(newer) {
+			t.Error("1µs did not sort before 100ms")
+		}
+	})
+
+	t.Run("equivalent encodings are the same instant", func(t *testing.T) {
+		// Same instant, three spellings. The order must then fall to the
+		// intrinsic tuple, which is what makes it total.
+		for _, pair := range [][2]string{
+			{"2026-09-11T12:00:00Z", "2026-09-11T12:00:00.000Z"},
+			{"2026-09-11T12:00:00.5Z", "2026-09-11T12:00:00.500000Z"},
+			{"2026-09-11T12:00:00Z", "2026-09-11T14:00:00+02:00"},
+		} {
+			a, b := key(pair[0], "job-a"), key(pair[1], "job-b")
+			if a.Less(b) == b.Less(a) {
+				t.Errorf("%q and %q did not resolve to a strict order", pair[0], pair[1])
+			}
+			// job-a < job-b, so a is first whichever spelling it used.
+			if !a.Less(b) {
+				t.Errorf("%q vs %q: the tie did not fall to the intrinsic tuple", pair[0], pair[1])
+			}
+			same := key(pair[1], "job-a")
+			if a.Less(same) || same.Less(a) {
+				t.Errorf("%q and %q are the same instant and the same row, but compared unequal", pair[0], pair[1])
+			}
+		}
+	})
+
+	t.Run("whole-second stamps still order as before", func(t *testing.T) {
+		older := key("2026-09-01T00:00:00Z", "job-a")
+		newer := key("2026-09-02T00:00:00Z", "job-b")
+		if !older.Less(newer) || newer.Less(older) {
+			t.Error("whole-second ordering regressed")
+		}
+	})
+
+	t.Run("an unparseable stamp sorts oldest and the order stays total", func(t *testing.T) {
+		bad := key("not-an-instant", "job-a")
+		good := key("2026-09-01T00:00:00Z", "job-b")
+		if !bad.Less(good) {
+			t.Error("an uninterpretable stamp was treated as the more recent row")
+		}
+		if good.Less(bad) == bad.Less(good) {
+			t.Error("the comparison is not a strict order across the parse boundary")
+		}
+		other := key("also-not-an-instant", "job-b")
+		if bad.Less(other) == other.Less(bad) {
+			t.Error("two unparseable stamps did not resolve to a strict order")
+		}
+	})
+
+	t.Run("eviction takes the oldest instant, not the smallest string", func(t *testing.T) {
+		// The property the order exists for, at the boundary that motivated it.
+		rows := []WallRingRow{
+			{ObservedStartRealtime: "2026-09-11T12:00:00.9Z", JobID: "job-late"},
+			{ObservedStartRealtime: "2026-09-11T12:00:00.11Z", JobID: "job-early"},
+		}
+		a := RingRecencyKeyOf(rows[0])
+		b := RingRecencyKeyOf(rows[1])
+		if !b.Less(a) {
+			t.Error("110ms did not sort before 900ms; text order would have put .9 first")
+		}
+	})
 }

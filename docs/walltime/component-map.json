@@ -393,6 +393,20 @@
    "dependency_impact": "R31-F19: call-site inspection found every symbol in these two files disconnected from the production planner - a frozen acquisition-environment snapshot, a frozen-PATH program resolver, a package-launcher delegation resolver, and the discovery argv of the acquisition closure. Each reference was a definition, a helper-internal call, or a test, so helper coverage looked like live-path coverage while the names still described a capability this product does not have. They were split out of wall-cli-and-acquisition rather than reclassified inside it: that component's R54 SIMPLIFY classification describes the files that remain, and rewriting it would falsify the salvage record instead of recording a later discovery. splitCommand, which IS live, stays in main.go."
   },
   {
+   "id": "dead-pidfd-signal-capability",
+   "kind": "platform-helpers",
+   "classification": "REMOVE",
+   "files": [
+    "internal/walltime/procsignal_linux.go",
+    "internal/walltime/procsignal_other.go"
+   ],
+   "evidence": [
+    "internal/walltime/procsignal_linux.go:32",
+    "internal/walltime/procsignal_other.go:11"
+   ],
+   "dependency_impact": "R31-R08: signalByIdentity signalled a process THROUGH A PINNED HANDLE rather than through its number, so a pid recycled between the identity check and the signal could not be signalled by mistake. Nothing called it on either platform: what this product signals is the process GROUP, whose ownership argument is its own, and the caller that pinned an individual process went with the observers and the containment peer. The symbol was the entire content of both files - the Linux file's two syscall numbers exist only to make that call, and the portable file is a stub that reports false - so the pair is removed rather than emptied. The bounded group escalation in exec.go and action.go is unchanged."
+  },
+  {
    "id": "wall-cli-and-acquisition",
    "kind": "command-and-tests",
    "classification": "SIMPLIFY",
@@ -1345,6 +1359,10 @@
     "workload-commit",
     "shard-plan"
    ],
+   "post_contract_inputs": [
+    "cache-scope"
+   ],
+   "post_contract_inputs_note": "R31-R06: NOT part of canonical A, and deliberately in its own list. acceptance-contract.md fixes add_inputs as the derived projection of A in order, both directions, and A's members are transported from the workflow-call union U that contract 21 enumerates; cache-scope is not one of those - it is a pre-existing caller input that now also reaches this action. It is declared here because the shipped input set is governed by this document, and an input governed nowhere is how an interface drifts. The wall observation artifact, its member file name and the record job's download selection are namespaced by it: two measured suites in one run fan out overlapping bucket names, and without the namespace each record job selected the other suite's observations and qualified them against its own plan.",
    "add_inputs_note": "S-4/R18-F1: runs-on-label is passed as one caller expression to both actions so that the key and the observation cannot disagree about it - QC12 is the comparison. The cache declaration reaches the plan action as a file whose leaves and transport are acceptance-contract.md 10.5.0 and 10.5.2's; this note names neither the leaves nor the mechanism.",
    "cache_note": "R12-D2/R13-D2/R18-F1: this action consumes the declaration and produces the outcomes. Which leaves are which, how the declaration is verified on arrival, where the restore result comes from, and what the QC split checks are all acceptance-contract.md 10.5's, and are neither enumerated, counted, nor paraphrased here."
   },

@@ -2,7 +2,6 @@ package walltime
 
 import (
 	"fmt"
-	"math"
 	"sort"
 	"time"
 )
@@ -154,21 +153,6 @@ func EvaluateAeta(samples []AetaSample, expected int) []GateResult {
 	}
 }
 
-// campaignScoped keeps only the gates the full population decides, and marks
-// them as such. The row-scope members of those sets were already decided by
-// each row's own verifier verdict; re-deciding them here would double-count a
-// judgement that has already been made.
-func campaignScoped(gates []GateResult) []GateResult {
-	var out []GateResult
-	for _, g := range gates {
-		if g.Scope != ScopeCampaign {
-			continue
-		}
-		out = append(out, g)
-	}
-	return out
-}
-
 // medianNs is the conventional even-n arithmetic mean of the two middle
 // values, as the contract specifies. No outlier deletion, no rounding
 // allowance.
@@ -178,19 +162,6 @@ func medianNs(v []int64) int64 {
 	}
 	s := append([]int64(nil), v...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
-	n := len(s)
-	if n%2 == 1 {
-		return s[n/2]
-	}
-	return (s[n/2-1] + s[n/2]) / 2
-}
-
-func medianFloat(v []float64) float64 {
-	if len(v) == 0 {
-		return math.Inf(1)
-	}
-	s := append([]float64(nil), v...)
-	sort.Float64s(s)
 	n := len(s)
 	if n%2 == 1 {
 		return s[n/2]

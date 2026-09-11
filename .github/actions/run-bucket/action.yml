@@ -50,15 +50,19 @@ inputs:
       block; a failure fails the bucket before any test runs. Empty = no setup
       step ⇒ unchanged behavior.
 
-      UNDER MEASUREMENT it runs through `wall run`, which strips both the
-      wall-time capabilities and the GitHub file-command channels
-      ($GITHUB_OUTPUT, $GITHUB_ENV, $GITHUB_PATH, $GITHUB_STEP_SUMMARY,
-      $GITHUB_STATE) from its environment. A setup command that sets step
-      outputs or job-wide variables therefore has no effect on a measured
-      bucket: those channels are how a later step's outputs and the job
-      environment are written, and consumer-supplied code must not be able to
-      read or write them.
-      Do that provisioning in a prior step of the caller's own job instead.
+      UNDER MEASUREMENT it runs through `wall run`, which opens a recorded
+      setup lifecycle around it so §3.1's floor `A >= setup_ns + script_ns`
+      has a measured term rather than a number supplied beside the records.
+
+      IT INHERITS THIS STEP'S ENVIRONMENT, unchanged. An earlier revision of
+      this description promised that the wall-time capabilities and the GitHub
+      file-command channels ($GITHUB_OUTPUT, $GITHUB_ENV, $GITHUB_PATH,
+      $GITHUB_STEP_SUMMARY, $GITHUB_STATE) were stripped from it; the
+      machinery that did that was removed with the hostile-runner model §0.1
+      places out of scope, and the promise outlived it. A setup command can
+      therefore write step outputs and job-wide variables exactly as any other
+      command in this job can. Supply only code you would run in your own job
+      — because that is what running it here is.
     default: ""
   wall-time-dir:
     description: >-
@@ -137,6 +141,21 @@ inputs:
       that is copied verbatim into the observation so QC13 has a real byte
       path. Required for a scored run.
     default: ""
+  cache-scope:
+    description: >-
+      The SUITE NAMESPACE, the same value the caller passes the reusable
+      workflow. Every other cross-job artifact this project names already
+      carries it — the timing store, the shard plan, the event bundles — and
+      the observation did not: it was named from `name` plus the run and
+      attempt only. Two measured suites in one run (this repository ships
+      exactly that: `dogfood` and `dogfood-vitest`) both fan out a bucket
+      called `bucket-0`, so both uploaded the same artifact name, and the
+      record job's unfiltered download merged whichever pair survived into one
+      ingest population — each suite then qualified the other's observation
+      against its own plan. The namespace travels through the artifact name,
+      the observation's own file name, and the download selection together,
+      because a namespace applied at only one of the three is not one.
+    default: default
 runs:
   using: composite
   steps:
@@ -478,9 +497,10 @@ runs:
         set -euo pipefail
         if [ -n "$TB_WALL_DIR" ]; then
           # NO --wrapper-chain: this is the CONSUMER'S command, so `wall run`
-          # strips the GitHub file-command channels from its child and records
-          # its own setup lifecycle. Caller-supplied code therefore cannot
-          # rewrite the measured step's outputs or the job environment.
+          # records a setup lifecycle around it. The branch that starts the
+          # bucket script passes the flag instead and writes none: that handoff
+          # is this tool starting itself, which is not a level. The child's
+          # environment is this step's either way.
           testbucket wall run --dir "$TB_WALL_DIR" -- bash -eo pipefail -c "$TB_SETUP_COMMAND"
         else
           bash -eo pipefail -c "$TB_SETUP_COMMAND"
@@ -672,12 +692,17 @@ runs:
         TB_CACHE_DECLARATION_FILE: ${{ inputs.cache-declaration-file }}
         TB_RUNNER: ${{ inputs.runner }}
         TB_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        TB_CACHE_SCOPE: ${{ inputs.cache-scope }}
       run: |
         set -euo pipefail
-        # NAMED FOR ITS BUCKET. The record job merges every bucket's artifact
-        # into one directory, so a fixed name would have each upload overwrite
-        # the last and the run would learn from exactly one bucket.
-        out="${RUNNER_TEMP}/observation-${BUCKET_NAME}.json"
+        # NAMED FOR ITS SUITE AND ITS BUCKET. The record job merges every
+        # bucket's artifact into one directory, so a fixed name would have each
+        # upload overwrite the last and the run would learn from exactly one
+        # bucket. The suite namespace is here for the same reason one step
+        # further out: bucket names are chosen per suite and repeat across
+        # suites, so `observation-bucket-0.json` is not a unique member name in
+        # a run that measures two suites.
+        out="${RUNNER_TEMP}/observation-${TB_CACHE_SCOPE}-${BUCKET_NAME}.json"
         args=(
           --dir "$TB_WALL_DIR"
           --shard-plan "$TB_SHARD_PLAN"
@@ -707,13 +732,22 @@ runs:
         fi
         testbucket wall assemble-observation "${args[@]}"
 
-    # UNIQUELY NAMED PER BUCKET, so the record job can download every bucket's
-    # observation into one directory without them overwriting each other.
+    # UNIQUELY NAMED PER SUITE AND BUCKET, so the record job can download every
+    # bucket's observation into one directory without them overwriting each
+    # other -- and so that the record job of ANOTHER suite in the same run
+    # cannot select this one.
+    #
+    # THE LITERAL `-run-...-bucket-` IS WHAT MAKES THE SCOPE A NAMESPACE. The
+    # download selects with a trailing `*`, and a trailing `*` after a bare
+    # scope is a prefix test, not a namespace test: `dogfood-*` matches every
+    # `dogfood-vitest-...` artifact. Fixed text between the scope and the only
+    # wildcard is what stops one suite's selector from reaching another's
+    # uploads, so the order of these segments is load-bearing.
     - name: Upload the wall observation
       if: always() && inputs.wall-time-dir != '' && inputs.shard-plan != ''
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: testbucket-wall-obs-${{ inputs.name }}-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/observation-${{ inputs.name }}.json
+        name: testbucket-wall-obs-${{ inputs.cache-scope }}-run-${{ github.run_id }}-${{ github.run_attempt }}-bucket-${{ inputs.name }}
+        path: ${{ runner.temp }}/observation-${{ inputs.cache-scope }}-${{ inputs.name }}.json
         if-no-files-found: warn
         retention-days: 14

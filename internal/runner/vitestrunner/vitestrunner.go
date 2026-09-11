@@ -147,8 +147,14 @@ type Options struct {
 	WallDir string
 	// Env is the exact environment every subprocess this runner spawns is
 	// given, as KEY=VALUE. nil inherits the ambient environment, which is what
-	// a caller that is not binding a plan wants; `wall bundle` supplies the
-	// same set it retains, so the recorded environment is the one that ran.
+	// a caller that is not binding a plan wants; a caller that supplies one
+	// gets exactly that set in every subprocess, so the environment a record
+	// names is the environment that ran.
+	//
+	// It named `wall bundle` as the supplier, which is a subcommand this
+	// binary has no case for: the Stage-1 planning-input bundle went with the
+	// protected-authority model, and the sentence describing who fills this
+	// field outlived the thing that filled it.
 	Env []string
 }
 

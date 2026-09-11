@@ -235,13 +235,23 @@ func observationFixtureForUnit(bucket string, index int, runID string, planDiges
 			StartedMonoNs:  1000, EndedMonoNs: 2_000_000_000,
 			ElapsedNs: 1_999_999_000,
 		}},
+		// EVERY DERIVED SPAN IS THE SPAN ITS ENDPOINTS DESCRIBE, and every
+		// residual is its own subtraction. The fixture used to carry
+		// script_ns = 8s beside a single 2s invocation and a 1ms overhead, which
+		// no wrapper produces: the script's residual would have been 6s. QC7
+		// recomputes these now, so the numbers have to be arithmetic rather than
+		// plausible.
+		//
+		//   A            = 10s      = ended(10s) - started(0)
+		//   wrapper_ns   =  7s      = A - setup(1s) - script(2s)
+		//   script_ns    =  2s      = ΣV(1.999999s) + overhead(1µs)
 		StartedMonoNs:    0,
 		EndedMonoNs:      10_000_000_000,
 		ElapsedNs:        10_000_000_000,
 		SetupNs:          1_000_000_000,
-		ScriptNs:         8_000_000_000,
-		ScriptOverheadNs: 1_000_000,
-		WrapperNs:        1_000_000_000,
+		ScriptNs:         2_000_000_000,
+		ScriptOverheadNs: 1_000,
+		WrapperNs:        7_000_000_000,
 		RealtimeStart:    "2026-09-01T00:00:00Z",
 		RealtimeEnd:      "2026-09-01T00:00:10Z",
 		// §13.1's clock domain, carried rather than dropped. A row that does not

@@ -451,6 +451,56 @@ func intervalInvariants(o Observation) error {
 			return fmt.Errorf("QC7: invocation %d reuses the envelope's endpoints; no endpoint is copied between records", i)
 		}
 	}
+
+	// EVERY DERIVED SPAN IS THE SPAN ITS OWN ENDPOINTS DESCRIBE.
+	//
+	// The checks above are bounds and orderings: nonnegative, A >= setup+script,
+	// script >= ΣV, each pair ordered. None of them compares a DURATION against
+	// the two readings it was supposedly computed from — so a row could report
+	// endpoints 1000 and 2000 and an elapsed_ns of anything at all, including a
+	// value that satisfies every bound. §3.1's terms are derived quantities, and
+	// a derived quantity nobody recomputes is a claim.
+	//
+	// The residual identities are the same shape. `wrapper_ns` is what the
+	// envelope holds beyond setup and script, and `script_overhead_ns` what the
+	// script holds beyond its invocations; both were carried and never checked.
+	//
+	// The arithmetic is nsmath's throughout: a difference that cannot be
+	// represented is a NAMED failure, never a smaller number.
+	span, err := nsmath.SumNs("envelope_span", int64(o.EndedMonoNs), -int64(o.StartedMonoNs))
+	if err != nil {
+		return fmt.Errorf("QC7: %w", err)
+	}
+	if int64(o.ElapsedNs) != span {
+		return fmt.Errorf("QC7: elapsed_ns is %d and its endpoints span %d (%d..%d); a derived duration is the difference of the readings it came from",
+			o.ElapsedNs, span, o.StartedMonoNs, o.EndedMonoNs)
+	}
+	for i, inv := range o.Invocations {
+		got, err := nsmath.SumNs("invocation_span", int64(inv.EndedMonoNs), -int64(inv.StartedMonoNs))
+		if err != nil {
+			return fmt.Errorf("QC7: invocation %d: %w", i, err)
+		}
+		if int64(inv.ElapsedNs) != got {
+			return fmt.Errorf("QC7: invocation %d elapsed_ns is %d and its endpoints span %d (%d..%d)",
+				i, inv.ElapsedNs, got, inv.StartedMonoNs, inv.EndedMonoNs)
+		}
+	}
+	wrapper, err := nsmath.SumNs("wrapper_residual", int64(o.ElapsedNs), -int64(o.SetupNs), -int64(o.ScriptNs))
+	if err != nil {
+		return fmt.Errorf("QC7: %w", err)
+	}
+	if int64(o.WrapperNs) != wrapper {
+		return fmt.Errorf("QC7: wrapper_ns is %d and A - setup_ns - script_ns is %d; the residual is what the envelope holds beyond its two named spans",
+			o.WrapperNs, wrapper)
+	}
+	overhead, err := nsmath.SumNs("script_overhead_residual", int64(o.ScriptNs), -sumV)
+	if err != nil {
+		return fmt.Errorf("QC7: %w", err)
+	}
+	if int64(o.ScriptOverheadNs) != overhead {
+		return fmt.Errorf("QC7: script_overhead_ns is %d and script_ns - the sum of invocation intervals is %d; the residual is what the script holds beyond the calls it made",
+			o.ScriptOverheadNs, overhead)
+	}
 	return nil
 }
 

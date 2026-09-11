@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/invakid404/testbucket/internal/core"
@@ -144,4 +145,99 @@ func TestAssemblyOrdersInvocationsNumerically(t *testing.T) {
 	if got := obs.Invocations[100].ArgvDigest; got != "sha256:argv-100" {
 		t.Fatalf("sequence 100 carries %s, want sha256:argv-100", got)
 	}
+}
+
+// TestAFailedNestedTerminalSurvivesAssemblyAndAdmission is R03's control.
+//
+// `runOwnedChild` set the exit code from the ROOT's exit alone. A same-group
+// descendant surviving the bounded settle makes the wrapper drain and kill the
+// group and record `crash_unclosed` — but the root had exited zero, so Exec
+// returned (0, nil), the shell saw success, the action envelope closed `passed`,
+// and assembly searched only for a non-zero exit code among setup and script. The
+// row reached QC9 as a passing action with zero exit codes: a measurement that
+// knew it was broken trained the model.
+//
+// The exit status now follows the terminal, and assembly keeps every recorded
+// non-passing terminal rather than discarding it.
+func TestAFailedNestedTerminalSurvivesAssemblyAndAdmission(t *testing.T) {
+	dir := t.TempDir()
+	writeEnvelope(t, dir, 5_000_000_000)
+	writeInvocationStream(t, dir, 0, 1_000_000_000, 2_000_000_000, "sha256:argv-000")
+
+	// The SCRIPT envelope records the escape, exactly as the wrapper writes it:
+	// a terminal of crash_unclosed while its own root exited zero.
+	path := filepath.Join(dir, "physical-script-01.jsonl")
+	w, err := walltime.NewWriter(path, walltime.ProducerPhysical, "physical")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []walltime.Record{
+		{
+			Kind: "boundary", Level: walltime.LevelScript, Boundary: "start",
+			Source: walltime.SourceWrapper,
+			Instant: walltime.Instant{
+				ClockID: walltime.ClockMonotonic, Mono: 500_000_000,
+				Realtime: "2026-09-01T00:00:00Z/2026-09-01T00:00:00.001Z", BootID: "boot-a",
+			},
+		},
+		{
+			Kind: "boundary", Level: walltime.LevelScript, Boundary: "end",
+			Source: walltime.SourceWrapper,
+			Instant: walltime.Instant{
+				ClockID: walltime.ClockMonotonic, Mono: 3_000_000_000,
+				Realtime: "2026-09-01T00:00:03Z/2026-09-01T00:00:03.001Z", BootID: "boot-a",
+			},
+			// ZERO exit code, which is exactly the shape that got through.
+			Proc:     walltime.ProcIdentity{PGID: 4242, ExitCode: 0},
+			Terminal: walltime.TerminalCrashUnclosed,
+			Reason:   "a descendant outlived its root",
+		},
+	} {
+		if _, err := w.Append(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+
+	plan := &core.PlanBucket{Invocations: []runner.Invocation{{Units: []string{"unit-000"}}}}
+	var obs walltime.Observation
+	obs.Terminal = walltime.TerminalPassed
+	if err := fillIntervals(&obs, plan, dir); err != nil {
+		t.Fatalf("fillIntervals: %v", err)
+	}
+
+	if obs.Terminal == walltime.TerminalPassed {
+		t.Fatal("the assembled observation reports `passed` over a script envelope that recorded crash_unclosed")
+	}
+	if obs.Terminal != walltime.TerminalCrashUnclosed {
+		t.Errorf("terminal = %q, want the nested %q", obs.Terminal, walltime.TerminalCrashUnclosed)
+	}
+	if obs.ExitCode == 0 {
+		t.Error("exit_code stayed 0 beside a non-passing terminal; the two must not disagree")
+	}
+	if !strings.Contains(obs.FailureReason, "crash_unclosed") {
+		t.Errorf("failure_reason does not carry the nested finding: %q", obs.FailureReason)
+	}
+
+	// The admission half needs no new control: QC9 admits `terminal == "passed"`
+	// and a zero exit code, and §22 test 3's QC9 case already asserts that. What
+	// was missing was any way for the nested failure to REACH it, which is what
+	// the three assertions above establish.
+
+	t.Run("a wholly clean measurement still reports passed", func(t *testing.T) {
+		clean := t.TempDir()
+		writeEnvelope(t, clean, 5_000_000_000)
+		writeInvocationStream(t, clean, 0, 1_000_000_000, 2_000_000_000, "sha256:argv-000")
+		var obs walltime.Observation
+		obs.Terminal = walltime.TerminalPassed
+		if err := fillIntervals(&obs, plan, clean); err != nil {
+			t.Fatalf("fillIntervals: %v", err)
+		}
+		if obs.Terminal != walltime.TerminalPassed {
+			t.Fatalf("a clean measurement reported %q", obs.Terminal)
+		}
+		if obs.ExitCode != 0 {
+			t.Errorf("a clean measurement reported exit code %d", obs.ExitCode)
+		}
+	})
 }

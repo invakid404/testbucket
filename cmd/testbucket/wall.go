@@ -154,16 +154,23 @@ func runWallRun(args []string) error {
 	fs := flag.NewFlagSet("wall run", flag.ExitOnError)
 	dir := fs.String("dir", "", "records directory (required)")
 	cwd := fs.String("cwd", "", "working directory for the command")
-	// THE CAPABILITY BOUNDARY, DECLARED AT THE CALL SITE.
+	// WHICH OF THE TWO CHILDREN THIS IS, DECLARED AT THE CALL SITE.
 	//
 	// Two very different commands run through `wall run`: the bucket command,
-	// which is this tool's own wrapper starting the measured script and needs
-	// the wall-time capabilities to do it, and the consumer-supplied setup
-	// command, which is somebody else's code and needs none of them. The
-	// default is the scrubbed environment, so a caller that does not think
-	// about it does not hand a signing capability to code it did not write.
+	// which is this tool's own wrapper starting the measured script, and the
+	// consumer-supplied setup command, which is somebody else's code. Only
+	// the second is a setup LIFECYCLE — the handoff from this tool to itself
+	// is not a level, and recording it made the interval labelled `setup`
+	// contain the script it went on to start, which §3.1's own floor then
+	// refused.
+	//
+	// It once also selected a capability boundary: the default was a scrubbed
+	// environment with the wall-time secrets and account selectors removed.
+	// That machinery went with the hostile-runner model §0.1 places out of
+	// scope, and this flag no longer decides anything about the child's
+	// environment — both children get this process's.
 	wrapperChain := fs.Bool("wrapper-chain", false,
-		"this child continues the wrapper chain and needs the wall-time capabilities (the bucket command). Without it the child runs with every wall-time secret and account selector removed, which is what a consumer-supplied setup command must get")
+		"this child continues the wrapper chain (the bucket command), so no setup lifecycle is recorded for it. Without it the child is the consumer's setup command and its interval is recorded, which is where §3.1's setup_ns comes from")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

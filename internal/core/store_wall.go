@@ -158,9 +158,40 @@ func RingRecencyKeyOf(r WallRingRow) RingRecencyKey {
 }
 
 // Less orders two recency keys, oldest first.
+//
+// THE FIRST ELEMENT IS AN INSTANT, AND INSTANTS ARE COMPARED AS INSTANTS.
+//
+// This compared the RFC 3339 TEXT. Assembly writes the stamp with
+// time.RFC3339Nano, which emits a VARIABLE-WIDTH fraction — trailing zeros are
+// dropped — so `…00.1Z` and `…00.11Z` are 100ms and 110ms apart in time and in
+// the opposite order as strings: `…00.11Z` sorts first because `1` < `Z`. The
+// same text comparison also calls `…00Z` and `…00.000Z` different instants when
+// they are the same one. §15.1b orders the first tuple element as an RFC 3339
+// UTC instant, and at W the ring EVICTS on this order, so a text comparison
+// discards the wrong measurement.
+//
+// An unparseable stamp is not silently ordered: QC16 refuses one at admission,
+// and a row that reached the ring without it sorts before every parseable stamp
+// so it is evicted first rather than retained by accident. The tie key stays the
+// row-intrinsic tuple, compared as text, because those ARE strings.
 func (a RingRecencyKey) Less(b RingRecencyKey) bool {
-	if a.ObservedStartRealtime != b.ObservedStartRealtime {
-		return a.ObservedStartRealtime < b.ObservedStartRealtime
+	at, aok := parseRecencyInstant(a.ObservedStartRealtime)
+	bt, bok := parseRecencyInstant(b.ObservedStartRealtime)
+	switch {
+	case aok && bok:
+		if !at.Equal(bt) {
+			return at.Before(bt)
+		}
+	case aok != bok:
+		// The parseable one is the later of the two: an uninterpretable stamp
+		// cannot be shown to be recent, and eviction takes the oldest.
+		return !aok
+	default:
+		// Neither parses. Fall back to text so the order is still total, which
+		// is what makes eviction shuffle-invariant.
+		if a.ObservedStartRealtime != b.ObservedStartRealtime {
+			return a.ObservedStartRealtime < b.ObservedStartRealtime
+		}
 	}
 	for i := range a.Intrinsic {
 		if a.Intrinsic[i] != b.Intrinsic[i] {
@@ -168,6 +199,18 @@ func (a RingRecencyKey) Less(b RingRecencyKey) bool {
 		}
 	}
 	return false
+}
+
+// parseRecencyInstant reads §15.1b's first tuple element. It accepts the
+// variable-width fraction time.RFC3339Nano emits and the whole-second form
+// alike, because they are the same grammar and the difference is only how many
+// digits a particular instant needed.
+func parseRecencyInstant(s string) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.UTC(), true
 }
 
 // Equal reports whether two keys are the same row identity.
@@ -444,7 +487,23 @@ func nowRFC3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 // A row that collapses them is REJECTED rather than silently overloaded: one
 // head_sha standing in for all three would make a candidate change invisible to
 // the comparability key and to the campaign's pair invariant alike.
-func QC15(r WallRingRow) error {
+//
+// THE PLAN-BOUND EXCEPTION TRAVELS WITH THE ROW, because this gate runs after
+// the qualifier and must reach the same verdict.
+//
+// §13.0's carve-out admits one commit in all three identities for an explicitly
+// unscored run whose PLAN declared the workload to be the orchestration
+// checkout — the project measuring its own suite, where the three genuinely are
+// one commit. The qualifier applies it; this ring-level gate did not, and
+// re-derived the pre-carve-out rule from the row alone. A dogfood row therefore
+// qualified and was then discarded one call before AppendRow, so the lane could
+// never reach wall history at all.
+//
+// Two checks cannot disagree about one rule. The caller passes the decision the
+// plan made — never something re-derived here — and a row that does not carry it
+// gets the strict rule, which is what every scored, undeclared and
+// external-consumer row still gets.
+func QC15(r WallRingRow, sameRepositoryWorkload bool) error {
 	for _, f := range []struct {
 		name, value string
 	}{
@@ -456,8 +515,8 @@ func QC15(r WallRingRow) error {
 			return fmt.Errorf("QC15: %s is absent; the three provenance identities are separately required", f.name)
 		}
 	}
-	if r.HeadSHA == r.CandidateSHA && r.CandidateSHA == r.WorkloadCommit {
-		return fmt.Errorf("QC15: all three provenance identities are the same value %q; a row that collapses them is rejected", r.HeadSHA)
+	if r.HeadSHA == r.CandidateSHA && r.CandidateSHA == r.WorkloadCommit && !sameRepositoryWorkload {
+		return fmt.Errorf("QC15: all three provenance identities are the same value %q and the plan declares no same-repository workload; a row that collapses them is rejected", r.HeadSHA)
 	}
 	if r.Repository == "" || r.RunID == "" || r.RunAttempt == "" || r.JobID == "" {
 		return fmt.Errorf("QC15: the intrinsic identity is incomplete, so the recency key would not be reconstructible from the row")

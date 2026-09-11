@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -330,6 +331,13 @@ func TestEveryActionShipsExactlyTheMapsInputSet(t *testing.T) {
 			RemoveInputs   []string `json:"remove_inputs"`
 			AddInputs      []string `json:"add_inputs"`
 			AddedInputs    []string `json:"added_inputs"`
+			// POST-CONTRACT, and a separate list on purpose. `add_inputs` is
+			// the derived projection of canonical `A` and the contract
+			// requires it to equal `A` in order, both directions, so an input
+			// that §21's table does not enumerate cannot be put there without
+			// making that relation false. It is still governed here, because
+			// the shipped input set is this document's to decide.
+			PostContractInputs []string `json:"post_contract_inputs"`
 		} `json:"action_interfaces"`
 	}
 	if err := json.Unmarshal([]byte(readRepoFile(t, "docs/walltime/component-map.json")), &cm); err != nil {
@@ -362,6 +370,9 @@ func TestEveryActionShipsExactlyTheMapsInputSet(t *testing.T) {
 			want[in] = true
 		}
 		for _, in := range iface.AddedInputs {
+			want[in] = true
+		}
+		for _, in := range iface.PostContractInputs {
 			want[in] = true
 		}
 		remove := map[string]bool{}
@@ -706,4 +717,151 @@ func TestTheBucketBannerNamesItsBasis(t *testing.T) {
 	if !strings.Contains(wf, "TB_EST_BASIS: ${{ matrix.est_basis }}") {
 		t.Error("the reusable workflow does not pass the matrix entry's est_basis to the bucket step")
 	}
+}
+
+// TestTwoSuitesInOneRunReachOnlyTheirOwnObservations is R06.
+//
+// Every other cross-job artifact this project names carries the caller's
+// `cache-scope` — the timing store, the shard plan, the event bundles. The
+// wall observation did not: it was uploaded as
+// `testbucket-wall-obs-<name>-<run>-<attempt>` and downloaded with
+// `testbucket-wall-obs-*-<run>-<attempt>`. Bucket names are chosen per suite
+// and repeat across suites, and this repository measures TWO suites in one
+// run, so both uploaded the same artifact name for `bucket-0` and each record
+// job then merged whichever pair survived into one ingest population and
+// qualified the other suite's observation against its own plan.
+//
+// The test evaluates the shipped naming rather than scanning it for a phrase:
+// it reads the upload name, the member path and the download pattern out of
+// the YAML, substitutes two suites' values into each, and requires that each
+// suite's selector reaches its own upload and not the other's. That is what
+// makes the adversarial pair load-bearing — `dogfood` and `dogfood-vitest`
+// are real scopes in this repository, and a bare `<scope>-*` pattern selects
+// both, so a namespace that is only a prefix fails here.
+func TestTwoSuitesInOneRunReachOnlyTheirOwnObservations(t *testing.T) {
+	action := readRepoFile(t, ".github/actions/run-bucket/action.yml")
+	wf := readRepoFile(t, ".github/workflows/bucketed-reusable.yml")
+
+	uploadName := oneMatch(t, action, `(?m)^        name: (testbucket-wall-obs-.*)$`,
+		"the run-bucket action uploads no wall observation")
+	memberPath := oneMatch(t, action, `(?m)^        path: (.*observation-.*)$`,
+		"the run-bucket action uploads no observation file")
+	pattern := oneMatch(t, wf, `(?m)^          pattern: (testbucket-wall-obs-.*)$`,
+		"the record job selects no wall observations")
+	planName := oneMatch(t, wf, `(?m)^          name: (testbucket-shard-plan-.*)$`,
+		"the record job downloads no shard plan")
+
+	// The namespace must be the CALLER'S, not a constant this action invents:
+	// two suites that both spell it `default` are one suite again.
+	if !strings.Contains(wf, "cache-scope: ${{ inputs.cache-scope }}") {
+		t.Error("the reusable workflow does not pass its own cache-scope to the bucket step")
+	}
+
+	// The real pair this repository runs, plus a synthetic pair with the same
+	// shape, so the case survives a rename of the dogfood suites.
+	scopes := append(workflowCallerCacheScopes(t), "suite", "suite-extra")
+	if len(scopes) < 4 {
+		t.Fatalf("bucketed.yml declares %d cache scopes; the two-suite case this test closes is gone", len(scopes)-2)
+	}
+
+	for _, mine := range scopes {
+		for _, theirs := range scopes {
+			if mine == theirs {
+				continue
+			}
+			// One run, one attempt, and the SAME bucket name in both suites:
+			// the collision is between suites, not between buckets.
+			myUpload := expandActionsExpr(t, uploadName, mine, "bucket-0")
+			theirUpload := expandActionsExpr(t, uploadName, theirs, "bucket-0")
+			if myUpload == theirUpload {
+				t.Errorf("suites %q and %q upload the same artifact name %q", mine, theirs, myUpload)
+			}
+
+			myPattern := expandActionsExpr(t, pattern, mine, "")
+			ok, err := path.Match(myPattern, myUpload)
+			if err != nil {
+				t.Fatalf("the download pattern %q is not a glob: %v", myPattern, err)
+			}
+			if !ok {
+				t.Errorf("suite %q selects with %q, which does not reach its own upload %q", mine, myPattern, myUpload)
+			}
+			reaches, err := path.Match(myPattern, theirUpload)
+			if err != nil {
+				t.Fatalf("the download pattern %q is not a glob: %v", myPattern, err)
+			}
+			if reaches {
+				t.Errorf("suite %q selects with %q, which also reaches suite %q's upload %q; "+
+					"each record job would ingest the other suite's observations against its own plan",
+					mine, myPattern, theirs, theirUpload)
+			}
+
+			// Distinct plans, so the two populations are genuinely different
+			// measurements rather than two names for one.
+			if expandActionsExpr(t, planName, mine, "") == expandActionsExpr(t, planName, theirs, "") {
+				t.Errorf("suites %q and %q download the same shard plan", mine, theirs)
+			}
+
+			// And the members are distinct too: `merge-multiple: true` merges
+			// by basename, so two identically named files in one directory
+			// leave one observation, silently.
+			myMember := path.Base(expandActionsExpr(t, memberPath, mine, "bucket-0"))
+			theirMember := path.Base(expandActionsExpr(t, memberPath, theirs, "bucket-0"))
+			if myMember == theirMember {
+				t.Errorf("suites %q and %q write the same observation file name %q", mine, theirs, myMember)
+			}
+		}
+	}
+}
+
+// oneMatch returns the single capture of re in src, failing on none.
+func oneMatch(t *testing.T, src, re, missing string) string {
+	t.Helper()
+	m := regexp.MustCompile(re).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatal(missing)
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// workflowCallerCacheScopes reads the scopes this repository's own caller runs.
+func workflowCallerCacheScopes(t *testing.T) []string {
+	t.Helper()
+	caller := readRepoFile(t, ".github/workflows/bucketed.yml")
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\s*cache-scope:\s*(\S+)\s*$`).FindAllStringSubmatch(caller, -1) {
+		if s := m[1]; !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// expandActionsExpr substitutes one suite's values into an Actions expression.
+//
+// It fails on any `${{ }}` it does not know, because an unrecognized token
+// silently left in place would compare two literals that are equal for reasons
+// this test is not testing.
+func expandActionsExpr(t *testing.T, tmpl, cacheScope, bucketName string) string {
+	t.Helper()
+	vals := map[string]string{
+		"inputs.cache-scope":   cacheScope,
+		"inputs.name":          bucketName,
+		"github.run_id":        "4242",
+		"github.run_attempt":   "1",
+		"runner.temp":          "/tmp/runner",
+		"matrix.name":          bucketName,
+		"matrix.bucket":        "0",
+		"inputs.wall-time-dir": "/tmp/wall",
+	}
+	out := regexp.MustCompile(`\$\{\{\s*([^}]+?)\s*\}\}`).ReplaceAllStringFunc(tmpl, func(tok string) string {
+		inner := regexp.MustCompile(`\$\{\{\s*([^}]+?)\s*\}\}`).FindStringSubmatch(tok)[1]
+		v, ok := vals[inner]
+		if !ok {
+			t.Fatalf("the expression %q reads %q, which this test cannot evaluate", tmpl, inner)
+		}
+		return v
+	})
+	return out
 }

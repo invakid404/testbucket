@@ -503,6 +503,11 @@ jobs:
           runner: ${{ inputs.runner }}
           script: ${{ matrix.script }}
           name: ${{ matrix.name }}
+          # THE SUITE NAMESPACE, carried so the observation this bucket uploads
+          # is addressable by THIS call's record job and by no other. Bucket
+          # names are per-suite and repeat across suites; the scope is the one
+          # value here that does not.
+          cache-scope: ${{ inputs.cache-scope }}
           # §10.5.2 step 3: the bytes come from the PLAN JOB'S OUTPUTS, never
           # from the caller inputs — exactly one value governs every bucket job
           # of a run, and a bucket wired to the caller would reintroduce the
@@ -640,13 +645,21 @@ jobs:
       # other two.
       #
       # Merging is only safe because each bucket names its own file, which is
-      # why the assembler writes `observation-<bucket>.json` rather than one
-      # fixed name every bucket would overwrite.
+      # why the assembler writes `observation-<scope>-<bucket>.json` rather
+      # than one fixed name every bucket would overwrite.
+      #
+      # AND THE SELECTION IS SCOPED, for the same reason the store, the plan
+      # and the event bundles above are. This pattern used to be
+      # `testbucket-wall-obs-*-<run>-<attempt>`, which is every measured
+      # suite's observation in the run: two calls of this workflow with
+      # different cache scopes both fan out a `bucket-0`, so each record job
+      # ingested the other's rows against its own plan. The wildcard now sits
+      # after fixed text that the other suite's names cannot reproduce.
       - name: Download the wall observations
         if: inputs.wall-time-dir != ''
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: testbucket-wall-obs-*-${{ github.run_id }}-${{ github.run_attempt }}
+          pattern: testbucket-wall-obs-${{ inputs.cache-scope }}-run-${{ github.run_id }}-${{ github.run_attempt }}-bucket-*
           merge-multiple: true
           path: ${{ runner.temp }}/wall-observations
 

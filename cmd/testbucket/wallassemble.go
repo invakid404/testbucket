@@ -235,14 +235,13 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 		return err
 	}
 
-	type pair struct{ start, end *walltime.Record }
-	byLevel := map[walltime.Level]*pair{}
+	byLevel := map[walltime.Level]*recordPair{}
 	// KEYED BY THE WRAPPER'S OWN INVOCATION ORDINAL. See the invocation branch
 	// below for why arrival order is not the ordinal.
-	byInvSeq := map[int]*pair{}
-	closeInvocation := func(p *pair, r *walltime.Record) *pair {
+	byInvSeq := map[int]*recordPair{}
+	closeInvocation := func(p *recordPair, r *walltime.Record) *recordPair {
 		if p == nil {
-			p = &pair{}
+			p = &recordPair{}
 		}
 		if r.Boundary == "start" {
 			p.start = r
@@ -272,7 +271,7 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 		}
 		p := byLevel[r.Level]
 		if p == nil {
-			p = &pair{}
+			p = &recordPair{}
 			byLevel[r.Level] = p
 		}
 		if r.Boundary == "start" {
@@ -303,7 +302,7 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 	obs.ClockID = action.start.Instant.ClockID
 	for _, e := range []struct {
 		what string
-		p    *pair
+		p    *recordPair
 	}{
 		{"action", action},
 		{"script", byLevel[walltime.LevelScript]},
@@ -385,6 +384,30 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 			obs.FailureReason = p.end.Reason
 		}
 		break
+	}
+
+	// A FAILED NESTED TERMINAL IS THE MEASUREMENT'S TERMINAL.
+	//
+	// This searched the setup and script envelopes for a non-zero EXIT CODE and
+	// took the action's own terminal otherwise — so a level that recorded
+	// `crash_unclosed` while its root exited zero was discarded twice over: the
+	// terminal was dropped and the exit code was already 0. The row reached QC9
+	// as a passing action with zero exit codes everywhere, and a measurement that
+	// knew it was broken trained the model.
+	//
+	// Every recorded level is inspected, invocations included, and the first
+	// non-passing terminal wins over the action's. `wall end` states why an
+	// action ended; it cannot state what a wrapper three levels down observed
+	// after it had already reported.
+	for _, e := range nonPassingTerminals(byLevel, byInvSeq) {
+		if obs.Terminal == walltime.TerminalPassed {
+			obs.Terminal = e.terminal
+		}
+		if obs.ExitCode == 0 {
+			obs.ExitCode = 1
+		}
+		obs.FailureReason = joinAssemblyReason(obs.FailureReason,
+			fmt.Sprintf("%s recorded terminal %q: %s", e.where, e.terminal, e.reason))
 	}
 
 	if p := byLevel[walltime.LevelSetup]; p != nil && p.start != nil && p.end != nil {
@@ -480,3 +503,57 @@ func observedCacheDeclaration(path string) *walltime.CacheDeclaration {
 	}
 	return &decl
 }
+
+// terminalFinding is one recorded level whose terminal is not `passed`.
+type terminalFinding struct{ where, terminal, reason string }
+
+// nonPassingTerminals collects every recorded level — envelopes and invocations
+// — whose closing record states a terminal other than `passed`.
+//
+// It exists because a nested failure used to be visible ONLY in the record it
+// was written to. Assembly read the action's terminal and the setup/script exit
+// codes, so a script or invocation that ended `crash_unclosed` with a zero root
+// exit produced a passing observation. The wrapper that observed the escape is
+// the one that knows; the action closed before it could learn.
+func nonPassingTerminals(byLevel map[walltime.Level]*recordPair, byInvSeq map[int]*recordPair) []terminalFinding {
+	var out []terminalFinding
+	for _, level := range []walltime.Level{walltime.LevelSetup, walltime.LevelScript, walltime.LevelInvocation} {
+		p := byLevel[level]
+		if p == nil || p.end == nil {
+			continue
+		}
+		if t := p.end.Terminal; t != "" && t != walltime.TerminalPassed {
+			out = append(out, terminalFinding{string(level) + " envelope", t, p.end.Reason})
+		}
+	}
+	seqs := make([]int, 0, len(byInvSeq))
+	for n := range byInvSeq {
+		seqs = append(seqs, n)
+	}
+	sort.Ints(seqs)
+	for _, n := range seqs {
+		p := byInvSeq[n]
+		if p == nil || p.end == nil {
+			continue
+		}
+		if t := p.end.Terminal; t != "" && t != walltime.TerminalPassed {
+			out = append(out, terminalFinding{fmt.Sprintf("invocation %d", n), t, p.end.Reason})
+		}
+	}
+	return out
+}
+
+// joinAssemblyReason appends a finding to a reason without losing the first.
+func joinAssemblyReason(existing, add string) string {
+	switch {
+	case add == "":
+		return existing
+	case existing == "":
+		return add
+	default:
+		return existing + "; " + add
+	}
+}
+
+// recordPair is one level's opening and closing boundary record.
+type recordPair struct{ start, end *walltime.Record }

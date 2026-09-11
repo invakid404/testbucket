@@ -1173,6 +1173,28 @@ func runPlan(args []string) error {
 		return err
 	}
 
+	// §0.8 PHASE 2, AGAINST THE PLAN THAT WAS ACTUALLY BUILT.
+	//
+	// SelectBasis runs before discovery, so its cold determination is about the
+	// STORE: present, right token, parseable. That is not the same question as
+	// "is this plan cold". A schema-2 store with matching flags and an empty — or
+	// wholly stale — units object passes every one of those tests, and then
+	// meanWeight finds no measured live target and BuildPlan records
+	// `cold_start` with `measuredCount == 0`. The scored veto had already run and
+	// said yes, so the CLI went on to write the shard plan and print the matrix:
+	// outcome (d) reached a fan-out.
+	//
+	// The veto is re-applied here because this is the first moment the answer
+	// exists, and it is before ANY artifact is written — no shard plan, no
+	// summary, no matrix. A plan that cannot be scored must leave nothing behind
+	// that a job could fan out from.
+	if *scored && doc.Summary.ColdStart {
+		return fmt.Errorf("%w: the built plan is a cold start (%s); §0.8's phase-2 veto rejects a scored cold plan, "+
+			"and no shard plan or matrix is emitted",
+			core.ErrScoredColdPlan,
+			firstNonEmptyReason(doc.Summary.ColdStartReason, "no usable weights for any live target"))
+	}
+
 	if *shardPlan != "" {
 		if err := writeJSONFile(*shardPlan, doc); err != nil {
 			return err
@@ -1250,4 +1272,13 @@ func emptyAsNone(s string) string {
 		return "(none recorded)"
 	}
 	return s
+}
+
+// firstNonEmptyReason renders a cold reason, falling back to a stated default so
+// a refusal never says only that it refused.
+func firstNonEmptyReason(reason, fallback string) string {
+	if strings.TrimSpace(reason) == "" {
+		return fallback
+	}
+	return reason
 }

@@ -104,7 +104,17 @@ func (w *wallRingStore) Append(obs walltime.Observation, trainable bool) error {
 	// QC15 and QC16 are the ring's own admission: the three provenance
 	// identities, and a recency key that is a total order against what is
 	// already stored.
-	if err := core.QC15(row); err != nil {
+	//
+	// THE SAME CARVE-OUT THE QUALIFIER APPLIED. §13.0's exception is the PLAN's
+	// declaration, carried in the profile block QC13 has already compared byte
+	// for byte — so the decision is read from the profile this row copied, never
+	// re-derived here. Without it this gate re-imposed the pre-carve-out rule and
+	// discarded a row the qualifier had just admitted, one call before AppendRow.
+	prof, err := obs.Profile.Parse()
+	if err != nil {
+		return fmt.Errorf("ring admission: %w", err)
+	}
+	if err := core.QC15(row, prof.SameRepositoryWorkload && !prof.Scored && prof.ScoredIsExplicit()); err != nil {
 		return err
 	}
 	if err := core.QC16(w.st.Wall.Observations, row); err != nil {

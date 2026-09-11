@@ -134,44 +134,6 @@ type VerifyOptions struct {
 	Audit AuditFunc
 }
 
-// runIdentityDiff names the FIRST field two identities disagree about, or "".
-// Every field is compared: a check that looked at three of them would accept a
-// record that agreed about the campaign and the run while naming another
-// attempt, job, step, plan or verifier.
-func runIdentityDiff(want, got RunIdentity) string {
-	for _, f := range []struct {
-		name      string
-		want, got string
-	}{
-		{"campaign_id", want.CampaignID, got.CampaignID},
-		{"run_id", want.RunID, got.RunID},
-		{"attempt_id", want.AttemptID, got.AttemptID},
-		{"bucket_id", want.BucketID, got.BucketID},
-		{"repository", want.Repository, got.Repository},
-		{"workflow_run", want.WorkflowRun, got.WorkflowRun},
-		{"job", want.Job, got.Job},
-		{"step", want.Step, got.Step},
-		{"step_attempt", want.StepAttempt, got.StepAttempt},
-	} {
-		if f.want != f.got {
-			return fmt.Sprintf("%s is %q, not %q", f.name, f.got, f.want)
-		}
-	}
-	return ""
-}
-
-func allGatesPass(gates []GateResult) bool {
-	if len(gates) == 0 {
-		return false
-	}
-	for _, g := range gates {
-		if !g.Pass {
-			return false
-		}
-	}
-	return true
-}
-
 // streamKey identifies one producer's stream at one level. Ordinal is the
 // INVOCATION ordinal (Record.Seqno), never the record sequence: one stream
 // holds many records, and grouping by the record sequence would shatter every
@@ -200,14 +162,6 @@ func groupStreams(recs []Record) map[streamKey][]Record {
 	for k := range out {
 		s := out[k]
 		sort.SliceStable(s, func(i, j int) bool { return s[i].Seq < s[j].Seq })
-	}
-	return out
-}
-
-func mapOfKeys(m map[string]map[string]bool) map[string]string {
-	out := map[string]string{}
-	for k := range m {
-		out[k] = k
 	}
 	return out
 }
@@ -288,11 +242,6 @@ func firstNonEmptyStr(vals ...string) string {
 	}
 	return ""
 }
-
-// BootstrapGapResolution is A_GH's own reporting resolution: GitHub reports
-// step timestamps in whole SECONDS, so a gap up to one tick is
-// indistinguishable from zero and cannot be attributed to anything.
-const BootstrapGapResolution = int64(second)
 
 // --- reporting kernel -------------------------------------------------------
 //
@@ -455,7 +404,11 @@ func (v *Verdict) Write(out io.Writer) error {
 	}
 	fmt.Fprintf(w, "\ncomplete: %v\teligible: %v\n", v.Complete, v.Eligible)
 	if v.Eligible {
-		fmt.Fprintf(w, "this row qualifies; the campaign-scope gates above are decided by `wall campaign` over the full frozen population.\n")
+		// NAMING A COMMAND THAT DOES NOT EXIST IS WORSE THAN NAMING NONE.
+		// This advised `wall campaign`, which the dispatcher has no case for:
+		// a reader following it got "unknown wall subcommand" and no way to
+		// tell whether the gates were decided elsewhere or not at all.
+		fmt.Fprintf(w, "this row qualifies; the campaign-scope gates above are decided over the full frozen population, which one run's records are a single sample of — not by this command.\n")
 	} else {
 		fmt.Fprintf(w, "this run contributes 0 scored rows; an absent measurement never fills a denominator.\n")
 	}
@@ -487,7 +440,8 @@ func (v *Verdict) Write(out io.Writer) error {
 //  1. SCHEMA — every record is of the epoch this binary understands;
 //  2. TERMINAL STATE — nothing reached a state other than `passed`;
 //  3. POSITIVE MONOTONIC DURATION — every interval closed, and closed after
-//     it opened;
+//     it opened, and the action and script streams a plan-bound measurement
+//     is made of are each present exactly once;
 //  4. PLAN/BUCKET IDENTITY — the records name one run, and every artifact
 //     compared against them is for the bucket that was measured;
 //  5. EXACT MEMBERSHIP — each measured invocation ran the argv, selector, unit
@@ -524,6 +478,7 @@ func VerifyDir(opt VerifyOptions) (*Verdict, error) {
 	verifySchema(v, recs)
 	v.Envelopes = collectEnvelopes(v, recs)
 	verifyRunIdentity(v, recs)
+	verifyMandatoryStreams(v, v.Envelopes)
 	verifyIntervals(v, v.Envelopes)
 	verifyInvocationMembership(v, opt, v.Envelopes)
 	verifyAudit(v, opt)
@@ -608,6 +563,78 @@ func collectEnvelopes(v *Verdict, recs []Record) []Envelope {
 		return out[i].Seq < out[j].Seq
 	})
 	return out
+}
+
+// verifyMandatoryStreams is check 3's presence half.
+//
+// EVERY CHECK BELOW THIS ONE VALIDATES WHAT IT FINDS. verifyIntervals required
+// that SOME envelope opened and that SOME interval closed, and then checked
+// the envelopes that existed; verifyRunIdentity takes the run and bucket from
+// any boundary record, including an invocation's; verifyInvocationMembership
+// compares the invocation envelopes against the manifest. So a record set
+// holding nothing but a clean invocation pair named every property those
+// checks look for and was COMPLETE and ELIGIBLE without ever containing the
+// action interval A -- the product outcome the whole measurement exists to
+// report -- or the script interval VB that §3.1's floor is written in terms
+// of. A verifier that only checks the streams it was given cannot tell a
+// measurement from a fragment of one.
+//
+// So the mandatory levels are named here, with their cardinality, before
+// anything is derived from them:
+//
+//   - ACTION, exactly once. A is the product outcome; a record set without it
+//     measures something, but not the thing every downstream gate reads.
+//   - SCRIPT, exactly once -- see below for the one case where its absence is
+//     a failed run rather than a broken stream.
+//   - SETUP, at most once. It is optional by design (§3.1 admits a bucket with
+//     no setup command), but two of them is two lifecycles.
+//   - INVOCATION, any number INCLUDING ZERO. A bucket the plan gave no work is
+//     a legitimate empty measurement, and its cardinality is the manifest's to
+//     check, not this function's -- a count checked against the records
+//     themselves would be a claim checked against its own source.
+//
+// A SECOND ENVELOPE AT ONE LEVEL is terminal for the same reason a second
+// opening in one stream is: the union of two runs is not the duration of one,
+// and nothing downstream picks between them.
+func verifyMandatoryStreams(v *Verdict, envs []Envelope) {
+	count := map[Level]int{}
+	actionTerminal := ""
+	for _, e := range envs {
+		count[e.Level]++
+		if e.Level == LevelAction {
+			actionTerminal = e.Terminal
+		}
+	}
+
+	if count[LevelAction] == 0 {
+		v.add("WT-004", SeverityTerminal,
+			"no action envelope: these records describe no complete run-bucket action, and A is the outcome every gate below is about")
+	}
+	// AN ABSENT SCRIPT IS A BROKEN STREAM ONLY WHEN THE ACTION SAYS IT
+	// FINISHED. A measured action opens the script envelope itself, so an
+	// action that terminated `passed` and recorded no script did not write
+	// what it ran -- that stream is truncated, not short. An action that
+	// terminated any other way may have died before the script opened, and
+	// those records are a complete description of a failed run: WT-014 has
+	// already made it ineligible, and calling it incomplete as well would
+	// erase the distinction complete/eligible exists to draw.
+	if count[LevelScript] == 0 {
+		sev := SeverityIneligible
+		detail := "no script envelope: the generated bucket script recorded no interval, so VB and §3.1's floor A >= setup_ns + script_ns have no measured term"
+		if actionTerminal == TerminalPassed {
+			sev = SeverityTerminal
+			detail = "no script envelope, yet the action terminated passed: the action is what opens the script interval, so a passing action that recorded none left a truncated stream"
+		}
+		v.add("WT-004", sev, detail)
+	}
+
+	for _, level := range []Level{LevelAction, LevelScript, LevelSetup} {
+		if n := count[level]; n > 1 {
+			v.add("WT-020", SeverityTerminal,
+				fmt.Sprintf("%d %s envelopes: one measurement has one %s interval, and the union of two runs is not the duration of one",
+					n, level, level))
+		}
+	}
 }
 
 // verifyIntervals is checks 2 and 3.
