@@ -809,7 +809,7 @@ contract §12 names the measurement that would justify restoring stronger contai
 
 ### 6.3 Qualification checks — where each check's inputs come from (annex)
 
-**The checks themselves are `acceptance-contract.md` §7.1**, which states QC1…QC17 including QC7a,
+**The checks themselves are `acceptance-contract.md` §7.1**, which states QC1…QC18 including QC7a,
 QC14a and QC14b. This section states no check (R14-F1); it records, for each, the artifact the
 inputs come from and the reason the check exists, which is the part a reader needs when
 implementing ingest and which the contract does not carry.
@@ -829,6 +829,7 @@ implementing ingest and which the contract does not carry.
 | QC15 | the three identity fields of §8.1a | one `head_sha` carrying three identities is the defect S-6 removed |
 | QC16 | `realtime_start` and the row-intrinsic tuple | contract §15.1b's recency key is a total order because of it |
 | QC17 | the observation's `runtime_profile` object and the plan document's `runtime_profile_declared` | the plan says what the run was configured to execute; only the bucket knows what it did execute, and contract §15.3a compares the two field by field |
+| QC18 | the plan document's displayed estimate and optimized objective for that bucket, and the row's echo of each | contract §5.1 makes the row's two estimate fields audit copies of what the plan decided, so the plan is the only thing that can falsify them; the assembler derives one of the row's fields from the other, which is why their agreeing with each other proves nothing about either |
 
 What the ingest CLI prints, and in what form, is **contract §14.2**'s; this section maps each check
 to the input it reads and says why that input is the right one.

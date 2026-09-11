@@ -1174,7 +1174,7 @@ when more than one holds (R24-F2).
     can carry the three separate identities QC15 requires. All five are **plan** inputs, so every
     one of AD-8…AD-10 is enforceable at the component that must refuse before emitting a matrix.
 
-### 7.1 Ingest qualification checks — QC1…QC17, stated here (R14-F1, owner F1)
+### 7.1 Ingest qualification checks — QC1…QC18, stated here (R14-F1, owner F1)
 
 **These are the checks.** Earlier drafts placed them in the companion and reached them only by
 following a citation out of this contract; they are stated here, and the companion section is a
@@ -1201,9 +1201,10 @@ check passes. Field names are the field registry's; this table does not restate 
 | **QC14b** | **record, at ingest** | the transferable half of the cache contract — §10.5.6 |
 | QC15 | record | `head_sha`, `candidate_sha`, and `workload_commit` are each present, well-formed, and distinct fields; a row carrying one value in all three, or omitting one, is rejected rather than silently overloaded |
 | QC17 | record | the row's `runtime_profile_digest` equals the plan document's `runtime_profile_declared_digest` (§15.3a). On mismatch the row is **rejected** and the failure names the **first differing constituent** by field number; the row never enters history, and a scored run's pair is **retained, unscored and non-passing** under §19.8's post-start rule — never voided and never rescheduled (owner F1, R15-F3) |
+| QC18 | record | the row's two estimate fields are the **plan's**, not the row's own: `a_eta_ns` is present **iff** the plan optimized an objective for that bucket and equals it, and `est_seconds` equals the estimate the plan **displayed** for that bucket. Both comparisons are **unconditional** — a displayed estimate of `0.0` is a value, not an absence, because §17.3a admits an empty bucket as a legitimate design row and a plan bucket always carries a displayed estimate. §5.1 makes both fields audit echoes of what the plan decided; the assembler derives one from the other, so a row whose two fields merely agree with each other has been compared against nothing |
 | QC16 | record | `realtime_start` is present and parses as an RFC 3339 UTC instant — absent or unparseable is **rejected**, never defaulted — and the row's `intrinsic_id` `(repository, run_id, run_attempt, job_id, bucket_index, plan_digest)` is complete and **not already present in the ring**, so the recency key is a total order |
 
-**"QC1–QC17" names this set including QC7a, QC14a and QC14b.** **`QC14` remains the name of the
+**"QC1–QC18" names this set including QC7a, QC14a and QC14b.** **`QC14` remains the name of the
 cache-state check as a whole**; what R14-F2 removed is the idea that it runs in **one** place. Where
 a document must say *where* the check happens it names the half — `QC14a` on the bucket runner,
 `QC14b` at ingest — and where only the subject matters, `QC14` still names the pair.
@@ -1385,7 +1386,7 @@ no retry or replacement after either arm starts a bucket script.**
 | sequential order | for every pair, authenticated `completed_at(first) ≤ started_at(second)` in the declared direction (§0.2, §19.5) — **launch order alone does not satisfy this gate** (S-9) |
 | cache state | every scored row passes QC14 and both arms of every pair agree **index-wise** on the `bc_inv` cache leaves (§10.5.0, §17.19) (S-5/D-5) |
 | model freeze | the four coefficients were fitted only from rows the pre-campaign selection retained; **no campaign row entered a fit** (§0.4, §6.4b, §15.1b) (S-2) |
-| integrity | every **scored** row passes QC1–QC17; every harness run the Actions API returns for the window appears in the **attempted** population with a disposition (§19.4a) |
+| integrity | every **scored** row passes QC1–QC18; every harness run the Actions API returns for the window appears in the **attempted** population with a disposition (§19.4a) |
 
 **This table is the only gate table in the package (R13-A).** §19.7 formerly carried a
 second copy, and `TestThresholdsAreFrozenBeforeRunOne` existed to stop the two from drifting — a
@@ -1397,7 +1398,7 @@ tail repair and live here, once.
 
 **`integrity` says "every scored row", not "every row" (§19.4a).** Failed, cancelled, and malformed
 observations are deliberately **retained as diagnostics** and by construction do not pass QC — a gate
-demanding that *every* row pass QC1–QC17 would be unsatisfiable whenever a diagnostic row exists. The
+demanding that *every* row pass QC1–QC18 would be unsatisfiable whenever a diagnostic row exists. The
 scored population is what the gate governs; the attempted population is governed by the accounting
 clause beside it.
 
@@ -2528,7 +2529,7 @@ today will find them.
 | 17.2 | `--est-basis wall` with `--file-parallelism > 1` | plan **fails** | required |
 | 17.3 | `AllocationScore` cannot score a unit | plan fails | existing |
 | 17.4 | `--wall-dir` with `--runner go` | error | existing |
-| 17.5 | any of QC1–QC17 fails | row not ingested; retained and printed | required |
+| 17.5 | any of QC1–QC18 fails | row not ingested; retained and printed | required |
 | 17.6 | duplicate observation for one key | **all** rejected | required |
 | 17.7 | unknown store schema | cold start with a reason | existing |
 | 17.8 | execution-profile change | wall rows and model cleared, loudly | required |
@@ -2713,7 +2714,7 @@ can be satisfied by a planner.
 | # | Gate |
 |---|---|
 | W-1 | a `--calibrate` run returns **SUFFICIENT** for the candidate universe under the intended `K`, recording the layouts that reach rank 4. The published boundary for this protocol is §17.3a's **`N = 3` not-found / `N = 4` sufficient** fixture, and `STRUCTURALLY_INFEASIBLE` names **column 4** for an all-whole universe and **column 3** for an all-slice one — the earlier N=4/N=5 and both-directions-column-3 statements are withdrawn (R10-D6) |
-| W-2 | those layouts are executed as **non-scored** runs under the same comparability key, producing observations that pass QC1–QC17 |
+| W-2 | those layouts are executed as **non-scored** runs under the same comparability key, producing observations that pass QC1–QC18 |
 | W-3 | **at least three distinct real runs** — distinct `(run_id, run_attempt)` — produce the **identical** `comparability_key_digest`, demonstrating that the repaired key (§15.3) is stable across runs rather than describing one plan-job instance |
 | W-4 | the ring for that key holds **≥ `MIN_ROWS` = 24** accepted rows across those **≥ `MIN_RUNS` = 3** runs, with `rank(X) == 4` and at least one `i_any_whole_file = 0` row |
 
@@ -3909,7 +3910,10 @@ is **never** an input and never a key leaf (`scope.md` §2A, S-4).
    `wrapper_ns` computed and reported, all in integer nanoseconds.
 2. `TestObservationRoundTrip` — `limitations` non-empty and naming the Exec-envelope, topology,
    runner-label, and cache-state limits.
-3. `TestQualificationChecks` — QC1–QC17, one case each, asserting the exact rejection reason.
+3. `TestQualificationChecks` — QC1–QC18, one case each, asserting the exact rejection reason, and
+   **three** for QC18: `a_eta_ns` alone, `est_seconds` alone, and a bucket whose displayed estimate
+   the plan legitimately set to `0`. One case cannot do it — the two fields are separate echoes, and
+   a case built on a non-zero plan estimate passes whether or not zero is compared.
 4. `TestDuplicateObservationRejectsAllRows` — a duplicate rejects **all** rows for the key.
 5. `TestModelFittingIsDeterministicAndStatusAware` — determinism over a shuffled input set; clamping; rank-deficient column;
    `insufficient` and `degraded`; the fitted population is selected by §15.1b recency **before** the

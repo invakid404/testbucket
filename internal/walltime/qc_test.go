@@ -78,8 +78,11 @@ func emptyRing() RingFacts {
 	}
 }
 
-// TestQualificationChecks is §22 test 3: QC1–QC17, ONE CASE EACH, asserting the
-// exact rejection reason.
+// TestQualificationChecks is §22 test 3: QC1–QC18, ONE CASE EACH, asserting the
+// exact rejection reason — and THREE for QC18, which §22 test 3 requires by
+// name. The check compares two separate echoes, so one case leaves the other
+// field uncompared, and a case built on a non-zero planned estimate passes
+// whether or not zero is compared at all.
 //
 // Each case breaks exactly one thing against a fixture that otherwise passes,
 // so a failure names the check that fired rather than the first check that
@@ -93,28 +96,32 @@ func TestQualificationChecks(t *testing.T) {
 	})
 
 	cases := []struct {
-		check  string
+		check string
+		// sub names the subtest where one check needs more than one case. The
+		// assertion is still on `check`, so the completeness subtest below sees
+		// the same closed set §7.1 names.
+		sub    string
 		mutate func(*PlanContext, *Observation, *RingFacts)
 	}{
-		{"QC1", func(p *PlanContext, o *Observation, r *RingFacts) { o.Schema = "testbucket.wall-observation/v9" }},
-		{"QC2", func(p *PlanContext, o *Observation, r *RingFacts) { o.Repository = "" }},
-		{"QC3", func(p *PlanContext, o *Observation, r *RingFacts) { o.PlanDigest = "sha256:other" }},
-		{"QC4", func(p *PlanContext, o *Observation, r *RingFacts) { o.BucketIndex = 5 }},
-		{"QC5", func(p *PlanContext, o *Observation, r *RingFacts) { o.UnitIDs = []string{"a.spec.ts"} }},
-		{"QC6", func(p *PlanContext, o *Observation, r *RingFacts) { o.Invocations[0].ArgvDigest = "sha256:tampered" }},
-		{"QC7", func(p *PlanContext, o *Observation, r *RingFacts) {
+		{check: "QC1", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.Schema = "testbucket.wall-observation/v9" }},
+		{check: "QC2", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.Repository = "" }},
+		{check: "QC3", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.PlanDigest = "sha256:other" }},
+		{check: "QC4", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.BucketIndex = 5 }},
+		{check: "QC5", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.UnitIDs = []string{"a.spec.ts"} }},
+		{check: "QC6", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.Invocations[0].ArgvDigest = "sha256:tampered" }},
+		{check: "QC7", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			// A < setup_ns + script_ns.
 			o.ElapsedNs = 1_000_000_000
 		}},
-		{"QC7a", func(p *PlanContext, o *Observation, r *RingFacts) { o.ProcessGroupID = "" }},
-		{"QC8", func(p *PlanContext, o *Observation, r *RingFacts) { o.BootIDEnd = "boot-b" }},
-		{"QC9", func(p *PlanContext, o *Observation, r *RingFacts) { o.Terminal = "failed" }},
-		{"QC10", func(p *PlanContext, o *Observation, r *RingFacts) { p.CoverageAuditPasses["bucket-0"] = false }},
-		{"QC11", func(p *PlanContext, o *Observation, r *RingFacts) {
+		{check: "QC7a", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.ProcessGroupID = "" }},
+		{check: "QC8", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.BootIDEnd = "boot-b" }},
+		{check: "QC9", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.Terminal = "failed" }},
+		{check: "QC10", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { p.CoverageAuditPasses["bucket-0"] = false }},
+		{check: "QC11", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			r.SeenObservationKeys[ObservationKey(*o)] = true
 		}},
-		{"QC12", func(p *PlanContext, o *Observation, r *RingFacts) { o.ObservedRunsOnLabel = "ubuntu-22.04" }},
-		{"QC13", func(p *PlanContext, o *Observation, r *RingFacts) {
+		{check: "QC12", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.ObservedRunsOnLabel = "ubuntu-22.04" }},
+		{check: "QC13", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			mutated := CanonicalProfile{
 				Scored: false, RunnerToken: "vitest", K: 9, Count: 1, FileParallelism: 1,
 				BucketIndices: []int{0}, EstBasis: BasisWall,
@@ -126,16 +133,59 @@ func TestQualificationChecks(t *testing.T) {
 			}
 			o.Profile = blk
 		}},
-		{"QC15", func(p *PlanContext, o *Observation, r *RingFacts) { o.CandidateSHA = "" }},
-		{"QC17", func(p *PlanContext, o *Observation, r *RingFacts) {
+		{check: "QC15", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.CandidateSHA = "" }},
+		{check: "QC17", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			o.RuntimeProfile.NodeVersion = "v20.0.0"
 			o.RuntimeProfileDigest = RuntimeProfileDigest(o.RuntimeProfile)
 		}},
-		{"QC16", func(p *PlanContext, o *Observation, r *RingFacts) { o.RealtimeStart = "not-an-instant" }},
+		// QC18, THREE CASES. The row carries two estimate echoes and the
+		// assembler derives one from the other, so each must be falsifiable on
+		// its own; and the planned display must be compared even when it is
+		// zero, which is the bypass a single non-zero case cannot see.
+		{check: "QC18", sub: "QC18 a_eta_ns alone", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			// Only the objective moves. est_seconds still equals the plan's
+			// display, so the a_eta_ns comparison is the only one that can fire.
+			o.AEtaNs = NanosPtr(21_000_000_000)
+		}},
+		{check: "QC18", sub: "QC18 est_seconds alone", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			// Only the display moves. The objective still equals the plan's, so
+			// the est_seconds comparison is the only one that can fire — the row
+			// is internally inconsistent, which is exactly the shape §5.1's echo
+			// rule exists to refuse and which nothing but the PLAN can detect.
+			o.EstSeconds = 99.0
+		}},
+		{check: "QC18", sub: "QC18 a plan bucket that displayed zero", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			// A LEGITIMATELY ZERO PLANNED ESTIMATE. §17.3a admits an empty
+			// bucket as a design row whose reporter sum is 0, and a reporter
+			// basis optimizes no objective, so a displayed 0.0 with no a_eta_ns
+			// is a plan bucket a real run produces. Zero was read as "the plan
+			// said nothing" and the comparison was skipped, so such a bucket
+			// accepted a row displaying any estimate at all.
+			prof, err := p.ProfileBlock.Parse()
+			if err != nil {
+				t.Fatal(err)
+			}
+			prof.EstBasis = BasisReporter
+			blk, err := NewProfileBlock(prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// QC13 is byte-identity, so the plan and the row carry one block.
+			p.ProfileBlock, o.Profile = blk, blk
+			ref := p.Buckets["bucket-0"]
+			ref.EstSeconds, ref.AEtaNs = 0, nil
+			p.Buckets["bucket-0"] = ref
+			o.AEtaNs, o.EstSeconds = nil, 99.0
+		}},
+		{check: "QC16", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.RealtimeStart = "not-an-instant" }},
 	}
 
 	for _, c := range cases {
-		t.Run(c.check, func(t *testing.T) {
+		name := c.check
+		if c.sub != "" {
+			name = c.sub
+		}
+		t.Run(name, func(t *testing.T) {
 			plan, obs := qcFixture(t)
 			ring := emptyRing()
 			c.mutate(&plan, &obs, &ring)

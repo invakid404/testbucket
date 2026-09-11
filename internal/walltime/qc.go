@@ -63,13 +63,14 @@ func IntrinsicID(o Observation) [6]string {
 		fmt.Sprintf("%d", o.BucketIndex), string(o.PlanDigest)}
 }
 
-// QualifyObservation runs contract §7.1's QC1…QC17 in order and returns the
+// QualifyObservation runs contract §7.1's QC1…QC18 in order and returns the
 // FIRST failure, named by check. An observation is ingested only if every
 // applicable check passes.
 //
 // The checks run in table order because several depend on earlier ones: QC4
-// needs the bucket to resolve before QC5 can compare its unit set, and QC17
-// compares against a plan document QC3 has already bound.
+// needs the bucket to resolve before QC5 can compare its unit set, QC17
+// compares against a plan document QC3 has already bound, and QC18 compares
+// against the bucket QC4 resolved.
 func QualifyObservation(o Observation, plan PlanContext, ring RingFacts) error {
 	// QC1 — schema recognised.
 	if o.Schema != ObservationSchema {
@@ -229,22 +230,32 @@ func QualifyObservation(o Observation, plan PlanContext, ring RingFacts) error {
 	// so long as its own two fields agreed with each other, which they do by
 	// construction because the assembler derives one from the other. An echo
 	// nobody checks is a field, not evidence.
-	if ref, ok := plan.Buckets[o.BucketName]; ok {
-		switch {
-		case ref.AEtaNs == nil && o.AEtaNs != nil:
-			return fmt.Errorf("QC18: the row reports a_eta_ns %d for a bucket the plan optimized no objective for",
-				int64(*o.AEtaNs))
-		case ref.AEtaNs != nil && o.AEtaNs == nil:
-			return fmt.Errorf("QC18: the plan optimized a_eta_ns %d for %s and the row reports none",
-				int64(*ref.AEtaNs), o.BucketName)
-		case ref.AEtaNs != nil && int64(*o.AEtaNs) != int64(*ref.AEtaNs):
-			return fmt.Errorf("QC18: the row reports a_eta_ns %d, the plan optimized %d",
-				int64(*o.AEtaNs), int64(*ref.AEtaNs))
-		}
-		if ref.EstSeconds != 0 && o.EstSeconds != ref.EstSeconds {
-			return fmt.Errorf("QC18: the row displays est_seconds %v, the plan displayed %v",
-				o.EstSeconds, ref.EstSeconds)
-		}
+	//
+	// `ref` is QC4's — the bucket it resolved, which is why reaching here at
+	// all means the plan has one. An additional lookup guarded by `ok` read as
+	// though QC18 were conditional on the bucket existing, and it is not.
+	//
+	// THE DISPLAYED ESTIMATE IS COMPARED UNCONDITIONALLY, zero included.
+	// Guarding the comparison on `ref.EstSeconds != 0` made zero an absence
+	// sentinel on a field that has no presence bit and is always assigned from
+	// the parsed plan bucket — so a bucket the plan honestly displayed `0` for,
+	// which §17.3a admits as a legitimate design row, would accept a row
+	// displaying any estimate whatever. Absence of a displayed estimate is not
+	// representable here because a plan bucket always has one; zero is a value.
+	switch {
+	case ref.AEtaNs == nil && o.AEtaNs != nil:
+		return fmt.Errorf("QC18: the row reports a_eta_ns %d for a bucket the plan optimized no objective for",
+			int64(*o.AEtaNs))
+	case ref.AEtaNs != nil && o.AEtaNs == nil:
+		return fmt.Errorf("QC18: the plan optimized a_eta_ns %d for %s and the row reports none",
+			int64(*ref.AEtaNs), o.BucketName)
+	case ref.AEtaNs != nil && int64(*o.AEtaNs) != int64(*ref.AEtaNs):
+		return fmt.Errorf("QC18: the row reports a_eta_ns %d, the plan optimized %d",
+			int64(*o.AEtaNs), int64(*ref.AEtaNs))
+	}
+	if o.EstSeconds != ref.EstSeconds {
+		return fmt.Errorf("QC18: the row displays est_seconds %v, the plan displayed %v",
+			o.EstSeconds, ref.EstSeconds)
 	}
 
 	// QC16 — the recency stamp parses, and the intrinsic id is not already in

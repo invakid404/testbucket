@@ -25,7 +25,7 @@ import (
 // writes through.
 //
 // Qualification happens HERE, inside Append, rather than beside it. The
-// contract admits a row only if every applicable QC1…QC17 check passes, so a
+// contract admits a row only if every applicable QC1…QC18 check passes, so a
 // row that fails must never reach the ring at all — and putting the gate at
 // the append boundary means there is no path into the ring that skips it.
 type wallRingStore struct {
