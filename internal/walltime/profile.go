@@ -38,6 +38,24 @@ type CanonicalProfile struct {
 	EstBasis              EstBasis `json:"est_basis"`
 	StoreSHA256           string   `json:"store_sha256"`
 	ExpandedUnitSetDigest string   `json:"expanded_unit_set_digest"`
+	// SameRepositoryWorkload declares that the workload this plan schedules is
+	// the ORCHESTRATION CHECKOUT ITSELF — the project dogfooding its own test
+	// suite — so §13's three provenance identities are genuinely one commit.
+	//
+	// It exists because QC15 rejects a row carrying one value in all three, and
+	// that rejection is right for every other shape: S-6's defect was one
+	// `head_sha` overloaded into three fields. A same-repository dogfood is not
+	// that defect. Its orchestration head, the source the `local` build compiled,
+	// and the workload checkout ARE the same commit, and there is no truthful
+	// distinct value to put in the other two fields.
+	//
+	// IT IS A PLAN DECLARATION, not a row's claim about itself. §13.0 has every
+	// observation copy this block VERBATIM and QC13 compares it byte for byte, so
+	// a bucket runner cannot award itself the carve-out: the plan job declared it
+	// before the matrix existed. A scored run may never declare it — see
+	// AdmitScoredProfile — and an external-consumer run has no reason to, which
+	// is what keeps the carve-out narrow.
+	SameRepositoryWorkload bool `json:"same_repository_workload"`
 }
 
 // runtimeProfileFieldOrder is the canonical order contract §15.3a's table
@@ -244,6 +262,17 @@ func AdmitScoredProfile(p CanonicalProfile, runnerClass, runsOnLabel, candidateS
 	}
 	if p.RunnerToken != "vitest" {
 		return fmt.Errorf("scored plan admission: runner_token is %q, must be vitest", p.RunnerToken)
+	}
+	// A SCORED ARM MEASURES A PINNED EXTERNAL WORKLOAD, so it can never be the
+	// orchestration checkout and may not declare the same-repository carve-out.
+	// §21 requires a scored arm to pin an exact `vX.Y.Z` binary, which already
+	// makes `candidate_sha` a different commit from the orchestration head. The
+	// refusal is here as well as in QC15 because a plan that cannot produce an
+	// ingestible row should not emit a matrix at all.
+	if p.SameRepositoryWorkload {
+		return fmt.Errorf("scored plan admission: same_repository_workload is declared; " +
+			"a scored arm measures a pinned external workload and its three provenance identities " +
+			"are separately bound (§7.1 QC15)")
 	}
 	want := make([]int, 8)
 	for i := range want {

@@ -1247,6 +1247,7 @@
     "runner-class",
     "runs-on-label",
     "scored",
+    "same-repository-workload",
     "cache-declaration-file",
     "candidate-sha",
     "workload-commit"
@@ -1455,6 +1456,7 @@
   "added_inputs": [
    "est-basis",
    "scored",
+   "same-repository-workload",
    "runner-class",
    "runs-on-label",
    "cache-declaration-json",
@@ -1535,6 +1537,7 @@
    "reusable_workflow": [
     "est-basis",
     "scored",
+    "same-repository-workload",
     "runner-class",
     "runs-on-label",
     "cache-declaration-json",

@@ -206,6 +206,12 @@ func TestQualificationChecks(t *testing.T) {
 		{check: "QC15", sub: "QC15 an uppercase hex identity", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			o.WorkloadCommit = strings.ToUpper(o.WorkloadCommit)
 		}},
+		// THE CARVE-OUT IS THE PLAN'S TO GRANT, and this fixture's plan does not.
+		// Collapsing the three identities without a declared same-repository
+		// workload is still S-6's defect.
+		{check: "QC15", sub: "QC15 all three equal with no declaration", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.CandidateSHA, o.WorkloadCommit = o.HeadSHA, o.HeadSHA
+		}},
 		// §13.1's PGID domain, for the same reason. `0` is the sharp one: in
 		// every negative-PGID signal API it names the CALLER's group.
 		{check: "QC7a", sub: "QC7a a process_group_id of zero", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
@@ -443,4 +449,154 @@ func TestDuplicateObservationRejectsAllRows(t *testing.T) {
 	if got := RejectDuplicateKeys([]Observation{a, c}); len(got) != 0 {
 		t.Fatalf("distinct keys were rejected: %v", got)
 	}
+}
+
+// sameRepoProfile rebuilds the fixture's profile block with the same-repository
+// declaration set as the caller asks, on BOTH sides.
+//
+// §13.0 has the observation copy the plan's block VERBATIM and QC13 compares it
+// byte for byte, which is the whole reason the declaration lives there: a bucket
+// runner cannot award itself the carve-out, because a profile that differs from
+// the plan's is refused before QC15 is reached.
+func sameRepoProfile(t *testing.T, plan *PlanContext, obs *Observation, sameRepo, scored bool) {
+	t.Helper()
+	prof, err := plan.ProfileBlock.Parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prof.SameRepositoryWorkload = sameRepo
+	prof.Scored = scored
+	blk, err := NewProfileBlock(prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.ProfileBlock, obs.Profile = blk, blk
+}
+
+// TestQC15AdmitsADeclaredSameRepositoryDogfoodAndNothingElse is the owner's
+// narrow carve-out, with both controls the decision requires.
+//
+// QC15 rejects a row carrying one value in all three provenance identities, and
+// that is right for every shape but one: S-6's defect was one `head_sha`
+// overloaded into three fields. A same-repository dogfood is not that defect —
+// when the project runs its own suite from its own checkout with a `local` build,
+// the orchestration head, the compiled source and the workload checkout ARE one
+// commit, and there is no truthful distinct value for the other two fields.
+// Inventing one would be the overloading this rule exists to stop, backwards.
+//
+// The carve-out is therefore granted by the PLAN and only for an unscored row.
+func TestQC15AdmitsADeclaredSameRepositoryDogfoodAndNothingElse(t *testing.T) {
+	// ONE COMMIT, truthfully, in all three fields.
+	one := sha40("the-dogfood-commit")
+
+	t.Run("POSITIVE: a declared, unscored, same-SHA dogfood row passes", func(t *testing.T) {
+		plan, obs := qcFixture(t)
+		sameRepoProfile(t, &plan, &obs, true, false)
+		obs.HeadSHA, obs.CandidateSHA, obs.WorkloadCommit = one, one, one
+		if err := QualifyObservation(obs, plan, emptyRing()); err != nil {
+			t.Fatalf("a declared same-repository dogfood row was rejected: %v", err)
+		}
+	})
+
+	t.Run("NEGATIVE: a scored row with all three equal is still rejected", func(t *testing.T) {
+		plan, obs := qcFixture(t)
+		sameRepoProfile(t, &plan, &obs, false, true)
+		obs.CampaignID = "cmp-1"
+		obs.CacheState = stateDisabled()
+		declDigest := DeclarationOf(obs.CacheState).Digest()
+		obs.CacheDeclarationDigest, plan.CacheDeclarationDigest = declDigest, declDigest
+		obs.HeadSHA, obs.CandidateSHA, obs.WorkloadCommit = one, one, one
+
+		err := QualifyObservation(obs, plan, emptyRing())
+		if err == nil {
+			t.Fatal("a scored row collapsed its three provenance identities and was accepted")
+		}
+		if !strings.HasPrefix(err.Error(), "QC15:") {
+			t.Fatalf("expected QC15 to fire, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "scored") {
+			t.Errorf("the refusal must say WHY a scored row cannot use the carve-out, got %q", err)
+		}
+	})
+
+	t.Run("NEGATIVE: a scored row may not even declare the carve-out", func(t *testing.T) {
+		// The same rule, stated where it can stop the run instead of discarding
+		// the row: a scored plan that declares a same-repository workload emits
+		// no matrix.
+		prof := CanonicalProfile{
+			Scored: true, RunnerToken: "vitest", K: 8, Count: 1, FileParallelism: 1,
+			BucketIndices:          []int{0, 1, 2, 3, 4, 5, 6, 7},
+			EstBasis:               BasisWall,
+			StoreSHA256:            "sha256:s",
+			ExpandedUnitSetDigest:  "sha256:u",
+			SameRepositoryWorkload: true,
+		}
+		err := AdmitScoredProfile(prof, "class", "ubuntu-24.04", sha40("cand"), sha40("work"), true)
+		if err == nil {
+			t.Fatal("a scored plan declaring a same-repository workload was admitted")
+		}
+		if !strings.Contains(err.Error(), "same_repository_workload") {
+			t.Errorf("the refusal does not name the declaration: %v", err)
+		}
+	})
+
+	t.Run("NEGATIVE: an undeclared unscored row with all three equal is rejected", func(t *testing.T) {
+		plan, obs := qcFixture(t)
+		sameRepoProfile(t, &plan, &obs, false, false)
+		obs.HeadSHA, obs.CandidateSHA, obs.WorkloadCommit = one, one, one
+		err := QualifyObservation(obs, plan, emptyRing())
+		if err == nil || !strings.HasPrefix(err.Error(), "QC15:") {
+			t.Fatalf("an undeclared collapsed row was accepted: %v", err)
+		}
+	})
+
+	t.Run("NEGATIVE: the carve-out does not excuse an absent identity", func(t *testing.T) {
+		// It permits EQUALITY, never omission. A row that simply has no
+		// candidate_sha is still missing an identity, declared or not.
+		plan, obs := qcFixture(t)
+		sameRepoProfile(t, &plan, &obs, true, false)
+		obs.HeadSHA, obs.WorkloadCommit = one, one
+		obs.CandidateSHA = ""
+		err := QualifyObservation(obs, plan, emptyRing())
+		if err == nil || !strings.HasPrefix(err.Error(), "QC15:") {
+			t.Fatalf("an absent candidate_sha was accepted under the carve-out: %v", err)
+		}
+	})
+
+	t.Run("NEGATIVE: a row cannot award itself the carve-out", func(t *testing.T) {
+		// The declaration is in the §13.0 block QC13 compares byte for byte, so a
+		// row that sets it while the plan did not is refused BEFORE QC15 — by the
+		// check that exists to make the block one value rather than two copies.
+		plan, obs := qcFixture(t)
+		prof, err := obs.Profile.Parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		prof.SameRepositoryWorkload = true
+		blk, err := NewProfileBlock(prof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		obs.Profile = blk // the PLAN's block is left alone
+		obs.HeadSHA, obs.CandidateSHA, obs.WorkloadCommit = one, one, one
+		err = QualifyObservation(obs, plan, emptyRing())
+		if err == nil {
+			t.Fatal("a row declared its own carve-out and was accepted")
+		}
+		if !strings.HasPrefix(err.Error(), "QC13:") {
+			t.Fatalf("expected QC13's byte-identity to refuse it first, got: %v", err)
+		}
+	})
+
+	t.Run("partial equality needs no declaration", func(t *testing.T) {
+		// A `local` build's source can equal the orchestration head while the
+		// workload is somewhere else. That was always legal and still is.
+		plan, obs := qcFixture(t)
+		sameRepoProfile(t, &plan, &obs, false, false)
+		obs.HeadSHA, obs.CandidateSHA = one, one
+		obs.WorkloadCommit = sha40("a-different-workload")
+		if err := QualifyObservation(obs, plan, emptyRing()); err != nil {
+			t.Fatalf("two equal identities and one distinct was rejected: %v", err)
+		}
+	})
 }

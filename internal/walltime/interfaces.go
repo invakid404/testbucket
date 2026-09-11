@@ -21,6 +21,7 @@ func WorkflowInputUnion() []string {
 	return []string{
 		"est-basis",
 		"scored",
+		"same-repository-workload",
 		"runner-class",
 		"runs-on-label",
 		"cache-declaration-json",
@@ -53,7 +54,8 @@ const (
 func WorkflowRoute() map[string][]string {
 	return map[string][]string{
 		JobPlan: {
-			"est-basis", "scored", "runner-class", "runs-on-label",
+			"est-basis", "scored", "same-repository-workload",
+			"runner-class", "runs-on-label",
 			"cache-declaration-json", "cache-declaration-digest-expected",
 			"candidate-sha", "workload-commit",
 		},
@@ -81,6 +83,7 @@ func AddedActionInputs() map[string][]string {
 	return map[string][]string{
 		ActionPlan: {
 			"est-basis", "runner-class", "runs-on-label", "scored",
+			"same-repository-workload",
 			"cache-declaration-file", "candidate-sha", "workload-commit",
 		},
 		ActionRunBucket: {
@@ -98,7 +101,13 @@ func AddedActionInputs() map[string][]string {
 // scoredExclusions are the two classes §21 excludes from `S`, by name: the
 // DEFAULTED input and the PRODUCER-CONDITIONAL pair. S is never compared as A.
 var scoredExclusions = map[string]string{
-	"est-basis":                    "defaulted",
+	"est-basis": "defaulted",
+	// DEFAULTED for a sharper reason than a default: §19.3a AD-11 requires
+	// `same_repository_workload` FALSE for a scored plan, so a scored caller does
+	// not supply it and may not. An input a scored run is forbidden to set is not
+	// an input it must pass, and leaving it out of this class would make S demand
+	// exactly that (R31-F14).
+	"same-repository-workload":     "defaulted",
 	"dependency-cache-matched-key": "producer-conditional",
 	"dependency-cache-hit":         "producer-conditional",
 }

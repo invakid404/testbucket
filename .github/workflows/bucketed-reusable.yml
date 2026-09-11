@@ -184,6 +184,19 @@ on:
           nothing else derives it — a scored B arm runs `reporter` too.
         type: string
         default: "false"
+      same-repository-workload:
+        description: >-
+          Whether the workload this run measures IS the orchestration checkout —
+          a project running its own test suite against its own source.
+
+          §7.1's QC15 rejects a row carrying one value in all three provenance
+          identities, which is right for every other shape: one `head_sha`
+          overloaded into three fields is the defect S-6 removed. For this one
+          they genuinely ARE one commit, and there is no truthful distinct value
+          for the other two. Declaring it admits that equality and nothing else;
+          a scored run may not declare it.
+        type: string
+        default: "false"
       runner-class:
         description: 'Stable execution-class leaf of the comparability key (§15.3, AD-8).'
         type: string
@@ -370,6 +383,7 @@ jobs:
         with:
           est-basis: ${{ inputs.est-basis }}
           scored: ${{ inputs.scored }}
+          same-repository-workload: ${{ inputs.same-repository-workload }}
           runner-class: ${{ inputs.runner-class }}
           runs-on-label: ${{ inputs.runs-on-label }}
           cache-declaration-file: ${{ steps.cache-declaration.outputs.file }}

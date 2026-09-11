@@ -817,6 +817,7 @@ func runPlan(args []string) error {
 	// --- contract §21 added plan inputs --------------------------------------
 	estBasis := fs.String("est-basis", string(core.BasisReporter), "which weight the partition is built from: reporter (default) or wall. Mode selection is contract §16.1; an explicit `wall` request with no fitted `ok` model is a hard error with no matrix (§0.8 outcome c), never a silent fallback")
 	scored := fs.Bool("scored", false, "this plan belongs to a scored campaign run. Nothing else can derive it — basis does not imply it, since a scored B arm runs `reporter` — so it is explicit, and it gates §0.8's phase-2 veto plus AD-8…AD-10")
+	sameRepoWorkload := fs.Bool("same-repository-workload", false, "the workload this plan schedules IS the orchestration checkout — the project running its own suite. §7.1's QC15 then admits one commit in all three provenance identities, because for this shape they genuinely are one commit and there is no truthful distinct value for the other two. Explicit, never inferred: a row may not award itself the carve-out. Refused for a scored plan, whose identities are separately bound")
 	runnerClass := fs.String("runner-class", "", "the stable execution-class leaf of the comparability key (§15.3). Required non-empty for a scored plan (AD-8); it replaces the former runner_name leaf, whose per-instance value had no cross-run stability contract")
 	setupCommand := fs.String("setup-command", "", "the per-job provisioning command the caller runs before this plan, verbatim. It is §15.3's setup_command key leaf: the plan action executes arbitrary consumer provisioning, and an environment built by a different command is a different population. Empty means no provisioning ran")
 	runsOnLabel := fs.String("runs-on-label", "", "the caller's resolved runs-on label, the producer for the runner_image_label key leaf. No context yields it inside a composite action, so the caller passes it; run-bucket echoes it and QC12 compares them (AD-8)")
@@ -1121,6 +1122,11 @@ func runPlan(args []string) error {
 		EstBasis:              walltime.EstBasis(decision.Basis),
 		StoreSHA256:           storeDigest(*store),
 		ExpandedUnitSetDigest: expandedDigest,
+		// DECLARED BY THE PLAN JOB, which is the only participant that knows
+		// whether the workload it scheduled is this checkout. The observation
+		// copies this block verbatim and QC13 compares it byte for byte, so the
+		// declaration cannot be added on the bucket runner.
+		SameRepositoryWorkload: *sameRepoWorkload,
 	}
 	if *scored {
 		if err := walltime.AdmitScoredProfile(profile, *runnerClass, *runsOnLabel,

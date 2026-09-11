@@ -295,8 +295,9 @@ func QualifyObservation(o Observation, plan PlanContext, ring RingFacts) error {
 		}
 	}
 
-	// QC15 — three separately present, well-formed, DISTINCT identity fields.
-	if err := qc15Observation(o); err != nil {
+	// QC15 — three separately present, well-formed identity fields, distinct
+	// unless the plan declared a same-repository workload.
+	if err := qc15Observation(o, prof); err != nil {
 		return err
 	}
 
@@ -418,9 +419,6 @@ func intervalInvariants(o Observation) error {
 	return nil
 }
 
-// qc15Observation is QC15 over an observation: the three provenance identities
-// are separately present, well-formed and DISTINCT. A row carrying one value in
-// all three, or omitting one, is rejected rather than silently overloaded.
 // CommitSHALen is the declared domain of §13's three provenance identities:
 // 40 lowercase hex characters, which is what the record schema spells for
 // head_sha, candidate_sha and workload_commit.
@@ -475,7 +473,11 @@ func wellFormedPGID(name, v string) error {
 	return nil
 }
 
-func qc15Observation(o Observation) error {
+// qc15Observation is QC15 over an observation: the three provenance identities
+// are separately present, well-formed, and distinct UNLESS the plan declared the
+// workload to be the orchestration checkout. Omitting one is always a rejection;
+// so is collapsing all three, except for that one declared, unscored shape.
+func qc15Observation(o Observation, prof CanonicalProfile) error {
 	for _, f := range []struct{ name, value string }{
 		{"head_sha", o.HeadSHA},
 		{"candidate_sha", o.CandidateSHA},
@@ -485,8 +487,37 @@ func qc15Observation(o Observation) error {
 			return err
 		}
 	}
-	if o.HeadSHA == o.CandidateSHA && o.CandidateSHA == o.WorkloadCommit {
-		return fmt.Errorf("QC15: all three provenance identities carry %q; a row that collapses them is rejected rather than silently overloaded",
+	if o.HeadSHA != o.CandidateSHA || o.CandidateSHA != o.WorkloadCommit {
+		// Three values, at least two of them different: nothing is collapsed and
+		// the rule has nothing to say. Partial equality has always been legal —
+		// a `local` build's source can equal the orchestration head while the
+		// workload is somewhere else — and still is.
+		return nil
+	}
+
+	// ALL THREE ARE ONE VALUE. Whether that is a defect depends on whether the
+	// three identities genuinely are one commit, and only the PLAN can say so.
+	//
+	// S-6's defect was one `head_sha` overloaded into three fields, and for a
+	// campaign arm or an external-consumer run that is still exactly what this
+	// shape means: the arm measures a pinned external workload with a pinned
+	// binary, so its three identities are separately bound by construction.
+	//
+	// A SAME-REPOSITORY DOGFOOD IS NOT THAT DEFECT. When the project runs its own
+	// suite from its own checkout with a `local` build, the orchestration head,
+	// the source that build compiled and the workload checkout ARE one commit.
+	// There is no truthful distinct value to put in the other two fields, and
+	// inventing one would be the overloading this rule exists to stop, written
+	// backwards. So the equality is admitted exactly when the plan declared the
+	// workload to be the orchestration checkout, and the row is NOT scored.
+	switch {
+	case prof.Scored:
+		return fmt.Errorf("QC15: a scored row carries %q in all three provenance identities; "+
+			"a scored arm's identities are separately bound and the same-repository carve-out is not available to it",
+			o.HeadSHA)
+	case !prof.SameRepositoryWorkload:
+		return fmt.Errorf("QC15: all three provenance identities carry %q and the plan declares no same-repository workload; "+
+			"a row that collapses them is rejected rather than silently overloaded",
 			o.HeadSHA)
 	}
 	return nil

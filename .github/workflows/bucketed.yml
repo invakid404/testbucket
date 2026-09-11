@@ -114,24 +114,22 @@ jobs:
       #
       # The Go lane above stays unwrapped deliberately: wall-time is
       # Vitest-only, and `--wall-dir` with `--runner go` is refused.
-      #
-      # WHAT THIS LANE CANNOT YET DEMONSTRATE, recorded rather than left silent.
-      #
-      # It measures and verifies. It does NOT demonstrate ingest or learning,
-      # because §7.1 QC15 requires `head_sha`, `candidate_sha` and
-      # `workload_commit` to be three DISTINCT commits and this lane has only
-      # one: the orchestration head, the testbucket source the `local` build
-      # compiles, and the `testdata/vitest-sample` workload are all
-      # `github.sha`. Passing that one value three times is rejected by QC15's
-      # explicit all-three-equal rule, which S-6 added on purpose — one
-      # `head_sha` carrying three identities is the defect it removed — and
-      # there is no truthful distinct value to pass instead.
-      #
-      # Resolving it is an OWNER DECISION with three shapes, none of which this
-      # file may take: reconcile QC15 so a genuinely single-commit dogfood is
-      # admissible; point the dogfood at an external workload at its own commit;
-      # or accept that ingest and learning are demonstrated only by the pinned
-      # consumer checks and not in this lane. Until then the measured rows this
-      # lane produces are verifiable and NOT ingestible, and that is a stated
-      # limitation rather than a silent rejection.
       wall-time-dir: /tmp/testbucket-wall
+      # AND IT DEMONSTRATES INGEST, which needs all three §13 identities.
+      #
+      # They are the same commit here, truthfully: the orchestration head, the
+      # source `testbucket-version: local` compiles, and the
+      # `testdata/vitest-sample` workload are one checkout. §7.1's QC15 rejects
+      # one value in all three fields for every other shape — one `head_sha`
+      # overloaded into three is the defect S-6 removed — so this lane DECLARES
+      # what it is, and QC15 admits the equality for a declared, unscored,
+      # same-repository run and nothing else.
+      #
+      # Passing `github.sha` three times without the declaration would be
+      # rejected, and inventing distinct values would be the overloading the rule
+      # exists to stop, written backwards. This lane is not scored, so the
+      # carve-out is available to it; a scored arm's plan is refused for
+      # declaring it at all.
+      same-repository-workload: "true"
+      candidate-sha: ${{ github.sha }}
+      workload-commit: ${{ github.sha }}

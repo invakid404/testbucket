@@ -286,6 +286,9 @@ wire_paths:
   - {path: "profile.est_basis",           artifact: profile, type: string,  cardinality: one}
   - {path: "profile.store_sha256",        artifact: profile, type: string,  cardinality: one}
   - {path: "profile.expanded_unit_set_digest", artifact: profile, type: string, cardinality: one}
+  # the QC15 carve-out, plan-declared — acceptance-contract.md 13.0, QC15
+  - {path: "profile.same_repository_workload", artifact: profile, type: boolean, cardinality: one,
+     provenance: {tags: [R31-F14], see: ["acceptance-contract.md 13.0", "acceptance-contract.md 19.3a"]}}
 
   # ---- ring_row — acceptance-contract.md 15.1a ----
   - {path: "ring.repository",             artifact: ring_row, type: string,  cardinality: one,

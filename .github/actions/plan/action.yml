@@ -99,6 +99,26 @@ inputs:
       and an unscored warm-up may too — so it is an explicit boolean and it
       gates PD-2's phase-2 veto plus AD-8…AD-10.
     default: "false"
+  same-repository-workload:
+    description: >-
+      Whether the workload this plan schedules IS the orchestration checkout —
+      the project running its own test suite against its own source.
+
+      §7.1's QC15 requires `head_sha`, `candidate_sha` and `workload_commit` to
+      be three separately bound identities and rejects a row carrying one value
+      in all three, because one `head_sha` overloaded into three fields is the
+      defect S-6 removed. For this one shape they genuinely ARE one commit: the
+      orchestration head, the source a `local` build compiled and the workload
+      checkout are the same commit, and there is no truthful distinct value to
+      put in the other two fields. Declaring it admits that equality and nothing
+      else.
+
+      It is the PLAN's declaration and travels in the §13.0 profile block the
+      observation copies verbatim, so a bucket runner cannot award itself the
+      carve-out. A scored plan may not declare it: its arm measures a pinned
+      external workload with a pinned binary, so its identities are separately
+      bound by construction, and the plan is refused before a matrix exists.
+    default: "false"
   runner-class:
     description: >-
       The stable execution-class string of comparability-key leaf 1 (§15.3). It
@@ -200,6 +220,7 @@ runs:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_EST_BASIS: ${{ inputs.est-basis }}
         TB_SCORED: ${{ inputs.scored }}
+        TB_SAME_REPOSITORY_WORKLOAD: ${{ inputs.same-repository-workload }}
         TB_RUNNER_CLASS: ${{ inputs.runner-class }}
         TB_RUNS_ON_LABEL: ${{ inputs.runs-on-label }}
         # THE SAME COMMAND THE STEP ABOVE EXECUTED. §15.3 makes setup_command a
@@ -308,6 +329,9 @@ runs:
         fi
         if [ "$TB_SCORED" = "true" ]; then
           extra+=(--scored)
+        fi
+        if [ "$TB_SAME_REPOSITORY_WORKLOAD" = "true" ]; then
+          extra+=(--same-repository-workload)
         fi
         for flag_pair in \
           "--runner-class:$TB_RUNNER_CLASS" \

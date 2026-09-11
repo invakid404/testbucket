@@ -1199,7 +1199,7 @@ check passes. Field names are the field registry's; this table does not restate 
 | QC13 | record | `profile` is **byte-identical** to the plan's canonical block — no field added, dropped, reordered, or retyped. Mandatory for every wall-basis observation and every campaign row; it is in no optional list |
 | **QC14a** | **bucket runner, inside `run-bucket`, before artifact upload** | the on-runner half of the cache contract — §10.5.6 |
 | **QC14b** | **record, at ingest** | the transferable half of the cache contract — §10.5.6 |
-| QC15 | record | `head_sha`, `candidate_sha`, and `workload_commit` are each present, well-formed, and distinct fields; a row carrying one value in all three, or omitting one, is rejected rather than silently overloaded |
+| QC15 | record | `head_sha`, `candidate_sha`, and `workload_commit` are each present and well-formed — 40 hex characters (§13) — and **separately bound**: a row omitting one is always rejected, and so is a row carrying one value in all three **unless** the plan declared `profile.same_repository_workload` and the row is **not scored** (§13.0, R31-F14). Partial equality was always legal and still is — a `local` build's source may equal the orchestration head while the workload is elsewhere. A **scored** row collapsing all three is rejected however its plan is declared |
 | QC17 | record | the row's `runtime_profile_digest` equals the plan document's `runtime_profile_declared_digest` (§15.3a). On mismatch the row is **rejected** and the failure names the **first differing constituent** by field number; the row never enters history, and a scored run's pair is **retained, unscored and non-passing** under §19.8's post-start rule — never voided and never rescheduled (owner F1, R15-F3) |
 | QC18 | record | the row's two estimate fields are the **plan's**, not the row's own: `a_eta_ns` is present **iff** the plan optimized an objective for that bucket and equals it, and `est_seconds` equals the estimate the plan **displayed** for that bucket. Both comparisons are **unconditional** — a displayed estimate of `0.0` is a value, not an absence, because §17.3a admits an empty bucket as a legitimate design row and a plan bucket always carries a displayed estimate. §5.1 makes both fields audit echoes of what the plan decided; the assembler derives one from the other, so a row whose two fields merely agree with each other has been compared against nothing |
 | QC16 | record | `realtime_start` is present and parses as an RFC 3339 UTC instant — absent or unparseable is **rejected**, never defaulted — and the row's `intrinsic_id` `(repository, run_id, run_attempt, job_id, bucket_index, plan_digest)` is complete and **not already present in the ring**, so the recency key is a total order |
@@ -1800,13 +1800,28 @@ validator compares the two. It is defined here and nowhere else.
   "bucket_indices": [0,1,2,3,4,5,6,7],
   "est_basis": "reporter|wall",
   "store_sha256": "sha256:…",
-  "expanded_unit_set_digest": "sha256:…"
+  "expanded_unit_set_digest": "sha256:…",
+  "same_repository_workload": false
 }
 ```
 
 Every field of the canonical profile is frozen at plan time; the block's membership is the field
 registry's `profile` projection and is **not** counted here (R14-F4). `bucket_indices` is the
 complete index set, not a count.
+
+**`same_repository_workload` is the one narrow carve-out QC15 admits, and the PLAN grants it
+(R31-F14).** It declares that the workload this plan schedules **is the orchestration checkout** — a
+project running its own suite against its own source. For that shape the three provenance identities
+of §13 genuinely are **one commit**: the orchestration head, the source a `local` build compiled, and
+the workload checkout. There is no truthful distinct value for the other two fields, and inventing
+one would be the overloading QC15 exists to stop, written backwards.
+
+The **plan job** declares it, because it is the only participant that knows what it scheduled, and it
+travels in this block — so QC13's byte-identity means a bucket runner **cannot** award itself the
+carve-out. Two limits keep it narrow and both are executable: a **scored** plan that declares it is
+**refused before a matrix exists** (§19.3a AD-11), since a scored arm measures a pinned external
+workload with a pinned `vX.Y.Z` binary and its identities are separately bound by construction; and
+the declaration admits **equality only**, never an absent identity.
 
 **`est_basis` has two distinct fields with two distinct roles (SR-5).** They are not a conflict;
 naming them as one was.
@@ -3092,7 +3107,8 @@ every field holds:
   "bucket_indices": [0,1,2,3,4,5,6,7],
   "est_basis": "reporter|wall",
   "store_sha256": "sha256:…",
-  "expanded_unit_set_digest": "sha256:…"
+  "expanded_unit_set_digest": "sha256:…",
+  "same_repository_workload": false
 }
 ```
 
@@ -3110,6 +3126,7 @@ Admission rules, each fail-closed at plan time (§17.17):
 | AD-8 | the `runner-class` and `runs-on-label` action inputs are **present and non-empty** (§15.3, S-4); a scored plan may not fall back to a default or to a runner-context value |
 | AD-9 | `cache_state` is declared for the run and satisfies §10.5.0 before any bucket script starts (S-5) |
 | AD-10 | `candidate-sha` and `workload-commit` are present and non-empty, so the observation can carry the three separate identities QC15 requires (S-6) |
+| AD-11 | `same_repository_workload` is **false**. §13.0's carve-out is for an unscored project measuring its own checkout; a scored arm measures a pinned external workload with a pinned `vX.Y.Z` binary, so its identities are separately bound by construction and the declaration would make the arm's rows unqualifiable. Refused here rather than at ingest, because a plan that cannot produce an ingestible row should emit no matrix (R31-F14) |
 
 `scored: false` runs are unaffected and keep every current default — this binds the campaign, not
 ordinary consumers.
@@ -3776,6 +3793,7 @@ input carrying it exists.
 | `run-bucket` | **`candidate-sha`** | **required for `scored: true`** | the testbucket commit the executing binary was built from, written into the observation as `candidate_sha`. Neither the runner context nor the binary carries it, so the caller that built the binary passes it (S-6, QC15) |
 | `run-bucket` | **`workload-commit`** | **required for `scored: true`** | the consumer checkout the bucket ran against, written into the observation as `workload_commit`. The orchestrator checked the workload out at a full SHA (§19.3), so it is the only party that knows it (S-6, QC15) |
 | `plan` | **`scored`** | always (defaults `false`) | **the producer for `profile.scored` (D-4).** Nothing else can derive it: basis does not imply it — scored **B** runs `reporter`, and an unscored warm-up may also run `reporter` — so it is an explicit boolean input. It gates PD-2's phase-2 veto and AD-8…AD-10 |
+| `plan` | **`same-repository-workload`** | always (defaults `false`); **must be `false` for `scored: true`** (AD-11) | **the producer for `profile.same_repository_workload` (R31-F14).** Only the plan job knows whether the workload it scheduled is the orchestration checkout, and §13.0's QC15 carve-out is granted by that declaration and by nothing the row can say about itself. It admits one commit in all three provenance identities for an unscored same-repository run — the shape where they genuinely are one commit — and admits no absent identity and no scored row |
 | `plan` | **`cache-declaration-file`** | **required for `scored: true`** (AD-9) | the **job-local** file the plan job materialized and verified at §10.5.2 steps 0b–0c. The **same immutable declaration leaves** §10.5.0 classes as such, which `run-bucket` also receives. `plan` validates only those and **refuses before emitting a matrix**; it never sees a matched key, a disposition, or an executed digest, because those do not exist yet (R11-D3). It publishes the canonical bytes and their digest as the job outputs `cache-declaration-json` and `cache-declaration-digest`, which is how they cross the job boundary (contract §10.5.2) |
 | `plan` | **`candidate-sha`**, **`workload-commit`** | **required for `scored: true`** (AD-10) | likewise passed to `plan`, so AD-10 is enforceable at the component the rule names |
 | `run-bucket` | **`shard-plan`** | **required for `scored: true`** | carries the canonical `profile` block, copied verbatim into the observation so **QC13 has a real byte path** (D-4) |
@@ -3786,7 +3804,7 @@ input carrying it exists.
 action six scored inputs while the reusable workflow exposed only three, so a caller could set
 `scored: true` through the workflow and then fail AD-9/AD-10 with no way to supply what they need.
 The workflow's input set is therefore **exactly** the union it must pass through — `est-basis`,
-`scored`, `runner-class`, `runs-on-label`, `cache-declaration-json`, `cache-declaration-digest-expected`,
+`scored`, `same-repository-workload`, `runner-class`, `runs-on-label`, `cache-declaration-json`, `cache-declaration-digest-expected`,
 `dependency-cache-producer`, `dependency-cache-matched-key`, `dependency-cache-hit`,
 `candidate-sha`, `workload-commit`,
 `campaign-id`, `wall-observations-dir`, `campaign-config-json`, `campaign-config-digest-expected`.
@@ -3815,7 +3833,7 @@ and every member of `U` reaches **at least one** job.
 
 | Job | `W[job]` — the caller inputs it receives |
 |---|---|
-| **plan job** | `est-basis`, `scored`, `runner-class`, `runs-on-label`, `cache-declaration-json`, `cache-declaration-digest-expected`, `candidate-sha`, `workload-commit` |
+| **plan job** | `est-basis`, `scored`, `same-repository-workload`, `runner-class`, `runs-on-label`, `cache-declaration-json`, `cache-declaration-digest-expected`, `candidate-sha`, `workload-commit` |
 | **bucket job** | `runs-on-label`, `dependency-cache-producer`, `dependency-cache-matched-key`, `dependency-cache-hit`, `candidate-sha`, `workload-commit`, `campaign-id` |
 | **record job** | `wall-observations-dir`, `campaign-config-json`, `campaign-config-digest-expected` |
 
@@ -3830,18 +3848,21 @@ the **plan job's outputs** have no position in `U` at all:
 | `record` | identity on all of `W[record]` | the record job materializes and verifies the config per §19.9c-1 before invoking `ingest`; no name changes |
 
 **`S` is `A` minus what a scored caller need not supply, and is never compared as `A`.** Exactly two
-classes are excluded, by name: the **defaulted** input `est-basis`, and the **producer-conditional**
-inputs `dependency-cache-matched-key` and `dependency-cache-hit`, which are required **iff**
-`dependency-cache-producer == caller` and forbidden otherwise. `S[action]` is therefore the ordered
-subsequence of `A[action]` that omits those three names, and nothing else. An earlier revision let
-`S` stand in an equality with `A`; that comparison is now forbidden by name.
+classes are excluded, by name: the **defaulted** inputs `est-basis` and `same-repository-workload`,
+and the **producer-conditional** inputs `dependency-cache-matched-key` and `dependency-cache-hit`,
+which are required **iff** `dependency-cache-producer == caller` and forbidden otherwise.
+`same-repository-workload` is in the defaulted class for a sharper reason than a default: AD-11
+requires it **false** for a scored plan, so a scored caller does not supply it and *may not* — an
+input a scored run is forbidden to set is not an input it must pass (R31-F14). `S[action]` is
+therefore the ordered subsequence of `A[action]` that omits those four names, and nothing else. An
+earlier revision let `S` stand in an equality with `A`; that comparison is now forbidden by name.
 
 **Canonical `A`, in order.** `component-map.json`'s `action_interfaces` is the derived projection of
 this and is compared against it **in order, in both directions**:
 
 | Action | `A[action]`, canonically ordered |
 |---|---|
-| `plan` | `est-basis`, `runner-class`, `runs-on-label`, `scored`, `cache-declaration-file`, `candidate-sha`, `workload-commit` |
+| `plan` | `est-basis`, `runner-class`, `runs-on-label`, `scored`, `same-repository-workload`, `cache-declaration-file`, `candidate-sha`, `workload-commit` |
 | `run-bucket` | `runs-on-label`, `cache-declaration-file`, `cache-declaration-digest`, `dependency-cache-producer`, `dependency-cache-matched-key`, `dependency-cache-hit`, `campaign-id`, `candidate-sha`, `workload-commit`, `shard-plan` |
 | `record` | `wall-observations-dir`, `campaign-config-json`, `campaign-config-digest-expected` |
 
