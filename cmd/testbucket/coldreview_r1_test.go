@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/invakid404/testbucket/internal/core"
+
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
 // degradedWallLeaves is a fit whose residuals exceeded the ceiling: it HAS
@@ -165,7 +167,8 @@ func TestTheWallSummaryTakesTheMeanInIntegerNanoseconds(t *testing.T) {
 		"model_version":            1,
 		"comparability_key_digest": key,
 		"status":                   "ok",
-		"observations":             []any{},
+		// A RING THAT SUPPORTS THE FIT BESIDE IT — see supportingRing.
+		"observations": supportingRing(key),
 	}
 	for k, v := range fittedWallLeaves() {
 		wall[k] = v
@@ -363,7 +366,9 @@ func TestTheAssemblerRefusesAnIncompleteClosingRecord(t *testing.T) {
 	}
 	run("wall", "begin", "--dir", records, "--bucket-id", "bucket-0")
 	inner := bin + " wall exec --dir " + records + " --level invocation" +
-		" --bucket-id bucket-0 --cwd " + dir + " -- sh -c true"
+		" --bucket-id bucket-0 --cwd " + dir +
+		" --selector ./f0.test.ts --unit-digest " + string(walltime.DigestJSONOrEmpty([]string{"f0.test.ts"})) +
+		" -- sh -c true"
 	run("wall", "exec", "--dir", records, "--level", "script", "--bucket-id", "bucket-0",
 		"--cwd", dir, "--", "sh", "-c", inner)
 	// The closing record with NO terminal: `wall end` is given an empty one.

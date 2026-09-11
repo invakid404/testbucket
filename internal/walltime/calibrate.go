@@ -39,12 +39,50 @@ type CalibrationUnit struct {
 type Packer func(units []CalibrationUnit, slots int) [][]CalibrationUnit
 
 // CalibrationEvidence is the `testbucket.calibration-evidence/v1` document.
+//
+// IT IS THE DOCUMENT §17.3a SPECIFIES, not a subset of it. Seven of the fields
+// below were absent entirely — the comparability key, the proposed plan
+// digests, the three rank diagnostics, the two column-content summaries and the
+// generation instant — so the proposal could not say which population it
+// belonged to, which plans it proposed, or on what numeric evidence the rank
+// verdict rested. §17.3a persists this document "for later runs"; a later run
+// reading one that cannot be attributed has no evidence, only an outcome word.
+//
+// Nothing here is authority. §17.3a is explicit that a later `--est-basis wall`
+// plan re-runs the §6.6 rank check against the ACTUAL ring and still requires
+// MIN_ROWS and MIN_RUNS. These fields make the proposal attributable, not
+// binding.
 type CalibrationEvidence struct {
-	Schema       string             `json:"schema"`
-	Outcome      CalibrationOutcome `json:"outcome"`
-	LayoutsTried int                `json:"layouts_tried"`
-	LayoutBudget int                `json:"layout_budget"`
-	Rank         int                `json:"rank,omitempty"`
+	Schema  string             `json:"schema"`
+	Outcome CalibrationOutcome `json:"outcome"`
+	// ComparabilityKeyDigest is which wall population this proposal was made
+	// for. Without it a persisted document cannot be matched to the history a
+	// later plan is allowed to join (§15.3).
+	ComparabilityKeyDigest string `json:"comparability_key_digest,omitempty"`
+	// ProposedPlanDigests identifies the layouts this document proposes, one
+	// digest per proposed plan, so W-2's non-scored executions can be bound to
+	// the proposal that asked for them rather than to its outcome word.
+	ProposedPlanDigests []Digest `json:"proposed_plan_digests,omitempty"`
+	LayoutsTried        int      `json:"layouts_tried"`
+	LayoutBudget        int      `json:"layout_budget"`
+	Rank                int      `json:"rank,omitempty"`
+	// SigmaMax, Tolerance and MinPivot are §6.6's own numbers for the DECISIVE
+	// design matrix — the admitted layout's, or the last one evaluated on a
+	// bounded miss. They are the rank verdict's evidence: a reader can see how
+	// far from the tolerance the smallest pivot fell instead of taking
+	// `admitted` on faith.
+	SigmaMax  string `json:"sigma_max,omitempty"`
+	Tolerance string `json:"tolerance,omitempty"`
+	MinPivot  string `json:"min_pivot,omitempty"`
+	// IndicatorValuesPresent and DistinctSliceCounts are columns 3 and 4 of
+	// that same decisive matrix, deduplicated and ascending. They are what
+	// makes a deficiency diagnosable: a column reported deficient because it
+	// holds one value says so here.
+	//
+	// A structural proof evaluates no layout, so the proven-constant column is
+	// reported from the universe and the other is absent rather than invented.
+	IndicatorValuesPresent []int `json:"indicator_values_present,omitempty"`
+	DistinctSliceCounts    []int `json:"distinct_slice_counts,omitempty"`
 	// GeneratorExhausted records that L(i) became undefined before the budget
 	// was reached, which §6.7 requires to be reported rather than folded into
 	// an ordinary bounded miss.
@@ -57,6 +95,35 @@ type CalibrationEvidence struct {
 	// Buckets and DesignRows are the accepted layout, present iff SUFFICIENT.
 	Buckets    [][]string  `json:"buckets,omitempty"`
 	DesignRows [][]float64 `json:"design_rows,omitempty"`
+	// GeneratedAt is the plan run's own instant, RFC 3339 UTC. It is the
+	// planner's `now` rather than a second clock read, so the document a test
+	// writes is the document the test can compare.
+	GeneratedAt string `json:"generated_at,omitempty"`
+}
+
+// columnValues returns the deduplicated ascending integer values of one design
+// column, which is how §17.3a reports columns 3 and 4.
+func columnValues(rows [][]float64, col int) []int {
+	seen := map[int]bool{}
+	for _, r := range rows {
+		if col < len(r) {
+			seen[int(r[col])] = true
+		}
+	}
+	out := make([]int, 0, len(seen))
+	for v := range seen {
+		out = append(out, v)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// withDesign records the rank diagnostics and column contents of the design
+// matrix a verdict was actually taken on.
+func (ev *CalibrationEvidence) withDesign(rows [][]float64, rank RankResult) {
+	ev.SigmaMax, ev.Tolerance, ev.MinPivot = rank.SigmaMax, rank.Tolerance, rank.MinPivot
+	ev.IndicatorValuesPresent = columnValues(rows, 2)
+	ev.DistinctSliceCounts = columnValues(rows, 3)
 }
 
 const CalibrationEvidenceSchema = "testbucket.calibration-evidence/v1"
@@ -256,16 +323,23 @@ func CalibrateProposer(u []CalibrationUnit, k, n int, pack Packer) (CalibrationE
 	case len(slices) == 0:
 		ev.Outcome = CalibrationStructurallyInfeasible
 		ev.ZeroColumn = 4
+		// The proof IS the column content: no slice unit means column 4 holds
+		// the single value 0 under every partition. Column 3 is not reported,
+		// because no layout was evaluated and its values are unknown.
+		ev.DistinctSliceCounts = []int{0}
 		ev.Reason = "no name-slice unit exists, so slice_count is 0 in every bucket of every partition: column 4 is identically zero and rank(X) <= 3 for ALL layouts"
 		return ev, nil
 	case len(whole) == 0:
 		ev.Outcome = CalibrationStructurallyInfeasible
 		ev.ZeroColumn = 3
+		ev.IndicatorValuesPresent = []int{0}
 		ev.Reason = "no whole-file unit exists, so I(any_whole_file) is 0 everywhere: column 3 is identically zero and rank(X) <= 3 for ALL layouts"
 		return ev, nil
 	}
 
 	var lastDeficient []int
+	var lastRows [][]float64
+	var lastRank RankResult
 	for i := 1; i <= n; i++ {
 		layout, err := Layout(u, k, i, pack)
 		if err != nil {
@@ -275,6 +349,9 @@ func CalibrateProposer(u []CalibrationUnit, k, n int, pack Packer) (CalibrationE
 			ev.LayoutsTried = i - 1
 			ev.GeneratorExhausted = true
 			ev.DeficientColumns = lastDeficient
+			if lastRows != nil {
+				ev.withDesign(lastRows, lastRank)
+			}
 			ev.Reason = fmt.Sprintf("the layout generator exhausted at i = %d: %v", i, err)
 			return ev, nil
 		}
@@ -294,14 +371,19 @@ func CalibrateProposer(u []CalibrationUnit, k, n int, pack Packer) (CalibrationE
 			ev.Rank = rank.Rank
 			ev.DesignRows = rows
 			ev.Buckets = bucketIDs(layout)
+			ev.withDesign(rows, rank)
 			return ev, nil
 		}
 		lastDeficient = rank.DeficientColumns
+		lastRows, lastRank = rows, rank
 	}
 
 	ev.Outcome = CalibrationNotFoundWithinBudget
 	ev.LayoutsTried = n
 	ev.DeficientColumns = lastDeficient
+	if lastRows != nil {
+		ev.withDesign(lastRows, lastRank)
+	}
 	ev.Reason = fmt.Sprintf("no evaluated layout reached rank 4 within the budget of %d; a layout outside the enumerated list may still succeed", n)
 	return ev, nil
 }

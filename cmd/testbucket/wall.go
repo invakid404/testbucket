@@ -246,6 +246,24 @@ func coverageAudit(shardPlan, eventsDir, runnerKind string) walltime.AuditFunc {
 			readers = append(readers, f)
 		}
 		if len(readers) == 0 {
+			// ZERO PLANNED WORK AND ZERO OBSERVED WORK AGREE.
+			//
+			// §17.3a admits an empty bucket as a legitimate design row — it is
+			// produced whenever U < K — and the repaired QC18 treats its
+			// displayed estimate of 0 as a real value. Such a bucket renders no
+			// invocation, so it emits no event file, while still having a real
+			// action and setup interval worth measuring. Reporting it as a
+			// coverage problem made the verifier fail every legal empty bucket
+			// terminally.
+			//
+			// A bucket with planned units and no events is still exactly the
+			// failure this audit exists to catch.
+			if planned.Units == 0 {
+				return &walltime.AuditEvidence{
+					Bucket: bucketID, PlanDigest: planDigest, Planned: 0, Reported: 0,
+					Report: fmt.Sprintf("bucket %s is an empty design row: 0 planned unit(s), 0 reported — §17.3a admits it and it renders no invocation, so it emits no events", bucketID),
+				}, nil
+			}
 			// An empty events directory is the exact failure the audit exists
 			// to catch — a bucket that produced nothing — so it is reported as
 			// a coverage problem rather than as a missing input.
@@ -485,6 +503,24 @@ func runWallVerify(args []string) error {
 	// bucket that did not run its plan, fail here.
 	if !v.Complete {
 		return fmt.Errorf("wall verify: the records are not a complete measurement (%d finding(s))", len(v.Findings))
+	}
+	// A PLAN-BOUND VERIFICATION FAILS ON ITS ELIGIBILITY VERDICT.
+	//
+	// The exit code was taken from `Complete` alone. Invocation-count, argv,
+	// membership and bucket-identity failures are SeverityIneligible, so a
+	// complete measurement that ran something other than its plan verified
+	// complete=true eligible=false — and the step that the action relies on for
+	// its exit code went green while the verdict in front of it said the
+	// identity did not match. §17.10 makes that the one thing required
+	// verification cannot do.
+	//
+	// The distinction is whether a plan was SUPPLIED. With none, the absence is
+	// a finding and the mode is diagnostic: a consumer that passes no plan
+	// artifact is not asserting an identity and must not be failed for it. With
+	// one, the comparison was asked for and its verdict decides.
+	if strings.TrimSpace(*shardPlan) != "" && !v.Eligible {
+		return fmt.Errorf("wall verify: the records are complete but NOT eligible against the supplied plan (%d finding(s)); a plan-bound verification reports its identity verdict in its exit code",
+			len(v.Findings))
 	}
 	return nil
 }

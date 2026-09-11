@@ -8,39 +8,6 @@ import (
 // their edges: one nanosecond either side of a frozen threshold, and the
 // populations the contract froze them over.
 
-func TestPredictorGates(t *testing.T) {
-	// Two invocations, each predicted 1 s short: inside the 5 s invocation MAE
-	// and the 10 s individual limit.
-	ok := []PredictorSample{
-		{InvocationSeq: 0, BucketIndex: 1, PredictedNs: 9 * second, ObservedNs: 10 * second},
-		{InvocationSeq: 1, BucketIndex: 1, PredictedNs: 4 * second, ObservedNs: 5 * second},
-	}
-	for _, g := range EvaluatePredictor(ok) {
-		if !g.Pass {
-			t.Errorf("gate %s failed on a well-predicted bucket: %s", g.Name, g.Observed)
-		}
-	}
-	// One badly predicted invocation fails the individual limit even though
-	// the mean would survive.
-	bad := append(append([]PredictorSample(nil), ok...),
-		PredictorSample{InvocationSeq: 2, BucketIndex: 1, PredictedNs: 1 * second, ObservedNs: 12 * second})
-	failed := map[string]bool{}
-	for _, g := range EvaluatePredictor(bad) {
-		if !g.Pass {
-			failed[g.Name] = true
-		}
-	}
-	if !failed["predictor:invocation-max"] {
-		t.Errorf("an 11 s individual error passed the 10 s limit")
-	}
-	// No projection is not a pass.
-	for _, g := range EvaluatePredictor(nil) {
-		if g.Pass {
-			t.Errorf("gate %s passed with no sample", g.Name)
-		}
-	}
-}
-
 func TestAetaGates(t *testing.T) {
 	inside := []AetaSample{{
 		BucketID: "b1", PointNs: 100 * second, LowerNs: 90 * second, UpperNs: 110 * second, ObservedNs: 105 * second,

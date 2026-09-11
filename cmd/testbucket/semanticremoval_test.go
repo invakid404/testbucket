@@ -10,6 +10,7 @@ import (
 
 	"github.com/invakid404/testbucket/internal/core"
 	"github.com/invakid404/testbucket/internal/planbind"
+	"io/fs"
 )
 
 // TestNoProhibitedProofSymbolSurvives is the SEMANTIC half of the governed
@@ -362,7 +363,12 @@ func TestTheInvocationManifestEmitsNoProofSlot(t *testing.T) {
 	cmd := exec.Command(bin, "wall", "verify", "--dir", records, "--shard-plan", plan, "--json")
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
+	// THIS TEST IS ABOUT THE PRINTED FIELDS, not the verdict. A plan-bound
+	// verification exits non-zero on an ineligible verdict, and on a platform
+	// without a raw monotonic clock every local measurement is ineligible
+	// (WT-027) — so the exit code is only asserted where the clock can carry one.
+	// The JSON is produced either way, which is what the assertions below read.
+	if err := cmd.Run(); err != nil && hostClockIsScorable(t) {
 		t.Fatalf("wall verify: %v\n%s", err, out.String())
 	}
 	if strings.Contains(out.String(), "stage2_digest") {
@@ -592,4 +598,71 @@ func TestNoShippedDescriptionPromisesRemovedMachinery(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestTheDeadFrozenPlanningAndPredictorMachineryIsGone is F19's control.
+//
+// Call-site inspection found the frozen-planning/resolution helpers and the
+// Pcheck-versus-V predictor gate family disconnected from production: every
+// reference was a definition, a helper-internal call, or a test. Helper coverage
+// then looked like live-path coverage, and each name still described a capability
+// the product does not have — a frozen acquisition environment, a delegated
+// launcher closure, a predictor projection.
+//
+// This asserts their ABSENCE by symbol, so reintroducing one fails here rather
+// than passing review as "it has tests".
+func TestTheDeadFrozenPlanningAndPredictorMachineryIsGone(t *testing.T) {
+	for _, c := range []struct{ symbol, what string }{
+		{"func discoveryArgv(", "the acquisition closure's discovery argv"},
+		{"planningSnapshot", "the frozen planning environment snapshot"},
+		{"func planningEnvValue(", "the frozen-snapshot environment reader"},
+		{"func resolveProgram(", "the frozen-PATH program resolver"},
+		{"func delegatedProgram(", "the package-launcher delegation resolver"},
+		{"func lookPathIn(", "the frozen-PATH LookPath"},
+		{"packageRunners", "the launcher subcommand table"},
+		{"func EvaluatePredictor(", "the Pcheck-versus-V predictor gates"},
+		{"func EvaluateCampaignPredictor(", "the campaign predictor gates"},
+		{"PredictorSample", "the predictor projection sample"},
+		{"PcheckInvocationMAELimit", "the predictor MAE threshold"},
+		{"PcheckInvocationMaxLimit", "the individual predictor error threshold"},
+		{"PcheckBucketMAELimit", "the predictor bucket MAE threshold"},
+		{"ReconMAELimit", "the trace-versus-containment-peer reconciliation threshold"},
+		{"ReconMaxLimit", "the trace-versus-containment-peer individual threshold"},
+		{"func RowScope(", "the predictor gate scope split"},
+	} {
+		if hits := goSourceMentioning(t, c.symbol); len(hits) > 0 {
+			t.Errorf("%s is back (%s): %v; it has no production consumer and names machinery this product does not have",
+				c.symbol, c.what, hits)
+		}
+	}
+}
+
+// goSourceMentioning lists the Go files under the repository that contain a
+// literal symbol, tests included: a helper kept alive only by its own test is
+// exactly the shape this control is about.
+func goSourceMentioning(t *testing.T, symbol string) []string {
+	t.Helper()
+	var hits []string
+	for _, dir := range []string{".", "../../internal"} {
+		err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !strings.HasSuffix(p, ".go") {
+				return nil
+			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			if strings.Contains(string(b), symbol) && !strings.Contains(p, "semanticremoval_test.go") {
+				hits = append(hits, p)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", dir, err)
+		}
+	}
+	return hits
 }

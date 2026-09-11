@@ -183,6 +183,58 @@ func TestCampaignProvenanceAndCutoff(t *testing.T) {
 		}
 	})
 
+	// F20's controls. Each of these inputs is otherwise valid — a real fitted_at,
+	// a real first authenticated start, named exclusion domains — and each used to
+	// return success while the exclusion evidence was incomplete.
+	t.Run("a half-open excluded window fails", func(t *testing.T) {
+		for _, c := range []struct {
+			name       string
+			start, end string
+		}{
+			{"no start", "", "2026-09-15T00:00:00Z"},
+			{"no end", "2026-09-01T00:00:00Z", ""},
+			{"neither", "", ""},
+		} {
+			p := base
+			p.ExcludedWindowStart, p.ExcludedWindowEnd = c.start, c.end
+			err := ValidateProvenance(p, []string{"warm-1"},
+				map[string]string{"warm-1": "2026-09-05T00:00:00Z"})
+			if err == nil {
+				t.Errorf("%s: an incomplete excluded window was accepted, and the row inside it was never compared", c.name)
+			}
+		}
+	})
+
+	t.Run("an inverted excluded window fails", func(t *testing.T) {
+		p := base
+		p.ExcludedWindowStart, p.ExcludedWindowEnd = "2026-09-15T00:00:00Z", "2026-09-01T00:00:00Z"
+		if err := ValidateProvenance(p, []string{"warm-1"},
+			map[string]string{"warm-1": "2026-08-01T00:00:00Z"}); err == nil {
+			t.Fatal("a window that ends before it starts was accepted")
+		}
+	})
+
+	t.Run("a ring run with no authenticated start fails", func(t *testing.T) {
+		// THE POPULATION DECIDED HOW MUCH OF ITSELF GOT CHECKED: the loop
+		// iterated the supplied timestamp map, so a run present in the ring and
+		// absent from it was never compared against the window.
+		err := ValidateProvenance(base, []string{"warm-1", "warm-2"},
+			map[string]string{"warm-1": "2026-08-01T00:00:00Z"})
+		if err == nil {
+			t.Fatal("a ring run with no authenticated run_started_at was accepted")
+		}
+		if !strings.Contains(err.Error(), "warm-2") {
+			t.Errorf("the rejection must name the run it could not place, got %v", err)
+		}
+	})
+
+	t.Run("an empty authenticated start is not a start", func(t *testing.T) {
+		if err := ValidateProvenance(base, []string{"warm-1"},
+			map[string]string{"warm-1": "   "}); err == nil {
+			t.Fatal("a blank run_started_at was accepted")
+		}
+	})
+
 	t.Run("an unnamed exclusion domain fails", func(t *testing.T) {
 		p := base
 		p.ExclusionDomains = []string{"harness runs", "  "}

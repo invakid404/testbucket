@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -236,25 +237,37 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 
 	type pair struct{ start, end *walltime.Record }
 	byLevel := map[walltime.Level]*pair{}
-	var invPairs []*pair
+	// KEYED BY THE WRAPPER'S OWN INVOCATION ORDINAL. See the invocation branch
+	// below for why arrival order is not the ordinal.
+	byInvSeq := map[int]*pair{}
+	closeInvocation := func(p *pair, r *walltime.Record) *pair {
+		if p == nil {
+			p = &pair{}
+		}
+		if r.Boundary == "start" {
+			p.start = r
+		} else {
+			p.end = r
+		}
+		return p
+	}
 	for i := range recs {
 		r := &recs[i]
 		if r.Kind != "boundary" {
 			continue
 		}
 		if r.Level == walltime.LevelInvocation {
-			if r.Boundary == "start" {
-				invPairs = append(invPairs, &pair{start: r})
-				continue
-			}
-			// Close the most recent open invocation: they nest inside the
-			// script and are written in order.
-			for j := len(invPairs) - 1; j >= 0; j-- {
-				if invPairs[j].end == nil {
-					invPairs[j].end = r
-					break
-				}
-			}
+			// PAIRED BY THE INVOCATION'S OWN ORDINAL, not by arrival order.
+			//
+			// Records arrive in lexicographic FILENAME order and the stream name
+			// pads the sequence to two digits, so from 101 invocations on,
+			// `physical-invocation-100.jsonl` sorts between `-10` and `-11`:
+			// invocation 100's measured argv and duration became sequence 11 and
+			// were attributed to plan invocation 11's membership. There is no
+			// 100-invocation limit anywhere else in the format, and the wrapper
+			// already stamps `invocation_seq` on every boundary — which is what
+			// verification has always paired on.
+			byInvSeq[r.Seqno] = closeInvocation(byInvSeq[r.Seqno], r)
 			continue
 		}
 		p := byLevel[r.Level]
@@ -272,6 +285,44 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 	action := byLevel[walltime.LevelAction]
 	if action == nil || action.start == nil || action.end == nil {
 		return fmt.Errorf("the records carry no closed action envelope; there is no interval to report")
+	}
+	// THE CLOCK DOMAIN IS CARRIED, not dropped.
+	//
+	// The record carries clock_id; the observation did not. Assembly copied the
+	// readings into *_mono_ns and lost the field, so after this function nothing
+	// downstream could tell a raw CLOCK_MONOTONIC interval from the non-Linux
+	// fallback's host-realtime one — QC8 compares boot identities, and the
+	// fallback supplies a fixed non-empty marker that matches itself. An
+	// unscorable local measurement could therefore qualify and train from a
+	// backend whose own documentation calls itself diagnostic.
+	//
+	// Carrying it is the fix rather than refusing here: a developer on a platform
+	// without a raw monotonic clock still produces records, an observation and a
+	// verdict. What the field buys is that §7.1 and the trainable decision can
+	// see the domain, which is where the hazard actually was.
+	obs.ClockID = action.start.Instant.ClockID
+	for _, e := range []struct {
+		what string
+		p    *pair
+	}{
+		{"action", action},
+		{"script", byLevel[walltime.LevelScript]},
+		{"setup", byLevel[walltime.LevelSetup]},
+	} {
+		if e.p == nil {
+			continue
+		}
+		for _, r := range []*walltime.Record{e.p.start, e.p.end} {
+			if r == nil {
+				continue
+			}
+			// TWO DOMAINS IN ONE MEASUREMENT is incoherent on every platform: a
+			// difference of epochs is not a duration, whichever clocks they are.
+			if r.Instant.ClockID != obs.ClockID {
+				return fmt.Errorf("the records mix clock domains — the action opened on %q and the %s envelope reads %q; two epochs do not make one interval",
+					obs.ClockID, e.what, r.Instant.ClockID)
+			}
+		}
 	}
 	obs.StartedMonoNs = walltime.Nanos(action.start.Instant.Mono)
 	obs.EndedMonoNs = walltime.Nanos(action.end.Instant.Mono)
@@ -346,12 +397,24 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 		}
 	}
 
+	// Numeric order over the stamped ordinals, so the nth emitted invocation is
+	// the nth the script ran.
+	seqs := make([]int, 0, len(byInvSeq))
+	for n := range byInvSeq {
+		seqs = append(seqs, n)
+	}
+	sort.Ints(seqs)
+
 	var invNs []int64
-	for seq, ip := range invPairs {
+	for _, seq := range seqs {
+		ip := byInvSeq[seq]
 		if ip.start == nil || ip.end == nil {
 			return fmt.Errorf("invocation %d has no closed start/end pair", seq)
 		}
 		inv := walltime.Invocation{
+			// THE STAMPED ORDINAL, not a renumbering. A gap here means an
+			// invocation was not recorded, and QC6 is what refuses it; renumbering
+			// would close the gap and hand the qualifier a complete-looking row.
 			Seq:            seq,
 			StartedMonoNs:  walltime.Nanos(ip.start.Instant.Mono),
 			EndedMonoNs:    walltime.Nanos(ip.end.Instant.Mono),
@@ -362,6 +425,12 @@ func fillIntervals(obs *walltime.Observation, plan *core.PlanBucket, dir string)
 		if ip.end.Spec != nil {
 			inv.ArgvDigest = ip.end.Spec.ArgvDigest
 			inv.CwdDigest = walltime.DigestJSONOrEmpty(ip.end.Spec.Cwd)
+			// THE OBSERVED SELECTION IDENTITIES, from the wrapper's own spec. The
+			// lists below are the plan's — the records carry digests, not lists —
+			// so these are what give QC6 a measured side to compare against.
+			inv.SelectorDigest = ip.end.Spec.SelectorDigest
+			inv.UnitDigest = ip.end.Spec.UnitDigest
+			inv.AtomDigest = ip.end.Spec.AtomDigest
 		}
 		// THE MEMBERSHIP COMES FROM THE PLAN. Units, selector and atoms are
 		// what the plan RENDERED; the records carry digests of them, not the

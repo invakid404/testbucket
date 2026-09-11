@@ -528,33 +528,88 @@ func (w WallObject) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
+// wallFitLeaves is §15.1c's fit group, in the spelling the wire uses. The
+// matrix makes the group ALL PRESENT or ALL ABSENT; nothing between the two is a
+// state it defines.
+var wallFitLeaves = []string{
+	"fitted_at", "rows_used", "runs_used",
+	"fixed_ns", "scale", "whole_invocation_overhead_ns", "per_slice_overhead_ns",
+	"residual_mae_ns", "residual_p90_ns", "rank_support",
+}
+
 // UnmarshalJSON reads the registered flat surface back into the grouped Go
-// shape. The fit group is present exactly when the wire carries a fitted_at,
-// which is the leaf whose presence the contract ties the group's to.
+// shape, PRESERVING WIRE PRESENCE.
+//
+// Three defaults used to erase the very facts §15.1c's matrix is decided on,
+// each turning a malformed store into a well-formed one before anything could
+// refuse it:
+//
+//   - an absent `observations` container was replaced by an empty one, so
+//     Validate's "always present once wall exists" check could not fire from any
+//     decoded store — it was unreachable by construction;
+//   - an absent coefficient was skipped and left at Go's zero, so a record with
+//     a fitted_at and no coefficients decoded to a complete all-zero fit and
+//     passed validation. An omitted quantity is not a measured zero: a model
+//     with `scale = 0` predicts that work takes no time;
+//   - a record with a FORBIDDEN coefficient and no fitted_at returned before the
+//     coefficient was read, so the presence matrix never saw the leaf it was
+//     supposed to reject.
+//
+// Presence is read from the bytes rather than inferred from zero values, because
+// `""` and absent are different wire facts and only one of them is a store this
+// reader can interpret. These are malformed or incomplete inputs — a truncated
+// write, a hand edit, a foreign producer — not a hostile-runner premise.
 func (w *WallObject) UnmarshalJSON(b []byte) error {
 	var in wallWire
 	if err := json.Unmarshal(b, &in); err != nil {
 		return err
 	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(b, &wire); err != nil {
+		return err
+	}
+	has := func(k string) bool { _, ok := wire[k]; return ok }
+
 	*w = WallObject{
 		ModelVersion:           in.ModelVersion,
 		ComparabilityKeyDigest: in.ComparabilityKeyDigest,
 		Status:                 in.Status,
 		FailureSubtype:         in.FailureSubtype,
-		Observations:           in.Observations,
+		// NOT DEFAULTED. Absent stays absent, and `null` is not a container
+		// either; Validate is what refuses, and it can only refuse what it can
+		// see.
+		Observations: in.Observations,
 	}
-	if w.Observations == nil {
-		w.Observations = []WallRingRow{}
+
+	var present, absent []string
+	for _, k := range wallFitLeaves {
+		if has(k) {
+			present = append(present, k)
+			continue
+		}
+		absent = append(absent, k)
 	}
-	if in.FittedAt == "" {
+	switch {
+	case len(present) == 0:
+		// No fit group on the wire at all, which every `insufficient` row of
+		// §15.1c requires. Validate decides whether that is legal for the
+		// status.
 		return nil
+	case len(absent) > 0:
+		return fmt.Errorf("wall fit group is partial on the wire: %v present, %v absent; "+
+			"§15.1c's fit group is all present or all absent, and an omitted quantity is not a measured zero",
+			present, absent)
 	}
+
 	fit := &WallFitGroup{FittedAt: in.FittedAt, RankSupport: in.RankSupport}
 	if in.RowsUsed != nil {
 		fit.RowsUsed = *in.RowsUsed
 	}
 	if in.RunsUsed != nil {
 		fit.RunsUsed = *in.RunsUsed
+	}
+	if in.FittedAt == "" {
+		return fmt.Errorf("wall.fitted_at is present and empty; it is the instant a fit was accepted, not a placeholder")
 	}
 	for _, f := range []struct {
 		name string
@@ -567,22 +622,20 @@ func (w *WallObject) UnmarshalJSON(b []byte) error {
 		{"residual_mae_ns", in.ResidualMAENs, &fit.ResidualMAENs},
 		{"residual_p90_ns", in.ResidualP90Ns, &fit.ResidualP90Ns},
 	} {
-		if f.src == "" {
-			continue
-		}
+		// NO `continue`. Every leaf is present by the check above, so a value
+		// that does not parse — including `""` — is a named failure rather than
+		// a zero nobody wrote.
 		v, err := strconv.ParseInt(f.src, 10, 64)
 		if err != nil {
 			return fmt.Errorf("wall.%s: %w", f.name, err)
 		}
 		*f.dst = v
 	}
-	if in.Scale != "" {
-		v, err := strconv.ParseFloat(in.Scale, 64)
-		if err != nil {
-			return fmt.Errorf("wall.scale: %w", err)
-		}
-		fit.Scale = v
+	v, err := strconv.ParseFloat(in.Scale, 64)
+	if err != nil {
+		return fmt.Errorf("wall.scale: %w", err)
 	}
+	fit.Scale = v
 	w.Fit = fit
 	return nil
 }

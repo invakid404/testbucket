@@ -144,10 +144,19 @@ func Exec(opt ExecOptions) (int, error) {
 	// the child below is given the same resolved value so the record and the
 	// execution cannot describe different directories.
 	opt.Cwd = AbsCwd(opt.Cwd)
+	// ONE DIGEST FUNCTION FOR ONE IDENTITY.
+	//
+	// This used mustDigest, which digests an EMPTY list as the digest of `[]`,
+	// while the plan side derives the same identities with DigestJSONOrEmpty,
+	// which renders an empty list as the empty digest. The two agreed only when
+	// both lists were non-empty — so as soon as QC6 began comparing them, an
+	// invocation with no selector disagreed with a plan that also had none. Two
+	// functions for one identity is the recurring defect this campaign keeps
+	// finding; the plan-side spelling is the canonical one and both sides use it.
 	spec := &SpecIdentity{
-		ArgvDigest:     mustDigest(opt.Argv),
+		ArgvDigest:     DigestJSONOrEmpty(opt.Argv),
 		Cwd:            opt.Cwd,
-		SelectorDigest: mustDigest(opt.Selector),
+		SelectorDigest: DigestJSONOrEmpty(opt.Selector),
 		UnitDigest:     opt.UnitDigest,
 		AtomDigest:     opt.AtomDigest,
 		Desc:           opt.Desc,
@@ -588,6 +597,9 @@ func sanitize(s string) string {
 	}, s)
 }
 
+// mustDigest digests a value or yields the empty digest. It is retained for the
+// verifier's own manifest construction; the measured spec identity uses
+// DigestJSONOrEmpty, which is also what the plan side uses — see RunExec.
 func mustDigest(v any) Digest {
 	d, err := DigestJSON(v)
 	if err != nil {

@@ -1188,10 +1188,10 @@ check passes. Field names are the field registry's; this table does not restate 
 | QC3 | record | `plan_digest` equals the digest of the shard plan this record job read once |
 | QC4 | record | `bucket_name` resolves in that plan and `bucket_index` agrees |
 | QC5 | record | `unit_ids` equals the plan's unit set for that bucket, exactly |
-| QC6 | record | invocation membership and order equal the plan's rendered invocations; each `argv_digest` matches |
+| QC6 | record | invocation membership and order equal the plan's rendered invocations; each `argv_digest` matches, and so does each invocation's **selection identity** — `selector_digest`, `unit_digest` and `atom_digest`, compared against the same identities derived independently from the plan. The three lists (`units`, `selector`, `atoms`) are the plan's, copied in by the assembler because the records carry digests rather than lists, so comparing THEM would compare the plan with itself; two name slices of one file differ in exactly the selector and in nothing an argv comparison can see. A plan context carrying no selection identities is a **refusal**, never a pass (R31-F09) |
 | QC7 | record | the §3.1 interval invariants hold; no endpoint copied between records |
 | QC7a | record | `cwd_digest` matches and `process_group_id` is well-formed |
-| QC8 | record | `boot_id_start == boot_id_end` |
+| QC8 | record | `boot_id_start == boot_id_end`, and `clock_id` names a clock that may delimit a scored interval — §13.1 admits `CLOCK_MONOTONIC` only. A **scored** row on any other clock is **rejected**; an ordinary one is admitted as the diagnostic it is and §15.1b's `trainable` decision keeps it out of the fit, because a platform without raw monotonic access reads host realtime under an honest name and an NTP step moves it (R31-F13) |
 | QC9 | record | `terminal == "passed"`, `exit_code == 0`, every invocation `exit_code == 0` |
 | QC10 | record | the reporter-event coverage audit for that bucket passes |
 | QC11 | record | exactly one observation for `(head_sha, run_id, run_attempt, bucket_name)`; a duplicate rejects all |
@@ -1851,12 +1851,15 @@ directions, so a field cannot be added to one without the other. There is **no l
   "unit_ids": ["src/a.spec.ts", "src/b.spec.ts"],
   "invocations": [
     {"seq": 0, "units": ["…"], "argv_digest": "sha256:…", "cwd_digest": "sha256:…",
-     "selector": ["…"], "atoms": ["…"], "process_group_id": "…",
+     "selector": ["…"], "atoms": ["…"],
+     "selector_digest": "sha256:…", "unit_digest": "sha256:…", "atom_digest": "sha256:…",
+     "process_group_id": "…",
      "started_mono_ns": "…", "ended_mono_ns": "…", "elapsed_ns": "…", "exit_code": 0}
   ],
   "started_mono_ns": "…", "ended_mono_ns": "…", "elapsed_ns": "…",
   "setup_ns": "…", "script_ns": "…", "script_overhead_ns": "…", "wrapper_ns": "…",
   "boot_id_start": "…", "boot_id_end": "…",
+  "clock_id": "CLOCK_MONOTONIC",
   "realtime_start": "…", "realtime_end": "…",
   "campaign_id": "cmp-2026-09-mandel-d9ae1d43",
   "cache_state": {

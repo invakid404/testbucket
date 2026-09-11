@@ -54,7 +54,11 @@ on:
   # EXPLICIT, EXECUTABLE JOB PERMISSIONS below, which says who it reaches and
   # when.
   workflow_call:
-    secrets:
+    # NO `secrets:` KEY. §21 exposes "no other input and no secret at all", and
+    # absence is how that is spelled. An empty `secrets:` mapping is not the
+    # declaration of an empty secret set — Actions rejects it at parse time
+    # ("Unexpected value ''"), which takes the whole reusable workflow down
+    # before any job starts, and actionlint does not model the rule.
     inputs:
       runner:
         description: 'Test-runner adapter: go or vitest.'
@@ -529,6 +533,12 @@ jobs:
           runner: ${{ inputs.runner }}
           shard-plan-file: ${{ inputs.wall-time-dir != '' && format('{0}/testbucket-plan/shard-plan.json', runner.temp) || '' }}
           events-dir: /tmp/testbucket-events
+          # THE SAME DIRECTORY THE PLAN AND BUCKET RAN IN. A rendered
+          # invocation's `dir` is relative to it — Vitest's is `.` — and §13.1's
+          # identity is the ABSOLUTE directory that resolves to. Verifying from
+          # the repository root resolved it against the wrong base and failed a
+          # correct nested run on cwd identity.
+          working-directory: ${{ inputs.working-directory }}
 
       # The raw records ARE the evidence: the predictor update reads them, and
       # a row whose records were discarded with the runner cannot be

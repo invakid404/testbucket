@@ -27,6 +27,12 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 				UnitIDs:     []string{"a.spec.ts", "b.spec.ts"},
 				ArgvDigests: []Digest{"sha256:argv0"},
 				CwdDigests:  []Digest{"sha256:cwd0"},
+				// The per-invocation SELECTION identities QC6 compares. Without
+				// them the check could see only the count, the sequence and the
+				// argv digest — and "membership" is what it is named for.
+				SelectorDigests: []Digest{"sha256:sel0"},
+				UnitDigests:     []Digest{"sha256:units0"},
+				AtomDigests:     []Digest{"sha256:atoms0"},
 				// What the PLAN decided. QC18 compares the row's echo against
 				// these; without them the fixture's observation agreed only
 				// with itself.
@@ -43,7 +49,10 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 	}
 	obs := Observation{
 		Schema: ObservationSchema, ComparabilityKeyDigest: "sha256:key",
-		Repository: "owner/name", HeadSHA: "head1", CandidateSHA: "cand1", WorkloadCommit: "work1",
+		// 40 HEX, which is the domain §13 declares. The fixture named these
+		// "head1"/"cand1"/"work1" and passed, because QC15 compared three
+		// non-empty strings for distinctness and nothing else.
+		Repository: "owner/name", HeadSHA: sha40("head1"), CandidateSHA: sha40("cand1"), WorkloadCommit: sha40("work1"),
 		RunID: "run-1", RunAttempt: "1", JobID: "job-1",
 		BucketIndex: 0, BucketName: "bucket-0", PlanDigest: "sha256:plan",
 		Profile: blk,
@@ -55,6 +64,7 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 		Invocations: []Invocation{{
 			Seq: 0, Units: []string{"a.spec.ts", "b.spec.ts"},
 			ArgvDigest: "sha256:argv0", CwdDigest: "sha256:cwd0",
+			SelectorDigest: "sha256:sel0", UnitDigest: "sha256:units0", AtomDigest: "sha256:atoms0",
 			ProcessGroupID: "4243",
 			StartedMonoNs:  1_000, EndedMonoNs: 9_000_001_000, ElapsedNs: 9_000_000_000,
 			ExitCode: 0,
@@ -63,6 +73,10 @@ func qcFixture(t *testing.T) (PlanContext, Observation) {
 		SetupNs: 5_000_000_000, ScriptNs: 10_000_000_000,
 		ScriptOverheadNs: 1_000_000_000, WrapperNs: 5_000_000_000,
 		BootIDStart: "boot-a", BootIDEnd: "boot-a",
+		// The clock the endpoints were read from. §13.1 admits CLOCK_MONOTONIC
+		// only, and the fixture now says which one it means rather than leaving
+		// the field empty and unexamined.
+		ClockID:       ClockMonotonic,
 		RealtimeStart: "2026-09-01T00:00:00Z", RealtimeEnd: "2026-09-01T00:00:20Z",
 		RuntimeProfile: rp, RuntimeProfileDigest: RuntimeProfileDigest(rp),
 		Terminal: "passed", ExitCode: 0,
@@ -109,14 +123,63 @@ func TestQualificationChecks(t *testing.T) {
 		{check: "QC4", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.BucketIndex = 5 }},
 		{check: "QC5", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.UnitIDs = []string{"a.spec.ts"} }},
 		{check: "QC6", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.Invocations[0].ArgvDigest = "sha256:tampered" }},
+		// MEMBERSHIP, which is QC6's stated subject and was not compared at all.
+		// A row with the right bucket-wide unit_ids and the right argv digests,
+		// over an invocation that selected something else, passed.
+		{check: "QC6", sub: "QC6 a selector that is not the plan's", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].SelectorDigest = "sha256:other-selection"
+		}},
+		{check: "QC6", sub: "QC6 an absent selector digest", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].SelectorDigest = ""
+		}},
+		{check: "QC6", sub: "QC6 a unit set that is not the plan's", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].UnitDigest = "sha256:other-units"
+		}},
+		{check: "QC6", sub: "QC6 an atom set that is not the plan's", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].AtomDigest = "sha256:other-atoms"
+		}},
+		{check: "QC6", sub: "QC6 a plan context carrying no membership identities", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			ref := p.Buckets["bucket-0"]
+			ref.SelectorDigests = nil
+			p.Buckets["bucket-0"] = ref
+		}},
 		{check: "QC7", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			// A < setup_ns + script_ns.
 			o.ElapsedNs = 1_000_000_000
 		}},
 		{check: "QC7a", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.ProcessGroupID = "" }},
 		{check: "QC8", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.BootIDEnd = "boot-b" }},
+		// THE CLOCK DOMAIN, for a SCORED row. §13.1 admits CLOCK_MONOTONIC only;
+		// the non-Linux fallback reads host realtime under an honest name, and its
+		// readings advance with a fixed boot marker that matches itself, so every
+		// other check here passed.
+		{check: "QC8", sub: "QC8 a scored row on an unscorable clock", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			prof, err := p.ProfileBlock.Parse()
+			if err != nil {
+				t.Fatal(err)
+			}
+			prof.Scored = true
+			blk, err := NewProfileBlock(prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.ProfileBlock, o.Profile = blk, blk
+			o.CampaignID = "cmp-1"
+			o.CacheState = stateDisabled()
+			o.ClockID = ClockRealtimeUnscored
+		}},
 		{check: "QC9", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.Terminal = "failed" }},
 		{check: "QC10", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { p.CoverageAuditPasses["bucket-0"] = false }},
+		// AN ABSENT VERDICT IS NOT A PASSING ONE. The guard was
+		// `CoverageAuditPasses != nil && !passes[name]`, so a nil map — or a map
+		// with no entry for this bucket — admitted the row, and the public ingest
+		// command supplied exactly that.
+		{check: "QC10", sub: "QC10 no verdict for this bucket", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			delete(p.CoverageAuditPasses, "bucket-0")
+		}},
+		{check: "QC10", sub: "QC10 no verdict map at all", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			p.CoverageAuditPasses = nil
+		}},
 		{check: "QC11", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			r.SeenObservationKeys[ObservationKey(*o)] = true
 		}},
@@ -134,6 +197,23 @@ func TestQualificationChecks(t *testing.T) {
 			o.Profile = blk
 		}},
 		{check: "QC15", mutate: func(p *PlanContext, o *Observation, r *RingFacts) { o.CandidateSHA = "" }},
+		// THE DECLARED DOMAIN, not merely presence. §13 spells all three as 40
+		// hex characters; QC15 compared three non-empty strings for distinctness,
+		// so "a"/"b"/"c" passed — three values, none of them a commit.
+		{check: "QC15", sub: "QC15 a candidate_sha that is not a commit", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.CandidateSHA = "b"
+		}},
+		{check: "QC15", sub: "QC15 an uppercase hex identity", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.WorkloadCommit = strings.ToUpper(o.WorkloadCommit)
+		}},
+		// §13.1's PGID domain, for the same reason. `0` is the sharp one: in
+		// every negative-PGID signal API it names the CALLER's group.
+		{check: "QC7a", sub: "QC7a a process_group_id of zero", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.ProcessGroupID = "0"
+		}},
+		{check: "QC7a", sub: "QC7a a non-numeric process_group_id", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
+			o.Invocations[0].ProcessGroupID = "abc"
+		}},
 		{check: "QC17", mutate: func(p *PlanContext, o *Observation, r *RingFacts) {
 			o.RuntimeProfile.NodeVersion = "v20.0.0"
 			o.RuntimeProfileDigest = RuntimeProfileDigest(o.RuntimeProfile)
@@ -215,10 +295,55 @@ func TestQualificationChecks(t *testing.T) {
 		plan.ProfileBlock, obs.Profile = blk, blk
 		obs.CampaignID = "cmp-1"
 		obs.CacheState = stateDisabled()
+		// §10.5.6 REQUIREMENT 3's two sides. The row's declaration leaves digest
+		// to what the row claims, and the plan validated the same declaration;
+		// without both, a misrouted row naming a different exact key was admitted
+		// while echoing the expected profile and key digests.
+		declDigest := DeclarationOf(obs.CacheState).Digest()
+		obs.CacheDeclarationDigest = declDigest
+		plan.CacheDeclarationDigest = declDigest
 
 		if err := QualifyObservation(obs, plan, emptyRing()); err != nil {
 			t.Fatalf("a scored row with a legal disabled cache state must pass: %v", err)
 		}
+
+		// A DIFFERENT declaration that leaves §10.5.1's tuple legal, so the
+		// failure is requirement 3's and not the tuple rule's. The expected and
+		// executed binary digests move together, which keeps QC14b's own equality
+		// check satisfied.
+		otherBinary := strings.Repeat("b", 64)
+
+		t.Run("the row's leaves must be the declaration it names", func(t *testing.T) {
+			bad := obs
+			bad.CacheState.MongoBinarySHA256 = otherBinary
+			bad.CacheState.ExpectedMongoBinarySHA256 = otherBinary
+			// CacheDeclarationDigest left at the old value: the leaves and the
+			// digest the row claims no longer agree.
+			if err := QualifyObservation(bad, plan, emptyRing()); err == nil ||
+				!strings.HasPrefix(err.Error(), "QC14b:") {
+				t.Fatalf("a row whose leaves are not the declaration it names was accepted: %v", err)
+			}
+		})
+		t.Run("a misrouted row is refused even when internally coherent", func(t *testing.T) {
+			// THE EXACT HAZARD: a DIFFERENT declaration, internally consistent
+			// and correctly self-digested, echoing the right profile and key.
+			other := obs
+			other.CacheState.MongoBinarySHA256 = otherBinary
+			other.CacheState.ExpectedMongoBinarySHA256 = otherBinary
+			other.CacheDeclarationDigest = DeclarationOf(other.CacheState).Digest()
+			if err := QualifyObservation(other, plan, emptyRing()); err == nil ||
+				!strings.HasPrefix(err.Error(), "QC14b:") {
+				t.Fatalf("a coherent row under another declaration was accepted: %v", err)
+			}
+		})
+		t.Run("an absent plan declaration is not a verified one", func(t *testing.T) {
+			p2 := plan
+			p2.CacheDeclarationDigest = ""
+			if err := QualifyObservation(obs, p2, emptyRing()); err == nil ||
+				!strings.HasPrefix(err.Error(), "QC14b:") {
+				t.Fatalf("an unverifiable declaration read as verified: %v", err)
+			}
+		})
 		// A row that did not pass QC14a on its own runner is not ingestible.
 		obs.CacheState.MongoBinaryVerifiedOnRunner = false
 		err = QualifyObservation(obs, plan, emptyRing())
@@ -310,6 +435,9 @@ func TestDuplicateObservationRejectsAllRows(t *testing.T) {
 	plan.Buckets["bucket-1"] = PlanBucketRef{
 		Index: 1, UnitIDs: obs.UnitIDs,
 		ArgvDigests: []Digest{"sha256:argv0"}, CwdDigests: []Digest{"sha256:cwd0"},
+		SelectorDigests: []Digest{"sha256:sel0"},
+		UnitDigests:     []Digest{"sha256:units0"},
+		AtomDigests:     []Digest{"sha256:atoms0"},
 	}
 	plan.CoverageAuditPasses["bucket-1"] = true
 	if got := RejectDuplicateKeys([]Observation{a, c}); len(got) != 0 {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/invakid404/testbucket/internal/core"
 	"github.com/invakid404/testbucket/internal/nsmath"
+	"github.com/invakid404/testbucket/internal/runner"
 	"github.com/invakid404/testbucket/internal/walltime"
 )
 
@@ -178,21 +179,7 @@ func wallFitter(st *core.Store) walltime.Fitter {
 		if st.Wall == nil {
 			return fmt.Errorf("refit: the store carries no wall object")
 		}
-		rows := st.Wall.TrainableRows()
-		fitRows := make([]walltime.FitRow, 0, len(rows))
-		for _, r := range rows {
-			fitRows = append(fitRows, walltime.FitRow{
-				ReporterSumNs: r.ReporterSumNs,
-				IAnyWholeFile: r.IAnyWholeFile,
-				SliceCount:    r.SliceCount,
-				ElapsedNs:     r.ElapsedNs,
-				HeadSHA:       r.HeadSHA,
-				RunID:         r.RunID,
-				RunAttempt:    r.RunAttempt,
-				BucketIndex:   r.BucketIndex,
-			})
-		}
-		res, err := walltime.FitModel(fitRows)
+		res, err := walltime.FitModel(wallFitRows(st))
 		if err != nil {
 			return err
 		}
@@ -303,7 +290,7 @@ func rankSupportOf(r walltime.RankResult) []string {
 // each read see a different file, and the key ingest migrates under would then
 // be able to come from a plan other than the one the rows are qualified
 // against.
-func planContextOf(doc *core.PlanDocument, runsOnLabel string, st *core.Store) (walltime.PlanContext, map[string]planFrozen, error) {
+func planContextOf(doc *core.PlanDocument, runsOnLabel string, st *core.Store, coverage map[string]bool) (walltime.PlanContext, map[string]planFrozen, error) {
 	frozen := map[string]planFrozen{}
 	ctx := walltime.PlanContext{
 		Buckets:             map[string]walltime.PlanBucketRef{},
@@ -320,6 +307,7 @@ func planContextOf(doc *core.PlanDocument, runsOnLabel string, st *core.Store) (
 	// makes the pair meaningful.
 	ctx.RunnerImageLabel = runsOnLabel
 	ctx.RuntimeProfileDeclaredDigest = walltime.Digest(doc.RuntimeProfileDeclaredDigest)
+	ctx.CacheDeclarationDigest = walltime.Digest(doc.CacheDeclarationDigest)
 	ctx.RuntimeProfileDeclared = runtimeProfileFromMap(doc.RuntimeProfileDeclared)
 	if len(doc.Profile) > 0 {
 		var block walltime.ProfileBlock
@@ -375,14 +363,32 @@ func planContextOf(doc *core.PlanDocument, runsOnLabel string, st *core.Store) (
 			// the plan's relative string let QC7a pass while the measuring job
 			// and this one resolved it under different roots.
 			ref.CwdDigests = append(ref.CwdDigests, walltime.DigestJSONOrEmpty(walltime.AbsCwd(inv.Dir)))
+			// THE PER-INVOCATION SELECTION IDENTITIES, derived here from the plan
+			// and digested by the same functions the wrapper uses on the measured
+			// side. QC6 compares the two; nothing compared them before, so an
+			// observation could carry correct argv digests over an invocation that
+			// selected something else entirely.
+			ref.SelectorDigests = append(ref.SelectorDigests, walltime.DigestJSONOrEmpty(inv.Selector))
+			ref.UnitDigests = append(ref.UnitDigests, walltime.DigestJSONOrEmpty(inv.Units))
+			ref.AtomDigests = append(ref.AtomDigests, walltime.DigestJSONOrEmpty(inv.Atoms))
 		}
 		ctx.Buckets[b.Name] = ref
-		// The reporter-event coverage verdict is core's, and the record job
-		// runs `audit` before it ingests: a bucket that reached here has been
-		// audited already, and QC10 reads that verdict rather than
-		// re-deriving it from a wall envelope, which can measure how long
-		// something took and never what it skipped.
-		ctx.CoverageAuditPasses[b.Name] = true
+		// THE VERDICT IS THE CALLER'S COMPUTED ONE, not an assumption.
+		//
+		// This assigned `true` unconditionally, on the reasoning that the record
+		// ACTION runs `audit` before it ingests. The public `ingest` command
+		// reaches this same function independently, and its own ParseTimings /
+		// ApplyIngest establish nothing about exact planned coverage — so a valid
+		// wall observation plus an incomplete-but-successful event subset was
+		// appended and refitted without anything proving the bucket ran its plan.
+		// A previous command in the same job is not evidence carried by this one.
+		//
+		// A bucket the caller has no verdict for is LEFT ABSENT, and QC10 refuses
+		// an absent verdict: "nobody checked" and "it passed" must not reach the
+		// same conclusion.
+		if pass, ok := coverage[b.Name]; ok {
+			ctx.CoverageAuditPasses[b.Name] = pass
+		}
 	}
 	return ctx, frozen, nil
 }
@@ -412,4 +418,55 @@ func runtimeProfileFromMap(m map[string]string) walltime.RuntimeProfile {
 		LockSHA256:          m["lock_sha256"],
 		DependencyCacheMode: m["dependency_cache_mode"],
 	}
+}
+
+// wallFitRows is the ring's trainable population as the fitter's rows.
+//
+// ONE CONVERSION, two callers: the refit that produces a model, and §6.7's
+// plan-time re-check of the ring that model is allowed to be used over. A second
+// copy of this loop is a second design matrix, and the whole point of the
+// re-check is that it evaluates the same one.
+func wallFitRows(st *core.Store) []walltime.FitRow {
+	if st == nil || st.Wall == nil {
+		return nil
+	}
+	rows := st.Wall.TrainableRows()
+	out := make([]walltime.FitRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, walltime.FitRow{
+			ReporterSumNs: r.ReporterSumNs,
+			IAnyWholeFile: r.IAnyWholeFile,
+			SliceCount:    r.SliceCount,
+			ElapsedNs:     r.ElapsedNs,
+			HeadSHA:       r.HeadSHA,
+			RunID:         r.RunID,
+			RunAttempt:    r.RunAttempt,
+			BucketIndex:   r.BucketIndex,
+		})
+	}
+	return out
+}
+
+// coverageVerdicts computes §7.1 QC10's per-bucket reporter-event coverage
+// verdict from the plan and the events THIS ingest read.
+//
+// It is the same comparison `wall verify`'s audit makes — core.AuditCoverage over
+// core.PlannedCoverageForBucket — applied at the ingest boundary, so the verdict
+// QC10 reads is derived from evidence this command holds rather than inherited
+// from a command that may not have run. A nil summary yields no verdicts at all,
+// which QC10 treats as a refusal.
+func coverageVerdicts(doc *core.PlanDocument, sum *runner.RunSummary) (map[string]bool, error) {
+	out := map[string]bool{}
+	if doc == nil || sum == nil {
+		return out, nil
+	}
+	for _, b := range doc.Buckets {
+		planned, err := core.PlannedCoverageForBucket(doc, b.Index)
+		if err != nil {
+			return nil, fmt.Errorf("bucket %s: %w", b.Name, err)
+		}
+		var report strings.Builder
+		out[b.Name] = core.AuditCoverage(&report, planned, sum) == nil
+	}
+	return out, nil
 }

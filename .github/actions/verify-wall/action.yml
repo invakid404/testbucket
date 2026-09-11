@@ -45,6 +45,18 @@ inputs:
     description: >-
       Which adapter's event parser reads `events-dir`: go or vitest.
     default: go
+  working-directory:
+    description: >-
+      The SAME directory the plan and run-bucket actions ran in (required
+      whenever that is not the repository root).
+
+      §13.1's cwd identity is the ABSOLUTE directory an invocation executed in,
+      and a rendered invocation's `dir` is relative to the working directory the
+      plan was built in — Vitest's is `.`. This action had no such input and ran
+      from the repository root, so verification resolved that `.` against the
+      WRONG base and reported a cwd identity failure for a correct nested run.
+      A relative directory is not rebased implicitly; the base is stated here.
+    default: "."
 
 runs:
   using: composite
@@ -60,6 +72,7 @@ runs:
 
     - name: Verify the wall-time records
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
         TB_WALL_DIR: ${{ inputs.wall-time-dir }}
         TB_SHARD_PLAN_FILE: ${{ inputs.shard-plan-file }}

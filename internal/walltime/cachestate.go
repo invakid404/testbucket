@@ -296,6 +296,54 @@ func QC14b(c CacheState) error {
 	return nil
 }
 
+// DeclarationOf reads the declaration half back out of a serialized row.
+//
+// §10.5.0 splits the block into a frozen DECLARATION and per-job OUTCOMES, and
+// the declaration leaves are carried on the row beside the outcomes. Extracting
+// them is what makes QC14b requirement 3 decidable from the row: the five leaves
+// re-digest to the value the row claims, or they are not the declaration it says
+// it ran under.
+func DeclarationOf(c CacheState) CacheDeclaration {
+	return CacheDeclaration{
+		DependencyCacheMode:       c.DependencyCacheMode,
+		DependencyCachePrimaryKey: c.DependencyCachePrimaryKey,
+		TransformCacheMode:        c.TransformCacheMode,
+		DependencyCacheProducer:   c.DependencyCacheProducer,
+		ExpectedMongoBinarySHA256: c.ExpectedMongoBinarySHA256,
+	}
+}
+
+// QC14bAgainstPlan is §10.5.6 requirement 3, which had no implementation.
+//
+// QC14b checked the row's internal coherence and its executed-versus-expected
+// binary digest. It could not check the requirement that matters for routing:
+// that the declaration leaves are byte-identical to the digest-verified
+// declaration the PLAN validated. Nothing carried that declaration into
+// admission, so an internally coherent row describing a DIFFERENT exact key or
+// producer was admitted while echoing the expected profile and key digests —
+// which is a misrouted measurement joining a history it did not belong to.
+//
+// Both halves are decidable from bytes this job holds: the row's own leaves must
+// re-digest to the digest the row claims, and that digest must be the plan's. No
+// access to the matrix runner's filesystem is needed or taken.
+func QC14bAgainstPlan(c CacheState, rowDeclDigest, planDeclDigest Digest) error {
+	if rowDeclDigest == "" {
+		return fmt.Errorf("QC14b: the row carries no cache_declaration_digest, so its declaration cannot be bound to the one the plan validated")
+	}
+	if got := DeclarationOf(c).Digest(); got != rowDeclDigest {
+		return fmt.Errorf("QC14b: the row's declaration leaves digest to %s and it claims cache_declaration_digest %s; the leaves are not the declaration the row names",
+			got, rowDeclDigest)
+	}
+	if planDeclDigest == "" {
+		return fmt.Errorf("QC14b: the plan context carries no cache_declaration_digest, so §10.5.6 requirement 3 cannot be checked; an unverifiable declaration is not a verified one")
+	}
+	if rowDeclDigest != planDeclDigest {
+		return fmt.Errorf("QC14b: the row ran under cache declaration %s and the plan validated %s; a row whose declaration is not the plan's belongs to another run",
+			rowDeclDigest, planDeclDigest)
+	}
+	return nil
+}
+
 // ScoredCacheSymmetry is contract §19.2b (ID-24): a scored pair is
 // cache-symmetric or cache-disabled, and there are only those two modes.
 //

@@ -57,7 +57,9 @@ func buildObservation(t *testing.T, scored bool, campaignID, workload, head stri
 	rp := planRuntimeProfile()
 	obs := Observation{
 		Schema: ObservationSchema, ComparabilityKeyDigest: "sha256:k",
-		Repository: "owner/name", HeadSHA: head, CandidateSHA: "cand", WorkloadCommit: workload,
+		// THE DECLARED DOMAIN. §13 spells all three as 40 hex characters and
+		// QC15 now checks it; the callers keep their readable labels.
+		Repository: "owner/name", HeadSHA: sha40(head), CandidateSHA: sha40("cand"), WorkloadCommit: sha40(workload),
 		RunID: "run-1", RunAttempt: "1", JobID: "job-1",
 		BucketIndex: bucket, BucketName: fmt.Sprintf("bucket-%d", bucket),
 		PlanDigest: "sha256:p", Profile: blk,
@@ -67,6 +69,10 @@ func buildObservation(t *testing.T, scored bool, campaignID, workload, head stri
 		RuntimeProfile: rp, RuntimeProfileDigest: RuntimeProfileDigest(rp),
 		Limitations: CanonicalLimitations(),
 		CampaignID:  campaignID,
+		// §13.1's clock domain. A row that does not say which clock measured it
+		// cannot train, and a fixture that leaves it empty is asserting about a
+		// row no scorable run produces.
+		ClockID: ClockMonotonic,
 	}
 	return obs
 }
@@ -156,7 +162,11 @@ func TestWallObservationRoundTripClosesRecordLoop(t *testing.T) {
 // the whole campaign_id → trainable state machine, which is the SOLE in-CI
 // mechanism.
 func TestCampaignRowsNeverRefitTheModel(t *testing.T) {
-	cfgBytes := []byte(`{"schema":"testbucket.campaign-config/v1","manifest":{"campaign_id":"cmp-1","workload_commit":"w1","excluded_orchestration_commits":["hx"]}}`)
+	// The config names the same identities the observations carry, expanded the
+	// same way — an exclusion list of labels could not match a row of commits.
+	cfgBytes := []byte(fmt.Sprintf(
+		`{"schema":"testbucket.campaign-config/v1","manifest":{"campaign_id":"cmp-1","workload_commit":%q,"excluded_orchestration_commits":[%q]}}`,
+		sha40("w1"), sha40("hx")))
 	verified, err := VerifyCampaignConfig(cfgBytes, sha256Hex(cfgBytes))
 	if err != nil {
 		t.Fatal(err)
@@ -573,5 +583,46 @@ func TestObservationsAreFoundBelowArtifactSubdirectories(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("read %d observation(s), want both the nested and the top-level document; "+
 			"a reader that misses one reports 0 of 0 and exits 0", len(got))
+	}
+}
+
+// TestAnUnscorableClockNeverTrains is F13's control.
+//
+// The non-Linux backend reads the host REALTIME clock under an honest name, and
+// its measurements could train: assembly dropped clock_id, the durations advance,
+// and the fixed boot marker matches itself, so every ordering and boot check
+// passed. An NTP step moves that clock, which is exactly why the backend calls
+// itself unscorable.
+//
+// The row is RETAINED — a developer run that exercises real endpoint ordering is
+// worth recording — and it is never trainable.
+func TestAnUnscorableClockNeverTrains(t *testing.T) {
+	t.Run("a monotonic row trains", func(t *testing.T) {
+		obs := buildObservation(t, false, "", "w1", "h1", 0)
+		obs.ClockID = ClockMonotonic
+		trainable, accept, reason := TrainableAtAppend(obs, nil)
+		if !accept {
+			t.Fatalf("an ordinary monotonic row must be accepted: %s", reason)
+		}
+		if !trainable {
+			t.Fatalf("an ordinary monotonic row must train, got %q", reason)
+		}
+	})
+
+	for _, clock := range []string{ClockRealtimeUnscored, "", "CLOCK_REALTIME"} {
+		t.Run("clock "+clock+" is retained and never trains", func(t *testing.T) {
+			obs := buildObservation(t, false, "", "w1", "h1", 0)
+			obs.ClockID = clock
+			trainable, accept, reason := TrainableAtAppend(obs, nil)
+			if !accept {
+				t.Fatalf("an unscorable row is retained as a diagnostic, not refused: %s", reason)
+			}
+			if trainable {
+				t.Fatalf("a row measured on clock %q trained; §13.1 admits %s only", clock, ClockMonotonic)
+			}
+			if reason == "" {
+				t.Error("a non-trainable row with no reason cannot be diagnosed later")
+			}
+		})
 	}
 }

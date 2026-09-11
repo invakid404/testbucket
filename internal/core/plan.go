@@ -2,11 +2,15 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
+	"sort"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -127,6 +131,14 @@ type PlanDocument struct {
 	RuntimeProfileDeclared       map[string]string `json:"runtime_profile_declared,omitempty"`
 	RuntimeProfileDeclaredDigest string            `json:"runtime_profile_declared_digest,omitempty"`
 
+	// CacheDeclarationDigest is the digest of the §10.5.0 cache declaration this
+	// plan job validated against its expected value (§10.5.2 step 0b). It rides
+	// in the document for the same reason the runtime profile does: the record
+	// job needs it, and §10.5.6 requirement 3 — the row's declaration leaves are
+	// byte-identical to the declaration the plan validated — had nothing to
+	// compare against without it.
+	CacheDeclarationDigest string `json:"cache_declaration_digest,omitempty"`
+
 	// fileParallelism is the intra-bucket concurrency the plan was built
 	// under. It is unexported and unserialized: it exists only so the human
 	// report can suppress §16.4's execution-model line above 1, where the
@@ -231,6 +243,7 @@ type PlanOptions struct {
 	// them is derivable from the live set and the store alone.
 	Profile                      json.RawMessage
 	ComparabilityKeyDigest       string
+	CacheDeclarationDigest       string
 	ExpandedUnitSetDigest        string
 	RuntimeProfileDeclared       map[string]string
 	RuntimeProfileDeclaredDigest string
@@ -259,6 +272,39 @@ func (o PlanOptions) Validate() error {
 	return nil
 }
 
+// StoreUsableFor is the ONE predicate that decides whether a loaded store is a
+// usable warm start for a plan running `token`, and the reason when it is not.
+//
+// It exists because two places need the answer and they must not compute it
+// twice. BuildPlan discards an unusable store and cold-starts; §0.8 phase 2
+// refuses a SCORED cold plan. The admission was told only `st != nil`, so a
+// scored run with a restored store recorded under a different token passed the
+// cold veto — the store existed — and then BuildPlan discarded it and emitted a
+// cold matrix for a scored arm. A normal incompatible restored cache is all that
+// takes. Determining usability once, before admission, is what makes the veto
+// apply to the state the plan will actually be built in.
+//
+// An empty stored `flags` is usable: it is a store that has not yet committed to
+// a token, not one that disagrees.
+func StoreUsableFor(st *Store, loadReason, token string) (usable bool, reason string) {
+	if st == nil {
+		if loadReason != "" {
+			return false, loadReason
+		}
+		return false, "no usable store"
+	}
+	if st.Flags != "" && st.Flags != token {
+		// Weights measured under a different comparability token are not
+		// comparable; using them would produce a confidently wrong split. This
+		// is the guard against the "renamed job, silently bad split" trap.
+		return false, fmt.Sprintf("store was recorded under flags %q but this plan runs %q", st.Flags, token)
+	}
+	if loadReason != "" {
+		return false, loadReason
+	}
+	return true, ""
+}
+
 // BuildPlan is the whole planner as a near-pure function of (live tree, store,
 // options). Its only outward call is to the runner adapter — to resolve the
 // runnable names of a name-sliced target, to render each bucket into a command,
@@ -271,21 +317,10 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 	}
 	token := opt.Token
 
-	coldStart := false
-	coldReason := reason
-	if st == nil {
-		coldStart = true
+	usable, coldReason := StoreUsableFor(st, reason, token)
+	coldStart := !usable
+	if !usable {
 		st = NewStore(token)
-	} else if st.Flags != "" && st.Flags != token {
-		// Weights measured under a different comparability token are not
-		// comparable; using them would produce a confidently wrong split. This
-		// is the guard against the "renamed job, silently bad split" trap.
-		coldStart = true
-		coldReason = fmt.Sprintf("store was recorded under flags %q but this plan runs %q", st.Flags, token)
-		st = NewStore(token)
-	}
-	if coldReason != "" {
-		coldStart = true
 	}
 
 	mean, measuredCount, _ := st.meanWeight(opt.Live)
@@ -406,6 +441,7 @@ func BuildPlan(ctx context.Context, rnr runner.Runner, st *Store, reason string,
 		EstBasis:                     basis,
 		Profile:                      opt.Profile,
 		ComparabilityKeyDigest:       opt.ComparabilityKeyDigest,
+		CacheDeclarationDigest:       opt.CacheDeclarationDigest,
 		ExpandedUnitSetDigest:        opt.ExpandedUnitSetDigest,
 		RuntimeProfileDeclared:       opt.RuntimeProfileDeclared,
 		RuntimeProfileDeclaredDigest: opt.RuntimeProfileDeclaredDigest,
@@ -796,4 +832,79 @@ func ReporterNs(u runner.Unit) (int64, error) { return reporterNsOf(u) }
 // conversion so a plan and the observation of it cannot disagree by rounding.
 func ReporterNsFromSeconds(sec float64) (int64, error) {
 	return reporterNsOf(runner.Unit{Seconds: sec})
+}
+
+// ExpandedTopologyDigest is the identity of the unit TOPOLOGY a plan is built
+// over: the digest of the EXPANDED universe, not of the discovered file set.
+//
+// The digest it replaces hashed sorted live package IDs. Discovery identity is
+// not topology identity: two plans over exactly the same files, with different
+// stored name-slice membership, different runnable sets or different sweep
+// widths, produced the same value. §10 and §19.2 put this digest in the B/C
+// invariant precisely so that an arm cannot differ in topology while claiming
+// comparability, and a digest that cannot see slices could not carry that claim.
+//
+// It expands over the store BuildPlan will actually use — StoreUsableFor decides
+// that, the same predicate BuildPlan applies — so the digest describes the
+// expansion the plan really gets rather than one computed from a store the plan
+// is about to discard. Supply opt.Runnables to share one resolution with the
+// plan build; the expansion is otherwise resolved twice.
+//
+// WEIGHTS ARE DELIBERATELY NOT HASHED. A unit's seconds are store state, which
+// `store_sha256` already identifies, and folding them in here would make every
+// ingest look like a topology change.
+func ExpandedTopologyDigest(ctx context.Context, rnr runner.Runner, st *Store, loadReason string, opt PlanOptions) (string, error) {
+	if usable, _ := StoreUsableFor(st, loadReason, opt.Token); !usable {
+		st = NewStore(opt.Token)
+	}
+	units, err := ExpandUnitsFor(ctx, rnr, st, opt)
+	if err != nil {
+		return "", err
+	}
+	type topo struct {
+		ID       string   `json:"id"`
+		Kind     string   `json:"kind"`
+		Mode     string   `json:"mode"`
+		Module   string   `json:"module"`
+		Count    int      `json:"count"`
+		Shard    int      `json:"shard"`
+		Shards   int      `json:"shards"`
+		Run      []string `json:"run"`
+		Packages []string `json:"packages"`
+	}
+	rows := make([]topo, 0, len(units))
+	for _, u := range units {
+		r := topo{
+			ID: u.ID, Kind: string(u.Kind), Mode: u.Mode, Module: u.Module,
+			Count: u.Count, Shard: u.Shard, Shards: u.Shards,
+			Run: append([]string(nil), u.Run...), Packages: []string{},
+		}
+		for _, p := range u.Packages {
+			r.Packages = append(r.Packages, p.ID)
+		}
+		// The membership lists are sorted so the digest is a function of the
+		// SET a unit covers, never of the order one expansion happened to
+		// produce it in.
+		sort.Strings(r.Run)
+		sort.Strings(r.Packages)
+		if r.Run == nil {
+			r.Run = []string{}
+		}
+		rows = append(rows, r)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].ID != rows[j].ID {
+			return rows[i].ID < rows[j].ID
+		}
+		if rows[i].Shard != rows[j].Shard {
+			return rows[i].Shard < rows[j].Shard
+		}
+		return strings.Join(rows[i].Run, "\x00") < strings.Join(rows[j].Run, "\x00")
+	})
+	b, err := json.Marshal(rows)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }

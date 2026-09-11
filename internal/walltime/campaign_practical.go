@@ -539,26 +539,60 @@ func ValidateProvenance(p CampaignProvenance, ringRunIDs []string, ringStarts ma
 			return fmt.Errorf("§19.5: the ring contains harness run_id %q, which the manifest excludes", id)
 		}
 	}
-	// A row inside the excluded window fails.
-	if p.ExcludedWindowStart != "" && p.ExcludedWindowEnd != "" {
-		ws, err := parseAuthenticatedInstant(p.ExcludedWindowStart)
-		if err != nil {
-			return fmt.Errorf("excluded_window.start: %w", err)
+	// THE WINDOW IS MANDATORY, AND BOTH ENDPOINTS ARE.
+	//
+	// The comparison ran only `if start != "" && end != ""`, so omitting either
+	// endpoint skipped the exclusion entirely and the validator returned success —
+	// on inputs whose fitted_at, first authenticated start and exclusion domains
+	// were all valid. §19.5's window is evidence that a named set of runs is
+	// outside the population; half a window is not half the evidence, it is none.
+	if p.ExcludedWindowStart == "" || p.ExcludedWindowEnd == "" {
+		return fmt.Errorf("§19.5: the excluded window is %s..%s; both endpoints are required, and an absent one skips the exclusion rather than satisfying it",
+			emptyAsAbsent(p.ExcludedWindowStart), emptyAsAbsent(p.ExcludedWindowEnd))
+	}
+	ws, err := parseAuthenticatedInstant(p.ExcludedWindowStart)
+	if err != nil {
+		return fmt.Errorf("excluded_window.start: %w", err)
+	}
+	we, err := parseAuthenticatedInstant(p.ExcludedWindowEnd)
+	if err != nil {
+		return fmt.Errorf("excluded_window.end: %w", err)
+	}
+	if we.Before(ws) {
+		return fmt.Errorf("§19.5: the excluded window ends at %s, before it starts at %s",
+			p.ExcludedWindowEnd, p.ExcludedWindowStart)
+	}
+	// EVERY RING RUN NEEDS AN AUTHENTICATED TIMESTAMP, not just the ones the
+	// caller happened to supply one for.
+	//
+	// The loop iterated `ringStarts`, so a run present in the ring and absent from
+	// that map was never compared against the window at all — the population the
+	// check is about decided how much of itself got checked. §19.9 makes every
+	// campaign date, cutoff and window gate read the AUTHENTICATED start, so a run
+	// without one cannot be shown to be outside the window.
+	for _, id := range ringRunIDs {
+		stamp, ok := ringStarts[id]
+		if !ok || strings.TrimSpace(stamp) == "" {
+			return fmt.Errorf("§19.9: ring run %q carries no authenticated run_started_at, so it cannot be shown to be outside the excluded window",
+				id)
 		}
-		we, err := parseAuthenticatedInstant(p.ExcludedWindowEnd)
+		at, err := parseAuthenticatedInstant(stamp)
 		if err != nil {
-			return fmt.Errorf("excluded_window.end: %w", err)
+			return fmt.Errorf("ring row %s run_started_at: %w", id, err)
 		}
-		for id, stamp := range ringStarts {
-			at, err := parseAuthenticatedInstant(stamp)
-			if err != nil {
-				return fmt.Errorf("ring row %s run_started_at: %w", id, err)
-			}
-			if !at.Before(ws) && !at.After(we) {
-				return fmt.Errorf("§19.5: ring row %s started at %s, inside the excluded window %s..%s",
-					id, stamp, p.ExcludedWindowStart, p.ExcludedWindowEnd)
-			}
+		if !at.Before(ws) && !at.After(we) {
+			return fmt.Errorf("§19.5: ring row %s started at %s, inside the excluded window %s..%s",
+				id, stamp, p.ExcludedWindowStart, p.ExcludedWindowEnd)
 		}
 	}
 	return nil
+}
+
+// emptyAsAbsent renders a missing endpoint readably, so a failure distinguishes
+// "absent" from "present and empty-looking".
+func emptyAsAbsent(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(absent)"
+	}
+	return s
 }

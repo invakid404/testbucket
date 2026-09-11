@@ -11,17 +11,30 @@ const ObservationSchema = "testbucket.wall-observation/v1"
 // Invocation is one row of the observation's `invocations` list: contract §13
 // gives it one entry per invocation the bucket ran.
 type Invocation struct {
-	Seq            int      `json:"seq"`
-	Units          []string `json:"units"`
-	ArgvDigest     Digest   `json:"argv_digest"`
-	CwdDigest      Digest   `json:"cwd_digest"`
-	Selector       []string `json:"selector"`
-	Atoms          []string `json:"atoms"`
-	ProcessGroupID string   `json:"process_group_id"`
-	StartedMonoNs  Nanos    `json:"started_mono_ns"`
-	EndedMonoNs    Nanos    `json:"ended_mono_ns"`
-	ElapsedNs      Nanos    `json:"elapsed_ns"`
-	ExitCode       int      `json:"exit_code"`
+	Seq        int      `json:"seq"`
+	Units      []string `json:"units"`
+	ArgvDigest Digest   `json:"argv_digest"`
+	CwdDigest  Digest   `json:"cwd_digest"`
+	Selector   []string `json:"selector"`
+	Atoms      []string `json:"atoms"`
+	// SelectorDigest, UnitDigest and AtomDigest are what the WRAPPER digested
+	// from the selection it actually passed, carried through from the record's
+	// spec identity.
+	//
+	// The three lists above are the PLAN's, copied in by the assembler because
+	// the records carry digests rather than lists. That made them useless as a
+	// gate: QC6 comparing them against the plan compares the plan with itself.
+	// These three come from the measured side, so QC6 has two independently
+	// derived values to compare — which is the difference between checking
+	// invocation membership and restating it.
+	SelectorDigest Digest `json:"selector_digest"`
+	UnitDigest     Digest `json:"unit_digest"`
+	AtomDigest     Digest `json:"atom_digest"`
+	ProcessGroupID string `json:"process_group_id"`
+	StartedMonoNs  Nanos  `json:"started_mono_ns"`
+	EndedMonoNs    Nanos  `json:"ended_mono_ns"`
+	ElapsedNs      Nanos  `json:"elapsed_ns"`
+	ExitCode       int    `json:"exit_code"`
 }
 
 // CacheState is the scored cache-state block of contract §10.5.0, checked by
@@ -84,6 +97,18 @@ type Observation struct {
 	AEtaNs     *Nanos  `json:"a_eta_ns,omitempty"`
 
 	ProcessGroupID string `json:"process_group_id"`
+
+	// ClockID names the clock domain the envelope's endpoints were read from.
+	//
+	// It is the record's own clock_id, carried through rather than dropped. The
+	// readings became *_mono_ns and this field did not exist, so a row measured
+	// on the non-Linux host-realtime fallback — a backend whose own comment calls
+	// itself unscorable — was indistinguishable from one measured on raw
+	// CLOCK_MONOTONIC: its durations advance and its fixed boot marker matches
+	// itself, so every ordering and boot check passed. §13.1's interval is
+	// CLOCK_MONOTONIC's; QC8 is what compares the domain, and §15.1b's trainable
+	// decision is what keeps an unscorable one out of the fit.
+	ClockID string `json:"clock_id"`
 
 	// Diagnostics (S-4). The runner instance name is deliberately not a
 	// comparability leaf; the observed label is compared against the key's

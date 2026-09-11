@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -155,24 +154,29 @@ func storeDigest(path string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// expandedUnitSetDigest is the identity of the unit TOPOLOGY the plan was built
-// over. It is store-derived in both bases, which is what makes it
-// byte-identical across a B/C pair: only the partition differs.
-func expandedUnitSetDigest(live []runner.LivePackage) string {
-	ids := make([]string, 0, len(live))
-	for _, p := range live {
-		if !p.HasTests {
-			continue
+// memoRunnables resolves a package's runnable names ONCE and serves every later
+// ask from the first answer.
+//
+// The expansion is needed twice — by core.ExpandedTopologyDigest and by
+// BuildPlan — and each resolution is a real `vitest list` / `go list` call per
+// name-sliced target. Caching makes the pair cheap, and more importantly makes
+// it IDENTICAL: two independent sweeps of a live tree can return different sets,
+// and a digest taken over one while the plan is built over the other describes a
+// topology nobody scheduled.
+func memoRunnables(ctx context.Context, rnr runner.Runner) func(runner.LivePackage) ([]string, error) {
+	type result struct {
+		names []string
+		err   error
+	}
+	cache := map[string]result{}
+	return func(p runner.LivePackage) ([]string, error) {
+		if r, ok := cache[p.ID]; ok {
+			return r.names, r.err
 		}
-		ids = append(ids, p.ID)
+		names, err := rnr.Runnables(ctx, p)
+		cache[p.ID] = result{names, err}
+		return names, err
 	}
-	sort.Strings(ids)
-	b, err := json.Marshal(ids)
-	if err != nil {
-		return ""
-	}
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // bucketIndices is the profile's declared bucket set, 0..K-1.
@@ -213,14 +217,31 @@ func atomicWriteJSON(path string, doc any) error {
 // It emits EVIDENCE and no matrix. The two are mutually exclusive on purpose:
 // a caller that asked for a proposal must not receive something it could fan
 // out over.
-func runCalibration(rnr runner.Runner, opt core.PlanOptions, out string, maxPlans int) error {
-	units, err := calibrationUniverse(rnr, opt)
+func runCalibration(rnr runner.Runner, st *core.Store, opt core.PlanOptions, out string, maxPlans int) error {
+	units, err := calibrationUniverse(rnr, st, opt)
 	if err != nil {
 		return err
 	}
 	ev, err := walltime.CalibrateProposer(units, opt.K, maxPlans, kkPacker)
 	if err != nil {
 		return err
+	}
+	// THE IDENTITIES THE PROPOSER CANNOT KNOW. §17.3a's document says which
+	// population the proposal was made for and which plans it proposes; the
+	// proposer sees a unit universe and a budget, so the caller carries them.
+	// Without this the persisted document was unattributable: a later run could
+	// read an outcome word and nothing that binds it to a history or a layout.
+	ev.ComparabilityKeyDigest = opt.ComparabilityKeyDigest
+	ev.GeneratedAt = opt.Now.UTC().Format(time.RFC3339)
+	if len(ev.Buckets) > 0 {
+		// One digest per PROPOSED plan. The proposer accepts one layout, so a
+		// sufficient document carries one; a miss proposes nothing and carries
+		// none rather than an empty-string placeholder.
+		d, derr := walltime.DigestJSON(ev.Buckets)
+		if derr != nil {
+			return fmt.Errorf("calibration proposed-plan digest: %w", derr)
+		}
+		ev.ProposedPlanDigests = []walltime.Digest{d}
 	}
 	if err := atomicWriteJSON(out, ev); err != nil {
 		return fmt.Errorf("write calibration evidence: %w", err)
@@ -242,8 +263,17 @@ func runCalibration(rnr runner.Runner, opt core.PlanOptions, out string, maxPlan
 //
 // It reuses the planner's own expansion rather than re-deriving one, so the
 // units a proposal is made of are the units a plan would actually schedule.
-func calibrationUniverse(rnr runner.Runner, opt core.PlanOptions) ([]walltime.CalibrationUnit, error) {
-	units, err := core.ExpandUnitsFor(context.Background(), rnr, nil, opt)
+//
+// THE LOADED STORE IS THE ONE ARGUMENT THAT MATTERS. This passed nil, and
+// ExpandUnitsFor substitutes a fresh empty store for nil — so the stored
+// reporter weights and, worse, the stored name-slice topology never reached the
+// proposer. A mixed whole/slice universe expanded to whole units only, every
+// unit carried the cold mean weight, and column 4's indicator could then be
+// reported STRUCTURALLY_INFEASIBLE for a universe that is nothing of the kind.
+// §17.3a proposes design rows for the population a plan would really schedule,
+// which means the same store ordinary planning just loaded.
+func calibrationUniverse(rnr runner.Runner, st *core.Store, opt core.PlanOptions) ([]walltime.CalibrationUnit, error) {
+	units, err := core.ExpandUnitsFor(context.Background(), rnr, st, opt)
 	if err != nil {
 		return nil, err
 	}

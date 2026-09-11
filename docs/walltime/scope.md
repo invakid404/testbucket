@@ -194,6 +194,9 @@ wire_paths:
   - {path: "a_eta_ns",                    artifact: observation, type: string,  cardinality: optional,
      provenance: {tags: [R18-F3], see: ["acceptance-contract.md 13", "acceptance-contract.md 5.1"]}}
   - {path: "process_group_id",            artifact: observation, type: string,  cardinality: one}
+  # clock domain of the endpoints — acceptance-contract.md 13.1, QC8
+  - {path: "clock_id",                    artifact: observation, type: string,  cardinality: one,
+     provenance: {tags: [R31-F13], see: ["acceptance-contract.md 13", "acceptance-contract.md 13.1"]}}
   - {path: "actual_runner_name",          artifact: observation, type: string,  cardinality: one}
   - {path: "observed_runs_on_label",      artifact: observation, type: string,  cardinality: one}
   - {path: "unit_ids",                    artifact: observation, type: array_of_string, cardinality: one}
@@ -204,6 +207,13 @@ wire_paths:
   - {path: "invocations[].cwd_digest",    artifact: observation, type: string,  cardinality: one_per_invocation}
   - {path: "invocations[].selector",      artifact: observation, type: array_of_string, cardinality: one_per_invocation}
   - {path: "invocations[].atoms",         artifact: observation, type: array_of_string, cardinality: one_per_invocation}
+  # measured selection identities, compared by QC6 — acceptance-contract.md 18.0
+  - {path: "invocations[].selector_digest", artifact: observation, type: string, cardinality: one_per_invocation,
+     provenance: {tags: [R31-F09], see: ["acceptance-contract.md 13", "acceptance-contract.md 18.0"]}}
+  - {path: "invocations[].unit_digest",   artifact: observation, type: string, cardinality: one_per_invocation,
+     provenance: {tags: [R31-F09], see: ["acceptance-contract.md 13", "acceptance-contract.md 18.0"]}}
+  - {path: "invocations[].atom_digest",   artifact: observation, type: string, cardinality: one_per_invocation,
+     provenance: {tags: [R31-F09], see: ["acceptance-contract.md 13", "acceptance-contract.md 18.0"]}}
   - {path: "invocations[].process_group_id", artifact: observation, type: string, cardinality: one_per_invocation}
   - {path: "invocations[].started_mono_ns",  artifact: observation, type: string, cardinality: one_per_invocation}
   - {path: "invocations[].ended_mono_ns",    artifact: observation, type: string, cardinality: one_per_invocation}
@@ -312,6 +322,9 @@ wire_paths:
   - {path: "plan.profile",                artifact: plan, type: object, cardinality: one, opaque: true,
      provenance: {tags: [R9-D3], see: ["acceptance-contract.md 13.0"]}}
   - {path: "plan.comparability_key_digest", artifact: plan, type: string, cardinality: one}
+  # the declaration the plan validated, QC14b requirement 3 — acceptance-contract.md 10.5.6
+  - {path: "plan.cache_declaration_digest", artifact: plan, type: string, cardinality: optional,
+     provenance: {tags: [R31-F11], see: ["acceptance-contract.md 10.5.2", "acceptance-contract.md 10.5.6"]}}
   - {path: "plan.runtime_profile_declared_digest", artifact: plan, type: string, cardinality: one,
      provenance: {tags: [R14-A1], see: ["acceptance-contract.md 15.3a"]}}
   - {path: "plan.runtime_profile_declared",  artifact: plan, type: object, cardinality: one,
@@ -465,10 +478,21 @@ wire_paths:
      provenance: {tags: [R22-F2], see: ["acceptance-contract.md 15.1a"]}}
   - {path: "calib.tolerance",               artifact: calibration_evidence, type: string, cardinality: one}
   - {path: "calib.min_pivot",               artifact: calibration_evidence, type: string, cardinality: one}
-  - {path: "calib.deficient_columns",       artifact: calibration_evidence, type: array_of_string, cardinality: one}
+  - {path: "calib.deficient_columns",       artifact: calibration_evidence, type: array_of_integer, cardinality: one}
   - {path: "calib.indicator_values_present", artifact: calibration_evidence, type: array_of_integer, cardinality: one}
   - {path: "calib.distinct_slice_counts",   artifact: calibration_evidence, type: array_of_integer, cardinality: one}
   - {path: "calib.generated_at",            artifact: calibration_evidence, type: string, cardinality: one}
+  # also serialized — acceptance-contract.md 6.7, acceptance-contract.md 17.3a
+  - {path: "calib.generator_exhausted",     artifact: calibration_evidence, type: boolean, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 6.7", "acceptance-contract.md 17.3a"]}}
+  - {path: "calib.zero_column",             artifact: calibration_evidence, type: integer, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
+  - {path: "calib.reason",                  artifact: calibration_evidence, type: string, cardinality: optional,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
+  - {path: "calib.buckets",                 artifact: calibration_evidence, type: array_of_string, cardinality: one_per_bucket,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 17.3a"]}}
+  - {path: "calib.design_rows",             artifact: calibration_evidence, type: array_of_number, cardinality: one_per_bucket,
+     provenance: {tags: [R31-F04], see: ["acceptance-contract.md 0.9", "acceptance-contract.md 17.3a"]}}
 
 # B. ROLES — acceptance-contract.md 22 test 63.
 #    role ∈ {REGRESSOR, RESPONSE, ADMISSION, DIAGNOSTIC, COMPARABILITY_KEY, OUTPUT_METADATA} · IDENTITY
@@ -541,7 +565,8 @@ roles:
   - {field: unit_ids,           role: ADMISSION, wire: [unit_ids]}
   - {field: invocation_membership, role: ADMISSION,
      wire: [invocations, "invocations[].seq", "invocations[].units", "invocations[].argv_digest",
-            "invocations[].selector", "invocations[].atoms"]}
+            "invocations[].selector", "invocations[].atoms",
+            "invocations[].selector_digest", "invocations[].unit_digest", "invocations[].atom_digest"]}
   - {field: campaign_id,        role: ADMISSION, wire: ["campaign_id", "manifest.campaign_id"],
      provenance: {tags: [R8-D2], see: ["acceptance-contract.md 15.1b"]}}
   - {field: trainable,          role: ADMISSION, wire: ["ring.trainable"]}

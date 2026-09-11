@@ -472,11 +472,23 @@ func runIngest(args []string) error {
 	switch {
 	case st.NeedsWallMigration():
 		if key == "" {
-			return fmt.Errorf("this store is schema 1 and ingest must migrate it (§15.2), " +
-				"but no comparability key is available: pass --comparability-key, or " +
-				"--wall-shard-plan so the key travels with the plan. `wall` records which " +
-				"history its rows belong to, and a migration that cannot name one produces " +
-				"a population nothing can compare against")
+			// AN UNOPTED INGEST STILL MIGRATES. This returned an error, so an
+			// ordinary `ingest --in <events> --store <schema-1 store>` — no wall
+			// observations, no plan, the Go runner — failed outright on a schema-1
+			// store, because Save refuses to stamp schema 2 over an unmigrated one.
+			// That is a default upgrade regression for a feature the command was
+			// not asked to use, and PD-1 and §8 are what it breaks.
+			//
+			// The LAYOUT migrates with the information available; `wall` stays
+			// absent, which §15.1c permits, because a wall object must name the
+			// population its rows belong to and this command cannot. No history is
+			// invented either way.
+			st.MigrateLayoutOnly()
+			fmt.Fprintf(os.Stderr,
+				"testbucket ingest: migrated this store's layout to schema 2 (§15.2); `wall` stays absent "+
+					"because no comparability key is available here — pass --comparability-key or "+
+					"--wall-shard-plan when wall history is wanted\n")
+			break
 		}
 		st.MigrateWall(key)
 	case key != "":
@@ -517,7 +529,14 @@ func runIngest(args []string) error {
 				"neither --comparability-key nor the plan named a comparability key, so §15.2's " +
 				"initialisation had nothing to record the history under")
 		}
-		planCtx, frozen, err := planContextOf(planDoc, *wallRunsOnLabel, st)
+		// QC10's verdicts are computed from the events THIS command read, over
+		// the plan it qualifies against. Without this, planContextOf asserted a
+		// pass for every bucket.
+		verdicts, err := coverageVerdicts(planDoc, sum)
+		if err != nil {
+			return err
+		}
+		planCtx, frozen, err := planContextOf(planDoc, *wallRunsOnLabel, st, verdicts)
 		if err != nil {
 			return err
 		}
@@ -808,7 +827,11 @@ func runPlan(args []string) error {
 	// --- contract §17.3a calibration ------------------------------------------
 	calibrate := fs.Bool("calibrate", false, "propose the calibration plan set of §17.3a instead of emitting a matrix: the design rows a fit needs to reach rank, packed by the same deterministic KK the reporter basis uses")
 	calibrationOut := fs.String("calibration-out", "", "write the proposed calibration plans here as JSON (required with --calibrate); the file is written atomically so a reader never sees a partial proposal")
-	calibrationMaxPlans := fs.Int("calibration-max-plans", 8, "the bounded search budget of §17.3a: at most this many plans are proposed before the proposer returns NOT_FOUND_WITHIN_BUDGET rather than searching without end")
+	// THE GOVERNED DEFAULT, not a second number. §6.7 and §17.3a prescribe N =
+	// 4 and the package declares it; this flag said 8, so the public command
+	// reported one budget while the contract stated another and searched four
+	// extra layouts nobody asked for.
+	calibrationMaxPlans := fs.Int("calibration-max-plans", walltime.DefaultCalibrationMaxPlans, "the bounded search budget of §17.3a: at most this many plans are proposed before the proposer returns NOT_FOUND_WITHIN_BUDGET rather than searching without end")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -873,11 +896,16 @@ func runPlan(args []string) error {
 	}
 
 	opt := core.PlanOptions{
-		K:          *k,
-		StorePath:  *store,
-		Count:      count,
-		StaleAfter: *staleAfter,
-		Now:        time.Now(),
+		K:         *k,
+		StorePath: *store,
+		Count:     count,
+		// THE SAME FLAG THE RUNNER GETS. It was passed to the adapter and not
+		// to the plan, so BuildPlan kept the diagnostic zero and WriteSummary
+		// printed §16.4's serial "-p=1, reporter-work sum" statement over
+		// invocations rendered with `-p=N`. One flag, both consumers.
+		FileParallelism: *fileParallelism,
+		StaleAfter:      *staleAfter,
+		Now:             time.Now(),
 	}
 	// Validate before the expensive discovery: a bad --count should cost a line
 	// of output, not a full `go list` sweep of every module.
@@ -953,6 +981,11 @@ func runPlan(args []string) error {
 		return fmt.Errorf("comparability key: %w", err)
 	}
 	opt.ComparabilityKeyDigest = string(keyDigest)
+	if cacheDecl != nil {
+		// §10.5.2 step 0b's verified declaration digest, recorded in the plan so
+		// QC14b requirement 3 has the plan's declaration to compare a row against.
+		opt.CacheDeclarationDigest = string(cacheDecl.Digest())
+	}
 
 	// THE STORE IS READ BEFORE DISCOVERY, because the basis decision depends on
 	// it and an unusable one must refuse before an expensive `go list` or
@@ -1005,9 +1038,33 @@ func runPlan(args []string) error {
 			}
 		}
 	}
+	// §6.7 RE-CHECKS THE REAL RING, every wall plan.
+	//
+	// The stored status and coefficients are evidence about the population that
+	// existed when the fit ran. A store whose observations array has since been
+	// emptied or thinned still carried status ok and a complete fit group, and
+	// that was taken as standing permission to allocate. The three preconditions
+	// §6.7 names are re-applied here against the rows actually present; a
+	// failure withdraws the model rather than rewriting the store, because the
+	// plan job is a reader.
+	if fitted != nil {
+		if rerr := walltime.AdmitWallRing(wallFitRows(st)); rerr != nil {
+			fmt.Fprintf(os.Stderr,
+				"testbucket plan: the stored wall model is not used — %v (§6.7 re-checks MIN_ROWS, MIN_RUNS and rank against the real ring on every wall plan)\n",
+				rerr)
+			fitted = nil
+			status = core.WallStatusInsufficient
+		}
+	}
+	// USABILITY IS DECIDED BEFORE ADMISSION, not after. `st != nil` said only
+	// that a file parsed; BuildPlan goes on to discard a store recorded under
+	// another token and cold-start, so a scored run passed the cold veto and
+	// then got a cold matrix. One predicate, evaluated once, shared with
+	// BuildPlan.
+	storeUsable, _ := core.StoreUsableFor(st, reason, rnr.CanonicalToken())
 	decision, err := core.SelectBasis(
 		core.BasisRequest{Basis: basis, Explicit: flagWasSet(fs, "est-basis")},
-		st != nil, status, *scored, *fileParallelism)
+		storeUsable, status, *scored, *fileParallelism)
 	if err != nil {
 		return err
 	}
@@ -1044,7 +1101,16 @@ func runPlan(args []string) error {
 	// §13.0's canonical profile: the shape this plan was built under, carried
 	// verbatim into every observation so QC13 compares one value rather than
 	// two derivations of it.
-	expandedDigest := expandedUnitSetDigest(livePkgs)
+	// ONE RESOLUTION, shared with the plan build. The expansion resolves the
+	// runnable names of every name-sliced target, so without this the digest and
+	// BuildPlan would each pay for a full `vitest list` / `go list` sweep — and
+	// two sweeps can disagree, which would make the digest describe an expansion
+	// the plan does not have.
+	opt.Runnables = memoRunnables(ctx, rnr)
+	expandedDigest, err := core.ExpandedTopologyDigest(ctx, rnr, st, reason, opt)
+	if err != nil {
+		return fmt.Errorf("expanded topology digest: %w", err)
+	}
 	profile := walltime.CanonicalProfile{
 		Scored:                *scored,
 		RunnerToken:           rnr.CanonicalToken(),
@@ -1075,7 +1141,9 @@ func runPlan(args []string) error {
 	opt.ExpandedUnitSetDigest = expandedDigest
 
 	if *calibrate {
-		return runCalibration(rnr, opt, *calibrationOut, *calibrationMaxPlans)
+		// The SAME store, live set and options ordinary planning uses — see
+		// calibrationUniverse on why nil was the defect.
+		return runCalibration(rnr, st, opt, *calibrationOut, *calibrationMaxPlans)
 	}
 
 	doc, err := core.BuildPlan(ctx, rnr, st, reason, opt)

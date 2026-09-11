@@ -159,6 +159,23 @@ func TrainableAtAppend(obs Observation, cfg *VerifiedCampaignConfig) (trainable 
 		return false, false, "profile does not parse"
 	}
 
+	// AN UNSCORABLE CLOCK DOMAIN NEVER TRAINS.
+	//
+	// §15.1b makes `trainable` the single carrier of every in-CI exclusion,
+	// written once at append from the row's own bytes — and the clock domain is
+	// one of the row's own bytes. The non-Linux backend reads the host REALTIME
+	// clock under an honest name, and nothing kept its measurements out of the
+	// fit: assembly dropped clock_id, the durations advance, and the fixed boot
+	// marker matches itself, so every ordering and boot check passed. An NTP step
+	// moves that clock, which is the whole reason the backend calls itself
+	// unscorable.
+	//
+	// The row is RETAINED as a diagnostic rather than refused: a developer run
+	// that exercises the real endpoint ordering is worth recording, and refusing
+	// it would delete the evidence instead of labelling it. A SCORED row on such a
+	// clock is a different thing and QC8 refuses it outright.
+	unscorableClock := obs.ClockID != ClockMonotonic
+
 	if cfg == nil {
 		// The ordinary CI path. §22 test 61: with NO config supplied, a
 		// campaign_id present, or a scored profile, is a MISWIRING and the row
@@ -170,6 +187,9 @@ func TrainableAtAppend(obs Observation, cfg *VerifiedCampaignConfig) (trainable 
 		}
 		if prof.Scored {
 			return false, false, "profile.scored is true with no verified config supplied: refused before append"
+		}
+		if unscorableClock {
+			return false, true, fmt.Sprintf("clock domain %q may not delimit a scored interval: retained diagnostic-only, never trains", obs.ClockID)
 		}
 		return true, true, "ordinary unscored CI row"
 	}

@@ -423,21 +423,38 @@ audit is stronger — it is terminal, because a bucket that did not execute its
 plan is not a measurement of that plan under any threshold, and no wall-time
 record can show what was never run.
 
-### Allocation, forecast and audit are three different numbers
+### What the estimate means, and which basis produced it
 
-- **`Palloc`** is the allocation score: `frozen_scorer(frozen_preplan_features)`,
-  and nothing else. At plan time it may read no label and no outcome —
-  including the timing store's own EWMA weight, which is reporter-derived and
-  would leak an outcome into allocation through the side door. A unit the model
-  scores at or below zero still has to be packed somewhere, so the score has a
-  floor: a zero-weight unit would make the partition think it is free.
-- **`est_seconds`** is unchanged: the store's measured weights, one decimal,
-  numeric. Consumers read it; the split no longer has to.
-- **`Pcheck`** is the post-render audit projection of those same frozen values
-  over the renderer's membership. It cannot re-plan.
-- **`Aeta`** is the pre-action forecast, instantiated per bucket before the
-  action starts. A phase nobody predicted is an ETA-completeness failure even
-  when the observation agreed with itself to the microsecond.
+`est_basis` is the one field that answers both questions, and it is on the plan
+document and on every matrix entry.
+
+- **`est_basis: reporter`** — the cold and default path. A bucket's
+  `est_seconds` is the sum of its units' stored reporter weights, one decimal,
+  numeric, exactly as in v0.2.2. Allocation packs by those weights through the
+  same Karmarkar-Karp partition it always has.
+- **`est_basis: wall`** — available only once a fitted model with status `ok`
+  exists for this comparability key. The allocator optimizes the model's
+  predicted action interval `A_eta_ns`, in integer nanoseconds, and a bucket's
+  `est_seconds` is that same value rendered for display — `round1(A_eta_ns /
+  1e9)`. It is therefore NOT the sum of its units' `est_seconds`, and the plan
+  report says so on the same screen.
+- **`wall_est_seconds`** is an additive SHADOW, emitted **iff** the basis is
+  `reporter` and a fitted `ok` model exists. Under the wall basis it is absent,
+  because `est_seconds` already is the model's value. It never reaches
+  allocation.
+- **Zero is a value.** An empty bucket is a legitimate design row — it happens
+  whenever there are fewer units than buckets — and it displays `0.0` honestly.
+  Nothing treats that as "no estimate".
+
+The model is four integer-nanosecond terms fitted over the bucket history: a
+fixed cost, a scale on the bucket's plan-time reporter sum, a whole-file
+indicator and a per-slice term. Every regressor is frozen at PLAN time, so a
+later store update cannot change what was fitted, and the reporter sum a row
+carries is the plan's — feeding the model its own `A_eta` display would make it
+regress on its own output.
+
+An observation echoes the plan's two estimate fields for audit, and `ingest`
+compares both against the plan rather than against each other (QC18).
 
 ### In a workflow
 

@@ -2,6 +2,7 @@ package walltime
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -498,3 +499,51 @@ func solvePassive(x [][]float64, y []float64, passive []bool) []float64 {
 // budget-exhaustion path, which resolves to a STATUS rather than a failure —
 // the one cap in this product that does.
 var nnlsOuterCapOverride int
+
+// ErrRingAdmission is the class AdmitWallRing returns, so a caller can wrap it
+// in its own unusable-model error without string matching.
+var ErrRingAdmission = errors.New("the real wall ring does not support wall allocation")
+
+// AdmitWallRing re-applies §6.7's three ring preconditions — MIN_ROWS, MIN_RUNS
+// and rank — against the population a plan is about to allocate from.
+//
+// §6.7 is explicit: "MIN_ROWS/MIN_RUNS/rank are re-checked against the real ring
+// on every wall plan." Nothing did. A stored `ok` status and a complete fit group
+// were taken as standing permission, so a store whose observations array had
+// since been emptied — by eviction, by a migration, by a hand edit, by a
+// comparability reset that cleared rows and left the status behind — still
+// reached wall allocation and emitted a matrix from coefficients no current row
+// supports. A fit-time admission is evidence about the population that existed
+// at fit time.
+//
+// The three checks are exactly the three the contract names here. The residual
+// ceiling is NOT re-applied: that is §6.8's fit-time judgement and re-deciding
+// it at plan time would silently change which models are usable.
+func AdmitWallRing(selected []FitRow) error {
+	if len(selected) < MinRows {
+		return fmt.Errorf("%w: %d trainable row(s) in the ring, MIN_ROWS is %d",
+			ErrRingAdmission, len(selected), MinRows)
+	}
+	runs := map[[2]string]bool{}
+	for _, r := range selected {
+		runs[[2]string{r.RunID, r.RunAttempt}] = true
+	}
+	if len(runs) < MinRuns {
+		return fmt.Errorf("%w: %d distinct run(s) in the ring, MIN_RUNS is %d",
+			ErrRingAdmission, len(runs), MinRuns)
+	}
+	// THE SAME MATRIX THE FIT USED, built by the same function, so the plan
+	// cannot check a different X from the one the coefficients came from.
+	x, _ := designOf(SortForFit(selected))
+	rank, err := RankAdmission(x)
+	if err != nil {
+		// E_RANK_NON_CONVERGENT is a named §1.3 condition, not a verdict: it
+		// propagates rather than becoming "not admitted".
+		return err
+	}
+	if !rank.Admitted {
+		return fmt.Errorf("%w: rank(X) over the current ring is %d, not %d (deficient columns %v)",
+			ErrRingAdmission, rank.Rank, DesignColumns, rank.DeficientColumns)
+	}
+	return nil
+}

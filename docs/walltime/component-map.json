@@ -377,6 +377,22 @@
    "dependency_impact": "Preserves ordinary build/test/Vitest integration/release dry-run while pinning external actions by immutable SHA."
   },
   {
+   "id": "dead-frozen-planning-and-resolution",
+   "kind": "command-helpers",
+   "classification": "REMOVE",
+   "files": [
+    "cmd/testbucket/planningsnapshot_test.go",
+    "cmd/testbucket/wallplan.go"
+   ],
+   "evidence": [
+    "cmd/testbucket/wallplan.go:13",
+    "cmd/testbucket/wallplan.go:41",
+    "cmd/testbucket/wallplan.go:68",
+    "cmd/testbucket/wallplan.go:130"
+   ],
+   "dependency_impact": "R31-F19: call-site inspection found every symbol in these two files disconnected from the production planner - a frozen acquisition-environment snapshot, a frozen-PATH program resolver, a package-launcher delegation resolver, and the discovery argv of the acquisition closure. Each reference was a definition, a helper-internal call, or a test, so helper coverage looked like live-path coverage while the names still described a capability this product does not have. They were split out of wall-cli-and-acquisition rather than reclassified inside it: that component's R54 SIMPLIFY classification describes the files that remain, and rewriting it would falsify the salvage record instead of recording a later discovery. splitCommand, which IS live, stays in main.go."
+  },
+  {
    "id": "wall-cli-and-acquisition",
    "kind": "command-and-tests",
    "classification": "SIMPLIFY",
@@ -385,9 +401,7 @@
     "cmd/testbucket/actionsexpr_test.go",
     "cmd/testbucket/main.go",
     "cmd/testbucket/main_test.go",
-    "cmd/testbucket/planningsnapshot_test.go",
     "cmd/testbucket/wall.go",
-    "cmd/testbucket/wallplan.go",
     "cmd/testbucket/workflowpermissions_test.go"
    ],
    "evidence": [
@@ -1344,6 +1358,10 @@
     "events-dir",
     "runner"
    ],
+   "add_inputs": [
+    "working-directory"
+   ],
+   "add_inputs_note": "R31-F25: the plan and run-bucket actions execute in inputs.working-directory and a rendered invocation's dir is relative to it - Vitest's is '.' - while acceptance-contract.md 13.1's identity is the ABSOLUTE directory that resolves to. This action had no such input and ran from the repository root, so verification resolved that relative dir against the wrong base and failed a correct nested run on cwd identity. A relative directory is not rebased implicitly; the base is stated.",
    "remove_inputs": [
     "require",
     "release-pins-ref",

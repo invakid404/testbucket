@@ -154,13 +154,22 @@ func vitestInvocation(cfg renderConfig, files, names []string, bucket, seq int) 
 	for _, f := range files {
 		args = append(args, filterPathArg(f))
 	}
-	if cfg.eventsDir != "" {
-		// A second reporter writes machine-readable JSON for `ingest` while the
-		// default reporter keeps the console log human-readable; the JSON goes
-		// to a per-bucket file the record job collects. It is part of the argv
-		// that actually runs, so it belongs in Args.
-		args = append(args, "--reporter=default", "--reporter=json",
-			fmt.Sprintf("--outputFile.json=%s/bucket-%d-%02d.json", strings.TrimSuffix(cfg.eventsDir, "/"), bucket, seq))
+	// THE REPORTER FLAGS REACH `Args` ONLY ON THE OPTED PATH.
+	//
+	// A second reporter writes machine-readable JSON for `ingest` while the
+	// default reporter keeps the console log human-readable, and under the wall
+	// wrapper it must be in Args: the wrapper executes the argv directly, digests
+	// it, and QC6 compares that digest against the plan's.
+	//
+	// Unopted, it must NOT be. `Args` is a serialized plan field PD-1's legacy
+	// projection carries, and moving these three tokens into it changed that field
+	// for every reporter plan — and changed the script BYTES, because the shell
+	// line quotes each Args token whole: an events path containing a space
+	// rendered as `'--outputFile.json=/tmp/a b/…'` where v0.2.2 emitted
+	// `--outputFile.json='/tmp/a b/…'`. The two are equivalent to a shell and not
+	// equivalent to a byte comparison, and the frozen surface is the bytes.
+	if cfg.eventsDir != "" && cfg.wallDir != "" {
+		args = append(args, reporterArgs(cfg, bucket, seq)...)
 	}
 	// Desc keeps the canonical ids: it is the human/plan-facing identity, and it
 	// must keep matching the store keys and the ids the reporter reports.
@@ -208,8 +217,29 @@ func shellLine(inv runner.Invocation, cfg renderConfig, bucket, seq int) string 
 		}
 		sb.WriteString(shellQuote(a))
 	}
+	if cfg.eventsDir != "" {
+		// APPENDED HERE, AND QUOTED THE WAY v0.2.2 QUOTED IT: the flag name and
+		// `=` are literal and only the PATH is quoted. Quoting the whole token
+		// instead is shell-equivalent and byte-different, and PD-1 freezes the
+		// bytes. See vitestInvocation on why these tokens stay out of `Args` when
+		// wall time is not in use.
+		fmt.Fprintf(&sb, " --reporter=default --reporter=json --outputFile.json=%s",
+			shellQuote(eventsFileFor(cfg, bucket, seq)))
+	}
 	sb.WriteString(" )")
 	return sb.String()
+}
+
+// eventsFileFor is the per-bucket JSON reporter path, in one place so the shell
+// line and the opted argv cannot disagree about it.
+func eventsFileFor(cfg renderConfig, bucket, seq int) string {
+	return fmt.Sprintf("%s/bucket-%d-%02d.json", strings.TrimSuffix(cfg.eventsDir, "/"), bucket, seq)
+}
+
+// reporterArgs is the three-token reporter argv the opted path carries in Args.
+func reporterArgs(cfg renderConfig, bucket, seq int) []string {
+	return []string{"--reporter=default", "--reporter=json",
+		"--outputFile.json=" + eventsFileFor(cfg, bucket, seq)}
 }
 
 // wallLine renders one invocation under the physical wrapper. The command is

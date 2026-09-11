@@ -245,6 +245,37 @@ func RunInActionWith(o RunInActionOptions) (int, error) {
 					reason = err.Error()
 				}
 			}
+			// §3.3 APPLIES TO NORMAL COMPLETION TOO.
+			//
+			// The drain ran only on the deadline path, so a setup shell could
+			// start an ordinary background child in its own group, exit 0, and
+			// leave that child running: the setup interval closed, EndAction
+			// never knew the group existed, and the action could finish while
+			// its own work was still executing on the runner. No setsid, no
+			// double fork and no hostile runner is needed — `cmd &` is enough.
+			//
+			// The root is ALREADY REAPED here — cmd.Wait returned — so ReapRoot
+			// reports that immediately rather than being omitted. Omitting it
+			// closes the reap channel, which leaves DrainOutcome.Reaped false,
+			// and the drain cannot conclude "empty" until the root has been
+			// reaped: it would burn the whole bounded escalation on every
+			// successful setup. That is the same ten-seconds-for-nothing shape
+			// this campaign already removed from the cancellation paths.
+			//
+			// What remains is the signal and the confirmed-empty probe, and a
+			// drain that cannot confirm emptiness is REPORTED rather than assumed.
+			if pgid > 1 {
+				out, derr := DrainGroup(DrainRequest{
+					PGID: pgid, TermGrace: cancellationGrace, KillGrace: reapGrace,
+					ReapRoot: func() error { return nil },
+				})
+				switch {
+				case derr != nil:
+					reason = appendReason(reason, "setup group drain: "+derr.Error())
+				case !out.GroupEmpty:
+					reason = appendReason(reason, out.Limitation())
+				}
+			}
 		case <-time.After(time.Until(setupDeadline(st, o.Timeout))):
 			// The same bounded escalation the measured child gets: a setup
 			// command is action-owned work, so it may not outlive the action
@@ -347,4 +378,17 @@ func EndAction(dir string, terminal, reason string) (*ActionState, error) {
 		return st, err
 	}
 	return st, nil
+}
+
+// appendReason joins a second reason onto an existing one without losing the
+// first. A retained record's reason field is the only place a drain limitation
+// can be read later, so it is appended rather than overwritten.
+func appendReason(existing, add string) string {
+	if add == "" {
+		return existing
+	}
+	if existing == "" {
+		return add
+	}
+	return existing + "; " + add
 }

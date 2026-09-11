@@ -253,10 +253,11 @@ func TestTheWallBasisPacksAndDisplaysOneObjective(t *testing.T) {
 	// declare — a store written that way is one no consumer reading the
 	// registered paths can find.
 	st["wall"] = map[string]any{
-		"model_version":                1,
-		"comparability_key_digest":     key,
-		"status":                       "ok",
-		"observations":                 []any{},
+		"model_version":            1,
+		"comparability_key_digest": key,
+		"status":                   "ok",
+		// A RING THAT SUPPORTS THE FIT BESIDE IT — see supportingRing.
+		"observations":                 supportingRing(key),
 		"fixed_ns":                     "2000000000",
 		"scale":                        "1.25",
 		"whole_invocation_overhead_ns": "500000000",
@@ -446,7 +447,8 @@ func TestAMatchingComparabilityKeyStillWarms(t *testing.T) {
 		"model_version":            1,
 		"comparability_key_digest": key,
 		"status":                   "ok",
-		"observations":             []any{},
+		// A RING THAT SUPPORTS THE FIT BESIDE IT — see supportingRing.
+		"observations": supportingRing(key),
 	}
 	// THE REGISTERED WIRE FORMAT IS FLAT: the registry declares fixed_ns,
 	// scale and fitted_at directly under `wall`, with scale as a STRING. A
@@ -499,6 +501,44 @@ func planComparabilityKey(t *testing.T, bin, dir, live, store string, extra ...s
 }
 
 // fittedWallLeaves is an accepted §15.1c fit on the registered flat surface.
+// supportingRing is a ring population that ACTUALLY SUPPORTS the fitted leaves
+// beside it: MIN_ROWS trainable rows over more than MIN_RUNS distinct runs, with
+// both topology columns varying so rank reaches 4.
+//
+// The fixtures used `"observations": []` next to `rows_used: 24`, which is a
+// store that cannot exist — and §6.7 re-checks MIN_ROWS, MIN_RUNS and rank
+// against the real ring on every wall plan, so it is now refused. A fixture
+// whose two halves contradict each other tests neither.
+func supportingRing(key string) []any {
+	rows := make([]any, 0, 24)
+	for i := 0; i < 24; i++ {
+		rows = append(rows, map[string]any{
+			"repository":               "owner/name",
+			"job_id":                   fmt.Sprintf("job-%d", i),
+			"head_sha":                 fmt.Sprintf("head-%d", i/8),
+			"candidate_sha":            "cand",
+			"workload_commit":          "work",
+			"run_id":                   fmt.Sprintf("run-%d", i/8),
+			"run_attempt":              "1",
+			"observed_start_realtime":  "2026-09-01T00:00:00Z",
+			"trainable":                true,
+			"ingest_seq":               i + 1,
+			"bucket_index":             i % 8,
+			"plan_digest":              fmt.Sprintf("sha256:plan-%d", i),
+			"store_sha256":             "sha256:store",
+			"comparability_key_digest": key,
+			"reporter_sum_ns":          fmt.Sprintf("%d", 1_000_000_000*(i+1)),
+			"i_any_whole_file":         i % 2,
+			"slice_count":              i % 5,
+			"elapsed_ns":               fmt.Sprintf("%d", 2_000_000_000*(i+1)),
+			"whole_file_count":         1,
+			"invocation_count":         1,
+			"terminal":                 "passed",
+		})
+	}
+	return rows
+}
+
 func fittedWallLeaves() map[string]any {
 	return map[string]any{
 		"fitted_at":                    "2026-09-01T00:00:00Z",

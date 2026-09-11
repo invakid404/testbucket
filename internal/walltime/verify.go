@@ -640,6 +640,30 @@ func verifyIntervals(v *Verdict, envs []Envelope) {
 					fmt.Sprintf("%s: the endpoints carry boot identities %s and %s; two readings on different timelines are never compared",
 						label, b, e.Physical.end.Instant.BootID))
 			}
+			// THE CLOCK DOMAIN IS CHECKED, not only the ordering.
+			//
+			// Nothing required Instant.Scorable. The non-Linux backend reads the
+			// host REALTIME clock under an honest name and a fixed non-empty boot
+			// marker, so its readings advance and its boot identities match — and
+			// every ordering, positivity and boot check above passed. A
+			// measurement from a backend whose own documentation calls itself
+			// unscorable was therefore complete and eligible, which is how it
+			// could reach training. An NTP step moves that clock; §13.1's
+			// interval is CLOCK_MONOTONIC's or it is a diagnostic.
+			//
+			// INELIGIBLE, not terminal: the records do describe a complete run,
+			// and a developer reading them locally is the reason the fallback
+			// exists.
+			for _, end := range []struct {
+				what string
+				i    Instant
+			}{{"opening", e.Physical.start.Instant}, {"closing", e.Physical.end.Instant}} {
+				if !end.i.Scorable() {
+					v.add("WT-027", SeverityIneligible,
+						fmt.Sprintf("%s: the %s reading is clock %q with boot identity %q, which may not delimit a scored interval (§13.1 admits %s only)",
+							label, end.what, end.i.ClockID, end.i.BootID, ClockMonotonic))
+				}
+			}
 		}
 		// AN ABSENT TERMINAL IS NOT A PASS EITHER. This too refused only a
 		// terminal that was present and not `passed`, so a closing record

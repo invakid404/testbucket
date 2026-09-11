@@ -1,6 +1,7 @@
 package walltime
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -338,4 +339,87 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestCalibrationEvidenceMatchesItsRegistryEntries is the control §22 test 63's
+// own clause needed and did not have.
+//
+// Test 63 checks that the calibration document has AT LEAST ONE registry entry.
+// That is what let the producer and the registry diverge completely: the
+// serialized type omitted seven §17.3a fields and emitted five nobody had
+// registered, and both documents agreed with themselves. A bidirectional claim
+// over a wholly-new document has to be compared in both directions or it is a
+// claim about one of them.
+//
+// The comparison is SET-EQUAL over the serialized keys, which means a field
+// added to the struct without a registry row fails here, and so does a row with
+// no field behind it.
+func TestCalibrationEvidenceMatchesItsRegistryEntries(t *testing.T) {
+	block := parseRegistryBlock(t, "# field-registry v2")
+	registered := map[string]bool{}
+	for _, p := range parseWirePaths(t, block) {
+		if p.Artifact != "calibration_evidence" {
+			continue
+		}
+		registered[strings.TrimPrefix(p.Path, "calib.")] = true
+	}
+	if len(registered) == 0 {
+		t.Fatal("the registry declares no calibration_evidence paths")
+	}
+
+	// EVERY field populated, because the comparison is over what the document
+	// CAN serialize and most fields are omitempty. A half-filled value would
+	// make an absent field look unregistered.
+	ev := CalibrationEvidence{
+		Schema:                 CalibrationEvidenceSchema,
+		Outcome:                CalibrationSufficient,
+		ComparabilityKeyDigest: "sha256:key",
+		ProposedPlanDigests:    []Digest{"sha256:plan"},
+		LayoutsTried:           1,
+		LayoutBudget:           DefaultCalibrationMaxPlans,
+		Rank:                   DesignColumns,
+		SigmaMax:               "1",
+		Tolerance:              "2",
+		MinPivot:               "3",
+		IndicatorValuesPresent: []int{0, 1},
+		DistinctSliceCounts:    []int{0, 2},
+		GeneratorExhausted:     true,
+		DeficientColumns:       []int{4},
+		ZeroColumn:             4,
+		Reason:                 "because",
+		Buckets:                [][]string{{"a"}},
+		DesignRows:             [][]float64{{1, 2, 3, 4}},
+		GeneratedAt:            "2026-09-11T00:00:00Z",
+	}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatal(err)
+	}
+
+	for k := range wire {
+		if !registered[k] {
+			t.Errorf("the calibration document serializes %q and the registry does not declare calib.%s", k, k)
+		}
+	}
+	for k := range registered {
+		if _, ok := wire[k]; !ok {
+			t.Errorf("the registry declares calib.%s and the document cannot serialize it", k)
+		}
+	}
+
+	// And the §17.3a identities specifically, because those are the ones a
+	// later run reads: an outcome word with no population and no proposal is
+	// not evidence.
+	for _, need := range []string{
+		"comparability_key_digest", "proposed_plan_digests", "sigma_max", "tolerance",
+		"min_pivot", "indicator_values_present", "distinct_slice_counts", "generated_at",
+	} {
+		if _, ok := wire[need]; !ok {
+			t.Errorf("§17.3a's evidence document requires %q and the type cannot emit it", need)
+		}
+	}
 }

@@ -98,6 +98,31 @@ func (s *Store) MigrateWall(comparabilityKeyDigest string) {
 	s.migratedFromLegacy = false
 }
 
+// MigrateLayoutOnly performs §15.2's `1 → 2` forward step for the STORE LAYOUT
+// and leaves `wall` absent, for the ordinary ingest that has no comparability key
+// to name a history with.
+//
+// The migration used to require a key unconditionally, so an unopted
+// `ingest --in <events> --store <schema-1 store>` — no wall observations, no
+// plan, the Go runner — failed outright, and Save refuses to stamp schema 2 over
+// an unmigrated store. That broke the plain v0.2.2 upgrade PD-1 and §8 exist to
+// protect, for a wall feature the command had not been asked to use.
+//
+// Leaving `wall` absent is not a deferred obligation: §15.1c makes `wall`
+// OPTIONAL, and a wall object must carry the key that says which population its
+// rows belong to — §15.2's own reason for requiring one. An object with an empty
+// key would be a history that cannot say what it is. The first ingest or plan that
+// knows a key initialises it through ResetWallForKeyChange, with no history
+// invented either way.
+func (s *Store) MigrateLayoutOnly() {
+	if !s.NeedsWallMigration() {
+		return
+	}
+	from := 1
+	s.MigratedFrom = &from
+	s.migratedFromLegacy = false
+}
+
 // ResetWallForKeyChange applies contract §15.3's second reset rule: a
 // comparability-key change clears `wall.observations` and sets the model
 // `insufficient`, and leaves the reporter EWMAs untouched. The two reset rules

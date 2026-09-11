@@ -169,9 +169,35 @@ func TestARunThatMeetsEveryPrerequisiteIsScorable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyDir: %v", err)
 	}
-	if !v.Complete || !v.Eligible {
-		t.Errorf("a run meeting every prerequisite verified as complete=%v eligible=%v; findings = %+v",
-			v.Complete, v.Eligible, v.Findings)
+	if !v.Complete {
+		t.Errorf("a run meeting every prerequisite verified as complete=%v; findings = %+v", v.Complete, v.Findings)
+	}
+	// ELIGIBILITY DEPENDS ON THE HOST'S CLOCK, and saying so is the point.
+	//
+	// §13.1 admits CLOCK_MONOTONIC only. On a platform without raw access the
+	// backend reads host realtime under an honest name, and this test used to
+	// assert the resulting run was scorable anyway — because nothing checked the
+	// domain. "Every prerequisite" includes the clock, so the assertion is made
+	// against what the host can actually provide, and the unscorable branch names
+	// the finding rather than accepting silence.
+	hostScorable := NewSystemClock().Now().Scorable()
+	switch {
+	case hostScorable && !v.Eligible:
+		t.Errorf("a run meeting every prerequisite on a scorable clock verified as eligible=false; findings = %+v", v.Findings)
+	case !hostScorable:
+		if v.Eligible {
+			t.Errorf("a run measured on clock %q verified as eligible; §13.1 admits %s only",
+				NewSystemClock().Now().ClockID, ClockMonotonic)
+		}
+		var found bool
+		for _, f := range v.Findings {
+			if f.Code == "WT-027" && f.Severity == SeverityIneligible {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("an unscorable clock domain produced no WT-027 finding; findings = %+v", v.Findings)
+		}
 	}
 
 	// And the membership is EXACT: one changed selector makes the same records

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/invakid404/testbucket/internal/walltime"
 )
 
 // TestTheShippedActionCompositionAssemblesAndIngests runs the run-bucket
@@ -69,8 +71,15 @@ func TestTheShippedActionCompositionAssemblesAndIngests(t *testing.T) {
 			// `wall run --wrapper-chain` starts a bash that runs the generated
 			// script, which is itself measured at the script level and which
 			// runs the rendered invocation.
-			invocation := fmt.Sprintf("%s wall exec --dir %s --level invocation --bucket-id bucket-0 --cwd %s -- sh -c true",
-				bin, records, dir)
+			// THE SELECTION THE PLAN RENDERS, passed through the same flags the
+			// real renderer's spec carries. It was omitted, so the measured
+			// invocation selected nothing while the plan rendered
+			// `./f0.test.ts` — and QC6 now compares the two, which is what it is
+			// named for. A fixture whose measured and planned selections differ
+			// tests a composition no run produces.
+			invocation := fmt.Sprintf("%s wall exec --dir %s --level invocation --bucket-id bucket-0 --cwd %s --selector %s --unit-digest %s -- sh -c true",
+				bin, records, dir, "./f0.test.ts",
+				string(walltime.DigestJSONOrEmpty([]string{"f0.test.ts"})))
 			script := fmt.Sprintf("%s wall exec --dir %s --level script --bucket-id bucket-0 --cwd %s -- sh -c '%s'",
 				bin, records, dir, invocation)
 			run("wall", "run", "--dir", records, "--wrapper-chain", "--",
@@ -80,13 +89,25 @@ func TestTheShippedActionCompositionAssemblesAndIngests(t *testing.T) {
 			plan, _ := writePlanDeclaring(t, dir, "bucket-0", 0, []string{"sh", "-c", "true"}, dir,
 				observedProfileOf(t, bin))
 
-			// The verifier the action itself runs must accept the records.
+			// The verifier the action itself runs must accept the records — on a
+			// platform whose clock can delimit a scored interval. Where it cannot,
+			// a plan-bound verification correctly reports WT-027 and exits
+			// non-zero; see hostClockIsScorable.
 			verify := exec.Command(bin, "wall", "verify", "--dir", records, "--shard-plan", plan)
 			var vErr strings.Builder
 			verify.Stderr = &vErr
 			verify.Stdout = &vErr
-			if err := verify.Run(); err != nil {
+			err := verify.Run()
+			switch {
+			case hostClockIsScorable(t) && err != nil:
 				t.Fatalf("wall verify refused the shipped composition: %v\n%s", err, vErr.String())
+			case !hostClockIsScorable(t):
+				if err == nil {
+					t.Fatalf("wall verify accepted records measured on an unscorable clock:\n%s", vErr.String())
+				}
+				if !strings.Contains(vErr.String(), "WT-027") {
+					t.Fatalf("the refusal is not the clock domain's; findings:\n%s", vErr.String())
+				}
 			}
 
 			obsFile := filepath.Join(obsDir, "bucket-0.json")

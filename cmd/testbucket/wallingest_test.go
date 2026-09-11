@@ -201,8 +201,11 @@ func observationFixture(bucket string, index int, runID string, planDigest wallt
 		// fixture carried one and the schema accepted it because it agreed
 		// with est_seconds — which the assembler derives from it, so the
 		// agreement was free.
-		EstSeconds:          10.0,
-		ProcessGroupID:      "pg-1",
+		EstSeconds: 10.0,
+		// A REAL PGID. §13.1 declares a positive integer in the platform's
+		// PID range, and QC7a now checks it: "pg-1" is not a process group,
+		// it is a label that passed a non-empty test.
+		ProcessGroupID:      "4242",
 		ActualRunnerName:    "runner-1",
 		ObservedRunsOnLabel: "ubuntu-latest",
 		UnitIDs:             []string{"f0.test.ts"},
@@ -216,7 +219,12 @@ func observationFixture(bucket string, index int, runID string, planDigest wallt
 			ArgvDigest: walltime.DigestJSONOrEmpty([]string{"run", "f0.test.ts"}),
 			CwdDigest:  walltime.DigestJSONOrEmpty(walltime.AbsCwd(".")),
 			Selector:   []string{"./f0.test.ts"}, Atoms: []string{},
-			ProcessGroupID: "pg-1",
+			// The OBSERVED selection identities, derived the same way the plan
+			// side derives them. QC6 compares membership now, not only the argv.
+			SelectorDigest: walltime.DigestJSONOrEmpty([]string{"./f0.test.ts"}),
+			UnitDigest:     walltime.DigestJSONOrEmpty([]string{"f0.test.ts"}),
+			AtomDigest:     walltime.DigestJSONOrEmpty([]string{}),
+			ProcessGroupID: "4243",
 			StartedMonoNs:  1000, EndedMonoNs: 2_000_000_000,
 			ElapsedNs: 1_999_999_000,
 		}},
@@ -229,6 +237,9 @@ func observationFixture(bucket string, index int, runID string, planDigest wallt
 		WrapperNs:        1_000_000_000,
 		RealtimeStart:    "2026-09-01T00:00:00Z",
 		RealtimeEnd:      "2026-09-01T00:00:10Z",
+		// §13.1's clock domain, carried rather than dropped. A row that does not
+		// name the clock its endpoints came from is a diagnostic and never trains.
+		ClockID: walltime.ClockMonotonic,
 		CacheState: walltime.CacheState{
 			DependencyCacheMode: "disabled", TransformCacheMode: "disabled",
 			DependencyCacheProducer:     "none",
@@ -392,7 +403,9 @@ func TestAssembledObservationSurvivesIngest(t *testing.T) {
 	// §3.1's `script_ns >= Σ V[j]` — which the assembler correctly refuses,
 	// and which is a property of the composition rather than of the tooling.
 	inner := bin + " wall exec --dir " + records + " --level invocation" +
-		" --bucket-id bucket-0 --cwd " + dir + " -- sh -c true"
+		" --bucket-id bucket-0 --cwd " + dir +
+		" --selector ./f0.test.ts --unit-digest " + string(walltime.DigestJSONOrEmpty([]string{"f0.test.ts"})) +
+		" -- sh -c true"
 	run("wall", "exec", "--dir", records, "--level", "script", "--bucket-id", "bucket-0",
 		"--cwd", dir, "--", "sh", "-c", inner)
 	run("wall", "end", "--dir", records, "--terminal", "passed")
@@ -549,7 +562,9 @@ func TestPlanFrozenRegressorsCountSlicesTheObservationCannotSee(t *testing.T) {
 		t.Fatalf("ParseShardPlan: %v", err)
 	}
 	st := core.NewStore("vitest")
-	_, frozen, err := planContextOf(parsed, "ubuntu-latest", st)
+	// This test is about the PLAN-FROZEN regressors; QC10's verdicts are the
+	// caller's and are supplied empty here.
+	_, frozen, err := planContextOf(parsed, "ubuntu-latest", st, nil)
 	if err != nil {
 		t.Fatalf("planContextOf: %v", err)
 	}
@@ -618,7 +633,9 @@ func TestQC17RejectsARunnerThatDriftedFromThePlan(t *testing.T) {
 	run("wall", "begin", "--dir", records, "--bucket-id", "bucket-0")
 	run("wall", "run", "--dir", records, "--", "sh", "-c", "true")
 	inner := bin + " wall exec --dir " + records + " --level invocation" +
-		" --bucket-id bucket-0 --cwd " + dir + " -- sh -c true"
+		" --bucket-id bucket-0 --cwd " + dir +
+		" --selector ./f0.test.ts --unit-digest " + string(walltime.DigestJSONOrEmpty([]string{"f0.test.ts"})) +
+		" -- sh -c true"
 	run("wall", "exec", "--dir", records, "--level", "script", "--bucket-id", "bucket-0",
 		"--cwd", dir, "--", "sh", "-c", inner)
 	run("wall", "end", "--dir", records, "--terminal", "passed")

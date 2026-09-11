@@ -11,6 +11,8 @@ package walltime
 // so it is checked here directly, on the records.
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -165,5 +167,51 @@ func TestTheComposedActionDerivesEverySpanFromItsOwnBytes(t *testing.T) {
 	}
 	if seen < 3 {
 		t.Errorf("saw %d measured closing records, want the setup, the script and the invocation", seen)
+	}
+}
+
+// TestSetupDrainsItsOwnedGroupOnNormalCompletion is F12's control.
+//
+// The drain ran only on the deadline path. A setup shell could start an ordinary
+// background child in its own group and exit 0, and nothing drained it: the setup
+// interval closed and the action could finish while its own work was still
+// running on the runner. `cmd &` is the whole trigger — no setsid, no double
+// fork, no hostile runner.
+//
+// The child's survival is observed through a file it only creates AFTER a delay,
+// so the assertion is about whether it was still running rather than about
+// winning a race to read its pid.
+func TestSetupDrainsItsOwnedGroupOnNormalCompletion(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := BeginAction(dir, RunIdentity{Repository: "owner/name", RunID: "r", AttemptID: "1",
+		Job: "j", BucketID: "bucket-0"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	survived := filepath.Join(dir, "survived")
+	start := time.Now()
+	code, err := RunInAction(dir, []string{"sh", "-c",
+		"sh -c 'sleep 3; touch " + survived + "' & exit 0"}, dir, nil, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("RunInAction: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("the setup command exited %d, want 0", code)
+	}
+	// A successful setup must not pay the bounded escalation: the root is
+	// already reaped when the drain starts, which is the difference between a
+	// drain and a ten-second pause.
+	if elapsed > 20*time.Second {
+		t.Fatalf("a successful setup took %v; the drain burned its escalation instead of confirming an empty group", elapsed)
+	}
+
+	// Well past the child's own delay. If it is still alive it will have created
+	// the file by now.
+	time.Sleep(5 * time.Second)
+	if _, err := os.Stat(survived); err == nil {
+		t.Fatal("the setup command's own background child outlived the setup interval and kept running; §3.3's drain applies to normal completion too")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", survived, err)
 	}
 }

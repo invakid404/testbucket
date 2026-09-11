@@ -10,22 +10,13 @@ import (
 // The frozen numeric gates. They are constants, not configuration: a threshold
 // a run can choose is a threshold a run can pass.
 const (
-	// ReconMAELimit and ReconMaxLimit bound the LIKE-FOR-LIKE reconciliation
-	// between a trace and its own containment peer. They are deliberately not
-	// applied to trace-versus-physical: the peer and the trace bracket the same
-	// admission-to-verified-empty lifecycle, while the physical envelope also
-	// contains real bootstrap and epilogue work, so comparing those two would
-	// fail a correctly instrumented run for accounting honestly.
-	ReconMAELimit = 50 * millisecond
-	ReconMaxLimit = 100 * millisecond
-
-	// PcheckInvocationMAELimit, PcheckInvocationMaxLimit and
-	// PcheckBucketMAELimit bound the PREDICTOR against observed physical V.
-	// Instrumentation agreement is not prediction accuracy; these are separate
-	// and neither substitutes for the other.
-	PcheckInvocationMAELimit = 5 * second
-	PcheckInvocationMaxLimit = 10 * second
-	PcheckBucketMAELimit     = 5 * second
+	// FIVE THRESHOLDS ARE REMOVED with the machinery they bounded: two that
+	// reconciled a trace against its own containment peer, and three that bounded
+	// a frozen predictor projection against observed V. There is no peer, no
+	// trace and no projection. Nothing in production read any of them, and a
+	// threshold naming a quantity the product does not have reads as a gate
+	// somebody could still apply. The symbols are named in the semantic-removal
+	// control that keeps them out, not here.
 
 	// AetaMAELimit and AetaMaxLimit bound the user-facing action forecast
 	// against observed A. AetaMinWidth and AetaWidthFraction bound how wide an
@@ -104,136 +95,6 @@ type GateResult struct {
 	Expected int    `json:"expected_population,omitempty"`
 	Pass     bool   `json:"pass"`
 	Detail   string `json:"detail,omitempty"`
-}
-
-// PredictorSample pairs one invocation's frozen projection with its observed
-// physical duration.
-type PredictorSample struct {
-	InvocationSeq int   `json:"invocation_seq"`
-	BucketIndex   int   `json:"bucket"`
-	PredictedNs   int64 `json:"predicted_ns"`
-	ObservedNs    int64 `json:"observed_ns"`
-}
-
-// EvaluatePredictor runs the Pcheck-versus-observed-V gates: invocation MAE,
-// individual invocation error, and bucket MAE. All three must pass; none of
-// them can be traded for instrumentation agreement.
-func EvaluatePredictor(samples []PredictorSample) []GateResult {
-	if len(samples) == 0 {
-		return []GateResult{{
-			Name: "predictor:invocation-max", Scope: ScopeRow,
-			Required: fmt.Sprintf("every |error| <= %s", dur(PcheckInvocationMaxLimit)),
-			Observed: "no sample", Detail: "no frozen projection was paired with an observed invocation",
-		}}
-	}
-	invMAE, worst := invocationErrors(samples)
-	// ONE ROW PER BUCKET OF THIS MEASUREMENT. In row context every sample
-	// belongs to the same scored row, so the bucket index separates nothing
-	// and the whole set is one bucket total — which is exactly the quantity
-	// the gate is about.
-	byBucket := map[int][]PredictorSample{}
-	var order []int
-	for _, s := range samples {
-		if _, seen := byBucket[s.BucketIndex]; !seen {
-			order = append(order, s.BucketIndex)
-		}
-		byBucket[s.BucketIndex] = append(byBucket[s.BucketIndex], s)
-	}
-	groups := make([][]PredictorSample, 0, len(order))
-	for _, b := range order {
-		groups = append(groups, byBucket[b])
-	}
-	bucketMAE, bucketRows := bucketMeanAbsoluteError(groups)
-
-	return []GateResult{
-		{
-			Name: "predictor:invocation-mae", Scope: ScopeCampaign, Required: "<= " + dur(PcheckInvocationMAELimit),
-			Observed: dur(invMAE), Population: len(samples), Pass: invMAE <= PcheckInvocationMAELimit,
-		},
-		{
-			Name: "predictor:invocation-max", Scope: ScopeRow, Required: "<= " + dur(PcheckInvocationMaxLimit),
-			Observed: dur(worst), Population: len(samples), Pass: worst <= PcheckInvocationMaxLimit,
-		},
-		{
-			Name: "predictor:bucket-mae", Scope: ScopeRow, Required: "<= " + dur(PcheckBucketMAELimit),
-			Observed: dur(bucketMAE), Population: bucketRows, Expected: bucketRows, Pass: bucketMAE <= PcheckBucketMAELimit,
-		},
-	}
-}
-
-// invocationErrors is the INVOCATION population: the mean absolute error over
-// every paired projection and observation, and the worst single one. Both are
-// unchanged by the bucket rule below; they answer a different question and the
-// contract names them separately.
-func invocationErrors(samples []PredictorSample) (mae, worst int64) {
-	var sum int64
-	for _, s := range samples {
-		e := abs64(s.PredictedNs - s.ObservedNs)
-		sum += e
-		if e > worst {
-			worst = e
-		}
-	}
-	if len(samples) == 0 {
-		return 0, 0
-	}
-	return sum / int64(len(samples)), worst
-}
-
-// bucketMeanAbsoluteError is the frozen bucket statistic: for each scored
-// (run, bucket) row, the error of that row's AGGREGATE projection against its
-// aggregate observation, averaged over the rows.
-//
-// SUMMATION PRECEDES THE ABSOLUTE VALUE, and that is the whole content of the
-// gate. What used to be computed took the absolute value of each invocation
-// error first, grouped those by bucket ordinal and averaged twice — which is
-// an invocation-error statistic wearing a bucket's name. With equal invocation
-// counts it reproduces the invocation MAE exactly, so the contract's third
-// independent gate silently duplicated its first.
-//
-// The difference is not academic. Six invocations each under-predicted by one
-// second give an invocation MAE of one second and a maximum of one second,
-// both comfortably inside their limits, while the bucket they belong to is
-// wrong by six. Averaging absolute invocation errors reports one second; the
-// bucket's projection is out by six, and it is the bucket total the contract
-// bounds. A systematic small under-prediction is enough to authorize a release
-// whose genuine campaign misses every one of its eighty bucket totals.
-func bucketMeanAbsoluteError(groups [][]PredictorSample) (mae int64, rows int) {
-	var sum int64
-	for _, g := range groups {
-		if len(g) == 0 {
-			// A row that retains no sample is not a bucket error of zero; it
-			// is an absent observation, which the coverage gate reports.
-			continue
-		}
-		var predicted, observed int64
-		for _, s := range g {
-			// SIGNED, both of them, all the way to the row total. Discarding
-			// the sign per invocation is what turned this into a different
-			// statistic.
-			predicted += s.PredictedNs
-			observed += s.ObservedNs
-		}
-		sum += abs64(predicted - observed)
-		rows++
-	}
-	if rows == 0 {
-		return 0, 0
-	}
-	return sum / int64(rows), rows
-}
-
-// RowScope selects the gates one verified row decides for itself. The rest are
-// campaign-scope and belong to `wall campaign` over the full population; a
-// per-run verdict reports them without ever passing them.
-func RowScope(gates []GateResult) []GateResult {
-	var out []GateResult
-	for _, g := range gates {
-		if g.Scope == ScopeRow {
-			out = append(out, g)
-		}
-	}
-	return out
 }
 
 // AetaSample pairs one bucket's pre-action forecast with the observed complete
@@ -357,68 +218,4 @@ func dur(ns int64) string {
 	default:
 		return fmt.Sprintf("%.3f s", float64(ns)/float64(second))
 	}
-}
-
-// EvaluateCampaignPredictor runs the frozen Pcheck-versus-observed-V gates
-// over the WHOLE population, and first checks that the population is there.
-//
-// The coverage gate is the load-bearing one. `EvaluatePredictor` on an empty
-// sample set returns a row-scope finding, and campaign scope discards row-scope
-// gates — so a campaign whose eighty verdicts all omitted their predictor
-// samples used to report no predictor gate at all and pass. Absence has to be
-// a failure, and it has to be distinguishable from a row that legitimately
-// measured no invocations, which is why each row carries its own invocation
-// count.
-func EvaluateCampaignPredictor(samples []PredictorSample, predictorRows [][]PredictorSample, invocations, rows, covered int) []GateResult {
-	coverage := GateResult{
-		Name: "predictor:coverage", Scope: ScopeCampaign,
-		Required:   "one Pcheck/observed-V sample per scored invocation, in every row",
-		Observed:   fmt.Sprintf("%d sample(s) for %d invocation(s) across %d row(s)", len(samples), invocations, rows),
-		Population: covered, Expected: rows,
-	}
-	switch {
-	case rows == 0:
-		coverage.Detail = "the population retains no rows, so predictor coverage cannot be established"
-	case covered < rows:
-		coverage.Detail = fmt.Sprintf("%d of %d row(s) retain a sample for every invocation they measured; the rest prove nothing about Pcheck against observed V", covered, rows)
-	case len(samples) != invocations:
-		coverage.Detail = fmt.Sprintf("the population holds %d sample(s) for %d scored invocation(s)", len(samples), invocations)
-	case invocations == 0:
-		// Every row measured zero invocations and every row says so. That is
-		// consistent and it is not predictor evidence, so it does not pass.
-		coverage.Detail = "no row measured any invocation, so the Pcheck-versus-observed-V gates have no population"
-	default:
-		coverage.Pass = true
-	}
-
-	out := []GateResult{coverage}
-	for _, g := range EvaluatePredictor(samples) {
-		// Every predictor gate is decided at CAMPAIGN scope here: the contract
-		// states invocation MAE, individual invocation error and bucket MAE
-		// over the campaign population, and a row-scope copy of them would be
-		// filtered out of a campaign verdict.
-		g.Scope = ScopeCampaign
-		// THE BUCKET GATE COUNTS BUCKET ROWS, not invocations. Overwriting its
-		// expected population with the invocation count reported that eighty
-		// bucket totals were four hundred and eighty of something, which is
-		// how a population of eight passed a gate the contract sizes at
-		// eighty.
-		if g.Name == "predictor:bucket-mae" {
-			bucketMAE, populated := bucketMeanAbsoluteError(predictorRows)
-			g.Observed, g.Population, g.Expected = dur(bucketMAE), populated, rows
-			g.Pass = bucketMAE <= PcheckBucketMAELimit && populated == rows
-			if populated != rows {
-				g.Detail = fmt.Sprintf(
-					"%d of %d scored bucket row(s) retain a projection to compare; a bucket mean over fewer rows is not the frozen statistic", populated, rows)
-			}
-		} else {
-			g.Expected = invocations
-		}
-		if !coverage.Pass {
-			g.Pass = false
-			g.Detail = firstNonEmptyStr(g.Detail, "predictor coverage is incomplete, so this statistic answers a different question than the frozen gate")
-		}
-		out = append(out, g)
-	}
-	return out
 }

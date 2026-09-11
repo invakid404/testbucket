@@ -45,3 +45,15 @@ func loadActionInterfaces(t *testing.T) map[string][]string {
 	}
 	return out
 }
+
+// sha40 turns a short, readable fixture label into the 40 lowercase hex
+// characters §13 declares for head_sha, candidate_sha and workload_commit.
+//
+// QC15 used to accept any three distinct non-empty strings, so fixtures named
+// identities "h1" and "w1" and passed. Those are not commits; the fixtures keep
+// their readable labels and this is what makes the bytes legal, so a test that
+// passes is a test over a row a real run could produce.
+func sha40(label string) string {
+	sum := sha256.Sum256([]byte(label))
+	return hex.EncodeToString(sum[:])[:CommitSHALen]
+}
