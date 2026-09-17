@@ -117,5 +117,5 @@ jobs:
         # the release workflow, so the dry-run validates what actually ships.
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "2.18.0"
+          version: "v2.18.2"
           args: release --snapshot --clean

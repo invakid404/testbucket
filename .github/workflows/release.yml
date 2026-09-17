@@ -53,7 +53,7 @@ jobs:
         # version in the same spirit.
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "2.18.0"
+          version: "v2.18.2"
           # --clean is safe to re-run: replace_existing_artifacts is enabled in
           # .goreleaser.yaml, so a rerun after a transient failure replaces the
           # assets instead of failing with `already_exists`.
