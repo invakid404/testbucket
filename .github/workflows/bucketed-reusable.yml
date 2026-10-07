@@ -241,14 +241,14 @@ jobs:
         run: npm ci
 
       - name: Download timing events
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: testbucket-events-${{ inputs.cache-scope }}-bucket-*
           merge-multiple: true
           path: /tmp/testbucket-events
 
       - name: Download the shard plan
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: testbucket-shard-plan-${{ inputs.cache-scope }}
           path: ${{ runner.temp }}/plan
