@@ -112,7 +112,7 @@ jobs:
 
       - name: Set up Node
         if: inputs.runner == 'vitest'
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ inputs.node-version }}
 
@@ -176,7 +176,7 @@ jobs:
 
       - name: Set up Node
         if: inputs.runner == 'vitest' || matrix.needs_node
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ inputs.node-version }}
 
@@ -231,7 +231,7 @@ jobs:
 
       - name: Set up Node
         if: inputs.runner == 'vitest'
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ inputs.node-version }}
 
