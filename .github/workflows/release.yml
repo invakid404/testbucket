@@ -51,7 +51,7 @@ jobs:
         # Pinned to a reviewed commit SHA (third-party code with a write token);
         # bump via an explicit PR. goreleaser itself is pinned to an exact
         # version in the same spirit.
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           version: "2.18.0"
           # --clean is safe to re-run: replace_existing_artifacts is enabled in
